@@ -1,0 +1,113 @@
+.data
+  ct: db 0x52, 0x41, 0x05, 0xD9, 0x30, 0x6C, 0x09, 0x9A, 0x15, 0x5F, 0x47, 0x65, 0x30, 0x7B, 0xAB, 0xE4, 0x7B, 0xC4, 0xA5, 0x58, 0x1C, 0xB8, 0x9F, 0xBB, 0xF9, 0xEC, 0xDD, 0x2F, 0xF5, 0xDB, 0xA7, 0x34, 0xFB, 0x90, 0x9C, 0xDF, 0xFC, 0x9A, 0x3B, 0x62, 0xA0, 0xD1, 0x2B, 0xC5, 0xDF, 0x5B, 0x4B, 0x09, 0x9B, 0x67, 0x2A, 0xE7
+
+.code
+  push_imm64 0xCBF29CE484222325
+  local_addr 64
+  swap
+  store64
+  push_imm64 0x0000000000000000
+  local_addr 72
+  swap
+  store64
+L_fnv:
+  local_addr 72
+  load64
+  push_arg 0
+  cmp_lt
+  jz L_fnv_done
+  local_addr 64
+  load64
+  local_addr 0
+  local_addr 72
+  load64
+  add
+  load8
+  xor
+  push_imm64 0x00000100000001B3
+  mul
+  local_addr 64
+  swap
+  store64
+  local_addr 72
+  load64
+  push_imm8 1
+  add
+  local_addr 72
+  swap
+  store64
+  jmp L_fnv
+L_fnv_done:
+  local_addr 64
+  load64
+  push_imm64 0xCCE6FCACC03B4421
+  cmp_eq
+  jz L_deny
+  push_imm64 0x0000000000000000
+  local_addr 72
+  swap
+  store64
+L_dec:
+  local_addr 72
+  load64
+  push_imm8 52
+  cmp_lt
+  jz L_grant
+  data_addr 0
+  local_addr 72
+  load64
+  add
+  load8
+  local_addr 0
+  local_addr 72
+  load64
+  push_arg 0
+  mod
+  add
+  load8
+  xor
+  local_addr 64
+  load64
+  local_addr 72
+  load64
+  push_imm8 7
+  and
+  push_imm8 8
+  mul
+  shr
+  push_imm8 0xFF
+  and
+  xor
+  local_addr 72
+  load64
+  push_imm8 0x25
+  mul
+  push_imm8 0x0D
+  add
+  push_imm8 0xFF
+  and
+  xor
+  local_addr 80
+  swap
+  store64
+  local_addr 128
+  local_addr 72
+  load64
+  add
+  local_addr 80
+  load64
+  store8
+  local_addr 72
+  load64
+  push_imm8 1
+  add
+  local_addr 72
+  swap
+  store64
+  jmp L_dec
+L_grant:
+  push_imm8 0
+  halt
+L_deny:
+  push_imm8 1
+  halt

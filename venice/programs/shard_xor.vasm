@@ -1,0 +1,47 @@
+; Contract: STATUS — 0=success, nonzero=error
+; VVM_PROG_SHARD_XOR -- replaces the shard block in pe_loader.c
+;
+; args[0] = key   (uint8_t[32], XOR'd in place)
+; locals: [0..64] shex (65-byte env buffer)   [65..96] shard (32 bytes)
+; data:   [0..11] "NV_RT_GATE\0\0"
+
+.data
+  env_name: db 0x4E, 0x56, 0x5F, 0x52, 0x54, 0x5F, 0x47, 0x41, 0x54, 0x45, 0x00, 0x00
+
+.code
+  ; -- read NV_RT_GATE env var --
+  data_addr 0
+  local_addr 0
+  push_imm8 65
+  n_getenv
+
+  ; -- check length == 64 (valid hex shard) --
+  push_imm8 64
+  cmp_eq
+  jz done
+
+  ; -- hex-decode shard into local buffer --
+  local_addr 0
+  push_imm8 64
+  local_addr 65
+  n_hex_decode
+
+  ; -- XOR shard into key --
+  push_arg 0
+  local_addr 65
+  push_imm8 32
+  push_imm8 32
+  n_xor_repeat
+
+  ; -- unset env var --
+  data_addr 0
+  n_setenv_null
+
+  ; -- wipe local buffers --
+  local_addr 0
+  push_imm8 97
+  n_zero_mem
+
+done:
+  push_imm8 0
+  halt

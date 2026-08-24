@@ -1,0 +1,283 @@
+; VVM_PROG_SEAL_CACHE -- virtualizes SecurityManager::protectBytes()
+;
+; Seals plaintext using DPAPI with machine-bound entropy.
+; Entropy = "orion-entitlement-v1|" + hex(SHA256(hostname|uniqueId|guid))
+;
+; args[0] = &VmExternals       (function pointer table)
+; args[1] = plaintext_ptr      (const uint8_t*)
+; args[2] = plaintext_len      (uint32_t, as u64)
+; args[3] = out_buf            (uint8_t*, caller-allocated)
+; args[4] = out_max_len        (uint32_t, as u64)
+;
+; VmExternals offsets used:
+;    0 = get_hostname(buf, bufsize)            -> chars written, 0=fail
+;    8 = get_machine_guid(buf, bufsize)        -> chars written, 0=fail
+;   16 = get_machine_unique_id(buf, bufsize)   -> bytes written, 0=fail
+;   40 = sha256_buf(data, len, out32)          -> 0=ok, 1=fail
+;   48 = dpapi_protect(in, in_len, entropy, ent_len, out, out_max)
+;                                              -> bytes written, -1=fail
+;
+; Locals memory map:
+;   [0..255]     material    256 bytes (hostname|uniqueId|guid)
+;   [256..287]   sha_out     32 bytes (SHA256 of material)
+;   [288..351]   hex_id      64 bytes (lowercase hex-encoded machineId)
+;   [352..436]   entropy     85 bytes (21-byte prefix + 64 hex chars)
+;   [440..447]   mat_len     u64 (running material byte count)
+;   [448..455]   sha_ptr     u64 (read pointer for hex encoding)
+;   [456..463]   hex_ptr     u64 (write pointer for hex encoding)
+;
+; Data section:
+;   [0..15]      hex_lut     "0123456789abcdef"
+;   [16..36]     ent_pfx     "orion-entitlement-v1|"
+;
+; Contract: DATA — >=0 bytes written on success, -1=error
+; Return: halt with dpapi_protect result (bytes written, or -1)
+
+.data
+  hex_lut: db 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37
+  db 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66
+  ent_pfx: db 0x6F, 0x72, 0x69, 0x6F, 0x6E, 0x2D, 0x65, 0x6E
+  db 0x74, 0x69, 0x74, 0x6C, 0x65, 0x6D, 0x65, 0x6E
+  db 0x74, 0x2D, 0x76, 0x31, 0x7C
+
+.code
+  ; ---- main entry ----
+  call build_entropy
+  jnz fail_neg1
+
+  ; ---- call dpapi_protect ----
+  ; dpapi_protect(plaintext, len, entropy, ent_len, out, out_max)
+  push_arg 1                ; plaintext_ptr
+  push_arg 2                ; plaintext_len
+  local_addr 352            ; entropy (&locals[352])
+  push_imm8 85              ; entropy_len = 21 + 64
+  push_arg 3                ; out_buf
+  push_arg 4                ; out_max_len
+  push_imm8 6               ; argc
+  push_arg 0                ; &VmExternals
+  push_imm8 48              ; offset 48 = dpapi_protect
+  add
+  load64
+  n_call_ptr                ; -> bytes written or -1
+  halt
+
+fail_neg1:
+  push_imm8 1
+  neg                       ; twos-complement -1 (0xFFFF...FFFF)
+  halt
+
+; ============================================================
+; Subroutine: build_entropy
+;
+; Computes machineId = hex(SHA256(hostname|uniqueId|guid))
+; and builds the full DPAPI entropy in locals[352..436].
+; Uses locals[0..463] for working storage.
+;
+; Stack convention: pushes 0 on success, nonzero on failure.
+; ============================================================
+build_entropy:
+
+  ; ---- Step 1: build material = hostname|uniqueId|guid ----
+
+  ; mat_len = 0
+  local_addr 440
+  push_imm8 0
+  store64
+
+  ; -- get_hostname(&locals[0], 256) --
+  local_addr 0
+  push_imm16 256
+  push_imm8 2               ; argc
+  push_arg 0
+  load64                    ; func ptr at offset 0 (get_hostname)
+  n_call_ptr                ; -> chars written
+  ; mat_len = hostname_len
+  local_addr 440
+  swap
+  store64
+
+  ; append '|'
+  local_addr 0
+  local_addr 440
+  load64
+  add
+  push_imm8 0x7C
+  store8
+  ; mat_len++
+  local_addr 440
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; -- get_machine_unique_id(&locals[mat_len], 256 - mat_len) --
+  local_addr 0
+  local_addr 440
+  load64
+  add                       ; buf = &locals[mat_len]
+  push_imm16 256
+  local_addr 440
+  load64
+  sub                       ; bufsize = 256 - mat_len
+  push_imm8 2               ; argc
+  push_arg 0
+  push_imm8 16              ; offset 16 = get_machine_unique_id
+  add
+  load64
+  n_call_ptr                ; -> bytes written
+  ; mat_len += uid_len
+  local_addr 440
+  load64
+  add
+  local_addr 440
+  swap
+  store64
+
+  ; append '|'
+  local_addr 0
+  local_addr 440
+  load64
+  add
+  push_imm8 0x7C
+  store8
+  local_addr 440
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; -- get_machine_guid(&locals[mat_len], 256 - mat_len) --
+  local_addr 0
+  local_addr 440
+  load64
+  add
+  push_imm16 256
+  local_addr 440
+  load64
+  sub
+  push_imm8 2               ; argc
+  push_arg 0
+  push_imm8 8               ; offset 8 = get_machine_guid
+  add
+  load64
+  n_call_ptr                ; -> chars written
+  ; mat_len += guid_len
+  local_addr 440
+  load64
+  add
+  local_addr 440
+  swap
+  store64
+
+  ; ---- Step 2: SHA256(material, mat_len) -> sha_out ----
+  ; sha256_buf(data, len, out)
+  local_addr 0              ; data = &material
+  local_addr 440
+  load64                    ; len = mat_len
+  local_addr 256            ; out = &sha_out
+  push_imm8 3               ; argc
+  push_arg 0
+  push_imm8 40              ; offset 40 = sha256_buf
+  add
+  load64
+  n_call_ptr                ; -> 0=ok, 1=fail
+  push_imm8 0
+  cmp_ne
+  jnz build_fail            ; SHA256 failed
+
+  ; ---- Step 3: hex-encode SHA256 into locals[288..351] ----
+
+  ; sha_ptr = &locals[256]
+  local_addr 448
+  local_addr 256
+  store64
+
+  ; hex_ptr = &locals[288]
+  local_addr 456
+  local_addr 288
+  store64
+
+hex_loop:
+  ; sha_ptr < &locals[288] (= locals[256] + 32)?
+  local_addr 448
+  load64
+  local_addr 288
+  cmp_lt
+  jz hex_done
+
+  ; load byte at sha_ptr
+  local_addr 448
+  load64
+  load8                     ; byte
+
+  ; -- high nibble --
+  dup                       ; byte byte
+  push_imm8 4
+  shr                       ; byte hi_nibble
+  data_addr 0               ; &hex_lut
+  add
+  load8                     ; byte hi_char
+
+  ; store hi_char at *hex_ptr
+  local_addr 456
+  load64
+  swap
+  store8                    ; byte
+
+  ; -- low nibble --
+  push_imm8 0x0F
+  and                       ; lo_nibble
+  data_addr 0
+  add
+  load8                     ; lo_char
+
+  ; store lo_char at *(hex_ptr + 1)
+  local_addr 456
+  load64
+  push_imm8 1
+  add
+  swap
+  store8
+
+  ; sha_ptr++
+  local_addr 448
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; hex_ptr += 2
+  local_addr 456
+  dup
+  load64
+  push_imm8 2
+  add
+  store64
+
+  jmp hex_loop
+
+hex_done:
+  ; ---- Step 4: build entropy in locals[352..436] ----
+
+  ; copy prefix "orion-entitlement-v1|" from data[16] to locals[352]
+  local_addr 352
+  data_addr 16
+  push_imm8 21
+  n_copy_mem
+
+  ; copy hex machineId from locals[288] to locals[373] (352 + 21)
+  local_addr 373
+  local_addr 288
+  push_imm8 64
+  n_copy_mem
+
+  ; success
+  push_imm8 0
+  ret
+
+build_fail:
+  push_imm8 1
+  ret

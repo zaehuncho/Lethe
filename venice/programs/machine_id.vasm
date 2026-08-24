@@ -1,0 +1,206 @@
+; VVM_PROG_MACHINE_ID -- virtualizes SecurityManager::machineId()
+;
+; Produces a 64-char lowercase hex SHA-256 of "hostname|unique_id|guid",
+; matching the C++ logic:
+;   material  = machineHostName + "|" + machineUniqueId + "|" + machineGuid
+;   result    = hexSha256(material).left(64)
+;
+; Args:
+;   [0] = &VmExternals      function pointer table (see vm_externals.h)
+;   [1] = out_buf            char*, 65 bytes min (64 hex chars + null)
+;
+; Locals usage:
+;   [0..511]   material buffer (hostname + '|' + uid + '|' + guid, max ~386 B)
+;   [600..631] SHA-256 digest output (32 bytes)
+;
+; Contract: STATUS — 0=success, nonzero=error
+; Return: halt 0 = success (out_buf filled), halt 1 = failure
+;
+; VmExternals offsets used:
+;    0: get_hostname(char* buf, uint32_t bufsize) -> len, 0=fail
+;    8: get_machine_guid(char* buf, uint32_t bufsize) -> len, 0=fail
+;   16: get_machine_unique_id(uint8_t* buf, uint32_t bufsize) -> len, 0=fail
+;   40: sha256_buf(const void* data, uint32_t len, uint8_t out[32]) -> 0=ok
+
+.data
+  ; "0123456789abcdef" lookup table for hex encoding
+  hex_lut: db 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66
+
+.code
+  ; ================================================================
+  ; Step 1: get_hostname -> locals[0..], returns hostname_len
+  ; ================================================================
+  ; n_call_ptr: push args L-to-R, push argc, push fn_ptr, call
+  local_addr 0                ; arg1: buf = &locals[0]
+  push_imm8 128               ; arg2: bufsize
+  push_imm8 2                 ; argc
+  push_arg 0                  ; &VmExternals
+  push_imm8 0                 ; offset 0 = get_hostname
+  add
+  load64                      ; fn_ptr
+  n_call_ptr                  ; -> hostname_len
+  ; stack: [hn_len]
+
+  ; fail if hostname_len == 0
+  dup
+  push_imm8 0
+  cmp_eq
+  jnz error
+
+  ; ================================================================
+  ; Step 2: store '|' separator after hostname
+  ; ================================================================
+  dup                          ; [hn_len, hn_len]
+  local_addr 0
+  add                          ; [hn_len, &locals[hn_len]]
+  push_imm8 0x7C               ; '|'
+  store8                       ; [hn_len]
+  push_imm8 1
+  add                          ; [pos1 = hn_len + 1]
+
+  ; ================================================================
+  ; Step 3: get_machine_unique_id -> locals[pos1..], returns uid_len
+  ; ================================================================
+  dup                          ; [pos1, pos1]
+  local_addr 0
+  add                          ; [pos1, &locals[pos1]]
+  push_imm8 128               ; bufsize
+  push_imm8 2                 ; argc
+  push_arg 0
+  push_imm8 16                ; offset 16 = get_machine_unique_id
+  add
+  load64
+  n_call_ptr                   ; [pos1, uid_len]
+
+  ; fail if uid_len == 0
+  dup
+  push_imm8 0
+  cmp_eq
+  jnz error
+
+  ; ================================================================
+  ; Step 4: store '|' separator after uid
+  ; ================================================================
+  add                          ; [pos2 = pos1 + uid_len]
+  dup                          ; [pos2, pos2]
+  local_addr 0
+  add                          ; [pos2, &locals[pos2]]
+  push_imm8 0x7C               ; '|'
+  store8                       ; [pos2]
+  push_imm8 1
+  add                          ; [pos3 = pos2 + 1]
+
+  ; ================================================================
+  ; Step 5: get_machine_guid -> locals[pos3..], returns guid_len
+  ; ================================================================
+  dup                          ; [pos3, pos3]
+  local_addr 0
+  add                          ; [pos3, &locals[pos3]]
+  push_imm8 128               ; bufsize
+  push_imm8 2                 ; argc
+  push_arg 0
+  push_imm8 8                 ; offset 8 = get_machine_guid
+  add
+  load64
+  n_call_ptr                   ; [pos3, guid_len]
+
+  ; fail if guid_len == 0
+  dup
+  push_imm8 0
+  cmp_eq
+  jnz error
+
+  ; ================================================================
+  ; Step 6: sha256_buf(material, total_len, digest)
+  ; ================================================================
+  add                          ; [total_len = pos3 + guid_len]
+  local_addr 0                 ; [total_len, &material]
+  swap                         ; [&material, total_len]
+  local_addr 600               ; [&material, total_len, &digest]
+  push_imm8 3                  ; argc
+  push_arg 0
+  push_imm8 40                 ; offset 40 = sha256_buf
+  add
+  load64
+  n_call_ptr                   ; [result] (0 = ok)
+  jnz error
+
+  ; ================================================================
+  ; Step 7: hex-encode 32-byte digest -> out_buf[0..63]
+  ; Loop: for each digest byte, write hi and lo nibble hex chars
+  ; ================================================================
+  push_imm8 0                  ; i = 0
+
+hex_loop:
+  dup                          ; [i, i]
+  push_imm8 32
+  cmp_lt                       ; [i, (i < 32)]
+  jz hex_done
+
+  ; -- load digest[i] --
+  dup                          ; [i, i]
+  local_addr 600               ; [i, i, &digest]
+  add                          ; [i, &digest[i]]
+  load8                        ; [i, byte]
+
+  ; -- hi nibble: (byte >> 4) -> hex char via lookup --
+  dup                          ; [i, byte, byte]
+  push_imm8 4
+  shr                          ; [i, byte, hi]
+  data_addr 0                  ; [i, byte, hi, &hex_lut]
+  add                          ; [i, byte, &hex_lut[hi]]
+  load8                        ; [i, byte, hex_hi_char]
+
+  ; -- store hex_hi at out_buf[2*i] --
+  pick 2                       ; [i, byte, hex_hi, i]
+  push_imm8 1
+  shl                          ; [i, byte, hex_hi, 2*i]
+  push_arg 1                   ; [i, byte, hex_hi, 2*i, out_buf]
+  add                          ; [i, byte, hex_hi, &out[2*i]]
+  swap                         ; [i, byte, &out[2*i], hex_hi]
+  store8                       ; [i, byte]
+
+  ; -- lo nibble: (byte & 0x0F) -> hex char via lookup --
+  push_imm8 0x0F
+  and                          ; [i, lo]
+  data_addr 0                  ; [i, lo, &hex_lut]
+  add                          ; [i, &hex_lut[lo]]
+  load8                        ; [i, hex_lo_char]
+
+  ; -- store hex_lo at out_buf[2*i + 1] --
+  pick 1                       ; [i, hex_lo, i]
+  push_imm8 1
+  shl                          ; [i, hex_lo, 2*i]
+  push_imm8 1
+  add                          ; [i, hex_lo, 2*i+1]
+  push_arg 1                   ; [i, hex_lo, 2*i+1, out_buf]
+  add                          ; [i, hex_lo, &out[2*i+1]]
+  swap                         ; [i, &out[2*i+1], hex_lo]
+  store8                       ; [i]
+
+  ; -- i++ --
+  push_imm8 1
+  add
+  jmp hex_loop
+
+hex_done:
+  pop                          ; discard i
+
+  ; ================================================================
+  ; Step 8: null-terminate out_buf
+  ; ================================================================
+  push_arg 1
+  push_imm8 64
+  add
+  push_imm8 0
+  store8
+
+  ; ================================================================
+  ; Success
+  ; ================================================================
+  push_imm8 0
+  halt
+
+error:
+  push_imm8 1
+  halt
