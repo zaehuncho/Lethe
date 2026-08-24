@@ -24,27 +24,55 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_cmake_sources_exist_and_bcrypt_is_a_static_system_import() -> None:
+def test_cmake_sources_exist_and_bcrypt_is_resolved_dynamically() -> None:
+    """The stub must NOT statically import bcrypt.
+
+    A static ``bcrypt.dll`` entry in the packed binary's import table is an
+    obvious reverse-engineering landmark and defeats import elision. The stub's
+    single entropy call (``crypto_csprng``) instead resolves ``BCryptGenRandom``
+    at runtime from an obfuscated name (``LoadLibrary`` + ``GetProcAddress`` on a
+    ``vstr_dec``-decoded string), so the IAT stays kernel32-only. This test pins
+    that decision so a future change cannot silently regress to a static import.
+    """
     cmake = _read(STUB_ROOT / "CMakeLists.txt")
     listed_sources = re.findall(r"\bsrc/[A-Za-z0-9_.-]+\.(?:c|asm)\b", cmake)
 
     assert listed_sources
     assert all((STUB_ROOT / source).is_file() for source in listed_sources)
     assert "src/bcrypt_dyn.c" not in listed_sources
-    assert re.search(
-        r"target_link_libraries\s*\(\s*lethe_stub_x64\s+PRIVATE"
-        r"[^)]*\bkernel32\b[^)]*\bbcrypt\b",
+
+    # Link line: kernel32 present, bcrypt DELIBERATELY absent (guard both ways).
+    link = re.search(
+        r"target_link_libraries\s*\(\s*lethe_stub_x64\s+PRIVATE([^)]*)\)",
         cmake,
         re.DOTALL,
     )
+    assert link, "expected target_link_libraries(lethe_stub_x64 PRIVATE ...)"
+    linked = link.group(1)
+    assert "kernel32" in linked
+    assert "bcrypt" not in linked.lower()
 
     compiled = "\n".join(
         _read(STUB_ROOT / source)
         for source in listed_sources
         if source.endswith(".c")
     )
+    # No source may pull bcrypt in through a link pragma either.
+    assert not re.search(
+        r'#pragma\s+comment\s*\(\s*lib\s*,\s*"bcrypt',
+        compiled,
+        re.IGNORECASE,
+    )
+
+    # crypto_csprng resolves BCryptGenRandom at runtime from an obfuscated name;
+    # the old separate-file dynamic loader (bcrypt_dyn_init / p_BCrypt) is gone.
+    crypto = _read(SRC / "crypto.c")
     assert "bcrypt_dyn_init" not in compiled
     assert "p_BCrypt" not in compiled
+    assert "int crypto_csprng(" in crypto
+    assert "LoadLibraryA" in crypto and "GetProcAddress" in crypto
+    assert "vstr_dec" in crypto
+    assert "_vs_bcrypt_dll" in crypto and "_vs_bcrypt_genrandom" in crypto
 
 
 def test_memguard_relocation_recipe_is_staged_fail_closed() -> None:
