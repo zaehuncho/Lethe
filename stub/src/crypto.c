@@ -10,6 +10,19 @@
  *
  * Freestanding / no-CRT: byte loops, small fixed stack buffers, xzero/xcopy and
  * the SecureZeroMemory macro only. All key material is volatile-wiped after use.
+ *
+ * SECURITY INVARIANT -- NO ATTACKER-CONTROLLED INPUTS.
+ * Every input to these routines is build-time / internal: keys are per-build
+ * (crypto_derive_key binds them to this stub's own .text + PackInfo), and the
+ * ciphertext / salt / nonce / AAD all come from the container the Lethe builder
+ * produced and shipped inside this same binary. There is NO runtime interface by
+ * which an attacker can submit chosen ciphertexts and observe decrypt success or
+ * timing, so the classic padding / chosen-ciphertext / timing oracles do not
+ * apply -- which is exactly why these compact, not-constant-time implementations
+ * are acceptable. If a future change EVER routes a customer- or network-supplied
+ * blob through crypto_aes256gcm_decrypt / crypto_hkdf_sha256 / crypto_sha256,
+ * that assumption is void: such a path needs a constant-time review and must
+ * authenticate (verify the GCM tag) BEFORE acting on any recovered plaintext.
  */
 #include "crypto.h"
 

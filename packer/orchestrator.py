@@ -31,8 +31,10 @@ from urllib.parse import urlparse
 # IMAGE_FILE_DLL bit in the COFF file-header Characteristics field.
 _IMAGE_FILE_DLL = 0x2000
 
-# Expected hostname for the shard upload API. If a configured shard_url points
-# elsewhere we log a warning (but don't hard-fail, since the URL is configurable).
+# Expected hostname for the shard upload API. A misrouted shard upload permanently
+# bricks the packed binary (it is keyed to a shard the real server never receives),
+# so a hostname mismatch HARD-FAILS the pack. Override only with an explicit
+# allow_unpinned_host / --allow-unpinned-host (e.g. a staging host).
 _SHARD_API_HOST = "api.zaeorion.com"
 
 
@@ -51,6 +53,8 @@ class PackOptions:
     shard_hwid_hash: Optional[str] = None    # SHA-256 hex of target machine HWID
     shard_max_activations: int = 0           # 0 = unlimited
     shard_ttl_hours: int = 0                 # 0 = no expiry
+    allow_unpinned_host: bool = False        # allow a shard_url host != _SHARD_API_HOST
+    shard_pin_pem: Optional[str] = None      # path to a pinned leaf/CA PEM (true TLS pin)
 
 
 @dataclass
@@ -77,15 +81,28 @@ def _emit(progress: ProgressFn, msg: str) -> None:
             pass                         # a noisy UI callback must never fail a pack
 
 
-def _make_pinned_context() -> ssl.SSLContext:
-    """SSLContext that only trusts the specific CA chain for the shard API."""
+def _make_pinned_context(pin_pem: Optional[str] = None) -> ssl.SSLContext:
+    """SSLContext for the shard upload.
+
+    If ``pin_pem`` is given (a PEM file holding the shard API's leaf or issuing
+    CA), trust ONLY that certificate -- true pinning: even a valid public-CA cert
+    for the host is rejected, defeating a mis-issued-cert MITM. Otherwise fall
+    back to the curated ``certifi`` CA bundle (CA-level trust, not leaf pinning),
+    which still excludes rogue system-installed CAs. ``check_hostname`` stays on
+    in both cases.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
-    # Pin to the curated CA bundle (certifi) rather than the OS store, so a
-    # rogue system-installed CA can't intercept. For production, pin to the
-    # specific CA or leaf cert of api.zaeorion.com.
+    if pin_pem:
+        # Trust ONLY the pinned leaf/CA. A wrong or unreadable pin must fail the
+        # pack (ssl raises), never silently widen trust.
+        ctx.load_verify_locations(cafile=pin_pem)
+        return ctx
+    # No explicit pin: curated CA bundle rather than the OS store, so a rogue
+    # system-installed CA can't intercept. Set LETHE_SHARD_PIN_PEM (or PackOptions
+    # .shard_pin_pem) to the leaf/CA of api.zaeorion.com for true pinning.
     try:
         import certifi
         ctx.load_verify_locations(certifi.where())
@@ -105,6 +122,8 @@ def _extract_error(raw: bytes) -> str:
 def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
                   license_id: str = "", hwid_hash: str = "",
                   max_activations: int = 0, ttl_hours: int = 0,
+                  allow_unpinned_host: bool = False,
+                  pin_pem: Optional[str] = None,
                   progress: ProgressFn = None) -> dict:
     """Upload a build's server shard to the Lambda shard gate (POST /api/shard/store).
 
@@ -120,10 +139,19 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
         raise ValueError(
             f"shard upload requires HTTPS, got {parsed.scheme!r} — "
             f"refusing to send shard over plaintext")
-    # --- hostname check: warn (don't hard-fail) on an unexpected host ---------
+    # --- hostname pin: HARD-FAIL on an unexpected host ------------------------
+    # A shard uploaded to the wrong host never reaches the real gate, so the
+    # packed binary is keyed to a shard the server can never release -> a
+    # permanent brick. Refuse rather than warn, unless explicitly allowed.
     if _SHARD_API_HOST and parsed.hostname != _SHARD_API_HOST:
-        _emit(progress, f"WARNING: shard upload host {parsed.hostname!r} does "
-                        f"not match expected {_SHARD_API_HOST!r}")
+        if not allow_unpinned_host:
+            raise ValueError(
+                f"shard upload host {parsed.hostname!r} does not match the pinned "
+                f"{_SHARD_API_HOST!r}; refusing (a misrouted shard permanently "
+                f"bricks the binary). Pass allow_unpinned_host / "
+                f"--allow-unpinned-host to override for a staging host.")
+        _emit(progress, f"WARNING: shard upload host {parsed.hostname!r} != "
+                        f"pinned {_SHARD_API_HOST!r} (allowed by override)")
 
     endpoint = f"{parsed.scheme}://{parsed.netloc}/api/shard/store"
     body = json.dumps({
@@ -146,7 +174,8 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
     # Pin the CA chain instead of trusting the whole system store (anti-MITM).
     try:
         with urllib.request.urlopen(
-                req, timeout=15, context=_make_pinned_context()) as resp:
+                req, timeout=15,
+                context=_make_pinned_context(pin_pem)) as resp:
             status = resp.status
             payload = resp.read()
     except urllib.error.HTTPError as e:
@@ -293,6 +322,9 @@ def pack_file(input_path: str, options: PackOptions,
                               hwid_hash=eff.shard_hwid_hash or "",
                               max_activations=eff.shard_max_activations,
                               ttl_hours=eff.shard_ttl_hours,
+                              allow_unpinned_host=getattr(eff, "allow_unpinned_host", False),
+                              pin_pem=(eff.shard_pin_pem
+                                       or os.environ.get("LETHE_SHARD_PIN_PEM")),
                               progress=progress)
             except Exception:
                 # The staged binary is keyed to a shard that never reached the
