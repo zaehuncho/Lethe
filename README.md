@@ -60,14 +60,14 @@ The builder consumes a **prebuilt** stub PE, so packing itself needs no compiler
 ```powershell
 # Standalone CMake project (VS2022 / x64, C, minimal CRT, no Qt),
 # mirroring installer/OrionSetup/CMakeLists.txt's hardening spirit.
-powershell tools\security\packer\stub\build_stub.ps1
-# -> refreshes tools\security\packer\stub\prebuilt\stub_x64.bin
+powershell stub\build_stub.ps1
+# -> refreshes stub\prebuilt\stub_x64.bin
 ```
 
 Under the hood this is roughly:
 
 ```powershell
-cmake -S tools\security\packer\stub -B <build> -G "Visual Studio 17 2022" -A x64
+cmake -S stub -B <build> -G "Visual Studio 17 2022" -A x64
 cmake --build <build> --config Release
 ```
 
@@ -105,17 +105,17 @@ python lethe.py OrionNative.exe out.exe --memory-guard --anti-debug on --verbose
 ```
 
 **Pipeline contract:** the pipeline calls exactly `lethe.py {input} {output}`,
-so `--packer-command "python tools\security\packer\lethe.py {input} {output}"`
+so `--packer-command "python lethe.py {input} {output}"`
 drops in with zero pipeline changes.
 
 ## Use the GUI
 
 ```powershell
 # run from source during development
-python tools\security\packer\gui\app.py
+python gui\app.py
 
 # freeze to a clickable Lethe.exe (bundles the packer lib + LIEF + stub_x64.bin)
-powershell tools\security\packer\gui\build_gui.ps1
+powershell gui\build_gui.ps1
 ```
 
 Workflow: **Add PEs** (button / drag-drop, multi-select) → each row shows the
@@ -130,12 +130,12 @@ per-file result row (✓/✗, sizes, ratio, time, inline errors).
 ```powershell
 # container ABI round-trips (no third-party deps — pass NOW)
 python -m pytest tests\test_lethe_container.py
-python -m pytest tools\security\packer\tests\test_lethe_container_abi.py
+python -m pytest tests\test_lethe_container_abi.py
 
 # end-to-end acceptance: build samples -> pack -> run original vs packed ->
 # assert identical stdout/exit + host-loads-packed-DLL. SKIPS cleanly (exit 2)
 # until lethe.py + stub_x64.bin exist; needs MSVC (cl.exe) to build samples.
-powershell tools\security\packer\tests\roundtrip.ps1
+powershell tests\roundtrip.ps1
 ```
 
 `roundtrip.ps1` encodes plan Verification **#2** (EXE round-trip) and **#4** (DLL

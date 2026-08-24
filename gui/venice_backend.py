@@ -25,12 +25,12 @@ import sys
 from typing import List, Optional, Tuple
 
 # --- import bootstrap ------------------------------------------------------
-# venice_backend.py lives at tools/security/packer/gui/venice_backend.py; the
-# ``packer`` package sits one directory up (tools/security/packer/packer). Put
+# venice_backend.py lives at gui/venice_backend.py; the
+# ``packer`` package sits one directory up (packer). Put
 # that parent on sys.path so ``import packer.orchestrator`` resolves both when
 # run from source and when frozen.
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # tools/security/packer
+_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # Lethe
 if _PACKER_ROOT not in sys.path:
     sys.path.insert(0, _PACKER_ROOT)
 

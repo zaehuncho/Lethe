@@ -46,16 +46,16 @@ User clicks OrionLauncher.exe
 ## 1. Build the Stub (one-time / when stub sources change)
 
 ```powershell
-powershell tools\security\packer\stub\build_stub.ps1
+powershell stub\build_stub.ps1
 ```
 
 Or manually:
 
 ```powershell
-cmake -S tools\security\packer\stub -B build_stub -G "Visual Studio 17 2022" -A x64
+cmake -S stub -B build_stub -G "Visual Studio 17 2022" -A x64
 cmake --build build_stub --config Release
 # Copy the built DLL to the prebuilt location:
-copy build_stub\Release\lethe_stub_x64.dll tools\security\packer\stub\prebuilt\
+copy build_stub\Release\lethe_stub_x64.dll stub\prebuilt\
 ```
 
 Only needed when any file in `stub/src/` changes. The packer uses the
@@ -66,7 +66,7 @@ checked-in prebuilt — no compiler needed at pack time.
 ## 2. Build the Bootstrap Launcher (one-time / when shard_bootstrap.c changes)
 
 ```powershell
-cmake -S tools\security\packer\bootstrap -B build_bootstrap -G "Visual Studio 17 2022" -A x64
+cmake -S bootstrap -B build_bootstrap -G "Visual Studio 17 2022" -A x64
 cmake --build build_bootstrap --config Release
 ```
 
@@ -79,21 +79,21 @@ Output: `build_bootstrap\Release\OrionLauncher.exe` (17.5 KB).
 ### Without server shard (Tier 1 + 2 only)
 
 ```powershell
-cd tools\security\packer
+cd Lethe
 python lethe.py <input.exe> <output.exe>
 ```
 
 ### With server shard (Tier 1 + 2 + 3) — production use
 
 ```powershell
-cd tools\security\packer
+cd Lethe
 python lethe.py <input.exe> <output.exe> ^
     --server-shard ^
     --shard-url https://api.zaeorion.com/api/shard ^
     --shard-auth <BUILDER_SECRET>
 ```
 
-The `BUILDER_SECRET` is stored in `tools/security/packer/.env` (gitignored).
+The `BUILDER_SECRET` is stored in `.env` (gitignored).
 
 **CLI flags:**
 
@@ -198,7 +198,7 @@ the anti-debug module is the trigger. Report the finding and A/B before shipping
 
 ## 8. Secrets Reference
 
-Stored in `tools/security/packer/.env` (gitignored, never committed):
+Stored in `.env` (gitignored, never committed):
 
 | Secret | Where it's used | Stored in |
 |--------|-----------------|-----------|
@@ -216,7 +216,7 @@ Stored in `tools/security/packer/.env` (gitignored, never committed):
 | `"License validation failed (403)"` at launch | Invalid or expired license | Re-activate in settings.json |
 | `"Too many launch attempts"` | Rate limit (30/hr per license) | Wait 1 hour |
 | `"Build not recognized (404)"` | build_id not in KV | Re-pack and upload; or the build was revoked |
-| `ModuleNotFoundError: pe_analyze` | Running lethe.py from wrong directory | `cd tools\security\packer` first |
+| `ModuleNotFoundError: pe_analyze` | Running lethe.py from wrong directory | `cd Lethe` first |
 | Defender quarantines packed binary | Anti-debug or memguard triggered AV | Try `--anti-debug off`; never ship `--memory-guard` without Defender testing |
 | Packed DLL fails LoadLibrary | Bounds check regression | Rebuild stub (`build_stub.ps1`) |
 
@@ -225,7 +225,7 @@ Stored in `tools/security/packer/.env` (gitignored, never committed):
 ## 10. File Reference
 
 ```
-tools/security/packer/
+
 ├── lethe.py              CLI front-end
 ├── packer/
 │   ├── container.py          ABI (PackInfo + SectionDesc structs)

@@ -185,7 +185,7 @@ endif()
 # History-keyed self-decrypting Venice bytecode (venice_rolling.c). OFF by
 # default so the shipped stub is byte-identical to today; turn ON to compile the
 # runtime rolling decoder (pack-time encoder + differential proof live in
-# tools/security/packer/venice/venice_rolling.py + tests/test_rolling_bytecode.py).
+# venice/venice_rolling.py + tests/test_rolling_bytecode.py).
 # Diagnostic tracing (writes lethe_diag.txt with per-step markers). Enable with
 # -DLETHE_ENABLE_DIAG=ON when hunting a stub-loader regression; OFF by default
 # so shipped builds don't leak side-channel telemetry to disk or announce a

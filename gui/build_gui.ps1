@@ -16,7 +16,7 @@
 
     ------------------------------------------------------------------------
     EXACT INVOCATION (what this script runs; paths shown relative to repo root
-    tools/security/packer):
+    Lethe):
 
         python -m nuitka ^
             --standalone ^
@@ -27,7 +27,7 @@
             --include-package=packer ^
             --include-package=lief ^
             --include-package=cryptography ^
-            --include-data-files=<repo>/tools/security/packer/stub/prebuilt/lethe_stub_x64.dll=stub/prebuilt/lethe_stub_x64.dll ^
+            --include-data-files=<repo>/stub/prebuilt/lethe_stub_x64.dll=stub/prebuilt/lethe_stub_x64.dll ^
             --output-filename=Lethe.exe ^
             --output-dir=<packer>/build ^
             --remove-output ^
@@ -50,11 +50,11 @@
         # in packer/assemble.py (or wherever the stub is loaded):
         _here = os.path.dirname(os.path.abspath(__file__))   # .../packer
         _root = os.path.dirname(_here)                       # dist root (frozen)
-                                                             #  OR tools/security/packer (source)
+                                                             #  OR Lethe (source)
         STUB_PATH = os.path.join(_root, "stub", "prebuilt", "lethe_stub_x64.dll")
 
-      * Source run:  _root = tools/security/packer, so the stub is found at
-                     tools/security/packer/stub/prebuilt/lethe_stub_x64.dll.
+      * Source run:  _root = Lethe, so the stub is found at
+                     stub/prebuilt/lethe_stub_x64.dll.
       * Frozen one-file: Nuitka extracts everything to a temp dist dir; the
                      `packer` package lands at <dist>/packer and the bundled
                      data at <dist>/stub/prebuilt/lethe_stub_x64.dll, so the
@@ -111,8 +111,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 # --- resolve layout from the script location -------------------------------
-$GuiDir     = $PSScriptRoot                              # tools/security/packer/gui
-$PackerRoot = Split-Path $GuiDir -Parent                 # tools/security/packer
+$GuiDir     = $PSScriptRoot                              # gui
+$PackerRoot = Split-Path $GuiDir -Parent                 # Lethe
 $Entry      = Join-Path $GuiDir "app.py"
 
 if (-not $OutputDir) { $OutputDir = Join-Path $PackerRoot "build" }
@@ -135,7 +135,7 @@ Prebuilt native stub not found:
     $StubPath
 
 Build it first (produces stub/prebuilt/lethe_stub_x64.dll), e.g.:
-    tools/security/packer/stub/build_stub.ps1
+    stub/build_stub.ps1
 
 Or re-run with -SkipStubCheck to freeze the UI without packing capability.
 "@

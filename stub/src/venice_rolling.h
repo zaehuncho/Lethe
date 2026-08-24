@@ -1,6 +1,6 @@
 /*
  * venice_rolling.h -- runtime decoder for history-keyed self-decrypting Venice
- * bytecode. Mirror of tools/security/packer/venice/venice_rolling.py (the
+ * bytecode. Mirror of venice/venice_rolling.py (the
  * pack-time encoder + SP5 differential oracle). The primitives here MUST stay
  * bit-exact with that file; test_rolling_bytecode.py::test_primitive_vectors_stable
  * pins the vectors, and vvm_rolling_selftest() below re-checks them in C.

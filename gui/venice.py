@@ -7,7 +7,7 @@ Run from source, either from the packer directory::
 
 or from the project root::
 
-    python tools/security/packer/gui/venice.py
+    python gui/venice.py
 
 This creates a ``QApplication`` (QML apps do not use widgets), instantiates
 :class:`~venice_backend.VeniceBackend`, exposes it to QML as the ``venice``
@@ -20,11 +20,11 @@ import signal
 import sys
 
 # --- import bootstrap ------------------------------------------------------
-# venice.py lives at tools/security/packer/gui/venice.py. Put both this dir (so
+# venice.py lives at gui/venice.py. Put both this dir (so
 # ``venice_backend`` imports) and the packer root (so ``packer.orchestrator``
 # resolves inside the worker) on sys.path, regardless of the launch cwd.
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # tools/security/packer
+_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # Lethe
 if _GUI_DIR not in sys.path:
     sys.path.insert(0, _GUI_DIR)
 if _PACKER_ROOT not in sys.path:

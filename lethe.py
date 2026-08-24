@@ -36,7 +36,7 @@ import os
 import sys
 
 # --- import bootstrap ------------------------------------------------------
-# lethe.py lives at tools/security/packer/lethe.py and the ``packer``
+# lethe.py lives at lethe.py and the ``packer``
 # package sits right beside it. Putting this script's directory at the front of
 # sys.path makes ``import packer.orchestrator`` resolve whether we are launched
 # as ``python lethe.py ...`` from an arbitrary cwd or from a Nuitka build.

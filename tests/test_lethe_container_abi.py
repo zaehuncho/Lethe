@@ -14,7 +14,7 @@ dependencies and pass NOW (both files already exist). The primary,
 gate-registered container tests live at repo root in
 ``tests/test_lethe_container.py``.
 
-Run: ``python -m pytest tools/security/packer/tests/test_lethe_container_abi.py``
+Run: ``python -m pytest tests/test_lethe_container_abi.py``
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 
-PACKER_ROOT = Path(__file__).resolve().parents[1]   # tools/security/packer
+PACKER_ROOT = Path(__file__).resolve().parents[1]   # Lethe
 CONTAINER_PATH = PACKER_ROOT / "packer" / "container.py"
 HEADER_PATH = PACKER_ROOT / "stub" / "src" / "pack_info.h"
 

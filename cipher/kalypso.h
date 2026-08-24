@@ -3,7 +3,7 @@
  *
  * Core is ChaCha20 (proven rotations 16/12/8/7, 20 rounds) -- soundness proven
  * bit-exact against RFC 8439 and the `cryptography` library in
- * tools/security/packer/tests/test_kalypso.py and the C KAT below.
+ * tests/test_kalypso.py and the C KAT below.
  *
  * ARCHITECTURE: this is the INNER keyed diffusion layer. AES-256-GCM remains the
  * OUTER authenticated gate. Kalypso never stands alone as the gate.

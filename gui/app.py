@@ -34,13 +34,13 @@ import struct
 import sys
 
 # --- import bootstrap ------------------------------------------------------
-# app.py lives at tools/security/packer/gui/app.py; the ``packer`` package sits
-# one directory up (tools/security/packer/packer). Put that parent on sys.path
+# app.py lives at gui/app.py; the ``packer`` package sits
+# one directory up (packer). Put that parent on sys.path
 # so ``import packer.orchestrator`` resolves both when run from source and when
 # frozen (the frozen build also embeds the package via --include-package=packer,
 # which makes it importable regardless of sys.path).
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # tools/security/packer
+_PACKER_ROOT = os.path.dirname(_GUI_DIR)  # Lethe
 if _PACKER_ROOT not in sys.path:
     sys.path.insert(0, _PACKER_ROOT)
 

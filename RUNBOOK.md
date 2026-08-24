@@ -15,10 +15,10 @@ future pipeline-wiring work (documented now, not built).
 
 ```powershell
 # (a) build the native stub -> refreshes stub\prebuilt\stub_x64.bin
-powershell tools\security\packer\stub\build_stub.ps1
+powershell stub\build_stub.ps1
 
 # (b) freeze the GUI -> Lethe.exe (bundles packer lib + LIEF + stub_x64.bin)
-powershell tools\security\packer\gui\build_gui.ps1
+powershell gui\build_gui.ps1
 ```
 
 Rebuild the stub after editing any `stub/src/*`. Pack-time itself needs no
@@ -35,9 +35,9 @@ compiler — only the checked-in `stub_x64.bin`.
    list (§2).
    ```powershell
    # EXE
-   python tools\security\packer\lethe.py OrionOwner.exe OrionOwner.packed.exe
+   python lethe.py OrionOwner.exe OrionOwner.packed.exe
    # DLL (or rely on header auto-detect and drop --dll)
-   python tools\security\packer\lethe.py SecurityCore.dll SecurityCore.packed.dll --dll
+   python lethe.py SecurityCore.dll SecurityCore.packed.dll --dll
    ```
 4. **Verify** each packed binary per the plan's Verification checklist (§3).
 5. **Sign** (pipeline, *after* pack) and regenerate the manifest hash — see §5.
@@ -109,9 +109,9 @@ the container test as a neighbor, e.g.:
         tests\test_orion_admin.py `
 ```
 
-(The `tools\security\packer\tests\test_lethe_container_abi.py` cross-check
+(The `tests\test_lethe_container_abi.py` cross-check
 also passes now and is collected by a plain `python -m pytest` from the repo
-root, since `tools/security/packer/tests` is not in `pytest.ini`'s
+root, since `tests` is not in `pytest.ini`'s
 `norecursedirs`; add it to the explicit gate list too if you want it enforced by
 name.)
 
@@ -125,7 +125,7 @@ When the product ships and packing goes live, wire Lethe into
 - **Point `--packer-command` at Lethe** (no pipeline change required — the
   CLI already matches the `{input} {output}` contract):
   ```
-  --packer-command "python tools\security\packer\lethe.py {input} {output}"
+  --packer-command "python lethe.py {input} {output}"
   ```
 - **Add `OrionCommon.dll` to `DEFAULT_TARGETS`** — it is currently missing from
   the target list (`pack_lethe_release.py:33-43`, which lists OrionOwner/Staff/

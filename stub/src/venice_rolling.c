@@ -1,7 +1,7 @@
 /*
  * venice_rolling.c -- runtime decoder for history-keyed self-decrypting Venice
  * bytecode. See venice_rolling.h and the pack-time oracle
- * tools/security/packer/venice/venice_rolling.py.
+ * venice/venice_rolling.py.
  *
  * Bit-exact primitives (mirror of the .py):
  *   resync(seed, leader)    = u64le( SHA256(seed16 ‖ 'R' ‖ u32le(leader))[0:8] )

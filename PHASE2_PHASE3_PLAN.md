@@ -341,7 +341,7 @@ an assembler.
 **Design:**
 
 ```
-tools/security/packer/venice/
+venice/
   venice_asm.py          assembler: .vasm text → binary blob (Python, build-time tool)
   venice_disasm.py       disassembler: binary → .vasm text (debugging aid)
   programs/              .vasm source files
@@ -552,7 +552,7 @@ is too complex to port manually (e.g., OrionAppController methods at 10K LOC).
 **Architecture:**
 
 ```
-tools/security/packer/lifter/
+lifter/
   lifter.py              main driver: ELF/PE → Venice bytecode
   disasm.py              x86-64 disassembly via Zydis (Python bindings or subprocess)
   ir.py                  intermediate representation (SSA-based)
@@ -640,22 +640,22 @@ Phase 3A:
   stub/src/venice_trampoline.asm
 
 Phase 3B:
-  tools/security/packer/venice/venice_asm.py
-  tools/security/packer/venice/venice_disasm.py
-  tools/security/packer/venice/programs/derive_key.vasm
-  tools/security/packer/venice/programs/shard_xor.vasm
+  venice/venice_asm.py
+  venice/venice_disasm.py
+  venice/programs/derive_key.vasm
+  venice/programs/shard_xor.vasm
 
 Phase 3C:
-  tools/security/packer/venice/programs/machine_id.vasm
-  tools/security/packer/venice/programs/validate_license.vasm
-  tools/security/packer/venice/programs/verify_lease.vasm
-  tools/security/packer/venice/programs/entitlement_binding.vasm
-  tools/security/packer/venice/programs/seal_cache.vasm
-  tools/security/packer/venice/programs/unseal_cache.vasm
-  tools/security/packer/venice/programs/lease_pubkey.vasm
+  venice/programs/machine_id.vasm
+  venice/programs/validate_license.vasm
+  venice/programs/verify_lease.vasm
+  venice/programs/entitlement_binding.vasm
+  venice/programs/seal_cache.vasm
+  venice/programs/unseal_cache.vasm
+  venice/programs/lease_pubkey.vasm
   (edits to SecurityManager.cpp, LeaseGate.cpp — replace function bodies with VM stubs)
 
 Phase 3D:
-  tools/security/packer/venice/shuffle_opcodes.py
+  venice/shuffle_opcodes.py
   (edits to venice_vm.c, venice_asm.py — conditional opcode table)
 ```
