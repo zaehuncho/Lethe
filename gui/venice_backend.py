@@ -18,6 +18,7 @@ of its sibling builder modules is still landing or missing a dependency.
 """
 from __future__ import annotations
 
+import json
 import os
 import struct
 import sys
@@ -308,6 +309,11 @@ class FileListModel(QAbstractListModel):
             return self._entries[row]["outputPath"]
         return ""
 
+    def path_at(self, row: int) -> str:
+        if 0 <= row < len(self._entries):
+            return self._entries[row]["path"]
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # background packer
@@ -385,6 +391,51 @@ class PackWorker(QThread):
 
 _MAX_LOG_LINES = 5000
 
+# Built-in option presets (always present, cannot be deleted/overwritten). Each
+# maps the four persisted knobs. User presets saved from the UI live alongside
+# them in ~/.lethe/presets.json.
+_BUILTIN_PRESETS = {
+    "Balanced (recommended)": {
+        "anti_debug": True, "memory_guard": False,
+        "compression_level": 9, "validate_after_pack": True,
+    },
+    "Maximum": {
+        "anti_debug": True, "memory_guard": True,
+        "compression_level": 9, "validate_after_pack": True,
+    },
+    "Fast (dev)": {
+        "anti_debug": False, "memory_guard": False,
+        "compression_level": 3, "validate_after_pack": False,
+    },
+}
+_PRESET_KEYS = ("anti_debug", "memory_guard", "compression_level",
+                "validate_after_pack")
+
+
+def _presets_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".lethe", "presets.json")
+
+
+def _load_user_presets() -> dict:
+    try:
+        with open(_presets_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out: dict = {}
+    if isinstance(data, dict):
+        for name, cfg in data.items():
+            if isinstance(name, str) and isinstance(cfg, dict):
+                out[name] = {k: cfg[k] for k in _PRESET_KEYS if k in cfg}
+    return out
+
+
+def _save_user_presets(presets: dict) -> None:
+    path = _presets_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(presets, fh, indent=2)
+
 
 class VeniceBackend(QObject):
     """The QObject QML talks to: owns options, the file model and the worker."""
@@ -394,6 +445,8 @@ class VeniceBackend(QObject):
     compressionLevelChanged = Signal()
     outputDirectoryChanged = Signal()
     isPackingChanged = Signal()
+    validateAfterPackChanged = Signal()
+    presetsChanged = Signal()
     logTextChanged = Signal()
     logMessage = Signal(str)            # emitted once per progress/status line
     statsChanged = Signal()
@@ -405,6 +458,8 @@ class VeniceBackend(QObject):
         self._compression_level = 9
         self._output_directory = ""
         self._is_packing = False
+        self._validate_after_pack = True
+        self._user_presets = _load_user_presets()
         self._file_model = FileListModel(self)
         self._log_lines: List[str] = []
         self._worker: Optional[PackWorker] = None
@@ -447,6 +502,20 @@ class VeniceBackend(QObject):
 
     memoryGuard = Property(bool, _get_memory_guard, _set_memory_guard,
                            notify=memoryGuardChanged)
+
+    # -- validateAfterPack (r/w) ------------------------------------------
+    def _get_validate_after_pack(self) -> bool:
+        return self._validate_after_pack
+
+    def _set_validate_after_pack(self, value: bool) -> None:
+        value = bool(value)
+        if self._validate_after_pack != value:
+            self._validate_after_pack = value
+            self.validateAfterPackChanged.emit()
+
+    validateAfterPack = Property(bool, _get_validate_after_pack,
+                                 _set_validate_after_pack,
+                                 notify=validateAfterPackChanged)
 
     # -- compressionLevel (r/w) -------------------------------------------
     def _get_compression_level(self) -> int:
@@ -593,10 +662,37 @@ class VeniceBackend(QObject):
             elapsed = int(getattr(result, "elapsed_ms", 0) or 0)
             output_path = getattr(result, "output_path", "") or ""
             status_text = f"Done · {ratio * 100:.1f}% · {elapsed} ms"
-            self._file_model.set_result(
-                row, "done", status_text, ratio, elapsed, output_path)
-            self._append_log(f"[{name}] OK → {output_path}  ({status_text})")
-            self._done_count += 1
+
+            # Optional structural round-trip: parse the packed output back and
+            # confirm the Lethe container is well-formed. Never executes it.
+            valid = True
+            if self._validate_after_pack and output_path:
+                try:
+                    from packer.report import validate_packed
+                    vr = validate_packed(output_path)
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(f"[{name}] validation error: {exc}")
+                else:
+                    if vr.ok:
+                        status_text += " · validated"
+                        self._append_log(f"[{name}] validation OK — {vr.summary()}")
+                    else:
+                        valid = False
+                        status_text = f"Packed but INVALID — {vr.reason}"
+                        self._append_log(
+                            f"[{name}] VALIDATION FAILED — {vr.summary()}")
+
+            if valid:
+                self._file_model.set_result(
+                    row, "done", status_text, ratio, elapsed, output_path)
+                self._append_log(f"[{name}] OK → {output_path}  ({status_text})")
+                self._done_count += 1
+            else:
+                # A packed-but-invalid output is not usable -> count it as a fail
+                # so the dashboard never reports a broken pack as a success.
+                self._file_model.set_result(
+                    row, "error", status_text, ratio, elapsed, output_path)
+                self._fail_count += 1
             self.statsChanged.emit()
         else:
             error = getattr(result, "error", None) or "unknown error"
@@ -671,6 +767,90 @@ class VeniceBackend(QObject):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"could not open folder: {exc}")
+
+    # -- presets -----------------------------------------------------------
+    def _get_preset_names(self) -> list:
+        return list(_BUILTIN_PRESETS.keys()) + sorted(self._user_presets.keys())
+
+    presetNames = Property("QVariantList", _get_preset_names,
+                           notify=presetsChanged)
+
+    def _preset(self, name: str) -> Optional[dict]:
+        if name in _BUILTIN_PRESETS:
+            return _BUILTIN_PRESETS[name]
+        return self._user_presets.get(name)
+
+    @Slot(str)
+    def applyPreset(self, name: str) -> None:
+        cfg = self._preset(name)
+        if not cfg:
+            self._append_log(f"preset not found: {name!r}")
+            return
+        if "anti_debug" in cfg:
+            self._set_anti_debug(bool(cfg["anti_debug"]))
+        if "memory_guard" in cfg:
+            self._set_memory_guard(bool(cfg["memory_guard"]))
+        if "compression_level" in cfg:
+            self._set_compression_level(int(cfg["compression_level"]))
+        if "validate_after_pack" in cfg:
+            self._set_validate_after_pack(bool(cfg["validate_after_pack"]))
+        self._append_log(f"applied preset: {name}")
+
+    @Slot(str)
+    def savePreset(self, name: str) -> None:
+        name = (name or "").strip()
+        if not name:
+            self._append_log("preset needs a name")
+            return
+        if name in _BUILTIN_PRESETS:
+            self._append_log(f"cannot overwrite built-in preset {name!r}")
+            return
+        self._user_presets[name] = {
+            "anti_debug": self._anti_debug,
+            "memory_guard": self._memory_guard,
+            "compression_level": self._compression_level,
+            "validate_after_pack": self._validate_after_pack,
+        }
+        try:
+            _save_user_presets(self._user_presets)
+        except OSError as exc:
+            self._append_log(f"could not save preset: {exc}")
+            return
+        self.presetsChanged.emit()
+        self._append_log(f"saved preset: {name}")
+
+    @Slot(str)
+    def deletePreset(self, name: str) -> None:
+        if name in _BUILTIN_PRESETS:
+            self._append_log(f"cannot delete built-in preset {name!r}")
+            return
+        if name in self._user_presets:
+            del self._user_presets[name]
+            try:
+                _save_user_presets(self._user_presets)
+            except OSError as exc:
+                self._append_log(f"could not update presets: {exc}")
+            self.presetsChanged.emit()
+            self._append_log(f"deleted preset: {name}")
+
+    # -- section / entropy report -----------------------------------------
+    @Slot(int)
+    def showReport(self, index: int) -> None:
+        """Log a section/entropy report for row ``index`` (original vs packed)."""
+        path = self._file_model.path_at(index)
+        if not path:
+            self._append_log("select a file to report on")
+            return
+        packed = self._file_model.output_at(index) or None
+        try:
+            from packer.report import format_report
+            text = format_report(path, packed)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"report failed: {exc}")
+            return
+        self._append_log("── section / entropy report ──")
+        for line in text.splitlines():
+            self._append_log(line)
 
     # -- drag & drop from QML ---------------------------------------------
     @Slot(list)

@@ -271,6 +271,11 @@ ApplicationWindow {
                                         enabled: !venice.isPacking && fileList.count > 0
                                         onClicked: venice.fileModel.clear()
                                     }
+                                    VeniceButton {
+                                        text: "Report"
+                                        enabled: fileList.count > 0 && fileList.currentIndex >= 0
+                                        onClicked: venice.showReport(fileList.currentIndex)
+                                    }
 
                                     Item { Layout.fillWidth: true }
 
@@ -464,6 +469,23 @@ ApplicationWindow {
 
                                     ThinRule {}
 
+                                    SectionLabel { label: "Presets" }
+
+                                    Flow {
+                                        Layout.fillWidth: true
+                                        spacing: 6
+                                        Repeater {
+                                            model: venice.presetNames
+                                            VeniceButton {
+                                                text: modelData
+                                                enabled: !venice.isPacking
+                                                onClicked: venice.applyPreset(modelData)
+                                            }
+                                        }
+                                    }
+
+                                    ThinRule {}
+
                                     SectionLabel { label: "Output" }
 
                                     Rectangle {
@@ -547,6 +569,21 @@ ApplicationWindow {
                                                 checked: venice.memoryGuard
                                                 enabled: !venice.isPacking
                                                 onToggled: function(checked) { venice.memoryGuard = checked }
+                                            }
+
+                                            Rectangle {
+                                                Layout.fillWidth: true
+                                                implicitHeight: 1
+                                                color: Theme.border
+                                            }
+
+                                            ToggleSwitch {
+                                                Layout.fillWidth: true
+                                                text: "Validate output"
+                                                description: "structural round-trip check (no run)"
+                                                checked: venice.validateAfterPack
+                                                enabled: !venice.isPacking
+                                                onToggled: function(checked) { venice.validateAfterPack = checked }
                                             }
                                         }
                                     }
