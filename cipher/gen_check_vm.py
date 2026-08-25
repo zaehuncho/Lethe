@@ -170,9 +170,16 @@ def run_check(blob, pw: bytes, flag_len: int):
 
 
 if __name__ == "__main__":
-    # the real crackme parameters
-    PASSWORD = b"REDACTED"
-    FLAG = b"REDACTED"
+    # The crackme password/flag are intentionally NOT stored in this repo -- the
+    # whole point of the exercise is that they stay unrecoverable. Supply them at
+    # generation time via the environment.
+    import os
+    PASSWORD = os.environ.get("LETHE_CRACKME_PASSWORD", "").encode()
+    FLAG = os.environ.get("LETHE_CRACKME_FLAG", "").encode()
+    if not PASSWORD or not FLAG:
+        raise SystemExit(
+            "set LETHE_CRACKME_PASSWORD and LETHE_CRACKME_FLAG to generate the "
+            "crackme (they are deliberately kept out of version control)")
 
     def fnv(s):
         h = BASIS

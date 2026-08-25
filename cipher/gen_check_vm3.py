@@ -80,9 +80,15 @@ def apply_shuffle_to_code(code: bytes, enc_map: dict, optable_canon=OPCODE_TABLE
 
 
 def build_round3(seed: bytes):
-    # 1. the proven plaintext check program (canonical ISA)
-    PASSWORD = b"REDACTED"
-    FLAG = b"REDACTED"
+    # 1. the proven plaintext check program (canonical ISA). The password/flag
+    # are intentionally NOT stored in this repo; supply them via the environment.
+    import os
+    PASSWORD = os.environ.get("LETHE_CRACKME_PASSWORD", "").encode()
+    FLAG = os.environ.get("LETHE_CRACKME_FLAG", "").encode()
+    if not PASSWORD or not FLAG:
+        raise SystemExit(
+            "set LETHE_CRACKME_PASSWORD and LETHE_CRACKME_FLAG to build round 3 "
+            "(they are deliberately kept out of version control)")
 
     def fnv(s):
         h = BASIS
