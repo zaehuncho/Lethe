@@ -11,6 +11,9 @@ env/
 # Secrets — never commit
 .env
 
+# Generated bounty challenge artifact (safe to share, but not a repo file)
+challenge.json
+
 # Build outputs (CMake, Nuitka, MSVC, regenerable sample fixtures under */build/)
 build/
 *.log
