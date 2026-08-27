@@ -40,7 +40,7 @@ SOUNDNESS ANCHOR
   proves this against the RFC 8439 test vectors. That is the proof this is real
   crypto, not homemade magic.
 
-Freestanding target: the C port (kalypso.c, TODO) uses only 32-bit adds,
+Freestanding target: the C port (kalypso.c) uses only 32-bit adds,
 rotates, and xors -- no tables, no CRT, side-channel-friendly.
 """
 from __future__ import annotations

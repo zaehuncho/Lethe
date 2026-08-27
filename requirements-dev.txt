@@ -1,0 +1,22 @@
+# Lethe development / test dependencies.
+#
+# The test suite uses importorskip for the optional native-analysis and crypto
+# deps, so it stays green where they're absent -- but installing everything here
+# runs the FULL suite (packer ABI, cipher RFC vectors, VM, lifter oracle, bind,
+# tracing, bounty, report).
+#
+#   pip install -r requirements-dev.txt
+
+pytest
+
+# PE parsing for the packer analyzer (packer/pe_analyze.py hard-requires this).
+lief
+
+# Kalypso AEAD cross-check + bounty challenge crypto.
+cryptography
+argon2-cffi
+
+# x64 lifter differential oracle (disassemble / emulate / assemble).
+iced-x86
+unicorn
+keystone-engine

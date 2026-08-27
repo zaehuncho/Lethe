@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_level_type,
         default=9,
         metavar="N",
-        help="LZMA compression level, 0-9",
+        help="deflate (zlib) compression level, 0-9",
     )
     parser.add_argument(
         "--server-shard",
