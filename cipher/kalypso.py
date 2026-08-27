@@ -18,19 +18,21 @@ do NOT weaken a stream cipher:
     different), and
   * a code-hash-bound, per-build key schedule (HKDF).
 
-ARCHITECTURE (intended -- integration pending)
-  Kalypso is designed as an INNER diffusion/whitening layer with AES-256-GCM
-  as the OUTER authenticated gate:  plaintext -> Kalypso -> AES-256-GCM.
-  Two independent keys; break-both required; Kalypso must NEVER stand alone
-  as the confidentiality/authentication gate.
+ARCHITECTURE -- two modes
+  * RAW STREAM (`crypt`): an inner diffusion/whitening layer meant to sit UNDER
+    AES-256-GCM (plaintext -> Kalypso -> AES-256-GCM). As a bare stream cipher it
+    must NEVER stand alone as the gate, and reusing a (key, nonce) pair across
+    two messages is a catastrophic two-time-pad break.
+  * AEAD (`aead_encrypt` / `aead_decrypt`): full ChaCha20-Poly1305 (RFC 8439).
+    With canonical parameters this is BIT-IDENTICAL to RFC 8439 / libsodium / the
+    `cryptography` library's ChaCha20Poly1305 (proven in test_kalypso), so this
+    mode IS a sound *standalone* authenticated cipher -- a wrong key/nonce/AAD or
+    a single tampered byte fails authentication (returns None), with no oracle.
 
-  STATUS: this module is NOT yet wired into the pack/unpack pipeline (no call
-  sites outside its tests). The two invariants above -- (a) the AES-256-GCM outer
-  wrap and (b) a UNIQUE per-message (key, nonce) -- are the integration's
-  responsibility; THIS module does not and cannot enforce them. As a raw stream
-  cipher, reusing a (key, nonce) pair across two messages is a catastrophic
-  two-time-pad break. Any wiring MUST supply a fresh nonce per message (e.g. a
-  monotonic counter or CSPRNG nonce carried in the container) and apply GCM.
+  BOTH modes still require a UNIQUE nonce per message under a given key (a
+  monotonic counter or a CSPRNG nonce carried in the container). The per-build
+  sigma + word-perm ride on the ChaCha keystream ONLY; Poly1305 is the
+  unmodified, standard MAC.
 
 SOUNDNESS ANCHOR
   With canonical parameters (standard sigma "expand 32-byte k", identity word
@@ -43,6 +45,7 @@ rotates, and xors -- no tables, no CRT, side-channel-friendly.
 """
 from __future__ import annotations
 
+import hmac
 import struct
 
 MASK32 = 0xFFFFFFFF
@@ -84,6 +87,44 @@ def chacha_block(key: bytes, counter: int, nonce: bytes,
         _qr(x, 2, 7, 8, 13); _qr(x, 3, 4, 9, 14)
     out = [(x[i] + state[i]) & MASK32 for i in range(16)]
     return struct.pack("<16I", *out)
+
+
+# --------------------------------------------------------------------------
+# Poly1305 one-time MAC (RFC 8439 s2.5) -- STANDARD, implemented from spec
+# --------------------------------------------------------------------------
+# Poly1305 is a proven MAC, NOT invented here. Combined with the ChaCha core it
+# yields ChaCha20-Poly1305; with canonical Kalypso parameters that is
+# bit-identical to RFC 8439 (proven in test_kalypso). The per-build sigma +
+# word-perm ride on the ChaCha keystream only -- the MAC is unmodified.
+_POLY1305_P = (1 << 130) - 5
+_POLY1305_R_CLAMP = 0x0ffffffc0ffffffc0ffffffc0fffffff
+
+
+def poly1305_mac(msg: bytes, one_time_key: bytes) -> bytes:
+    """RFC 8439 Poly1305. `one_time_key` is 32 bytes (r||s) and MUST be used
+    once. Returns a 16-byte tag."""
+    if len(one_time_key) != 32:
+        raise ValueError("poly1305 key must be 32 bytes")
+    r = int.from_bytes(one_time_key[:16], "little") & _POLY1305_R_CLAMP
+    s = int.from_bytes(one_time_key[16:32], "little")
+    acc = 0
+    for i in range(0, len(msg), 16):
+        block = msg[i:i + 16]
+        # a 1 bit is set just above the block's bytes (full or partial block)
+        n = int.from_bytes(block + b"\x01", "little")
+        acc = ((acc + n) * r) % _POLY1305_P
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def _pad16(data: bytes) -> bytes:
+    rem = len(data) % 16
+    return b"\x00" * (16 - rem) if rem else b""
+
+
+def _aead_mac_data(aad: bytes, ciphertext: bytes) -> bytes:
+    """RFC 8439 s2.8: AAD || pad16 || CT || pad16 || len64(AAD) || len64(CT)."""
+    return (aad + _pad16(aad) + ciphertext + _pad16(ciphertext)
+            + struct.pack("<Q", len(aad)) + struct.pack("<Q", len(ciphertext)))
 
 
 # --------------------------------------------------------------------------
@@ -158,6 +199,38 @@ class Kalypso:
     encrypt = crypt
     decrypt = crypt
 
+    # -- AEAD: ChaCha20-Poly1305 (RFC 8439) -------------------------------
+    def aead_encrypt(self, nonce: bytes, plaintext: bytes,
+                     aad: bytes = b"") -> bytes:
+        """Authenticated encryption. Returns ciphertext || 16-byte tag.
+
+        The Poly1305 one-time key is the keystream block at counter 0; the
+        message is encrypted from counter 1 (RFC 8439). Canonical parameters =>
+        RFC 8439 ChaCha20-Poly1305 exactly. A UNIQUE nonce per message (under a
+        given key) is still mandatory.
+        """
+        if len(nonce) != 12:
+            raise ValueError("nonce must be 12 bytes")
+        otk = self.keystream_block(0, nonce)[:32]
+        ciphertext = self.crypt(plaintext, nonce, counter0=1)
+        tag = poly1305_mac(_aead_mac_data(aad, ciphertext), otk)
+        return ciphertext + tag
+
+    def aead_decrypt(self, nonce: bytes, sealed: bytes,
+                     aad: bytes = b"") -> "bytes | None":
+        """Verify then decrypt. Returns the plaintext, or None on ANY
+        authentication failure (wrong key/nonce/AAD, tampered ciphertext or
+        tag). The tag check is constant-time; no plaintext is produced on
+        failure."""
+        if len(nonce) != 12 or len(sealed) < 16:
+            return None
+        ciphertext, tag = sealed[:-16], sealed[-16:]
+        otk = self.keystream_block(0, nonce)[:32]
+        expected = poly1305_mac(_aead_mac_data(aad, ciphertext), otk)
+        if not hmac.compare_digest(expected, tag):
+            return None
+        return self.crypt(ciphertext, nonce, counter0=1)
+
 
 if __name__ == "__main__":
     # tiny smoke demo
@@ -165,5 +238,8 @@ if __name__ == "__main__":
     nonce = bytes(12)
     c = Kalypso(key, build_seed=b"build-42", rounds=20)
     ct = c.encrypt(b"Lethe inner layer", nonce)
-    pt = c.decrypt(ct, nonce)
-    print("roundtrip ok:", pt == b"Lethe inner layer")
+    print("stream roundtrip ok:", c.decrypt(ct, nonce) == b"Lethe inner layer")
+    # AEAD demo
+    sealed = c.aead_encrypt(nonce, b"Lethe authenticated", aad=b"hdr")
+    print("aead roundtrip ok:  ", c.aead_decrypt(nonce, sealed, aad=b"hdr") == b"Lethe authenticated")
+    print("aead rejects tamper:", c.aead_decrypt(nonce, sealed[:-1] + bytes([sealed[-1] ^ 1]), aad=b"hdr") is None)

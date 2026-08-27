@@ -162,6 +162,65 @@ def test_perbuild_properties():
         assert sorted(perm) == list(range(16)), "word_perm is not a permutation"
 
 
+# ---------------------------------------------------------------------------
+# 7. Poly1305 known-answer test (RFC 8439 s2.5.2)
+# ---------------------------------------------------------------------------
+def test_poly1305_rfc8439_kat():
+    key = bytes.fromhex("85d6be7857556d337f4452fe42d506a8"
+                        "0103808afb0db2fd4abff6af4149f51b")
+    msg = b"Cryptographic Forum Research Group"
+    expected = bytes.fromhex("a8061dc1305136c6c22b8baf0c0127a9")
+    assert L.poly1305_mac(msg, key) == expected, "Poly1305 != RFC 8439 vector"
+
+
+# ---------------------------------------------------------------------------
+# 8. AEAD cross-check: canonical Kalypso-Poly1305 == library ChaCha20Poly1305
+# ---------------------------------------------------------------------------
+def test_aead_crosscheck_vs_cryptography():
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    rng = random.Random(2025)
+    for _ in range(40):
+        key = bytes(rng.getrandbits(8) for _ in range(32))
+        nonce = bytes(rng.getrandbits(8) for _ in range(12))
+        pt = bytes(rng.getrandbits(8)
+                   for _ in range(rng.choice([0, 1, 16, 63, 64, 65, 200])))
+        aad = bytes(rng.getrandbits(8) for _ in range(rng.choice([0, 12, 20])))
+        ours = L.Kalypso(key, build_seed=b"", rounds=20).aead_encrypt(nonce, pt, aad)
+        theirs = ChaCha20Poly1305(key).encrypt(nonce, pt, aad)
+        assert ours == theirs, "canonical Kalypso-Poly1305 != RFC 8439 AEAD"
+
+
+# ---------------------------------------------------------------------------
+# 9. AEAD round-trip + authentication (canonical AND per-build)
+# ---------------------------------------------------------------------------
+def test_aead_roundtrip_and_tamper():
+    rng = random.Random(11)
+    for _ in range(40):
+        key = bytes(rng.getrandbits(8) for _ in range(32))
+        nonce = bytes(rng.getrandbits(8) for _ in range(12))
+        seed = rng.choice([b"", b"buildA", os.urandom(6)])
+        pt = bytes(rng.getrandbits(8) for _ in range(rng.choice([0, 1, 32, 100])))
+        aad = bytes(rng.getrandbits(8) for _ in range(rng.choice([0, 16])))
+        c = L.Kalypso(key, build_seed=seed, rounds=20)
+        sealed = c.aead_encrypt(nonce, pt, aad)
+
+        assert c.aead_decrypt(nonce, sealed, aad) == pt          # round-trips
+        # flip the first byte (ciphertext or, for empty pt, the tag)
+        bad = bytearray(sealed); bad[0] ^= 0x01
+        assert c.aead_decrypt(nonce, bytes(bad), aad) is None
+        # flip a tag byte
+        bad2 = bytearray(sealed); bad2[-1] ^= 0x80
+        assert c.aead_decrypt(nonce, bytes(bad2), aad) is None
+        # wrong AAD
+        assert c.aead_decrypt(nonce, sealed, aad + b"x") is None
+        # wrong key
+        wrong = bytearray(key); wrong[5] ^= 0x01
+        assert L.Kalypso(bytes(wrong), build_seed=seed).aead_decrypt(nonce, sealed, aad) is None
+        # a per-build seal cannot be opened with canonical params
+        if seed:
+            assert L.Kalypso(key, build_seed=b"").aead_decrypt(nonce, sealed, aad) is None
+
+
 def _main():
     import traceback
     fns = [v for k, v in sorted(globals().items())
