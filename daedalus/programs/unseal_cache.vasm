@@ -1,4 +1,4 @@
-; VVM_PROG_UNSEAL_CACHE -- virtualizes SecurityManager::unprotectBytes()
+; DVM_PROG_UNSEAL_CACHE -- virtualizes SecurityManager::unprotectBytes()
 ;
 ; Unseals DPAPI-protected data using machine-bound entropy.
 ; Entropy = "orion-entitlement-v1|" + hex(SHA256(hostname|uniqueId|guid))

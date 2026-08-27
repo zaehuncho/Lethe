@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * Function-pointer table passed to Venice VM programs as arg[0].
+ * Function-pointer table passed to Daedalus VM programs as arg[0].
  *
  * Layout (byte offset : name : C signature):
  *   0:  get_hostname          int(char*, uint32_t)

@@ -1,5 +1,5 @@
 ; Contract: STATUS — 0=success, nonzero=error
-; VVM_PROG_DERIVE_KEY -- replaces crypto_derive_key()
+; DVM_PROG_DERIVE_KEY -- replaces crypto_derive_key()
 ;
 ; args[0] = pi          (const PackInfo *)
 ; args[1] = image_base  (const void *)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Differential harness for history-keyed self-decrypting Venice bytecode
-(venice/venice_rolling.py) + the reference interpreter (venice/venice_ref.py).
+Differential harness for history-keyed self-decrypting Daedalus bytecode
+(daedalus/daedalus_rolling.py) + the reference interpreter (daedalus/daedalus_ref.py).
 
 This is the SP5 gate for the rolling-bytecode technique. It proves, before any
 C ships:
@@ -32,14 +32,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
-sys.path.insert(0, str(PKG / "venice"))
+sys.path.insert(0, str(PKG / "daedalus"))
 
-import venice_asm            # noqa: E402
-import venice_ref            # noqa: E402
-import venice_rolling as vr  # noqa: E402
-from venice_ref import RefVM, run_plaintext, compute_leaders, iter_instructions  # noqa: E402
+import daedalus_asm            # noqa: E402
+import daedalus_ref            # noqa: E402
+import daedalus_rolling as vr  # noqa: E402
+from daedalus_ref import RefVM, run_plaintext, compute_leaders, iter_instructions  # noqa: E402
 
-PROGRAMS_DIR = PKG / "venice" / "programs"
+PROGRAMS_DIR = PKG / "daedalus" / "programs"
 
 
 def _seed(i: int) -> bytes:
@@ -57,7 +57,7 @@ def _split(blob):
 def _real_program_blobs():
     out = {}
     for vasm in sorted(PROGRAMS_DIR.glob("*.vasm")):
-        out[vasm.name] = venice_asm.assemble(vasm.read_text(encoding="utf-8"))
+        out[vasm.name] = daedalus_asm.assemble(vasm.read_text(encoding="utf-8"))
     return out
 
 
@@ -218,7 +218,7 @@ def _run_rolling(blob, args, seed):
 
 def test_interpreter_equivalence_synthetic():
     for name, src, args, expected in SYNTH:
-        blob = venice_asm.assemble(src)
+        blob = daedalus_asm.assemble(src)
         plain_val, plain_trace = run_plaintext(blob, args)
         assert plain_val == expected, f"{name}: plaintext got {plain_val}, want {expected}"
         for s in range(8):
@@ -265,7 +265,7 @@ def test_midblock_decode_is_wrong():
         try:
             _m, _w, _k, _o, wrong_plain = attacker.fetch(off)
             assert wrong_plain != true_plain, f"{name}: mid-block decode matched at 0x{off:04X}"
-        except venice_ref.VeniceError:
+        except daedalus_ref.DaedalusError:
             pass  # garbage opcode under the wrong accumulator is a stronger poison
         checked += 1
     assert checked >= 3, "expected several multi-instruction blocks to test"
@@ -285,12 +285,12 @@ def test_byte_flip_avalanches_within_block():
       xor
       halt
     """
-    blob = venice_asm.assemble(src)
+    blob = daedalus_asm.assemble(src)
     _data, code = _split(blob)
     seed = _seed(5)
     ct, leaders = vr.encrypt_code(code, seed)
     assert leaders == [0], "expected a single block"
-    offs = venice_ref.instruction_offsets(code)
+    offs = daedalus_ref.instruction_offsets(code)
     # flip the opcode byte of the 2nd instruction
     flip_at = offs[1]
     tampered = bytearray(ct)
@@ -302,7 +302,7 @@ def test_byte_flip_avalanches_within_block():
     while pc < len(tampered):
         try:
             _m, width, _k, _o, plain = dec.fetch(pc)
-        except venice_ref.VeniceError:
+        except daedalus_ref.DaedalusError:
             diverged_after = True  # a corrupt opcode/width is itself divergence
             break
         true_plain = code[pc : pc + 1 + width]
@@ -316,7 +316,7 @@ def test_byte_flip_avalanches_within_block():
 def test_wrong_seed_decodes_garbage():
     """The per-build seed is load-bearing: decoding with the wrong seed does not
     reproduce the program."""
-    blob = venice_asm.assemble(SYNTH[0][1])
+    blob = daedalus_asm.assemble(SYNTH[0][1])
     _data, code = _split(blob)
     ct, leaders = vr.encrypt_code(code, _seed(0))
     recovered_right = vr.decode_stream(ct, _seed(0), leaders)
@@ -325,7 +325,7 @@ def test_wrong_seed_decodes_garbage():
     try:
         recovered_wrong = vr.decode_stream(ct, _seed(1), leaders)
         assert recovered_wrong != code, "wrong seed reproduced the program"
-    except venice_ref.VeniceError:
+    except daedalus_ref.DaedalusError:
         pass  # bad opcode / truncation under the wrong seed is a valid outcome
 
 

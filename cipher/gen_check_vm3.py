@@ -33,11 +33,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
-sys.path.insert(0, str(PKG / "venice"))
-import venice_asm            # noqa: E402
-import venice_rolling as vr  # noqa: E402
-from venice_ref import RefVM  # noqa: E402
-from venice_disasm import OPCODE_TABLE  # noqa: E402
+sys.path.insert(0, str(PKG / "daedalus"))
+import daedalus_asm            # noqa: E402
+import daedalus_rolling as vr  # noqa: E402
+from daedalus_ref import RefVM  # noqa: E402
+from daedalus_disasm import OPCODE_TABLE  # noqa: E402
 
 sys.path.insert(0, str(HERE))
 import gen_check_vm as g     # noqa: E402  (reuse the proven builder + run_check)
@@ -102,7 +102,7 @@ def build_round3(seed: bytes):
     H = fnv(PASSWORD)
     ct = bytes(FLAG[i] ^ ksb(PASSWORD, i, H) for i in range(len(FLAG)))
     src = g.build_vasm(ct, H, len(FLAG))
-    blob = venice_asm.assemble(src)          # [u16 ds][data][canonical code]
+    blob = daedalus_asm.assemble(src)          # [u16 ds][data][canonical code]
     ds = struct.unpack_from("<H", blob, 0)[0]
     data = blob[2:2 + ds]
     canon_code = blob[2 + ds:]

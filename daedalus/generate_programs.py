@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-generate_programs.py -- emit venice_programs_shuffled.h at build time.
+generate_programs.py -- emit daedalus_programs_shuffled.h at build time.
 
-The Venice VM's ``venice_programs.h`` carries hand-written bytecode blobs for
-``VVM_PROG_DERIVE_KEY`` and ``VVM_PROG_SHARD_XOR`` encoded with the CANONICAL
-opcode map. When ``VVM_SHUFFLE_OPCODES=ON`` (the default) the interpreter is
+The Daedalus VM's ``daedalus_programs.h`` carries hand-written bytecode blobs for
+``DVM_PROG_DERIVE_KEY`` and ``DVM_PROG_SHARD_XOR`` encoded with the CANONICAL
+opcode map. When ``DVM_SHUFFLE_OPCODES=ON`` (the default) the interpreter is
 built to dispatch a per-build randomized map, so the canonical bytecode would
 be misinterpreted and every packed binary would fail its first crypto call.
 
 This generator closes that loop: it assembles the ``.vasm`` sources in
 ``programs/`` with the current build's shuffled opcode map and emits a
-drop-in header exposing the same public symbols. ``venice_programs.h``
-conditionally ``#include``s this file when ``VVM_SHUFFLED`` is defined.
+drop-in header exposing the same public symbols. ``daedalus_programs.h``
+conditionally ``#include``s this file when ``DVM_SHUFFLED`` is defined.
 
 Runs once per configure/build (CMake custom command; depends on the
 shuffled-opcode file so a fresh shuffle triggers a re-assembly).
 
 Usage:
     python generate_programs.py \\
-        --shuffled-map venice_opcodes_shuffled.py \\
+        --shuffled-map daedalus_opcodes_shuffled.py \\
         --programs-dir programs \\
-        --output venice_programs_shuffled.h
+        --output daedalus_programs_shuffled.h
 """
 from __future__ import annotations
 
@@ -30,47 +30,47 @@ import sys
 from pathlib import Path
 
 
-# Public symbol names emitted by ``venice_programs.h``. Each maps to the
+# Public symbol names emitted by ``daedalus_programs.h``. Each maps to the
 # ``.vasm`` source that replaces it under a shuffled opcode map. The list is
 # deliberately explicit — silently emitting extra programs would drift from
-# what venice_programs.h exposes.
+# what daedalus_programs.h exposes.
 PROGRAMS = [
-    ("VVM_PROG_DERIVE_KEY", "derive_key.vasm"),
-    ("VVM_PROG_SHARD_XOR",  "shard_xor.vasm"),
+    ("DVM_PROG_DERIVE_KEY", "derive_key.vasm"),
+    ("DVM_PROG_SHARD_XOR",  "shard_xor.vasm"),
 ]
 
 
-def _load_asm(venice_dir: Path):
-    """Import venice_asm from the sibling dir (it's not an installed package)."""
-    if str(venice_dir) not in sys.path:
-        sys.path.insert(0, str(venice_dir))
-    import venice_asm  # type: ignore
-    return venice_asm
+def _load_asm(daedalus_dir: Path):
+    """Import daedalus_asm from the sibling dir (it's not an installed package)."""
+    if str(daedalus_dir) not in sys.path:
+        sys.path.insert(0, str(daedalus_dir))
+    import daedalus_asm  # type: ignore
+    return daedalus_asm
 
 
 def _load_shuffled_map(path: Path):
-    spec = importlib.util.spec_from_file_location("_vvm_shuffled", path)
+    spec = importlib.util.spec_from_file_location("_dvm_shuffled", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod.SHUFFLED_OPCODES
 
 
-def _assemble(vasm_path: Path, shuffled_map: dict, venice_asm,
+def _assemble(vasm_path: Path, shuffled_map: dict, daedalus_asm,
               mba: bool = True) -> bytes:
     source = vasm_path.read_text(encoding="utf-8")
     if mba:
         # Solver-hostile arithmetic: rewrite xor/add into MBA expansions BEFORE
         # assembly (proven semantics-preserving by tests/test_mba.py).
-        import venice_mba
-        source = venice_mba.rewrite_source(source)
+        import daedalus_mba
+        source = daedalus_mba.rewrite_source(source)
     # Swap the assembler's opcode table for the shuffled map, assemble, restore.
-    saved = venice_asm.OPCODES
-    venice_asm.OPCODES = shuffled_map
+    saved = daedalus_asm.OPCODES
+    daedalus_asm.OPCODES = shuffled_map
     try:
-        blob = venice_asm.assemble(source)
+        blob = daedalus_asm.assemble(source)
     finally:
-        venice_asm.OPCODES = saved
+        daedalus_asm.OPCODES = saved
     return bytes(blob)
 
 
@@ -88,7 +88,7 @@ def _derive_seed(shuffled_map_path: Path, sym: str) -> bytes:
     build's opcode shuffle (unique per build since the shuffle is per build)."""
     import hashlib
     base = shuffled_map_path.read_bytes()
-    return hashlib.sha256(b"venice-rolling-v1|" + base + b"|" + sym.encode()).digest()[:16]
+    return hashlib.sha256(b"daedalus-rolling-v1|" + base + b"|" + sym.encode()).digest()[:16]
 
 
 def _format_c_array(name: str, data: bytes) -> str:
@@ -105,30 +105,30 @@ def _format_c_array(name: str, data: bytes) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--shuffled-map", required=True, type=Path,
-                    help="Path to venice_opcodes_shuffled.py")
+                    help="Path to daedalus_opcodes_shuffled.py")
     ap.add_argument("--programs-dir", required=True, type=Path,
                     help="Directory containing the .vasm source programs")
     ap.add_argument("--output", required=True, type=Path,
-                    help="Path to write venice_programs_shuffled.h")
+                    help="Path to write daedalus_programs_shuffled.h")
     ap.add_argument("--rolling", action="store_true",
                     help="Emit history-keyed rolling ('VR') containers "
-                         "(requires the stub built with -DVVM_ROLLING=ON)")
+                         "(requires the stub built with -DDVM_ROLLING=ON)")
     ap.add_argument("--no-mba", action="store_true",
                     help="Disable the MBA arithmetic rewrite (on by default)")
     args = ap.parse_args()
 
-    venice_dir = Path(__file__).resolve().parent
-    venice_asm = _load_asm(venice_dir)
+    daedalus_dir = Path(__file__).resolve().parent
+    daedalus_asm = _load_asm(daedalus_dir)
     shuffled_map = _load_shuffled_map(args.shuffled_map)
     mba = not args.no_mba
     optable = _shuffled_optable(shuffled_map) if args.rolling else None
 
     header = [
-        "/* venice_programs_shuffled.h -- generated by generate_programs.py.",
+        "/* daedalus_programs_shuffled.h -- generated by generate_programs.py.",
         " *",
         " * DO NOT EDIT. Re-emitted on every build with the shuffled opcode map.",
-        " * If VVM_SHUFFLE_OPCODES is OFF, this file is not included; the",
-        " * hand-written canonical bytecode in venice_programs.h is used instead.",
+        " * If DVM_SHUFFLE_OPCODES is OFF, this file is not included; the",
+        " * hand-written canonical bytecode in daedalus_programs.h is used instead.",
         " */",
         "#pragma once",
         "#include <stdint.h>",
@@ -140,12 +140,12 @@ def main() -> int:
         if not vasm_path.is_file():
             print(f"error: {vasm_path} not found", file=sys.stderr)
             return 1
-        blob = _assemble(vasm_path, shuffled_map, venice_asm, mba=mba)
+        blob = _assemble(vasm_path, shuffled_map, daedalus_asm, mba=mba)
         note = "MBA" if mba else "plain"
         if args.rolling:
-            import venice_rolling
+            import daedalus_rolling
             seed = _derive_seed(args.shuffled_map, sym)
-            blob = venice_rolling.pack_rolling_blob(blob, seed, optable=optable)
+            blob = daedalus_rolling.pack_rolling_blob(blob, seed, optable=optable)
             note += "+rolling"
         header.append(f"/* {sym}: assembled from {filename} "
                       f"({note}, {len(blob)} bytes) */")

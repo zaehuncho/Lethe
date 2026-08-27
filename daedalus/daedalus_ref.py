@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-venice_ref.py -- Reference interpreter + basic-block decomposition for the
-Venice VM ISA.
+daedalus_ref.py -- Reference interpreter + basic-block decomposition for the
+Daedalus VM ISA.
 
 This is the Python oracle for the SP5 differential harness: the assembler /
 rolling codec is only trusted when the reference interpreter produces the
@@ -14,10 +14,10 @@ locals+data addressing and locals/data memory ops). The domain-specific native
 ops (n_sha256, n_hkdf, n_scatter_init, n_call_ptr, ...) are NOT modeled here --
 they call into stub crypto / Win32 and have no meaning outside the loaded image.
 A program that dispatches a native op raises NativeOpUnsupported; the rolling
-*codec* round-trip (venice_rolling.decode == plaintext) is proven separately on
+*codec* round-trip (daedalus_rolling.decode == plaintext) is proven separately on
 the real native-using programs, where it does not need to execute them.
 
-Decode metadata (byte -> mnemonic/width/kind) is imported from venice_disasm so
+Decode metadata (byte -> mnemonic/width/kind) is imported from daedalus_disasm so
 there is exactly one source of truth for the wire format.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 
 # Single source of truth for the wire format.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from venice_disasm import OPCODE_TABLE  # noqa: E402  byte -> (mnemonic, width, kind)
+from daedalus_disasm import OPCODE_TABLE  # noqa: E402  byte -> (mnemonic, width, kind)
 
 MASK64 = (1 << 64) - 1
 MAX_INSTR_LEN = 9  # push_imm64 = opcode + 8 operand bytes
@@ -38,9 +38,9 @@ MAX_INSTR_LEN = 9  # push_imm64 = opcode + 8 operand bytes
 _BRANCH = {'jmp', 'jz', 'jnz', 'call', 'ret', 'halt'}
 _HAS_TARGET = {'jmp', 'jz', 'jnz', 'call'}
 
-VVM_STACK_SIZE = 64
-VVM_LOCAL_SIZE = 1024
-VVM_RET_STACK_SIZE = 32
+DVM_STACK_SIZE = 64
+DVM_LOCAL_SIZE = 1024
+DVM_RET_STACK_SIZE = 32
 
 # Synthetic, stable base addresses handed out by local_addr / data_addr so the
 # interpreter can model memory ops without a real address space.
@@ -48,11 +48,11 @@ _LOCAL_BASE = 0x0001_0000
 _DATA_BASE = 0x0002_0000
 
 
-class VeniceError(Exception):
-    """Structural VM fault (mirrors venice_vm_exec returning -1)."""
+class DaedalusError(Exception):
+    """Structural VM fault (mirrors daedalus_vm_exec returning -1)."""
 
 
-class NativeOpUnsupported(VeniceError):
+class NativeOpUnsupported(DaedalusError):
     """A native n_* op was dispatched; not modeled by the reference VM."""
 
 
@@ -64,7 +64,7 @@ def iter_instructions(code: bytes, optable=None):
     (wire) bytecode -- boundaries/leaders are identical to canonical, but the
     branch-op identification needs the right table.
 
-    Raises VeniceError on an unknown opcode or a truncated operand -- the same
+    Raises DaedalusError on an unknown opcode or a truncated operand -- the same
     conditions under which the C interpreter returns -1.
     """
     if optable is None:
@@ -74,10 +74,10 @@ def iter_instructions(code: bytes, optable=None):
     while pc < n:
         opc = code[pc]
         if opc not in optable:
-            raise VeniceError(f"unknown opcode 0x{opc:02X} at 0x{pc:04X}")
+            raise DaedalusError(f"unknown opcode 0x{opc:02X} at 0x{pc:04X}")
         mnemonic, width, kind = optable[opc]
         if pc + 1 + width > n:
-            raise VeniceError(f"truncated {mnemonic} at 0x{pc:04X}")
+            raise DaedalusError(f"truncated {mnemonic} at 0x{pc:04X}")
         operand = None
         if width == 1:
             operand = code[pc + 1]
@@ -121,7 +121,7 @@ def compute_leaders(code: bytes, optable=None) -> list[int]:
     # surface it rather than silently keying a mid-instruction offset.
     for L in leaders:
         if L != len(code) and L not in valid and L != 0:
-            raise VeniceError(f"leader 0x{L:04X} is not an instruction boundary")
+            raise DaedalusError(f"leader 0x{L:04X} is not an instruction boundary")
     return sorted(leaders)
 
 
@@ -129,10 +129,10 @@ def compute_leaders(code: bytes, optable=None) -> list[int]:
 # Reference interpreter (pure ISA subset)
 # --------------------------------------------------------------------------
 class RefVM:
-    """Faithful stack-machine interpreter for the pure Venice ISA subset.
+    """Faithful stack-machine interpreter for the pure Daedalus ISA subset.
 
-    Mirrors venice_vm.c semantics: 64-bit little-endian values, sp = next free
-    slot, structural faults -> VeniceError (the C -1). Native ops are refused.
+    Mirrors daedalus_vm.c semantics: 64-bit little-endian values, sp = next free
+    slot, structural faults -> DaedalusError (the C -1). Native ops are refused.
     Memory ops are honored only for addresses inside the synthetic locals/data
     windows handed out by local_addr / data_addr.
     """
@@ -144,7 +144,7 @@ class RefVM:
         self.args = list(args or [])
         self.stack: list[int] = []
         self.ret_stack: list[int] = []
-        self.locals = bytearray(VVM_LOCAL_SIZE)
+        self.locals = bytearray(DVM_LOCAL_SIZE)
         self.pc = 0
         # `decoder`, when supplied, is a RollingDecoder-like object exposing
         # fetch(pc) -> (mnemonic, width, kind, operand, plain_bytes). When None
@@ -154,28 +154,28 @@ class RefVM:
 
     # ---- stack helpers (fault on under/overflow, like the C) -------------
     def _push(self, v):
-        if len(self.stack) >= VVM_STACK_SIZE:
-            raise VeniceError("stack overflow")
+        if len(self.stack) >= DVM_STACK_SIZE:
+            raise DaedalusError("stack overflow")
         self.stack.append(v & MASK64)
 
     def _pop(self):
         if not self.stack:
-            raise VeniceError("stack underflow")
+            raise DaedalusError("stack underflow")
         return self.stack.pop()
 
     def _mem_ref(self, addr, size):
         """Resolve a synthetic address to (buffer, index) or fault."""
-        if _LOCAL_BASE <= addr < _LOCAL_BASE + VVM_LOCAL_SIZE:
+        if _LOCAL_BASE <= addr < _LOCAL_BASE + DVM_LOCAL_SIZE:
             off = addr - _LOCAL_BASE
-            if off + size > VVM_LOCAL_SIZE:
-                raise VeniceError("local OOB")
+            if off + size > DVM_LOCAL_SIZE:
+                raise DaedalusError("local OOB")
             return self.locals, off
         if _DATA_BASE <= addr < _DATA_BASE + len(self.data):
             off = addr - _DATA_BASE
             if off + size > len(self.data):
-                raise VeniceError("data OOB")
+                raise DaedalusError("data OOB")
             return self.data, off
-        raise VeniceError(f"unmodeled memory address 0x{addr:X}")
+        raise DaedalusError(f"unmodeled memory address 0x{addr:X}")
 
     def _fetch(self):
         if self.decoder is not None:
@@ -184,17 +184,17 @@ class RefVM:
                 self.code[self.pc:self.pc + MAX_INSTR_LEN]):
             plain = self.code[self.pc:self.pc + 1 + width]
             return mnemonic, width, kind, operand, plain
-        raise VeniceError("fetch past end")
+        raise DaedalusError("fetch past end")
 
     def run(self, max_steps=1_000_000):
-        """Execute to halt; return the HALT value. Faults raise VeniceError."""
+        """Execute to halt; return the HALT value. Faults raise DaedalusError."""
         steps = 0
         while True:
             steps += 1
             if steps > max_steps:
-                raise VeniceError("step limit (possible infinite loop)")
+                raise DaedalusError("step limit (possible infinite loop)")
             if self.pc >= len(self.code):
-                raise VeniceError("ran past code without halt")
+                raise DaedalusError("ran past code without halt")
             mnemonic, width, kind, operand, _plain = self._fetch()
             self.trace.append(self.pc)
             nxt = self.pc + 1 + width
@@ -226,7 +226,7 @@ class RefVM:
             elif m in ('div', 'mod'):
                 b = self._pop(); a = self._pop()
                 if b == 0:
-                    raise VeniceError("div/mod by zero")
+                    raise DaedalusError("div/mod by zero")
                 self._push(a // b if m == 'div' else a % b)
             elif m == 'neg':
                 self._push((-self._pop()) & MASK64)
@@ -250,28 +250,28 @@ class RefVM:
                 val = self._pop(); addr = self._pop()
                 buf, idx = self._mem_ref(addr, size)
                 if not isinstance(buf, bytearray):
-                    raise VeniceError("store into read-only data")
+                    raise DaedalusError("store into read-only data")
                 buf[idx:idx + size] = (val & ((1 << (8 * size)) - 1)).to_bytes(size, 'little')
             elif m == 'push_arg':
                 if operand >= len(self.args):
-                    raise VeniceError("arg index OOB")
+                    raise DaedalusError("arg index OOB")
                 self._push(self.args[operand])
             elif m == 'local_addr':
-                if operand >= VVM_LOCAL_SIZE:
-                    raise VeniceError("local_addr OOB")
+                if operand >= DVM_LOCAL_SIZE:
+                    raise DaedalusError("local_addr OOB")
                 self._push(_LOCAL_BASE + operand)
             elif m == 'data_addr':
                 if operand >= len(self.data):
-                    raise VeniceError("data_addr OOB")
+                    raise DaedalusError("data_addr OOB")
                 self._push(_DATA_BASE + operand)
             elif m == 'rot3':
-                # [c b a] top=a -> [a c b] top=b  (mirror venice_vm.c ROT3)
+                # [c b a] top=a -> [a c b] top=b  (mirror daedalus_vm.c ROT3)
                 a = self._pop(); b = self._pop(); c = self._pop()
                 self._push(a); self._push(c); self._push(b)
             elif m == 'pick':
                 n = operand
                 if n >= len(self.stack):
-                    raise VeniceError("pick OOB")
+                    raise DaedalusError("pick OOB")
                 self._push(self.stack[len(self.stack) - 1 - n])
             elif m == 'jmp':
                 self.pc = operand
@@ -285,20 +285,20 @@ class RefVM:
                 self.pc = operand if cond != 0 else nxt
                 continue
             elif m == 'call':
-                if len(self.ret_stack) >= VVM_RET_STACK_SIZE:
-                    raise VeniceError("ret stack overflow")
+                if len(self.ret_stack) >= DVM_RET_STACK_SIZE:
+                    raise DaedalusError("ret stack overflow")
                 self.ret_stack.append(nxt)
                 self.pc = operand
                 continue
             elif m == 'ret':
                 if not self.ret_stack:
-                    raise VeniceError("ret stack underflow")
+                    raise DaedalusError("ret stack underflow")
                 self.pc = self.ret_stack.pop()
                 continue
             elif m.startswith('n_'):
                 raise NativeOpUnsupported(m)
             else:
-                raise VeniceError(f"unhandled opcode '{m}'")
+                raise DaedalusError(f"unhandled opcode '{m}'")
 
             self.pc = nxt
 

@@ -69,7 +69,7 @@ static void sha256_fin(sha256 *c,uint8_t out[32]){ uint64_t bits=c->n*8; uint8_t
     for(i=0;i<8;i++){ out[i*4]=c->s[i]>>24;out[i*4+1]=c->s[i]>>16;out[i*4+2]=c->s[i]>>8;out[i*4+3]=c->s[i]; } }
 static void sha256_hash(const uint8_t *p,uint32_t l,uint8_t out[32]){ sha256 c; sha256_init(&c); sha256_upd(&c,p,l); sha256_fin(&c,out); }
 
-/* ---- rolling primitives (mirror venice_rolling) -------------------------- */
+/* ---- rolling primitives (mirror daedalus_rolling) -------------------------- */
 static uint64_t rotl64(uint64_t v,int r){ r&=63; return r? (v<<r)|(v>>(64-r)) : v; }
 static uint64_t rd64le(const uint8_t *p){ uint64_t v=0;int i;for(i=0;i<8;i++)v|=(uint64_t)p[i]<<(8*i);return v; }
 static uint64_t roll_resync(const uint8_t seed[16], uint32_t leader){

@@ -243,11 +243,11 @@ type names that reveal class/method names.
 
 **Goal:** Critical functions never exist as native x86-64 in memory. Even after
 unpacking and deobfuscation, an attacker sees only custom bytecode interpreted by the
-Venice VM. This is the strongest client-side protection short of hardware enclaves.
+Daedalus VM. This is the strongest client-side protection short of hardware enclaves.
 
 ---
 
-### 3A: Venice VM v2 — Extend the Interpreter (~3 days)
+### 3A: Daedalus VM v2 — Extend the Interpreter (~3 days)
 
 **Current state:** 40 opcodes, pure stack machine, 64-slot stack, 256-byte locals,
 11 native call-outs, no CALL/RET, no subroutines. 487 LOC. Two hand-encoded programs
@@ -306,7 +306,7 @@ RCX/RDX/R8/R9, rest on stack), calls via an indirect `call` through a small ASM
 trampoline, and pushes the u64 return value.
 
 **Implementation:** The trampoline is a ~30-instruction x64 ASM routine
-(`venice_trampoline.asm`) that:
+(`daedalus_trampoline.asm`) that:
 - Receives (func_ptr, arg_count, args[]) from the C dispatcher
 - Sets up the x64 shadow space + register args
 - Issues `call [func_ptr]`
@@ -320,30 +320,30 @@ for CALL/RET. Functions within the bytecode program can call each other. A stack
 overflow returns -1 (fatal VM error, same as operand stack overflow).
 
 **Files to modify:**
-- `stub/src/venice_vm.h` — add new opcode constants, bump VVM version
-- `stub/src/venice_vm.c` — add dispatch cases (~150 LOC)
-- `stub/src/venice_trampoline.asm` — N_CALL_PTR x64 ABI bridge (~50 LOC)
-- `stub/CMakeLists.txt` — add venice_trampoline.asm
+- `stub/src/daedalus_vm.h` — add new opcode constants, bump DVM version
+- `stub/src/daedalus_vm.c` — add dispatch cases (~150 LOC)
+- `stub/src/daedalus_trampoline.asm` — N_CALL_PTR x64 ABI bridge (~50 LOC)
+- `stub/CMakeLists.txt` — add daedalus_trampoline.asm
 
 **Verification:**
 - Roundtrip: existing DERIVE_KEY and SHARD_XOR programs still work (backward compat).
 - Unit test: write a test program exercising every new opcode, run it from a test
-  harness (call `venice_vm_exec` from a C test, assert results).
+  harness (call `daedalus_vm_exec` from a C test, assert results).
 
 ---
 
-### 3B: Venice Assembler — Human-Readable Bytecode (~2 days)
+### 3B: Daedalus Assembler — Human-Readable Bytecode (~2 days)
 
-**The problem:** Current programs are hand-encoded hex blobs in `venice_programs.h`.
+**The problem:** Current programs are hand-encoded hex blobs in `daedalus_programs.h`.
 This doesn't scale beyond tiny programs. We need a text-based assembly language and
 an assembler.
 
 **Design:**
 
 ```
-venice/
-  venice_asm.py          assembler: .vasm text → binary blob (Python, build-time tool)
-  venice_disasm.py       disassembler: binary → .vasm text (debugging aid)
+daedalus/
+  daedalus_asm.py          assembler: .vasm text → binary blob (Python, build-time tool)
+  daedalus_disasm.py       disassembler: binary → .vasm text (debugging aid)
   programs/              .vasm source files
     derive_key.vasm      existing program, ported from hand-encoded hex
     shard_xor.vasm       existing program, ported from hand-encoded hex
@@ -353,7 +353,7 @@ venice/
 **Assembly syntax:**
 
 ```asm
-; Venice Assembly — derive_key.vasm
+; Daedalus Assembly — derive_key.vasm
 ; Lines starting with ; are comments. Labels end with :.
 ; Operands are decimal or 0x hex.
 
@@ -393,9 +393,9 @@ done:
 - `.data` section for inline byte arrays
 - Named constants (`.const STACK_SIZE 64`)
 - `#include` for shared definitions
-- Output: the same `[u16 data_size][data][code]` binary format venice_vm_exec expects
+- Output: the same `[u16 data_size][data][code]` binary format daedalus_vm_exec expects
 - Optional: output as C header (`static const uint8_t PROG[] = { ... };`) for direct
-  embedding in venice_programs.h
+  embedding in daedalus_programs.h
 
 **Verification:**
 - Assemble existing DERIVE_KEY and SHARD_XOR from .vasm source → compare output
@@ -426,12 +426,12 @@ done:
 | `LeaseGate::verifyLeaseSignature()` | LeaseGate.cpp:137 | ~30 | Ed25519 verify — lease forgery target |
 | `LeaseGate::leaseVerifyPublicKey()` | LeaseGate.cpp:~85 | ~5 | Public key accessor — key swap target |
 
-**Approach: Source-level port to Venice assembly.**
+**Approach: Source-level port to Daedalus assembly.**
 
 For each target function:
 1. Read the C++ source.
 2. Identify all external calls it makes (Qt APIs, Win32 APIs, Ed25519 functions).
-3. Write equivalent logic in Venice assembly, using `n_call_ptr` for external calls.
+3. Write equivalent logic in Daedalus assembly, using `n_call_ptr` for external calls.
 4. The function's native body is replaced with a VM entry stub:
 
 ```cpp
@@ -446,7 +446,7 @@ QString SecurityManager::machineId() const {
     uint64_t args[2];
     args[0] = (uint64_t)(uintptr_t)this;
     args[1] = (uint64_t)(uintptr_t)&result;
-    venice_vm_exec(VVM_PROG_MACHINE_ID, VVM_PROG_MACHINE_ID_SIZE, args, 2);
+    daedalus_vm_exec(DVM_PROG_MACHINE_ID, DVM_PROG_MACHINE_ID_SIZE, args, 2);
     return result;
 }
 ```
@@ -475,7 +475,7 @@ function pointers from it and uses `n_call_ptr` to invoke them.
 
 **Why not automate with an x86 lifter?**
 
-An automated x86-64 → Venice lifter would be ideal but is a multi-month project:
+An automated x86-64 → Daedalus lifter would be ideal but is a multi-month project:
 - Reliable x86-64 disassembly (Zydis) is solved, but lifting to IR is not — x86
   has ~1500 instruction forms, flags register semantics, SIMD, etc.
 - Open-source lifters exist (Remill, RetDec) but they're 100K+ LOC projects.
@@ -498,14 +498,14 @@ automated lifter. For now, manual port is the right call.
 ### 3D: Packer Integration — Bytecode Protection (~1 day)
 
 **The problem:** The bytecode programs are embedded as static arrays in the product
-binary. An attacker could extract them, disassemble them (reverse the Venice ISA),
+binary. An attacker could extract them, disassemble them (reverse the Daedalus ISA),
 and read the logic. We need to protect the bytecode itself.
 
 **Approach:** The bytecode is encrypted at build time and decrypted at runtime by the
 packer stub, just like section data.
 
 **Design:**
-1. The Venice programs are stored in a dedicated `.vdata` section of the product binary.
+1. The Daedalus programs are stored in a dedicated `.vdata` section of the product binary.
 2. At pack time, Lethe encrypts `.vdata` along with the other sections (AES-256-GCM
    with per-section subkey derivation — already implemented).
 3. At runtime, the stub decrypts `.vdata` before the VM runs any program.
@@ -523,7 +523,7 @@ do — the stubs are called from the product's code, which runs after unpack).
 
 **Bytecode obfuscation (defense-in-depth):**
 
-Even encrypted, the bytecode runs through a public ISA (the Venice opcode set). An
+Even encrypted, the bytecode runs through a public ISA (the Daedalus opcode set). An
 attacker who reverse-engineers the VM interpreter can write a disassembler. Counter:
 
 1. **Per-build opcode shuffling:** At build time, randomly permute the opcode
@@ -540,7 +540,7 @@ attacker who reverse-engineers the VM interpreter can write a disassembler. Coun
    them as noise between real instructions.
 
 **Implementation:** The permutation table is generated by the build script and
-`#include`d by both `venice_vm.c` (C side) and `venice_asm.py` (Python side).
+`#include`d by both `daedalus_vm.c` (C side) and `daedalus_asm.py` (Python side).
 
 ---
 
@@ -553,11 +553,11 @@ is too complex to port manually (e.g., OrionAppController methods at 10K LOC).
 
 ```
 lifter/
-  lifter.py              main driver: ELF/PE → Venice bytecode
+  lifter.py              main driver: ELF/PE → Daedalus bytecode
   disasm.py              x86-64 disassembly via Zydis (Python bindings or subprocess)
   ir.py                  intermediate representation (SSA-based)
   lift_x86.py            x86-64 → IR translation (~200 instruction forms, not all 1500)
-  lower_venice.py        IR → Venice bytecode
+  lower_daedalus.py        IR → Daedalus bytecode
   optimize.py            dead-code elimination, constant folding, register allocation
 ```
 
@@ -567,9 +567,9 @@ IMUL, XOR, AND, OR, SHL, SHR, CMP, TEST, Jcc, CALL, RET, PUSH, POP, MOVZX, MOVSX
 CDQ, CMOV, SET, and their memory-operand variants.
 
 **Key challenges:**
-- **Flags register:** x86 sets FLAGS on most ALU ops; Venice has no flags. The lifter
+- **Flags register:** x86 sets FLAGS on most ALU ops; Daedalus has no flags. The lifter
   must synthesize flag values as explicit comparisons.
-- **Memory addressing modes:** x86 has base+index*scale+disp; Venice has flat LOAD/STORE.
+- **Memory addressing modes:** x86 has base+index*scale+disp; Daedalus has flat LOAD/STORE.
   The lifter must decompose complex addressing into arithmetic + load.
 - **Calling convention:** The lifter must recognize and handle x64 ABI (shadow space,
   register args, stack args) when the lifted code calls native functions.
@@ -590,10 +590,10 @@ subset. Ongoing maintenance as MSVC codegen evolves.
 Week 1:
   Day 1-2:  2A (string encryption)  — ship independently, immediate value
   Day 3:    2C (symbol stripping)   — build flags only
-  Day 3-5:  3A (Venice VM v2)       — extend interpreter (parallel with 2B setup)
+  Day 3-5:  3A (Daedalus VM v2)       — extend interpreter (parallel with 2B setup)
 
 Week 2:
-  Day 1-2:  3B (Venice assembler)   — port existing programs, validate
+  Day 1-2:  3B (Daedalus assembler)   — port existing programs, validate
   Day 1-5:  2B (SecurityCore OLLVM) — build LLVM fork, integrate ExternalProject
                                       (parallel with 3B)
   Day 3-5:  3C (port first 3 functions: machineId, validateLicenseKey, leaseVerify)
@@ -616,7 +616,7 @@ independent. 3C depends on 3A + 3B. Everything converges in week 3 for integrati
 | OLLVM fork doesn't compile with current LLVM | 2B blocked | Build from source; cherry-pick passes onto stock LLVM |
 | clang-cl breaks Qt MOC for SecurityCore | 2B broken | Qt officially supports clang-cl; if it breaks, file upstream |
 | Obfuscated SecurityCore triggers Defender | Ship blocker | A/B test: obfuscated vs. clean on Defender VM before commit |
-| Manual Venice port introduces logic bugs | Silent failure | Dual-run test: VM output == native output for all inputs |
+| Manual Daedalus port introduces logic bugs | Silent failure | Dual-run test: VM output == native output for all inputs |
 | N_CALL_PTR ABI mismatch | VM crash | Trampoline is small (~50 LOC asm), exhaustively testable |
 | Opcode shuffle breaks backward compat | Old packed binaries fail | Shuffle is per-build; the packer embeds the VM interpreter, so the shuffle + bytecode are always matched |
 
@@ -636,26 +636,26 @@ Phase 2B:
   (edits to native_orion/CMakeLists.txt)
 
 Phase 3A:
-  (edits to stub/src/venice_vm.h, venice_vm.c)
-  stub/src/venice_trampoline.asm
+  (edits to stub/src/daedalus_vm.h, daedalus_vm.c)
+  stub/src/daedalus_trampoline.asm
 
 Phase 3B:
-  venice/venice_asm.py
-  venice/venice_disasm.py
-  venice/programs/derive_key.vasm
-  venice/programs/shard_xor.vasm
+  daedalus/daedalus_asm.py
+  daedalus/daedalus_disasm.py
+  daedalus/programs/derive_key.vasm
+  daedalus/programs/shard_xor.vasm
 
 Phase 3C:
-  venice/programs/machine_id.vasm
-  venice/programs/validate_license.vasm
-  venice/programs/verify_lease.vasm
-  venice/programs/entitlement_binding.vasm
-  venice/programs/seal_cache.vasm
-  venice/programs/unseal_cache.vasm
-  venice/programs/lease_pubkey.vasm
+  daedalus/programs/machine_id.vasm
+  daedalus/programs/validate_license.vasm
+  daedalus/programs/verify_lease.vasm
+  daedalus/programs/entitlement_binding.vasm
+  daedalus/programs/seal_cache.vasm
+  daedalus/programs/unseal_cache.vasm
+  daedalus/programs/lease_pubkey.vasm
   (edits to SecurityManager.cpp, LeaseGate.cpp — replace function bodies with VM stubs)
 
 Phase 3D:
-  venice/shuffle_opcodes.py
-  (edits to venice_vm.c, venice_asm.py — conditional opcode table)
+  daedalus/shuffle_opcodes.py
+  (edits to daedalus_vm.c, daedalus_asm.py — conditional opcode table)
 ```

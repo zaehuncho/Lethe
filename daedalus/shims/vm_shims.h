@@ -1,8 +1,8 @@
 /*
- * vm_shims.h -- Declarations for all Venice VM shim functions.
+ * vm_shims.h -- Declarations for all Daedalus VM shim functions.
  *
  * Each function is extern "C" with a flat ABI (scalar / pointer args only)
- * so that Venice bytecode can invoke them through N_CALL_PTR.
+ * so that Daedalus bytecode can invoke them through N_CALL_PTR.
  *
  * Include vm_externals.h for the VmExternals struct and init helper.
  */

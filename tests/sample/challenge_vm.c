@@ -1,7 +1,7 @@
 /*
  * challenge_vm.c -- Lethe red-team crackme, VIRTUALIZED edition.
  *
- * The password check is NOT native code -- it runs as Venice VM bytecode
+ * The password check is NOT native code -- it runs as Daedalus VM bytecode
  * (Logic Mortaring). A fully-unpacked dump reveals a tiny stack-VM interpreter
  * plus an XOR-obfuscated bytecode blob, NOT the FNV/XOR formula. To recover the
  * check an analyst must first devirtualize the embedded VM. The flag is still
@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include "check_vm_blob.h"
 
-/* Minimal Venice VM (pure-ISA subset). Raw-pointer memory model, like the real
+/* Minimal Daedalus VM (pure-ISA subset). Raw-pointer memory model, like the real
  * interpreter: local_addr/data_addr push real addresses, load/store deref them. */
 static int run_vm(const unsigned char *prog, uint32_t prog_len,
                   uint8_t *locals, const uint64_t *args)

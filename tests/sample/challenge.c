@@ -8,7 +8,7 @@
  *
  * This ships inside the Lethe-protected payload: sections AES-256-GCM
  * encrypted at rest, the section key derived by a history-keyed self-decrypting
- * Venice VM program (rolling bytecode + MBA arithmetic + per-build opcode
+ * Daedalus VM program (rolling bytecode + MBA arithmetic + per-build opcode
  * shuffle), with anti-debug + anti-dump active.
  */
 #include <stdio.h>

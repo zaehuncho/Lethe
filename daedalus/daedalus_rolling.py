@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-venice_rolling.py -- History-keyed self-decrypting bytecode for the Venice VM.
+daedalus_rolling.py -- History-keyed self-decrypting bytecode for the Daedalus VM.
 
 THE IDEA
 --------
-At rest the Venice bytecode is ciphertext. There is no decodable program image:
+At rest the Daedalus bytecode is ciphertext. There is no decodable program image:
 each instruction's plaintext exists only for the instant the VM is about to
 execute it, reconstructed from a keystream that folds the *execution history*
 (the accumulator) of the basic block that reached it. Immediately behind the PC
@@ -57,9 +57,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from venice_disasm import OPCODE_TABLE  # noqa: E402
-from venice_ref import (  # noqa: E402
-    compute_leaders, iter_instructions, VeniceError, MAX_INSTR_LEN,
+from daedalus_disasm import OPCODE_TABLE  # noqa: E402
+from daedalus_ref import (  # noqa: E402
+    compute_leaders, iter_instructions, DaedalusError, MAX_INSTR_LEN,
 )
 
 MASK64 = (1 << 64) - 1
@@ -129,7 +129,7 @@ def pack_rolling_blob(plain_blob: bytes, seed: bytes, optable=None) -> bytes:
 
     Container: [2 'VR'][16 seed][u16 data_size][data][u16 n_leaders]
                [u32 leader…][code_ct]
-    The seed is self-contained so venice_vm_exec needs no cross-TU global.
+    The seed is self-contained so daedalus_vm_exec needs no cross-TU global.
     `optable` selects the decode table for the wire bytecode (shuffled builds).
     """
     if len(seed) != SEED_LEN:
@@ -165,7 +165,7 @@ def unpack_rolling_blob(blob: bytes):
 
 
 # --------------------------------------------------------------------------
-# Decoder (runtime side; mirrors the intended venice_vm.c fetch path)
+# Decoder (runtime side; mirrors the intended daedalus_vm.c fetch path)
 # --------------------------------------------------------------------------
 class RollingDecoder:
     """Reconstructs one plaintext instruction at a time from the ciphertext.
@@ -185,17 +185,17 @@ class RollingDecoder:
 
     def fetch(self, pc: int):
         if pc >= len(self.ct):
-            raise VeniceError("fetch past end")
+            raise DaedalusError("fetch past end")
         if pc in self.leaders:
             self.acc = resync(self.seed, pc)
         ks = keystream(self.seed, pc, self.acc)
         opc = self.ct[pc] ^ ks[0]
         if opc not in self.optable:
-            raise VeniceError(f"rolling: bad opcode 0x{opc:02X} at 0x{pc:04X}")
+            raise DaedalusError(f"rolling: bad opcode 0x{opc:02X} at 0x{pc:04X}")
         mnemonic, width, kind = self.optable[opc]
         ilen = 1 + width
         if pc + ilen > len(self.ct):
-            raise VeniceError("rolling: truncated instruction")
+            raise DaedalusError("rolling: truncated instruction")
         plain = bytes(self.ct[pc + i] ^ ks[i] for i in range(ilen))
         operand = None
         if width == 1:

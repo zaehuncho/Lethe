@@ -1,6 +1,6 @@
-; venice_trampoline.asm -- MASM x64 trampoline for Venice VM N_CALL_PTR opcode.
+; daedalus_trampoline.asm -- MASM x64 trampoline for Daedalus VM N_CALL_PTR opcode.
 ;
-; uint64_t venice_trampoline_call(void *func, int argc, const uint64_t *argv);
+; uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv);
 ;
 ; Calls an arbitrary C function pointer with up to 8 scalar/pointer arguments
 ; using the Microsoft x64 calling convention (RCX, RDX, R8, R9, stack).
@@ -12,10 +12,10 @@
 ;
 ; Returns RAX from the called function.
 
-PUBLIC venice_trampoline_call
+PUBLIC daedalus_trampoline_call
 .code
 
-venice_trampoline_call PROC FRAME
+daedalus_trampoline_call PROC FRAME
 
     push    rbp
     .pushreg rbp
@@ -96,6 +96,6 @@ do_call:
     pop     rbp
     ret
 
-venice_trampoline_call ENDP
+daedalus_trampoline_call ENDP
 
 END

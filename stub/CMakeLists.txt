@@ -14,8 +14,8 @@ add_library(lethe_stub_x64 SHARED
     src/antidebug.c
     src/antidump.c
     src/memguard.c
-    src/venice_vm.c
-    src/venice_trampoline.asm
+    src/daedalus_vm.c
+    src/daedalus_trampoline.asm
     src/miniz.c
     src/chkstk.asm
     # Decoy imports (user32/advapi32/ole32/shell32/gdi32/shlwapi): never called,
@@ -67,24 +67,24 @@ foreach(_flag CMAKE_SHARED_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS_RELEASE CMAKE_
     string(REPLACE "/guard:cf" "" ${_flag} "${${_flag}}")
 endforeach()
 
-# History-keyed self-decrypting Venice bytecode (venice_rolling.c). OFF by
+# History-keyed self-decrypting Daedalus bytecode (daedalus_rolling.c). OFF by
 # default so the shipped stub is unchanged; ON compiles the runtime rolling
 # decoder AND makes generate_programs emit 'VR' containers (pack-time encoder +
-# differential proof: venice/venice_rolling.py + tests/test_rolling_bytecode.py).
+# differential proof: daedalus/daedalus_rolling.py + tests/test_rolling_bytecode.py).
 # Declared before the shuffle block because that block reads it.
-option(VVM_ROLLING "Compile+emit history-keyed rolling-bytecode virtualization" OFF)
+option(DVM_ROLLING "Compile+emit history-keyed rolling-bytecode virtualization" OFF)
 # Observation-poison: fold an anti-instrumentation signal into the rolling
 # accumulator so a debugger silently mis-keys (zero-FP on clean runs). Kill-
 # switch; default ON when rolling is on.
-# NOTE: keep VVM_ROLLING/VVM_ROLL_POISON OFF for any build you intend to attach a
+# NOTE: keep DVM_ROLLING/DVM_ROLL_POISON OFF for any build you intend to attach a
 # debugger to yourself -- the poison's failure mode is an opaque decrypt failure,
 # not a clean exit, so a self-debug session would look like corruption.
-option(VVM_ROLL_POISON "Fold anti-instrumentation poison into rolling decode" ON)
-if(VVM_ROLLING)
-    target_sources(lethe_stub_x64 PRIVATE src/venice_rolling.c)
-    target_compile_definitions(lethe_stub_x64 PRIVATE VVM_ROLLING)
-    if(VVM_ROLL_POISON)
-        target_compile_definitions(lethe_stub_x64 PRIVATE VVM_ROLL_POISON)
+option(DVM_ROLL_POISON "Fold anti-instrumentation poison into rolling decode" ON)
+if(DVM_ROLLING)
+    target_sources(lethe_stub_x64 PRIVATE src/daedalus_rolling.c)
+    target_compile_definitions(lethe_stub_x64 PRIVATE DVM_ROLLING)
+    if(DVM_ROLL_POISON)
+        target_compile_definitions(lethe_stub_x64 PRIVATE DVM_ROLL_POISON)
     endif()
 endif()
 
@@ -108,84 +108,84 @@ if(MEMGUARD_KALYPSO)
     target_compile_definitions(lethe_stub_x64 PRIVATE MEMGUARD_KALYPSO)
 endif()
 
-option(VVM_SHUFFLE_OPCODES "Enable per-build opcode shuffling for Venice VM" ON)
+option(DVM_SHUFFLE_OPCODES "Enable per-build opcode shuffling for Daedalus VM" ON)
 
 # Guard against a silent security DOWNGRADE: the rolling ('VR') containers are
 # emitted by generate_programs, which runs only inside the shuffle block below.
-# So VVM_ROLLING without VVM_SHUFFLE_OPCODES would compile the rolling decoder +
+# So DVM_ROLLING without DVM_SHUFFLE_OPCODES would compile the rolling decoder +
 # poison but ship un-rolled canonical plaintext bytecode (no 'VR' magic), and the
 # runtime would silently route to the plaintext path -- protection the operator
 # thinks is on would be off. Fail loudly instead.
-if(VVM_ROLLING AND NOT VVM_SHUFFLE_OPCODES)
+if(DVM_ROLLING AND NOT DVM_SHUFFLE_OPCODES)
     message(FATAL_ERROR
-        "VVM_ROLLING requires VVM_SHUFFLE_OPCODES=ON (the rolling 'VR' encoder "
-        "runs inside the shuffle step). Enable VVM_SHUFFLE_OPCODES or disable "
-        "VVM_ROLLING -- otherwise the stub would ship un-rolled bytecode.")
+        "DVM_ROLLING requires DVM_SHUFFLE_OPCODES=ON (the rolling 'VR' encoder "
+        "runs inside the shuffle step). Enable DVM_SHUFFLE_OPCODES or disable "
+        "DVM_ROLLING -- otherwise the stub would ship un-rolled bytecode.")
 endif()
 
-if(VVM_SHUFFLE_OPCODES)
+if(DVM_SHUFFLE_OPCODES)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(_vvm_venice_dir  "${CMAKE_CURRENT_SOURCE_DIR}/../venice")
-    set(_vvm_shuffler    "${_vvm_venice_dir}/shuffle_opcodes.py")
-    set(_vvm_progen      "${_vvm_venice_dir}/generate_programs.py")
-    set(_vvm_asm         "${_vvm_venice_dir}/venice_asm.py")
-    set(_vvm_programs_dir "${_vvm_venice_dir}/programs")
-    set(_vvm_shuffled_h  "${CMAKE_CURRENT_BINARY_DIR}/venice_opcodes_shuffled.h")
-    set(_vvm_shuffled_py "${_vvm_venice_dir}/venice_opcodes_shuffled.py")
-    set(_vvm_programs_h  "${CMAKE_CURRENT_BINARY_DIR}/venice_programs_shuffled.h")
+    set(_dvm_daedalus_dir  "${CMAKE_CURRENT_SOURCE_DIR}/../daedalus")
+    set(_dvm_shuffler    "${_dvm_daedalus_dir}/shuffle_opcodes.py")
+    set(_dvm_progen      "${_dvm_daedalus_dir}/generate_programs.py")
+    set(_dvm_asm         "${_dvm_daedalus_dir}/daedalus_asm.py")
+    set(_dvm_programs_dir "${_dvm_daedalus_dir}/programs")
+    set(_dvm_shuffled_h  "${CMAKE_CURRENT_BINARY_DIR}/daedalus_opcodes_shuffled.h")
+    set(_dvm_shuffled_py "${_dvm_daedalus_dir}/daedalus_opcodes_shuffled.py")
+    set(_dvm_programs_h  "${CMAKE_CURRENT_BINARY_DIR}/daedalus_programs_shuffled.h")
 
     # Step 1: mint a fresh per-build opcode permutation.
     add_custom_command(
-        OUTPUT "${_vvm_shuffled_h}" "${_vvm_shuffled_py}"
-        COMMAND ${Python3_EXECUTABLE} "${_vvm_shuffler}" generate
-                --c-header "${_vvm_shuffled_h}"
-                --py-dict "${_vvm_shuffled_py}"
-        COMMENT "Shuffling Venice VM opcodes (per-build randomization)"
-        DEPENDS "${_vvm_shuffler}"
+        OUTPUT "${_dvm_shuffled_h}" "${_dvm_shuffled_py}"
+        COMMAND ${Python3_EXECUTABLE} "${_dvm_shuffler}" generate
+                --c-header "${_dvm_shuffled_h}"
+                --py-dict "${_dvm_shuffled_py}"
+        COMMENT "Shuffling Daedalus VM opcodes (per-build randomization)"
+        DEPENDS "${_dvm_shuffler}"
         VERBATIM
     )
 
     # Step 2: re-assemble the .vasm sources against the shuffled map so the
-    # bytecode blobs in venice_programs.h match the interpreter's decode.
+    # bytecode blobs in daedalus_programs.h match the interpreter's decode.
     # Without this the interpreter would misdispatch canonical bytecode and
     # every packed binary would fail crypto_derive_key. All .vasm files are
     # DEPENDS so a source edit forces a rebuild.
-    file(GLOB _vvm_vasm_sources "${_vvm_programs_dir}/*.vasm")
-    # When VVM_ROLLING is ON, emit history-keyed rolling ('VR') containers so
+    file(GLOB _dvm_vasm_sources "${_dvm_programs_dir}/*.vasm")
+    # When DVM_ROLLING is ON, emit history-keyed rolling ('VR') containers so
     # the crypto-critical programs ship as self-decrypting ciphertext. MBA
     # arithmetic rewrite is always on (proven semantics-preserving).
-    if(VVM_ROLLING)
-        set(_vvm_rolling_flag "--rolling")
+    if(DVM_ROLLING)
+        set(_dvm_rolling_flag "--rolling")
     else()
-        set(_vvm_rolling_flag "")
+        set(_dvm_rolling_flag "")
     endif()
     add_custom_command(
-        OUTPUT "${_vvm_programs_h}"
-        COMMAND ${Python3_EXECUTABLE} "${_vvm_progen}"
-                --shuffled-map "${_vvm_shuffled_py}"
-                --programs-dir "${_vvm_programs_dir}"
-                --output       "${_vvm_programs_h}"
-                ${_vvm_rolling_flag}
-        COMMENT "Assembling Venice VM programs (shuffled + MBA${_vvm_rolling_flag})"
-        DEPENDS "${_vvm_progen}" "${_vvm_asm}" "${_vvm_shuffled_py}"
-                "${_vvm_venice_dir}/venice_mba.py"
-                "${_vvm_venice_dir}/venice_rolling.py"
-                "${_vvm_venice_dir}/venice_ref.py"
-                ${_vvm_vasm_sources}
+        OUTPUT "${_dvm_programs_h}"
+        COMMAND ${Python3_EXECUTABLE} "${_dvm_progen}"
+                --shuffled-map "${_dvm_shuffled_py}"
+                --programs-dir "${_dvm_programs_dir}"
+                --output       "${_dvm_programs_h}"
+                ${_dvm_rolling_flag}
+        COMMENT "Assembling Daedalus VM programs (shuffled + MBA${_dvm_rolling_flag})"
+        DEPENDS "${_dvm_progen}" "${_dvm_asm}" "${_dvm_shuffled_py}"
+                "${_dvm_daedalus_dir}/daedalus_mba.py"
+                "${_dvm_daedalus_dir}/daedalus_rolling.py"
+                "${_dvm_daedalus_dir}/daedalus_ref.py"
+                ${_dvm_vasm_sources}
         VERBATIM
     )
 
-    add_custom_target(venice_shuffle
-        DEPENDS "${_vvm_shuffled_h}" "${_vvm_programs_h}")
-    add_dependencies(lethe_stub_x64 venice_shuffle)
+    add_custom_target(daedalus_shuffle
+        DEPENDS "${_dvm_shuffled_h}" "${_dvm_programs_h}")
+    add_dependencies(lethe_stub_x64 daedalus_shuffle)
     target_include_directories(lethe_stub_x64 PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-    target_compile_definitions(lethe_stub_x64 PRIVATE VVM_SHUFFLED)
+    target_compile_definitions(lethe_stub_x64 PRIVATE DVM_SHUFFLED)
 endif()
 
-# History-keyed self-decrypting Venice bytecode (venice_rolling.c). OFF by
+# History-keyed self-decrypting Daedalus bytecode (daedalus_rolling.c). OFF by
 # default so the shipped stub is byte-identical to today; turn ON to compile the
 # runtime rolling decoder (pack-time encoder + differential proof live in
-# venice/venice_rolling.py + tests/test_rolling_bytecode.py).
+# daedalus/daedalus_rolling.py + tests/test_rolling_bytecode.py).
 # Diagnostic tracing (writes lethe_diag.txt with per-step markers). Enable with
 # -DLETHE_ENABLE_DIAG=ON when hunting a stub-loader regression; OFF by default
 # so shipped builds don't leak side-channel telemetry to disk or announce a

@@ -1,5 +1,5 @@
 ; Contract: STATUS — 0=success, nonzero=error
-; VVM_PROG_SHARD_XOR -- replaces the shard block in pe_loader.c
+; DVM_PROG_SHARD_XOR -- replaces the shard block in pe_loader.c
 ;
 ; args[0] = key   (uint8_t[32], XOR'd in place)
 ; locals: [0..64] shex (65-byte env buffer)   [65..96] shard (32 bytes)

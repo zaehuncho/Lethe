@@ -66,14 +66,14 @@ Implement these as the foundation; every track consumes them.
 
 | # | Primitive | What it is | Consumed by |
 |---|-----------|-----------|-------------|
-| P1 | **Rolling state accumulator** | A 64-bit (+ SHA/ARX midstate) fold updated at the `vvm_push`/`vvm_pop` choke points and at each dispatched `opcode‖operand‖sp‖taken-edge`. The one keystream/decode seed. | VM decode, key binding, handler chaining, decode-of-dispatch |
+| P1 | **Rolling state accumulator** | A 64-bit (+ SHA/ARX midstate) fold updated at the `dvm_push`/`dvm_pop` choke points and at each dispatched `opcode‖operand‖sp‖taken-edge`. The one keystream/decode seed. | VM decode, key binding, handler chaining, decode-of-dispatch |
 | P2 | **Fine-grained crypto (memguard v3)** | Per-page AEAD + per-shard key assembly so no whole section/key/blob is ever resident; randomized short re-encrypt jitter; decoy resident pages. | Anti-dump, moving code, JIT secrets |
 | P3 | **Environment-as-summand KDF** | `antidebug.c` reads (PEB, DR0-3, remote-debug flag, TLS-ran boolean, code-hash, quantized self-timing bucket) become HKDF `info` terms, not `if()`s. Baked expectations in `container.py`. | Anti-automation, tamper response, key binding |
 | P4 | **Silent deception router** | A tamper/analysis signal selects *which cryptographically-valid blob/key/OEP* is used (real vs decoy) — both decrypt cleanly, so a false positive is survivable and a true positive is invisible. | All deception, tamper response |
 
 **Also foundational (do first):**
-- **Per-build seed** shared across `venice_asm.py` / `venice_vm.c` /
-  `venice_disasm.py` / `shuffle_opcodes.py` so every build is structurally unique.
+- **Per-build seed** shared across `daedalus_asm.py` / `daedalus_vm.c` /
+  `daedalus_disasm.py` / `shuffle_opcodes.py` so every build is structurally unique.
 - **Differential harness**: assembler-simulated result vs interpreter result must
   match bit-exactly on a clean build, or the *pack* fails (never the customer).
   This is the safety net for every rolling/entangled scheme.
@@ -83,23 +83,23 @@ Implement these as the foundation; every track consumes them.
 
 ---
 
-## 3. Track 1 — Venice VM overhaul (the centerpiece)
+## 3. Track 1 — Daedalus VM overhaul (the centerpiece)
 
 Goal: defeat automated lifters/devirtualizers and make the bytecode unliftable
 statically and non-general dynamically. Ordered by build sequence.
 
 ### 1.1 Threaded, decode-fused dispatch — *kill the readable `switch()`*
-Replace `vvm_run`'s `switch(op)` with **subroutine-threaded handler thunks**
+Replace `dvm_run`'s `switch(op)` with **subroutine-threaded handler thunks**
 (read-only, CFG-registered table) dispatched by computed-goto. The post-unmap
 opcode index becomes a **jump target, not a readable integer** — no dispatcher
-loop for VMHunt/back-edge heuristics to fingerprint. *Files:* `venice_vm.c`,
-`venice_disasm.py` (matching emulator). *No ABI change.* Effort: **M**.
+loop for VMHunt/back-edge heuristics to fingerprint. *Files:* `daedalus_vm.c`,
+`daedalus_disasm.py` (matching emulator). *No ABI change.* Effort: **M**.
 
 ### 1.2 Path-Entangled Rolling Bytecode — *the blob is ciphertext that eats itself*
 Wrap the single fetch site so each instruction is **JIT-decrypted from the
 rolling accumulator (P1)** keyed on running ARX state + stack-top + the
 actually-taken edge, then the consumed bytes are re-encrypted/zeroed behind PC.
-`venice_asm.py` emits the pre-image-encrypted stream by **simulating the concrete
+`daedalus_asm.py` emits the pre-image-encrypted stream by **simulating the concrete
 execution**; branch targets reseed from a per-target header constant so *legit*
 branching decodes but forked/out-of-order exploration self-corrupts to zeros.
 Keep `code[]` in a private **RW `VirtualAlloc` page** (data self-modification —
@@ -112,7 +112,7 @@ Keep `code[]` in a private **RW `VirtualAlloc` page** (data self-modification �
   → the *next* decrypt yields garbage (the "eaten to zeros" property now works
   against the live tracer); (c) fold-in **output validation** so a corrupted run
   fails closed instead of leaking a clean trace.
-*Files:* `venice_vm.c`, `venice_asm.py`, header `[u16 data_size]` reseed
+*Files:* `daedalus_vm.c`, `daedalus_asm.py`, header `[u16 data_size]` reseed
 constants. Effort: **L**. Risk: legit-run brittleness from timing/protection
 mixing → gate those summands to quantized/robust bits + rely on the differential
 harness.
@@ -124,11 +124,11 @@ it derails into a **decoy thunk**. *Hardening:* fold `crc32(thunk_bytes)` into
 `h` so any 0xCC/inline hook on a handler entry corrupts `h` and derails —
 punishes DBI/x64dbg directly. Inject **operand-dependent folds** into the
 straight-line crypto handlers so even branch-free code can't be replayed from one
-generic trace. *Files:* `venice_vm.c`, `venice_disasm.py`. Effort: **M**.
+generic trace. *Files:* `daedalus_vm.c`, `daedalus_disasm.py`. Effort: **M**.
 
 ### 1.4 History-Keyed Decode & Overlapping Encoding — *one byte, two opcodes*
-Promote `VVM_OPCODE_UNMAP` from const to **live-permuting**:
-`decode = UNMAP[wire ^ acc ^ (acc>>29)]`, with a `VVM_RESYNC` op reseeding at loop
+Promote `DVM_OPCODE_UNMAP` from const to **live-permuting**:
+`decode = UNMAP[wire ^ acc ^ (acc>>29)]`, with a `DVM_RESYNC` op reseeding at loop
 headers so iterations re-enter identically. Because the ISA already decodes
 byte-by-byte, lay **overlapping/stride-permuted spans** where the same bytes are
 a real KDF at one entry and a plausible-wrong KDF at offset+1. A static
@@ -136,7 +136,7 @@ byte→opcode assignment *provably does not exist.* *Hardening:* make the
 overlapping decoy **actually execute** on real runs as a deception poison (so one
 trace isn't self-evidently the real routine), and fuse the `acc`-mixed decode
 into the computed-goto so no clean integer opcode ever materializes. *Files:*
-`venice_vm.c`, `venice_asm.py` (becomes a forward simulator solving per wire
+`daedalus_vm.c`, `daedalus_asm.py` (becomes a forward simulator solving per wire
 byte). Effort: **L**.
 
 ### 1.5 Image-Bound Opcode Semantics — *the ISA doesn't exist until the real image decrypts*
@@ -145,17 +145,17 @@ only exists after a `.text`-hash-verified section decrypt. *Hardening:* never le
 the full 256-entry table be resident — use an **inline keyed PRP** (3-4 round
 ARX/S-box) over the opcode byte at each dispatch, and **rotate it per basic
 block** by mixing the VM PC into the HKDF info. A snapshot yields no table; the
-analyst must enumerate all 256 inputs *per position.* *Files:* `venice_vm.c`,
+analyst must enumerate all 256 inputs *per position.* *Files:* `daedalus_vm.c`,
 `shuffle_opcodes.py` (emits HKDF seed, not a static array). Effort: **M**.
 
 ### 1.6 Reflective Microcode — *handlers are deliberately incomplete*
 Move the meaning-bearing constants (which rotate, which fold, which mask) out of
 handler C and into the **encrypted `data[]` blob**, resolved per-program.
 *Hardening:* resolve params through the **rolling accumulator** (same
-`VVM_FOLD` reads a different effective mixing each iteration), decrypt one param
+`DVM_FOLD` reads a different effective mixing each iteration), decrypt one param
 at a time under P2 and re-encrypt immediately, and derive the param key partly
 from the handler's own instruction bytes so an inline hook silently poisons the
-values it's trying to read. *Files:* `venice_vm.c`, `venice_asm.py`,
+values it's trying to read. *Files:* `daedalus_vm.c`, `daedalus_asm.py`,
 `generate_programs.py`. Effort: **M**.
 
 ### 1.7 Defunctionalized CPS — *no call stack, no return opcode*
@@ -164,20 +164,20 @@ Build-time CPS transform: every call → `push cont-id; jump callee`, every retu
 it's a worse single chokepoint):* make the continuation id **opaque and
 runtime-keyed** (MBA-mixed with the P1 accumulator) and keep the id→target table
 under P2, never plaintext-resident. Ship **only** composed with 1.2/1.3, never on
-the standalone "nothing to key on" claim. *Files:* `venice_asm.py`, `venice_vm.c`.
+the standalone "nothing to key on" claim. *Files:* `daedalus_asm.py`, `daedalus_vm.c`.
 Effort: **M**. Note: 64-slot cap forbids deep recursion — add a build-time depth
 check.
 
 ### 1.8 Self-Generating Inner VM — *the inner program is an output, not a file*
 The outer program computes the inner VM's bytecode as **data**, then trampolines
-(`VVM_N_CALL_PTR`, `venice_trampoline.asm`) into a nested `vvm_execute` under a
+(`DVM_N_CALL_PTR`, `daedalus_trampoline.asm`) into a nested `dvm_execute` under a
 different HKDF-seeded ISA. The inner blob appears nowhere in the packed file.
 *Hardening:* never materialize the whole inner program — **lazy keyed-stream
 fetch** (rolling key) so at most one inner opcode is live; break determinism by
 seeding the inner ISA from decrypted secret/license state so a dump doesn't
 generalize across runs/builds; interleave inner/outer steps (mode flag) so "a
-second `vvm_execute` call" isn't a clean breakpoint signal. *Files:*
-`venice_vm.c`, `venice_asm.py`. Effort: **L**. Reserve for the crown-jewel
+second `dvm_execute` call" isn't a clean breakpoint signal. *Files:*
+`daedalus_vm.c`, `daedalus_asm.py`. Effort: **L**. Reserve for the crown-jewel
 routine only (license decision + key derivation).
 
 ### 1.9 Per-Build & Runtime ISA Metamorphism — *superoperators cut mid-operation*
@@ -189,12 +189,12 @@ rolling state. *Hardening:* the mandated bit-identical semantics guarantee an
 output-lift always works, so **move the consumer into the VM** (AES-GCM decrypt
 over VM-managed scattered state — no stable key-buffer breakpoint target) and
 make a *subset* of variants **anti-debug-gated poison paths** (feeds deception).
-*Files:* all three `venice_*` tools + `venice_vm.c`. Effort: **M**.
+*Files:* all three `daedalus_*` tools + `daedalus_vm.c`. Effort: **M**.
 
 ### 1.10 Execution- & Bytecode-Bound Key Binding — *the key is the fingerprint of the exact path walked*
 Extend `crypto_derive_key` (already hashes stub `.text`) with two HKDF info
 terms: a rolling fold over every dispatched `opcode‖operand‖sp` (the dynamic
-trace) **and** the byte-exact Venice blob(s). Devirt-and-recompile changes the
+trace) **and** the byte-exact Daedalus blob(s). Devirt-and-recompile changes the
 blob; reorder/patch changes the trace; either → wrong key → GCM failure,
 fail-closed. *Honest limit (documented):* the key must be build-time-predictable,
 so the trace is recordable by an observer — this **kills the low-effort tamper
@@ -202,7 +202,7 @@ path** (naive NOP-and-rerun breaks loudly with the cause 3 layers upstream) but
 does not stop an analyst who understands it. Its real teeth come from pairing
 with 1.2 (rolling fetch forces the whole genuine VM to stay resident and executed
 in-order, defeating "hash inert blob + run devirt'd native"). *Files:*
-`crypto.c`/`crypto_derive_key`, `packer/container.py`, `venice_vm.c`. Effort:
+`crypto.c`/`crypto_derive_key`, `packer/container.py`, `daedalus_vm.c`. Effort:
 **S** (mechanism) / **M** (paired). No new failure mode beyond existing code-hash
 bind.
 
@@ -221,7 +221,7 @@ working set). Delete memguard's stored `keys[][32]`; derive
 `SHA256` of section N's **post-fixup plaintext**, cryptographically enforcing
 decrypt order + reloc completeness.
 - **Red-team hardening:** the chain input is on-disk, so it reduces to one secret
-  `section_master`. Perform the per-page HKDF **inside Venice VM over scattered
+  `section_master`. Perform the per-page HKDF **inside Daedalus VM over scattered
   shards** so `section_master` never exists contiguously; mix a per-legit-fault
   **liveness counter** into the section→section subkey (keep a page-intrinsic
   fallback for correctness) so offline batch-decrypt of a cold section also
@@ -258,7 +258,7 @@ Derive the FNV offset-basis/prime **per build from the stub self-hash** so
 precomputed API-name tables miss (forces live PEB-walk). After resolve, relocate
 real pointers to a fresh region and write per-process XOR-recover **trampolines**
 into the header IAT slots; scatter a chosen license/integrity subset into
-`key_scatter` fragments reassembled per-call via `VVM_N_CALL_PTR`; the sweeper
+`key_scatter` fragments reassembled per-call via `DVM_N_CALL_PTR`; the sweeper
 periodically re-encrypts the exiled thunk region, which **roves to a new VA** on a
 timer. Curate `stub_junk_imports.c` decoys into a coherent false narrative (a
 registry-key trial dialog) so IDA's import view **tells a lie.** All targets
@@ -270,13 +270,13 @@ CFG-registered (`SetProcessValidCallTargets`), RX not RWX.
   pointer non-replayable); resolve lazily on first real call interleaved with
   decoy resolutions; wrap the resolver in a VM-hosted BP/timing tripwire that
   diverts to the decoy graph. *Files:* `pe_loader.c`, `memguard.c`,
-  `stub_junk_imports.c`, `venice_vm.c`. Effort: **L**.
+  `stub_junk_imports.c`, `daedalus_vm.c`. Effort: **L**.
 
 ### 2.4 Fiber-isolated crypto core + touch-and-scrub secrets
 Run VM key-derivation/scatter on a **second fiber** whose private stack is flipped
 RW immediately before `SwitchToFiber` and back to **PAGE_NOACCESS** after it
 yields. For at-rest `.rdata`/`.data` secrets (`key_scatter` output,
-`venice_str_data.h` strings, the bytecode blob): `get(scratch)→use→SecureZero`
+`daedalus_str_data.h` strings, the bytecode blob): `get(scratch)→use→SecureZero`
 discipline, stored XOR/AES-sealed, plaintext only for the microsecond of use. A
 full-process dump **taken while parked contains no key material.**
 - **Hardening:** keep the key **sharded** and fed incrementally into the AES key
@@ -286,7 +286,7 @@ full-process dump **taken while parked contains no key material.**
   never-scrubbed **decoy key buffer** with plausible entropy; randomize per-build
   which handler assembles which shard. Verify the Qt payload doesn't itself
   `ConvertThreadToFiber` (else use a dedicated worker thread). *Files:* new
-  `fiber_core.c`, `crypto.c`, `key_scatter.c`, `venice_vm.c`. Effort: **L**.
+  `fiber_core.c`, `crypto.c`, `key_scatter.c`, `daedalus_vm.c`. Effort: **L**.
 
 ---
 
@@ -350,7 +350,7 @@ the genuine hidden path.
   `packer/payload.py`. Effort: **M**.
 
 ### 3.4 Self-Hash-Gated Predicates with decoy fold
-`venice_asm.py` macro emits predicates `byte k of SHA256(runtime-decrypted
+`daedalus_asm.py` macro emits predicates `byte k of SHA256(runtime-decrypted
 region) == C` feeding `JZ/JNZ`; the TRUE arm does the correct fold, the FALSE arm
 (reachable only by forcing the edge) runs a **self-consistent wrong fold + decoy
 scatter/OEP**. *Hardening:* both arms live and **input-dependent** (gate on a
@@ -360,7 +360,7 @@ the hashed range so `C` doesn't exist on disk (defeats offline hash-folding); ma
 the FALSE fold decrypt a **real small decoy payload** so a tamper-tripped analyst
 sees a coherent "trial expired," not a garbage fault. The anti-patch canary
 property is free (reuses the code-hash-bound key: can't 0xCC in-region without
-breaking decryption). *Files:* `venice_asm.py`, `venice_vm.c`, `crypto.c`.
+breaking decryption). *Files:* `daedalus_asm.py`, `daedalus_vm.c`, `crypto.c`.
 Effort: **M**.
 
 ### 3.5 Static Decoy Artifacts Bundle — *a dump full of mutually-corroborating lies*
@@ -425,7 +425,7 @@ existing opcodes) — a dense arithmetic circuit SiMBA/Arybo/msynth can't fold.
 the **AND of tripwire results** into the same MBA coefficients so they're exact
 only when pristine+clean; under instrumentation the "quicksand" terms stop
 canceling → a plausible-wrong salt → decoy key. Wipe intermediates (extend the
-envelope wipe). *Files:* `venice_asm.py`, `generate_programs.py`. Effort: **M**.
+envelope wipe). *Files:* `daedalus_asm.py`, `generate_programs.py`. Effort: **M**.
 
 ### 4.3 Perjured Unwind — *structurally valid, semantically false `.pdata`*
 A build pass synthesizes decoy `RUNTIME_FUNCTION`+`UNWIND_INFO` over the stub's
@@ -443,7 +443,7 @@ Honest scope: cheap AV-clean seed-poisoning of automated pipelines; an expert
 presses `P` and moves on.
 
 ### 4.4 Exception/Unwind/APC-Threaded Dispatch — *the real edges live in a CONTEXT record*
-For **coarse transitions only:** replace selected `VVM_JMP/JZ` with a controlled
+For **coarse transitions only:** replace selected `DVM_JMP/JZ` with a controlled
 fault whose target is encoded in the fault address (decoded by the memguard VEH);
 end some blocks with `RaiseException` so `RtlDispatchException` picks the next
 handler via crafted `UNWIND_INFO`; queue an unpack stage via `QueueUserAPC` +
@@ -453,7 +453,7 @@ VMProtect/Themida lifter follows a fault into a VEH or an unwind language handle
 code-hash key + rolling VM state** so the resolved RIP is path/run-dependent (one
 trace doesn't generalize; patching `.text` to observe breaks the decode); plant
 **decoy fault sites** that resolve to poison unless a covert VM-state predicate
-holds. *Files:* `venice_vm.c`, `memguard.c`, `pe_loader.c`, `perjury_pass.py`.
+holds. *Files:* `daedalus_vm.c`, `memguard.c`, `pe_loader.c`, `perjury_pass.py`.
 Effort: **L**. Scope to a handful of edges.
 
 ### 4.5 Emulation-Divergence & Spoof-Consistency Panel
@@ -473,7 +473,7 @@ staggered points). *Files:* new `divergence_panel.c`, `key_scatter.c`,
 `memguard.c`. Effort: **M**.
 
 ### 4.6 Consensus / N-Version Key (folded, never compared)
-Derive `K` structurally-divergent VVM implementations of `derive_key` +
+Derive `K` structurally-divergent DVM implementations of `derive_key` +
 a native-C recomputation; combine as `out_1 XOR (out_1^out_2^…^out_K)` into
 `key_scatter_init` — agreement ⇒ zero extra term, disagreement ⇒ silent poison,
 **no equality test to NOP.** *Hardening:* each path folds an **independent
@@ -535,7 +535,7 @@ Each phase is self-contained, testable, and AV-smoke-gated. Early phases are
 low-risk and non-ABI-breaking; brick-risk items are late and kill-switched.
 
 ### Phase 0 — Foundations (no attacker-visible change)
-- Per-build seed plumbing across `venice_asm.py`/`venice_vm.c`/`venice_disasm.py`/
+- Per-build seed plumbing across `daedalus_asm.py`/`daedalus_vm.c`/`daedalus_disasm.py`/
   `shuffle_opcodes.py`.
 - **Differential harness** (assembler-sim vs interpreter, bit-exact or pack
   fails) — the safety net for every later phase.
@@ -546,7 +546,7 @@ low-risk and non-ABI-breaking; brick-risk items are late and kill-switched.
 - 1.1 threaded dispatch → 1.2 rolling bytecode → 1.3 handler chaining → 1.4
   history-keyed/overlapping → 1.6 reflective microcode. Handler polymorphism +
   1.9 metamorphism ride along.
-- **Gate:** round-trip parity on sample EXE/DLL; `venice_disasm.py` emulator
+- **Gate:** round-trip parity on sample EXE/DLL; `daedalus_disasm.py` emulator
   matches; AV-smoke on clean Defender VM with `--anti-debug on`.
 
 ### Phase 2 — Anti-dump core *(ABI-BREAKING — bump `LETHE_FORMAT_VERSION`)*
@@ -604,8 +604,8 @@ listed so no future pass re-proposes them:
   delayed-poison-via-scatter spirit is retained in 3.6.*
 - **Aliased-cell taint blowup** — sound alias handling cuts through it; not novel
   enough and risks corrupting real derivation.
-- **"Dump Hole" (lift a real payload function to VVM)** — requires a full,
-  validated x64→VVM lifter; a mis-lift corrupts a shipping function. *Anti-dump
+- **"Dump Hole" (lift a real payload function to DVM)** — requires a full,
+  validated x64→DVM lifter; a mis-lift corrupts a shipping function. *Anti-dump
   goal is better served by 2.1.*
 
 **Universal rule:** any technique that diverges/poisons on detection ships behind

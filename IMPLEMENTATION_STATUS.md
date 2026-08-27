@@ -12,20 +12,20 @@ test in this repo proves it; "pending rig" means the code exists but needs MSVC
 
 The full chain is integrated, compiled, and proven on a real EXE:
 
-- **Rolling bytecode integrated into `venice_vm.c`** — the dispatch loop
+- **Rolling bytecode integrated into `daedalus_vm.c`** — the dispatch loop
   reconstructs one instruction at a time from the history-keyed ciphertext
-  (`ip` window + `vvm_rolling_fetch`); `venice_vm_exec` parses the self-describing
-  `VR` container (seed + leaders embedded). Built with `-DVVM_ROLLING=ON` under
+  (`ip` window + `dvm_rolling_fetch`); `daedalus_vm_exec` parses the self-describing
+  `VR` container (seed + leaders embedded). Built with `-DDVM_ROLLING=ON` under
   `/W4 /WX` — clean.
 - **`generate_programs.py` emits `VR` containers** — MBA rewrite → shuffle →
   rolling-encode, per-build derived seed. The two on-critical-path programs
-  (`VVM_PROG_DERIVE_KEY`, `VVM_PROG_SHARD_XOR`) now ship as `MBA+rolling` and
+  (`DVM_PROG_DERIVE_KEY`, `DVM_PROG_SHARD_XOR`) now ship as `MBA+rolling` and
   begin with `0x56 0x52` ('VR').
 - **End-to-end proof:** `sample_exe.exe` packed with the rolling stub runs
   byte-identically (exit 42); the round-trip harness path holds; and a purpose-
   built **crackme** (`challenge.exe`) packs and runs correctly on all paths
   (GRANTED/DENIED/usage) while its strings vanish from the packed image
-  (entropy 6.18→7.40/8). The Venice VM decodes rolling ciphertext at runtime to
+  (entropy 6.18→7.40/8). The Daedalus VM decodes rolling ciphertext at runtime to
   derive the real AES-256-GCM section key — a bug would brick it; it doesn't.
 
 Deliverable: `tests/build/challenge.packed.exe` (rolling VM + MBA + per-build
@@ -37,7 +37,7 @@ shuffle + anti-debug + anti-dump + memory-guard). Build toolchain: MSVC 2022
 ## ✅ Phase 0 foundations + Technique 1.2 (History-Keyed Rolling Bytecode) — pack-time half VERIFIED
 
 The single highest-novelty VM technique from both design runs (rated N10). At
-rest the Venice bytecode is ciphertext with no decodable image; each instruction's
+rest the Daedalus bytecode is ciphertext with no decodable image; each instruction's
 plaintext exists only for the instant before it executes, reconstructed from a
 keystream that folds the executing basic block's accumulator.
 
@@ -51,11 +51,11 @@ kills naive self-decrypting VMs.
 ### Files
 | File | Role | Status |
 |------|------|--------|
-| `venice/venice_ref.py` | Reference interpreter (pure ISA subset) + basic-block decomposition | ✅ verified |
-| `venice/venice_rolling.py` | Pack-time encoder + `RollingDecoder` + container format + SHA-256 primitives | ✅ verified |
-| `stub/src/venice_rolling.{c,h}` | Runtime decoder (no-CRT, `crypto_sha256`), bit-exact mirror + self-test | ⏳ pending rig compile |
+| `daedalus/daedalus_ref.py` | Reference interpreter (pure ISA subset) + basic-block decomposition | ✅ verified |
+| `daedalus/daedalus_rolling.py` | Pack-time encoder + `RollingDecoder` + container format + SHA-256 primitives | ✅ verified |
+| `stub/src/daedalus_rolling.{c,h}` | Runtime decoder (no-CRT, `crypto_sha256`), bit-exact mirror + self-test | ⏳ pending rig compile |
 | `tests/test_rolling_bytecode.py` | Differential + self-poisoning harness | ✅ 8/8 pass |
-| `stub/CMakeLists.txt` | `option(VVM_ROLLING … OFF)` gate | ✅ additive, default build unchanged |
+| `stub/CMakeLists.txt` | `option(DVM_ROLLING … OFF)` gate | ✅ additive, default build unchanged |
 
 ### What the tests prove (`python -m pytest tests/test_rolling_bytecode.py -q` → 8 passed)
 1. **Codec round-trip** — `decode(encrypt(code)) == code` for **all 8 real
@@ -69,7 +69,7 @@ kills naive self-decrypting VMs.
    faults or yields wrong bytes; (b) flipping one ciphertext byte avalanches
    through the rest of its block; (c) the wrong seed decodes garbage.
 4. **Primitive vectors pinned** — `resync/keystream/fold` have fixed test vectors;
-   `venice_rolling.c::vvm_rolling_selftest()` re-checks the same vectors in C.
+   `daedalus_rolling.c::dvm_rolling_selftest()` re-checks the same vectors in C.
 
 ### Primitives (bit-exact across Python `hashlib` and stub `crypto_sha256`)
 ```
@@ -88,13 +88,13 @@ Pinned vectors: `resync(0..15, 0) = 0x0E17E9881DD39855`,
 without them; it cannot decode a block without executing into it).
 
 ### Remaining to fully ship Technique 1.2 (all default-OFF, no ship-build impact)
-1. **`venice_vm.c` dispatch integration** (behind `#ifdef VVM_ROLLING`): at the
-   fetch site (`venice_vm.c:93`), call `vvm_rolling_fetch()` into a 9-byte
+1. **`daedalus_vm.c` dispatch integration** (behind `#ifdef DVM_ROLLING`): at the
+   fetch site (`daedalus_vm.c:93`), call `dvm_rolling_fetch()` into a 9-byte
    scratch, point operand reads at the scratch, dispatch, advance. Loader learns
    the `VR` container (leaders + seed). *Not yet wired — keeps the tree pristine
    until compiled on the rig.*
-2. **Rig build + differential parity**: `cmake -DVVM_ROLLING=ON`, run
-   `vvm_rolling_selftest()` at stub init (must return 0), then round-trip a
+2. **Rig build + differential parity**: `cmake -DDVM_ROLLING=ON`, run
+   `dvm_rolling_selftest()` at stub init (must return 0), then round-trip a
    packed sample and confirm identical behavior to the plaintext-VM build.
 3. **AV-smoke**: the rolling `code[]` lives in a private **RW `VirtualAlloc`**
    page (data self-modification — *not* `.text`, no RWX), so it stays AV-clean;
@@ -120,8 +120,8 @@ opcode shuffle and the rolling encoder.
 
 | File | Role | Status |
 |------|------|--------|
-| `venice/venice_mba.py` | The rewriter (`rewrite_source`, `count_rewritable`) | ✅ verified |
-| `tests/test_mba.py` | Correctness proof via the `venice_ref` oracle | ✅ 5/5 pass |
+| `daedalus/daedalus_mba.py` | The rewriter (`rewrite_source`, `count_rewritable`) | ✅ verified |
+| `tests/test_mba.py` | Correctness proof via the `daedalus_ref` oracle | ✅ 5/5 pass |
 
 **What the tests prove:** xor/add expansions match native over **200+ random
 64-bit input pairs each**; a composed program (xor+add+branches+locals) matches
@@ -140,7 +140,7 @@ Ordered by impact-to-risk, each landing with its own differential/round-trip tes
    per-build from the seed, so the same `xor` looks different at every site and
    every build (extends the verified pass; oracle-checked).
 2. **Tableless / threaded dispatch** — replace the readable `switch` in
-   `venice_vm.c` with a computed successor; kills VM-loop fingerprinting.
+   `daedalus_vm.c` with a computed successor; kills VM-loop fingerprinting.
 3. **Execution/bytecode-bound key** (Plan §1.10, F9) — extend `crypto_derive_key`
    with a trace-fold + blob-hash HKDF term; fail-closed anti-tamper.
 4. **Per-page AEAD** (Plan §2.1) — THE anti-dump fix; **ABI-breaking**

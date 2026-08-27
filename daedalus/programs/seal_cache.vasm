@@ -1,4 +1,4 @@
-; VVM_PROG_SEAL_CACHE -- virtualizes SecurityManager::protectBytes()
+; DVM_PROG_SEAL_CACHE -- virtualizes SecurityManager::protectBytes()
 ;
 ; Seals plaintext using DPAPI with machine-bound entropy.
 ; Entropy = "orion-entitlement-v1|" + hex(SHA256(hostname|uniqueId|guid))

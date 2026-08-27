@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-venice_asm.py -- Two-pass assembler for the Venice VM bytecode ISA.
+daedalus_asm.py -- Two-pass assembler for the Daedalus VM bytecode ISA.
 
 Input:  .vasm text file
 Output: binary blob [u16_LE data_size][data_bytes][code_bytes]
         or C header array (--format header)
 
 Usage:
-    python venice_asm.py input.vasm -o out.bin
-    python venice_asm.py input.vasm --format header -o out.h
-    python venice_asm.py input.vasm --format header --name VVM_PROG_FOO
+    python daedalus_asm.py input.vasm -o out.bin
+    python daedalus_asm.py input.vasm --format header -o out.h
+    python daedalus_asm.py input.vasm --format header --name DVM_PROG_FOO
 """
 
 import argparse
@@ -103,7 +103,7 @@ def _parse_int(s):
 
 def assemble(source):
     """
-    Two-pass assembly of Venice .vasm source.
+    Two-pass assembly of Daedalus .vasm source.
 
     Returns bytes: [u16_LE data_size][data_bytes][code_bytes]
     """
@@ -287,7 +287,7 @@ def _load_shuffled_opcodes(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Venice VM assembler')
+    ap = argparse.ArgumentParser(description='Daedalus VM assembler')
     ap.add_argument('input', help='Input .vasm file')
     ap.add_argument('--format', choices=['bin', 'header'], default='bin',
                     help='Output format (default: bin)')
@@ -295,7 +295,7 @@ def main():
     ap.add_argument('--name', default=None,
                     help='C array name for --format header')
     ap.add_argument('--shuffled-map', default=None,
-                    help='Path to venice_opcodes_shuffled.py for per-build opcode randomization')
+                    help='Path to daedalus_opcodes_shuffled.py for per-build opcode randomization')
     args = ap.parse_args()
 
     if args.shuffled_map:
@@ -317,7 +317,7 @@ def main():
         name = args.name
         if name is None:
             base = os.path.splitext(os.path.basename(args.input))[0].upper()
-            name = 'VVM_PROG_' + base
+            name = 'DVM_PROG_' + base
         text = _format_header(blob, name)
         if args.output:
             with open(args.output, 'w') as f:

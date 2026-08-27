@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-venice_disasm.py -- Disassembler for Venice VM bytecode blobs.
+daedalus_disasm.py -- Disassembler for Daedalus VM bytecode blobs.
 
 Reads a binary blob ([u16_LE data_size][data][code]) and emits
 human-readable .vasm text with byte-offset comments.
 
 Usage:
-    python venice_disasm.py input.bin
-    python venice_disasm.py input.bin -o output.vasm
+    python daedalus_disasm.py input.bin
+    python daedalus_disasm.py input.bin -o output.vasm
 """
 
 import argparse
@@ -79,7 +79,7 @@ OPCODE_TABLE = {
 
 def disassemble(blob):
     """
-    Disassemble a Venice VM binary blob into .vasm text.
+    Disassemble a Daedalus VM binary blob into .vasm text.
 
     Returns the text as a string, with byte-offset comments on each line
     and synthetic labels for branch/call targets.
@@ -132,7 +132,7 @@ def disassemble(blob):
 
     # -- Render output -----------------------------------------------------
     out = []
-    out.append('; Venice VM disassembly')
+    out.append('; Daedalus VM disassembly')
     out.append(f'; blob size: {len(blob)} bytes  '
                f'(data: {data_size}, code: {len(code)})')
     out.append('')
@@ -176,7 +176,7 @@ def disassemble(blob):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Venice VM disassembler')
+    ap = argparse.ArgumentParser(description='Daedalus VM disassembler')
     ap.add_argument('input', help='Input binary blob file')
     ap.add_argument('--output', '-o', help='Output .vasm file (default: stdout)')
     args = ap.parse_args()

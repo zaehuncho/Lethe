@@ -1,4 +1,4 @@
-; VVM_PROG_MACHINE_ID -- virtualizes SecurityManager::machineId()
+; DVM_PROG_MACHINE_ID -- virtualizes SecurityManager::machineId()
 ;
 ; Produces a 64-char lowercase hex SHA-256 of "hostname|unique_id|guid",
 ; matching the C++ logic:

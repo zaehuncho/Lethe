@@ -1,4 +1,4 @@
-; VVM_PROG_VALIDATE_LICENSE -- virtualizes SecurityManager::validateLicenseKeyFormat()
+; DVM_PROG_VALIDATE_LICENSE -- virtualizes SecurityManager::validateLicenseKeyFormat()
 ;
 ; Hand-compiled DFA for the regex: ^[A-Z0-9][A-Z0-9\-]{9,95}$
 ; applied to trimmed+uppercased input.

@@ -1,5 +1,5 @@
 /*
- * venice_strings.h -- runtime string decryption for Lethe stub
+ * daedalus_strings.h -- runtime string decryption for Lethe stub
  *
  * Position-dependent XOR: plaintext[i] = encrypted[i] ^ (key ^ (i * mul))
  * Each string uses its own random (key, mul) pair so that recovering one
@@ -13,11 +13,11 @@
 #include <stdint.h>
 
 /* Runtime narrow-string decryption.
- *   enc  -- encrypted byte array (from venice_str_data.h)
+ *   enc  -- encrypted byte array (from daedalus_str_data.h)
  *   out  -- caller-owned stack buffer (must hold len+1 bytes)
  *   len  -- character count (excluding NUL)
- *   key  -- per-string VSTR_xxx_KEY from venice_str_data.h
- *   mul  -- per-string VSTR_xxx_MUL from venice_str_data.h
+ *   key  -- per-string VSTR_xxx_KEY from daedalus_str_data.h
+ *   mul  -- per-string VSTR_xxx_MUL from daedalus_str_data.h
  */
 static __forceinline void vstr_dec(const uint8_t *enc, char *out,
                                    int len, uint8_t key, uint8_t mul)
@@ -30,11 +30,11 @@ static __forceinline void vstr_dec(const uint8_t *enc, char *out,
 }
 
 /* Runtime wide-string decryption.
- *   enc        -- encrypted byte array (UTF-16LE bytes, from venice_str_data.h)
+ *   enc        -- encrypted byte array (UTF-16LE bytes, from daedalus_str_data.h)
  *   out        -- caller-owned stack buffer (must hold char_count+1 wchar_t)
  *   char_count -- number of wide characters (excluding NUL)
- *   key        -- per-string VSTR_xxx_KEY from venice_str_data.h
- *   mul        -- per-string VSTR_xxx_MUL from venice_str_data.h
+ *   key        -- per-string VSTR_xxx_KEY from daedalus_str_data.h
+ *   mul        -- per-string VSTR_xxx_MUL from daedalus_str_data.h
  */
 static __forceinline void vstr_dec_w(const uint8_t *enc, wchar_t *out,
                                       int char_count, uint8_t key, uint8_t mul)

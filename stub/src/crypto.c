@@ -30,8 +30,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "venice_vm.h"
-#include "venice_programs.h"
+#include "daedalus_vm.h"
+#include "daedalus_programs.h"
 
 #define LETHE_RNG_SYSTEM_PREFERRED 0x00000002u
 
@@ -453,12 +453,12 @@ typedef LONG (WINAPI *LETHE_GenRandom_fn)(PVOID, PUCHAR, ULONG, ULONG);
 /* Red-team pass 2026-08-06 found that the previous stack-by-byte assembly of
  * "bcrypt.dll" / "BCryptGenRandom" was coalesced by MSVC's optimizer into a
  * memcpy from an .rdata constant -- the plaintext ended up visible in the
- * shipped stub. venice_strings.h's vstr_dec uses a `volatile uint8_t *` write,
+ * shipped stub. daedalus_strings.h's vstr_dec uses a `volatile uint8_t *` write,
  * which the optimizer can't hoist into an .rdata copy: only the XOR-encrypted
  * bytes appear in the shipped image, plaintext lives on the stack transiently
  * and is wiped before the function returns. */
-#include "venice_strings.h"
-#include "venice_str_data.h"
+#include "daedalus_strings.h"
+#include "daedalus_str_data.h"
 
 int crypto_csprng(void *buf, size_t len)
 {
@@ -491,7 +491,7 @@ int crypto_derive_key(const PackInfo *pi, const void *image_base,
     vm_args[0] = (uint64_t)(uintptr_t)pi;
     vm_args[1] = (uint64_t)(uintptr_t)image_base;
     vm_args[2] = (uint64_t)(uintptr_t)out_key;
-    return venice_vm_exec(VVM_PROG_DERIVE_KEY, VVM_PROG_DERIVE_KEY_SIZE,
+    return daedalus_vm_exec(DVM_PROG_DERIVE_KEY, DVM_PROG_DERIVE_KEY_SIZE,
                           vm_args, 3);
 }
 

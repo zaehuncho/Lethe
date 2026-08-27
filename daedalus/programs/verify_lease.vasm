@@ -1,4 +1,4 @@
-; VVM_PROG_VERIFY_LEASE -- virtualizes LeaseGate::verifyLeaseSignature()
+; DVM_PROG_VERIFY_LEASE -- virtualizes LeaseGate::verifyLeaseSignature()
 ;
 ; Verifies an Ed25519 signature over the message:
 ;   upper(trim(licenseKey)) + ":" + trim(machineId) + ":" + decimal(epoch)

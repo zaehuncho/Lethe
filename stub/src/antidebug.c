@@ -13,7 +13,7 @@
  * file uses Win32 (kernel32) + ntdll (dynamically resolved) + MSVC intrinsics
  * (__readgsqword, __rdtsc, _mm_lfence) only. No CRT calls, no static writable
  * data, no allocations. All sensitive string literals (ntdll / API / module /
- * process names) are XOR-obfuscated in venice_str_data.h and decrypted onto a
+ * process names) are XOR-obfuscated in daedalus_str_data.h and decrypted onto a
  * short-lived stack buffer that is wiped after use, so none are greppable in
  * the shipped binary.
  *
@@ -63,8 +63,8 @@
 #include <stdint.h>
 
 #include "stub_hooks.h"
-#include "venice_strings.h"
-#include "venice_str_data.h"
+#include "daedalus_strings.h"
+#include "daedalus_str_data.h"
 
 /*
  * x64 PEB layout offsets (stable across all shipping Windows x64):
@@ -293,7 +293,7 @@ static int check_debug_object(void)
  * present-module hit is high-signal and false-positive-free. Names are
  * decrypted onto the stack and wiped immediately.
  */
-static int venice_module_present(const uint8_t *enc, int len,
+static int daedalus_module_present(const uint8_t *enc, int len,
                                  uint8_t key, uint8_t mul)
 {
     char nm[24];   /* longest name ("HookLibraryx64.dll") is 18 + NUL */
@@ -306,13 +306,13 @@ static int venice_module_present(const uint8_t *enc, int len,
 
 static int check_instrumentation(void)
 {
-    if (venice_module_present(_vs_frida_agent,  VSTR_FRIDA_AGENT_LEN,  VSTR_FRIDA_AGENT_KEY,  VSTR_FRIDA_AGENT_MUL))  return 1;
-    if (venice_module_present(_vs_frida_gadget, VSTR_FRIDA_GADGET_LEN, VSTR_FRIDA_GADGET_KEY, VSTR_FRIDA_GADGET_MUL)) return 1;
-    if (venice_module_present(_vs_dynamorio,    VSTR_DYNAMORIO_LEN,    VSTR_DYNAMORIO_KEY,    VSTR_DYNAMORIO_MUL))    return 1;
-    if (venice_module_present(_vs_pinvm,        VSTR_PINVM_LEN,        VSTR_PINVM_KEY,        VSTR_PINVM_MUL))        return 1;
-    if (venice_module_present(_vs_x64dbg_dll,   VSTR_X64DBG_DLL_LEN,  VSTR_X64DBG_DLL_KEY,   VSTR_X64DBG_DLL_MUL))   return 1;
-    if (venice_module_present(_vs_x32dbg_dll,   VSTR_X32DBG_DLL_LEN,  VSTR_X32DBG_DLL_KEY,   VSTR_X32DBG_DLL_MUL))   return 1;
-    if (venice_module_present(_vs_hooklib,      VSTR_HOOKLIB_LEN,      VSTR_HOOKLIB_KEY,      VSTR_HOOKLIB_MUL))      return 1;
+    if (daedalus_module_present(_vs_frida_agent,  VSTR_FRIDA_AGENT_LEN,  VSTR_FRIDA_AGENT_KEY,  VSTR_FRIDA_AGENT_MUL))  return 1;
+    if (daedalus_module_present(_vs_frida_gadget, VSTR_FRIDA_GADGET_LEN, VSTR_FRIDA_GADGET_KEY, VSTR_FRIDA_GADGET_MUL)) return 1;
+    if (daedalus_module_present(_vs_dynamorio,    VSTR_DYNAMORIO_LEN,    VSTR_DYNAMORIO_KEY,    VSTR_DYNAMORIO_MUL))    return 1;
+    if (daedalus_module_present(_vs_pinvm,        VSTR_PINVM_LEN,        VSTR_PINVM_KEY,        VSTR_PINVM_MUL))        return 1;
+    if (daedalus_module_present(_vs_x64dbg_dll,   VSTR_X64DBG_DLL_LEN,  VSTR_X64DBG_DLL_KEY,   VSTR_X64DBG_DLL_MUL))   return 1;
+    if (daedalus_module_present(_vs_x32dbg_dll,   VSTR_X32DBG_DLL_LEN,  VSTR_X32DBG_DLL_KEY,   VSTR_X32DBG_DLL_MUL))   return 1;
+    if (daedalus_module_present(_vs_hooklib,      VSTR_HOOKLIB_LEN,      VSTR_HOOKLIB_KEY,      VSTR_HOOKLIB_MUL))      return 1;
     return 0;
 }
 

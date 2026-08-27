@@ -1,8 +1,8 @@
 /*
- * vm_shims.cpp -- Venice VM shim implementations.
+ * vm_shims.cpp -- Daedalus VM shim implementations.
  *
  * Flat C ABI wrappers around Win32 + Qt + project APIs, callable from
- * Venice bytecode via N_CALL_PTR.  Links against:
+ * Daedalus bytecode via N_CALL_PTR.  Links against:
  *   Qt6::Core, Qt6::Network, crypt32.lib, advapi32.lib
  */
 

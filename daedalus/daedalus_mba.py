@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-venice_mba.py -- Mixed Boolean-Arithmetic (MBA) rewriter for Venice bytecode.
+daedalus_mba.py -- Mixed Boolean-Arithmetic (MBA) rewriter for Daedalus bytecode.
 
 Solver-hostile arithmetic (NEXTGEN_PROTECTION_PLAN §6.2 / §4.2): replace simple
 arithmetic opcodes with semantically-identical but algebraically-tangled
@@ -15,7 +15,7 @@ construction. It composes cleanly in front of the opcode shuffle and the rolling
 encoder (both operate on the assembled wire bytes afterward).
 
 Correctness is not argued -- it is PROVEN: tests/test_mba.py runs the reference
-interpreter (venice_ref) on the original and rewritten programs over random
+interpreter (daedalus_ref) on the original and rewritten programs over random
 inputs and asserts identical results. An identity bug is caught by the oracle,
 not shipped.
 
@@ -27,7 +27,7 @@ Stack discipline: each expansion consumes [.. a b] (b = TOS) and leaves
 [.. result], juggling copies with `pick` and dropping the two originals with
 `swap; pop; swap; pop`. Peak ABSOLUTE depth during an expansion is base+5 (e.g.
 `[a b (a^b) a b]`), so an `xor`/`add` rewritten while the operand stack is
-already at depth >= VVM_STACK_SIZE-5 (= 59) would overflow where the original
+already at depth >= DVM_STACK_SIZE-5 (= 59) would overflow where the original
 succeeded. This is FAIL-CLOSED (overflow -> exec returns -1, never a silent
 wrong result) and the shipped crypto programs run far shallower, but keep this
 5-slot headroom in mind before virtualizing deep-stack code.
@@ -140,7 +140,7 @@ def count_rewritable(vasm_text: str, ops=("xor", "add")) -> int:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Venice MBA rewriter")
+    ap = argparse.ArgumentParser(description="Daedalus MBA rewriter")
     ap.add_argument("input", help="input .vasm")
     ap.add_argument("--output", "-o")
     ap.add_argument("--ops", default="xor,add",

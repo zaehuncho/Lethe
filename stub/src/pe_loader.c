@@ -15,8 +15,8 @@
 #include "key_scatter.h"
 #include "tls_anchor.h"
 #include "miniz.h"
-#include "venice_vm.h"
-#include "venice_programs.h"
+#include "daedalus_vm.h"
+#include "daedalus_programs.h"
 
 #include "stub_intrin.h"
 
@@ -695,13 +695,13 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
        key is wrong and every GCM auth check will fail. If the env var is absent
        the key stays as-is. */
     {
-        /* Shard fetch/hex-decode/XOR/wipe/unset now lives in Venice VM bytecode
-           (VVM_PROG_SHARD_XOR); the VM performs the GetEnvironmentVariableA,
+        /* Shard fetch/hex-decode/XOR/wipe/unset now lives in Daedalus VM bytecode
+           (DVM_PROG_SHARD_XOR); the VM performs the GetEnvironmentVariableA,
            hex decode, in-place key XOR, SetEnvironmentVariableA(NULL) and local
-           wipe via native ops. See venice_programs.h. */
+           wipe via native ops. See daedalus_programs.h. */
         uint64_t shard_args[1];
         shard_args[0] = (uint64_t)(uintptr_t)key;
-        venice_vm_exec(VVM_PROG_SHARD_XOR, VVM_PROG_SHARD_XOR_SIZE,
+        daedalus_vm_exec(DVM_PROG_SHARD_XOR, DVM_PROG_SHARD_XOR_SIZE,
                        shard_args, 1);
     }
 

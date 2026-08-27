@@ -1,4 +1,4 @@
-; VVM_PROG_LEASE_PUBKEY -- virtualizes LeaseGate::leaseVerifyPublicKey()
+; DVM_PROG_LEASE_PUBKEY -- virtualizes LeaseGate::leaseVerifyPublicKey()
 ;
 ; Copies the Ed25519 public key used for lease signature verification.
 ; The raw 32-byte key is pre-decoded from base64 at assembly time and
