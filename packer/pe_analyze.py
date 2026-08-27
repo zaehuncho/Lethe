@@ -267,6 +267,17 @@ def analyze_pe(path: str) -> ParsedPE:
             f"{path!r} targets machine 0x{machine:X}, not AMD64 (0x8664). "
             "Lethe supports x64 only (x86/ARM/ARM64 unsupported).")
 
+    # Managed/.NET refusal: a CLR runtime header means the "real" entry point is
+    # the .NET runtime, not native code. Packing it the native way (mapping +
+    # native OEP transfer) silently breaks it. Fail closed rather than ship a
+    # broken pack -- functionality is paramount.
+    clr_rva, clr_size = _data_dir(binary, "CLR_RUNTIME_HEADER")
+    if clr_rva or clr_size:
+        raise PEArchError(
+            f"{path!r} is a managed/.NET assembly (CLR runtime header at "
+            f"rva=0x{clr_rva:X}); Lethe packs NATIVE x64 PEs only. Packing a "
+            "managed binary the native way would silently break it -- refused.")
+
     image_base = _i(opt.imagebase)
     is_dll = bool(_i(binary.header.characteristics) & _IMAGE_FILE_DLL)
 
