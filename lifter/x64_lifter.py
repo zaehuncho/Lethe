@@ -26,6 +26,17 @@ instruction set. A 32-bit register shares its 64-bit parent's local offset; a
 computed at the operation's width (sign bit 31, 32-bit unsigned compares). The
 64-bit path is byte-identical to cut 1. Memory operands, calls, mul/div,
 sar/rotate, shift-by-CL, and 8/16-bit sub-registers still bail.
+
+CUT 3 (this file) adds, for the SAME 64-bit and 32-bit register/immediate operand
+widths: `lea` (address arithmetic only -- base+index*scale+disp, no dereference),
+2-/3-operand `imul` (low product + exact signed CF/OF), `sar`, `rol`/`ror`, and
+shift/rotate by CL. The VM has no `sar` or rotate op, so those are synthesized
+from shl/shr/or/and/not; the 64-bit `imul` overflow flag needs the high 64 bits
+of the 128-bit signed product, synthesized by a 32x32 schoolbook multiply. CL
+counts use a runtime zero-count guard (jz) so the x86 "flags unchanged when the
+masked count is 0" rule is honoured exactly. 1-operand mul/imul, div/idiv, memory
+dereference, RIP-relative / 32-bit-addressed / segment-overridden lea, and
+8/16-bit sub-registers still bail.
 """
 from __future__ import annotations
 
@@ -51,7 +62,9 @@ GPR_NAMES = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
 
 CF, ZF, SF, OF = 128, 136, 144, 152          # flag locals
 SA, SB, SR = 160, 168, 176                   # scratch: operand a, b, result
-LOCALS_NEEDED = 184
+# extra scratch for the wide (64x64->128) multiply used by imul overflow synthesis
+T0, T1, T2, T3, T4, T5 = 184, 192, 200, 208, 216, 224
+LOCALS_NEEDED = 232
 
 MASK64 = (1 << 64) - 1
 SIGN64 = 63
@@ -96,6 +109,13 @@ class _Lifter:
         self.base = base
         self.end = base + len(code)
         self.a = _Asm()
+        self._lblctr = 0
+
+    def _new_label(self) -> str:
+        """A unique intra-instruction label (for CL-shift zero-count guards).
+        Prefixed so it never collides with the `L_<ip>` instruction labels."""
+        self._lblctr += 1
+        return f"g{self._lblctr}"
 
     # -- primitive emit helpers ------------------------------------------
     def _reg_info(self, reg):
@@ -275,11 +295,15 @@ class _Lifter:
         (self.flags_add if add else self.flags_sub)(set_cf=False, signbit=signbit)
 
     def _shift(self, instr, vmop: str) -> None:
-        # shl/shr reg, imm|cl  -- CUT 1/2: immediate count only.
+        # shl/shr reg, imm|cl.
         dst, width = self.require_reg(instr, 0)
+        if (instr.op_kind(1) == OpKind.REGISTER
+                and instr.op_register(1) == Register.CL):
+            self._shift_cl(dst, width, vmop)   # dynamic (CL) count -- cut 3
+            return
         if instr.op_kind(1) not in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
                                     OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
-            raise LiftUnsupported("shift by CL not supported in cut 1/2")
+            raise LiftUnsupported("shift by non-immediate/CL not supported")
         signbit = _width_signbit(width)
         # x64 masks the shift count by 5 bits for 32-bit ops, 6 bits for 64-bit.
         cnt = instr.immediate(1) & (31 if width == 32 else 63)
@@ -297,6 +321,259 @@ class _Lifter:
         self.rd_local(SA); self.push_imm(bit); self.a("shr")
         self.push_imm(1); self.a("and"); self.wr_local(CF)
         self.push_imm(0); self.wr_local(OF)   # approximate OF as 0 (cnt!=1 undefined)
+
+    def _read_cl_count(self, width: int) -> None:
+        """SB = CL & (width-1). CL is the low 8 bits of rcx; since width-1 <= 63
+        this equals (rcx & 0xFF) & (width-1)."""
+        self.rd_local(REG_OFF[Register.RCX]); self.push_imm(width - 1)
+        self.a("and"); self.wr_local(SB)
+
+    def _shift_cl(self, dst, width: int, vmop: str) -> None:
+        # shl/shr reg, CL -- dynamic count masked by (width-1). The VM shl/shr
+        # take the count off the stack, so a dynamic count is a direct fit.
+        signbit = _width_signbit(width)
+        self._read_cl_count(width)                 # SB = cnt
+        # Value is written unconditionally: x86 writes the destination even when
+        # the masked count is 0, so a 32-bit shift zero-extends the parent no
+        # matter the count (cnt==0 -> shift by 0 -> the low bits, zero-extended).
+        self.rd_reg(dst); self.wr_local(SA)
+        self.rd_local(SA); self.rd_local(SB); self.a(vmop)
+        self._mask_sr(width); self.wr_local(SR)
+        self.rd_local(SR); self.wr_reg(dst)
+        # Flags are unchanged when cnt==0; guard the flag writes behind jz.
+        skip = self._new_label()
+        self.rd_local(SB); self.a(f"jz {skip}")
+        self._zf_sf_from_sr(signbit)
+        # CF = last bit shifted out: shl -> bit (width-cnt) of x; shr -> bit
+        # (cnt-1) of x. In this branch cnt in [1, width-1] so the index is valid.
+        self.rd_local(SA)
+        if vmop == "shl":
+            self.push_imm(width); self.rd_local(SB); self.a("sub")
+        else:
+            self.rd_local(SB); self.push_imm(1); self.a("sub")
+        self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+        self.push_imm(0); self.wr_local(OF)        # OF defined only for cnt==1
+        self.a.label(skip)
+
+    def _shift_count(self, instr):
+        """Classify a shift/rotate count operand: return ('imm', masked_cnt) or
+        ('cl', None), or bail. `width` masking is applied by the caller."""
+        k1 = instr.op_kind(1)
+        if k1 == OpKind.REGISTER and instr.op_register(1) == Register.CL:
+            return "cl", None
+        if k1 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
+                  OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
+            return "imm", instr.immediate(1)
+        raise LiftUnsupported("shift/rotate count must be an immediate or CL")
+
+    def _sar(self, instr) -> None:
+        # sar reg, imm|cl -- arithmetic shift right (no VM sar; synthesized).
+        dst, width = self.require_reg(instr, 0)
+        signbit = _width_signbit(width)
+        mask = width - 1
+        mask_val = _width_mask(width)
+        src, raw = self._shift_count(instr)
+        is_imm = src == "imm"
+        cnt = (raw & mask) if is_imm else None
+        if not is_imm:
+            self._read_cl_count(width)              # SB = cnt
+
+        def push_cnt():
+            self.push_imm(cnt) if is_imm else self.rd_local(SB)
+
+        # Value (count-0 safe, written unconditionally so 32-bit sar zero-extends):
+        #   SR = (x >> n) | (sign_all & fill_mask)
+        #   sign_all = 0 - sign(x)  (all-ones if x negative)
+        #   fill_mask = ~(MASK >> n) & MASK  (top n bits; 0 when n==0)
+        self.rd_reg(dst); self.wr_local(SA)
+        self.rd_local(SA); push_cnt(); self.a("shr")               # x >> n
+        self.rd_local(SA); self.push_imm(signbit); self.a("shr")
+        self.push_imm(1); self.a("and"); self.a("neg")             # sign_all
+        self.push_imm(mask_val); push_cnt(); self.a("shr")
+        self.a("not"); self.push_imm(mask_val); self.a("and")      # fill_mask
+        self.a("and")                                              # sign_all & fill
+        self.a("or")                                               # | (x>>n)
+        self._mask_sr(width); self.wr_local(SR)
+        self.rd_local(SR); self.wr_reg(dst)
+
+        # Flags: unchanged when n==0; else ZF/SF from result, CF = bit(n-1), OF=0.
+        def emit_flags():
+            self._zf_sf_from_sr(signbit)
+            self.rd_local(SA)
+            if is_imm:
+                self.push_imm(cnt - 1)
+            else:
+                self.rd_local(SB); self.push_imm(1); self.a("sub")
+            self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+            self.push_imm(0); self.wr_local(OF)
+
+        if is_imm:
+            if cnt != 0:
+                emit_flags()
+        else:
+            skip = self._new_label()
+            self.rd_local(SB); self.a(f"jz {skip}")
+            emit_flags()
+            self.a.label(skip)
+
+    def _rotate(self, instr, direction: str) -> None:
+        # rol/ror reg, imm|cl -- synthesized from shl/shr/or (no VM rotate op).
+        dst, width = self.require_reg(instr, 0)
+        mask = width - 1
+        src, raw = self._shift_count(instr)
+        is_imm = src == "imm"
+        cnt = (raw & mask) if is_imm else None
+        if not is_imm:
+            self._read_cl_count(width)              # SB = cnt
+
+        def push_cnt():
+            self.push_imm(cnt) if is_imm else self.rd_local(SB)
+
+        self.rd_reg(dst); self.wr_local(SA)
+        # Value is count-0 safe thanks to the VM masking the shift count by 63:
+        # at n==0 the (width-n) shift becomes a shift by `width`, which the VM
+        # reduces so the two halves recombine to x. Written unconditionally so a
+        # 32-bit rotate zero-extends the parent regardless of the count.
+        if direction == "rol":                     # (x << n) | (x >> (width-n))
+            self.rd_local(SA); push_cnt(); self.a("shl")
+            self.rd_local(SA); self.push_imm(width); push_cnt(); self.a("sub")
+            self.a("shr"); self.a("or")
+        else:                                       # ror: (x >> n) | (x << (width-n))
+            self.rd_local(SA); push_cnt(); self.a("shr")
+            self.rd_local(SA); self.push_imm(width); push_cnt(); self.a("sub")
+            self.a("shl"); self.a("or")
+        self._mask_sr(width); self.wr_local(SR)
+        self.rd_local(SR); self.wr_reg(dst)
+
+        # Only CF is affected (ZF/SF untouched; OF defined only for count==1 and
+        # left unwritten). Unchanged when cnt==0.
+        def emit_cf():
+            if direction == "rol":                 # CF = LSB of result
+                self.rd_local(SR); self.push_imm(1); self.a("and"); self.wr_local(CF)
+            else:                                  # ror: CF = MSB of result
+                self.rd_local(SR); self.push_imm(width - 1); self.a("shr")
+                self.push_imm(1); self.a("and"); self.wr_local(CF)
+
+        if is_imm:
+            if cnt != 0:
+                emit_cf()
+        else:
+            skip = self._new_label()
+            self.rd_local(SB); self.a(f"jz {skip}")
+            emit_cf()
+            self.a.label(skip)
+
+    def _lea(self, instr) -> None:
+        # lea reg, [base + index*scale + disp] -- computes the effective address
+        # only (NO dereference). No flags.
+        dst, width = self.require_reg(instr, 0)
+        if instr.op_kind(1) != OpKind.MEMORY:
+            raise LiftUnsupported("lea without a memory operand")
+        if instr.is_ip_rel_memory_operand:
+            raise LiftUnsupported("lea RIP-relative memory")
+        if instr.segment_prefix != Register.NONE:
+            raise LiftUnsupported("lea with a segment override")
+        base = instr.memory_base
+        index = instr.memory_index
+        scale = instr.memory_index_scale
+        disp = instr.memory_displacement & MASK64
+        # Require 64-bit base/index (or none): a 32-bit-addressed lea computes the
+        # address mod 2^32, which our 64-bit arithmetic would not reproduce.
+        if base != Register.NONE and base not in REG_OFF:
+            raise LiftUnsupported("lea base is not a supported 64-bit GPR")
+        if index != Register.NONE and index not in REG_OFF:
+            raise LiftUnsupported("lea index is not a supported 64-bit GPR")
+        # addr = disp + base + index*scale (mod 2^64). For a 32-bit destination
+        # wr_reg masks to 32 bits (zero-extending the parent) -- exactly the x86
+        # truncation of the 64-bit effective address.
+        self.push_imm(disp)
+        if base != Register.NONE:
+            self.rd_reg(base); self.a("add")
+        if index != Register.NONE:
+            self.rd_reg(index); self.push_imm(scale & MASK64)
+            self.a("mul"); self.a("add")
+        self.wr_reg(dst)
+
+    def _imul(self, instr) -> None:
+        # 2-op `imul r, r/imm` and 3-op `imul r, r/imm, imm`. dst = low `width`
+        # bits of the signed product (VM mul gives the correct low bits). 1-op
+        # `imul` (rdx:rax, 128-bit) bails.
+        dst, width = self.require_reg(instr, 0)
+        n = instr.op_count
+        if n == 2:                          # dst = op0 * op1
+            self.push_operand(instr, 0, width); self.wr_local(SA)
+            self.push_operand(instr, 1, width); self.wr_local(SB)
+        elif n == 3:                        # dst = op1 * op2  (iced normalizes
+            self.push_operand(instr, 1, width); self.wr_local(SA)   # `imul r,imm`
+            self.push_operand(instr, 2, width); self.wr_local(SB)   # to 3 operands)
+        else:
+            raise LiftUnsupported("1-operand imul (rdx:rax) not supported")
+        # low result
+        self.rd_local(SA); self.rd_local(SB); self.a("mul")
+        self._mask_sr(width); self.wr_local(SR)
+        self.rd_local(SR); self.wr_reg(dst)
+        # CF = OF = 1 iff the full signed product does not fit in `width` bits.
+        # SF/ZF/AF/PF are left UNDEFINED by Intel -- not written/checked.
+        if width == 32:
+            self._imul_of_32()
+        else:
+            self._imul_of_64()
+
+    def _push_sext32(self, off: int) -> None:
+        """Push the sign-extension to 64 bits of the 32-bit value at local `off`
+        (which the caller has already masked to its low 32 bits)."""
+        self.rd_local(off)                                  # x (top 32 zero)
+        self.rd_local(off); self.push_imm(SIGN32); self.a("shr")
+        self.push_imm(1); self.a("and"); self.a("neg")      # 0 or 0xFFFF..FFFF
+        self.push_imm(32); self.a("shl")                    # fill high 32 (or 0)
+        self.a("or")                                        # x | fill = sext(x)
+
+    def _store_cf_of(self) -> None:
+        """Top of stack holds the overflow bit -> CF and OF."""
+        self.a("dup"); self.wr_local(CF); self.wr_local(OF)
+
+    def _imul_of_32(self) -> None:
+        # Sign-extend both 32-bit factors to 64 bits, take the exact 64-bit
+        # product, and compare its sign-extended low 32 bits to the full product.
+        self._push_sext32(SA); self._push_sext32(SB); self.a("mul")  # true product
+        self.wr_local(T0)
+        self._push_sext32(SR); self.rd_local(T0); self.a("cmp_ne")   # overflow?
+        self._store_cf_of()
+
+    def _imul_of_64(self) -> None:
+        # Need the high 64 bits of the 128-bit signed product. Compute the
+        # unsigned high word via a 32x32 schoolbook multiply, then sign-correct.
+        self.rd_local(SA); self.push_imm(0xFFFFFFFF); self.a("and"); self.wr_local(T0)  # aL
+        self.rd_local(SA); self.push_imm(32); self.a("shr"); self.wr_local(T1)          # aH
+        self.rd_local(SB); self.push_imm(0xFFFFFFFF); self.a("and"); self.wr_local(T2)  # bL
+        self.rd_local(SB); self.push_imm(32); self.a("shr"); self.wr_local(T3)          # bH
+        # cross = (aL*bL >> 32) + (aH*bL & 0xFFFFFFFF) + (aL*bH & 0xFFFFFFFF)
+        self.rd_local(T0); self.rd_local(T2); self.a("mul")
+        self.push_imm(32); self.a("shr")
+        self.rd_local(T1); self.rd_local(T2); self.a("mul")
+        self.push_imm(0xFFFFFFFF); self.a("and"); self.a("add")
+        self.rd_local(T0); self.rd_local(T3); self.a("mul")
+        self.push_imm(0xFFFFFFFF); self.a("and"); self.a("add")
+        self.wr_local(T4)                                                               # cross
+        # uhi = aH*bH + (aH*bL >> 32) + (aL*bH >> 32) + (cross >> 32)
+        self.rd_local(T1); self.rd_local(T3); self.a("mul")
+        self.rd_local(T1); self.rd_local(T2); self.a("mul")
+        self.push_imm(32); self.a("shr"); self.a("add")
+        self.rd_local(T0); self.rd_local(T3); self.a("mul")
+        self.push_imm(32); self.a("shr"); self.a("add")
+        self.rd_local(T4); self.push_imm(32); self.a("shr"); self.a("add")
+        self.wr_local(T5)                                                               # uhi
+        # signed high = uhi - sign(a)*b - sign(b)*a
+        self.rd_local(T5)
+        self.rd_local(SA); self.push_imm(63); self.a("shr"); self.push_imm(1)
+        self.a("and"); self.rd_local(SB); self.a("mul"); self.a("sub")
+        self.rd_local(SB); self.push_imm(63); self.a("shr"); self.push_imm(1)
+        self.a("and"); self.rd_local(SA); self.a("mul"); self.a("sub")   # -> signed hi
+        # overflow iff signed hi != sign-extension of lo  (0 - (lo >> 63))
+        self.rd_local(SR); self.push_imm(63); self.a("shr"); self.push_imm(1)
+        self.a("and"); self.a("neg")
+        self.a("cmp_ne")
+        self._store_cf_of()
 
     # conditional-jump condition emitters: leave a 0/1 on the stack (1 == take).
     def _cc(self, m) -> None:
@@ -380,6 +657,16 @@ class _Lifter:
                 self._shift(instr, "shl")
             elif m == Mnemonic.SHR:
                 self._shift(instr, "shr")
+            elif m == Mnemonic.SAR:
+                self._sar(instr)
+            elif m == Mnemonic.ROL:
+                self._rotate(instr, "rol")
+            elif m == Mnemonic.ROR:
+                self._rotate(instr, "ror")
+            elif m == Mnemonic.LEA:
+                self._lea(instr)
+            elif m == Mnemonic.IMUL:
+                self._imul(instr)
             elif m == Mnemonic.JMP:
                 self.a(f"jmp {_lbl(self._branch_target(instr))}")
             elif m in _CC:

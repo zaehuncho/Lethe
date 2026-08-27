@@ -243,29 +243,254 @@ def test_fuzz_mixed_width():
         oracle.check(asm("; ".join(lines)), init=init)
 
 
+# ---------------------------------------------------------------------------
+# lea / imul / sar / rol / ror / shift-by-CL (cut 3)
+# ---------------------------------------------------------------------------
+def test_lea_addressing():
+    # base + index*scale + disp; lea computes the address only (no deref, no flags)
+    oracle.check(asm("lea rax, [rbx+rcx*4+8]"),
+                 init=_init(rbx=0x1000, rcx=7), flags=())
+    oracle.check(asm("lea rax, [rbx-4]"), init=_init(rbx=0x1000), flags=())
+    oracle.check(asm("lea rax, [rcx*8+16]"), init=_init(rcx=3), flags=())
+    oracle.check(asm("lea rdx, [rdx+rdx*1]"), init=_init(rdx=0x777), flags=())
+    # negative displacement wraps mod 2^64
+    oracle.check(asm("lea rax, [rbx-0x100]"), init=_init(rbx=0x80), flags=())
+    # index == base register is fine (read twice)
+    oracle.check(asm("lea rsi, [rdi+rdi*8]"), init=_init(rdi=0x123), flags=())
+
+
+def test_lea32_truncates():
+    # a 32-bit destination truncates the effective address to 32 bits (zero-ext)
+    oracle.check(asm("lea eax, [rbx+rcx*2]"),
+                 init=_init(rbx=0xFFFFFFFE, rcx=5), flags=())
+    # dirty upper parent bits must be cleared by the 32-bit write, and the
+    # 64-bit address must wrap into 32 bits before that write.
+    oracle.check(asm("lea eax, [rbx+8]"),
+                 init=_init(rax=0xDEADBEEF00000000, rbx=0x1_FFFFFFF9), flags=())
+
+
+def test_imul_64():
+    # no overflow: small product
+    oracle.check(asm("imul rax, rbx"), init=_init(rax=3, rbx=5), flags=("CF", "OF"))
+    # overflow: 2^32 * 2^32 = 2^64 does not fit signed-64
+    oracle.check(asm("imul rax, rbx"),
+                 init=_init(rax=0x100000000, rbx=0x100000000), flags=("CF", "OF"))
+    # -1 * -1 = 1 fits -> no overflow
+    oracle.check(asm("imul rax, rbx"),
+                 init=_init(rax=(1 << 64) - 1, rbx=(1 << 64) - 1), flags=("CF", "OF"))
+    # INT64_MIN * 2 overflows; INT64_MIN * 1 does not
+    oracle.check(asm("imul rax, rbx"),
+                 init=_init(rax=1 << 63, rbx=2), flags=("CF", "OF"))
+    oracle.check(asm("imul rax, rbx"),
+                 init=_init(rax=1 << 63, rbx=1), flags=("CF", "OF"))
+    # 2-operand-with-immediate (iced normalizes it to a 3-operand form)
+    oracle.check(asm("imul rax, 5"),
+                 init=_init(rax=0x1999999999999999), flags=("CF", "OF"))
+    # 3-operand form dst = src * imm
+    oracle.check(asm("imul rax, rbx, 7"),
+                 init=_init(rbx=0x2492492492492492), flags=("CF", "OF"))
+
+
+def test_imul_32():
+    # overflow at 32-bit width: 2^16 * 2^16 = 2^32
+    oracle.check(asm("imul eax, ebx"),
+                 init=_init(rax=0x10000, rbx=0x10000), flags=("CF", "OF"))
+    oracle.check(asm("imul eax, ebx"), init=_init(rax=3, rbx=5), flags=("CF", "OF"))
+    # (-1)*(-1)=1 at 32-bit -> no overflow; upper parent bits ignored + zero-ext
+    oracle.check(asm("imul ecx, ecx"),
+                 init=_init(rcx=0x1234_FFFFFFFF), flags=("CF", "OF"))
+    oracle.check(asm("imul eax, ebx, 3"),
+                 init=_init(rbx=0x30000000), flags=("CF", "OF"))
+    # negative immediate is sign-extended before the multiply
+    oracle.check(asm("imul eax, ebx, -2"),
+                 init=_init(rbx=0x40000000), flags=("CF", "OF"))
+
+
+def test_sar():
+    # sign fill on a negative value; CF = last bit shifted out
+    oracle.check(asm("sar rax, 4"), init=_init(rax=0x8000000000000001),
+                 flags=("CF", "ZF", "SF"))
+    # count 1 -> OF is defined (0) for sar
+    oracle.check(asm("sar rax, 1"), init=_init(rax=0xFFFFFFFFFFFFFFFF),
+                 flags=("CF", "ZF", "SF", "OF"))
+    oracle.check(asm("sar rax, 63"), init=_init(rax=0x8000000000000000),
+                 flags=("CF", "ZF", "SF"))
+    # positive value shifts in zeros
+    oracle.check(asm("sar rax, 8"), init=_init(rax=0x7F00), flags=("CF", "ZF", "SF"))
+
+
+def test_sar32():
+    oracle.check(asm("sar eax, 4"), init=_init(rax=0x80000000),
+                 flags=("CF", "ZF", "SF"))
+    oracle.check(asm("sar eax, 31"), init=_init(rax=0x40000000),
+                 flags=("CF", "ZF", "SF"))
+    # count 0: the value is written (zero-extends the parent), flags unchanged
+    oracle.check(asm("sar eax, 0"), init=_init(rax=0xDEADBEEF_0000ABCD), flags=())
+    # dirty upper parent bits cleared by the 32-bit write
+    oracle.check(asm("sar eax, 2"), init=_init(rax=0xFFFFFFFF_80000010),
+                 flags=("CF", "ZF", "SF"))
+
+
+def test_rol_ror():
+    oracle.check(asm("rol rax, 4"), init=_init(rax=0xF000000000000001), flags=("CF",))
+    oracle.check(asm("ror rax, 4"), init=_init(rax=0x1), flags=("CF",))
+    oracle.check(asm("rol rax, 60"), init=_init(rax=0x123456789ABCDEF), flags=("CF",))
+    # wraparound near the width boundary
+    oracle.check(asm("ror rax, 63"), init=_init(rax=0x2), flags=("CF",))
+
+
+def test_rol_ror32():
+    oracle.check(asm("rol eax, 1"), init=_init(rax=0x80000001), flags=("CF",))
+    oracle.check(asm("ror eax, 3"), init=_init(rax=0x5), flags=("CF",))
+    # count 0: value written (zero-extend), CF unchanged
+    oracle.check(asm("rol eax, 0"), init=_init(rax=0xAAAAAAAA_12345678), flags=())
+    oracle.check(asm("ror eax, 8"), init=_init(rax=0xFFFFFFFF_000000FF), flags=("CF",))
+
+
+def test_shift_by_cl():
+    oracle.check(asm("shl eax, cl"), init=_init(rax=0x00ABCDEF, rcx=8),
+                 flags=("CF", "ZF", "SF"))
+    oracle.check(asm("shr rax, cl"), init=_init(rax=0xFF00, rcx=4),
+                 flags=("CF", "ZF", "SF"))
+    oracle.check(asm("sar eax, cl"), init=_init(rax=0x80000000, rcx=4),
+                 flags=("CF", "ZF", "SF"))
+    oracle.check(asm("shl rax, cl"), init=_init(rax=1, rcx=63),
+                 flags=("CF", "ZF", "SF"))
+    oracle.check(asm("rol eax, cl"), init=_init(rax=0x80000001, rcx=1), flags=("CF",))
+    oracle.check(asm("ror rax, cl"), init=_init(rax=0x1, rcx=4), flags=("CF",))
+
+
+def test_shift_by_cl_zero_count():
+    # CL masked count == 0: the destination is still written (a 32-bit op
+    # zero-extends the parent) but every flag is left unchanged.
+    oracle.check(asm("shl eax, cl"), init=_init(rax=0xFFFFFFFF_00001234, rcx=32),
+                 flags=())
+    oracle.check(asm("sar eax, cl"), init=_init(rax=0xFFFFFFFF_80000000, rcx=0),
+                 flags=())
+    oracle.check(asm("shr eax, cl"), init=_init(rax=0xFFFFFFFF_0000ABCD, rcx=64),
+                 flags=())
+    oracle.check(asm("rol rax, cl"), init=_init(rax=0xDEADBEEFCAFEBABE, rcx=64),
+                 flags=())
+    # 64-bit CL==0 leaves the value untouched too
+    oracle.check(asm("shl rax, cl"), init=_init(rax=0x1122334455667788, rcx=0),
+                 flags=())
+
+
+def test_cl_zero_count_preserves_flags():
+    # A prior op sets known flags; a CL shift whose masked count is 0 must leave
+    # ALL of them unchanged (the destination edx is still written / zero-extended).
+    oracle.check(asm("sub rax, rbx; shl edx, cl"),
+                 init=_init(rax=5, rbx=9, rdx=0xAB, rcx=32),
+                 flags=("CF", "ZF", "SF", "OF"))
+
+
+def test_fuzz_imul():
+    rng = random.Random(0x1EE7)
+    regs64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
+              "r11", "r12", "r13", "r14", "r15"]
+    regs32 = ["eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d", "r10d"]
+    for _ in range(400):
+        pool = regs64 if rng.random() < 0.5 else regs32
+        d, s = rng.choice(pool), rng.choice(pool)
+        form = rng.randint(0, 2)
+        if form == 0:
+            src = f"imul {d}, {s}"
+        elif form == 1:
+            src = f"imul {d}, {rng.randint(-(2 ** 31), 2 ** 31 - 1)}"
+        else:
+            src = f"imul {d}, {s}, {rng.randint(-(2 ** 31), 2 ** 31 - 1)}"
+        init = [rng.getrandbits(64) for _ in range(16)]
+        # SF/ZF/AF/PF are UNDEFINED for imul -> check only CF and OF.
+        oracle.check(asm(src), init=init, flags=("CF", "OF"))
+
+
+def test_fuzz_sar_and_shift_cl():
+    rng = random.Random(0x5A12)
+    regs64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9"]
+    regs32 = ["eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d"]
+    for _ in range(400):
+        d = rng.choice(regs64 if rng.random() < 0.5 else regs32)
+        r = rng.random()
+        if r < 0.34:
+            src = f"sar {d}, {rng.randint(0, 40)}"     # imm (incl. 0 and > width)
+        elif r < 0.5:
+            src = f"sar {d}, cl"
+        else:
+            src = f"{rng.choice(['shl', 'shr'])} {d}, cl"
+        init = [rng.getrandbits(64) for _ in range(16)]
+        # A CL count may mask to 0 (flags unchanged) but CF/ZF/SF stay consistent
+        # with Unicorn. OF is undefined for count != 1, so it is NOT checked.
+        oracle.check(asm(src), init=init, flags=("CF", "ZF", "SF"))
+
+
+def test_fuzz_rotate():
+    rng = random.Random(0x0201)
+    regs64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9"]
+    regs32 = ["eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d"]
+    for _ in range(400):
+        d = rng.choice(regs64 if rng.random() < 0.5 else regs32)
+        op = rng.choice(["rol", "ror"])
+        src = (f"{op} {d}, cl" if rng.random() < 0.5
+               else f"{op} {d}, {rng.randint(0, 40)}")
+        init = [rng.getrandbits(64) for _ in range(16)]
+        # only CF is defined for a rotate by an arbitrary count
+        oracle.check(asm(src), init=init, flags=("CF",))
+
+
+def test_fuzz_lea():
+    rng = random.Random(0x1EA0)
+    regs64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9",
+              "r10", "r11", "r12", "r13", "r14", "r15"]
+    idx_pool = [r for r in regs64 if r != "rsp"]      # rsp cannot be an index
+    dsts = regs64 + ["eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d"]
+    for _ in range(400):
+        b = rng.choice(regs64 + [None])
+        ix = rng.choice(idx_pool + [None])
+        if b is None and ix is None:
+            b = rng.choice(regs64)   # pure-disp assembles RIP-relative -> skip
+        scale = rng.choice([1, 2, 4, 8])
+        disp = rng.randint(-(2 ** 31), 2 ** 31 - 1)
+        parts = []
+        if b:
+            parts.append(b)
+        if ix:
+            parts.append(f"{ix}*{scale}")
+        parts.append(str(disp))
+        mem = "+".join(parts).replace("+-", "-")
+        src = f"lea {rng.choice(dsts)}, [{mem}]"
+        init = [rng.getrandbits(64) for _ in range(16)]
+        oracle.check(asm(src), init=init, flags=())
+
+
 @pytest.mark.parametrize("src", [
     "mov rax, [rbx]",       # memory source (64-bit)
     "mov [rbx], rax",       # memory dest (64-bit)
     "call rax",             # call
-    "sar rax, 1",           # arithmetic shift (no VM op)
-    "rol rax, 3",           # rotate
-    "imul rax, rbx",        # multiply
     "movsb",                # string op
-    # -- cut 2 supports 32-bit REGISTER operands, but these 32-bit forms must
-    #    still bail (out of the register/immediate subset) --
+    # -- cut 3 adds lea/imul/sar/rol/ror + shift-by-CL, but these forms of them
+    #    stay out of the faithful subset and must still bail --
+    "imul rbx",             # 1-operand imul (128-bit rdx:rax)
+    "imul ebx",             # 1-operand imul (edx:eax)
+    "mul rbx",              # unsigned 1-operand multiply
+    "div rcx",              # unsigned division
+    "idiv rcx",             # signed division
+    "imul rax, [rbx]",      # imul with a memory source
+    "imul rax, [rbx], 5",   # 3-operand imul with a memory source
+    "lea rax, [rip+0x10]",  # RIP-relative lea
+    "lea eax, [rip+8]",     # RIP-relative lea (32-bit dest)
+    "lea rax, [ebx+ecx]",   # 32-bit-addressed lea (mod-2^32, not modeled)
+    "lea rax, fs:[rbx]",    # segment-overridden lea
+    # -- cut 2 memory forms still bail --
     "mov eax, [rbx]",       # 32-bit memory source
     "mov [rbx], eax",       # 32-bit memory dest
-    "sar eax, 1",           # 32-bit arithmetic shift (no VM op)
-    "rol eax, 3",           # 32-bit rotate
-    "ror eax, 2",           # 32-bit rotate
-    "imul eax, ebx",        # 32-bit multiply
-    "shl eax, cl",          # shift by CL (variable count)
-    "shr eax, cl",          # shift by CL (variable count)
     # -- 8/16-bit sub-registers remain unsupported at any width --
     "mov al, 5",            # 8-bit sub-register
     "mov ax, 5",            # 16-bit sub-register
     "add al, bl",           # 8-bit ALU
     "add ax, bx",           # 16-bit ALU
+    "sar al, 1",            # 8-bit arithmetic shift
+    "rol al, 1",            # 8-bit rotate
+    "ror bl, cl",           # 8-bit rotate by CL
     "movzx rax, al",        # zero-extend move
     "movsx eax, bl",        # sign-extend move
 ])
