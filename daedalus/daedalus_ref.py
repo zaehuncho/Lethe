@@ -138,13 +138,18 @@ class RefVM:
     """
 
     def __init__(self, code: bytes, data: bytes, args=None,
-                 decoder=None):
+                 decoder=None, mem=None, mem_base=0):
         self.code = code
         self.data = bytes(data)
         self.args = list(args or [])
         self.stack: list[int] = []
         self.ret_stack: list[int] = []
         self.locals = bytearray(DVM_LOCAL_SIZE)
+        # Optional writable memory region: lets the x64-lifter oracle model real
+        # process memory for lifted load/store. None (the default) preserves the
+        # exact prior behaviour for every other caller.
+        self.mem = bytearray(mem) if mem is not None else None
+        self.mem_base = mem_base
         self.pc = 0
         # `decoder`, when supplied, is a RollingDecoder-like object exposing
         # fetch(pc) -> (mnemonic, width, kind, operand, plain_bytes). When None
@@ -175,6 +180,12 @@ class RefVM:
             if off + size > len(self.data):
                 raise DaedalusError("data OOB")
             return self.data, off
+        if self.mem is not None and \
+                self.mem_base <= addr < self.mem_base + len(self.mem):
+            off = addr - self.mem_base
+            if off + size > len(self.mem):
+                raise DaedalusError("mem OOB")
+            return self.mem, off
         raise DaedalusError(f"unmodeled memory address 0x{addr:X}")
 
     def _fetch(self):

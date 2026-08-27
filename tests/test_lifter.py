@@ -462,28 +462,100 @@ def test_fuzz_lea():
         oracle.check(asm(src), init=init, flags=())
 
 
+# ---------------------------------------------------------------------------
+# memory operands (cut 4): load / store / ALU-with-memory-source
+# ---------------------------------------------------------------------------
+_MEM = bytes((i * 37 + 11) & 0xFF for i in range(256))
+
+
+def test_mem_load_64_and_addressing():
+    oracle.check(asm("mov rax, [rbx]"),
+                 init=_init(rbx=oracle.MEM_BASE), flags=(), mem=_MEM)
+    oracle.check(asm("mov rax, [rbx+16]"),
+                 init=_init(rbx=oracle.MEM_BASE), flags=(), mem=_MEM)
+    oracle.check(asm("mov rax, [rbx+rcx*4]"),
+                 init=_init(rbx=oracle.MEM_BASE, rcx=3), flags=(), mem=_MEM)
+
+
+def test_mem_load_32_zero_extends():
+    oracle.check(asm("mov eax, [rbx+4]"),
+                 init=_init(rax=0xFFFFFFFFFFFFFFFF, rbx=oracle.MEM_BASE),
+                 flags=(), mem=_MEM)
+
+
+def test_mem_store_64_and_32():
+    oracle.check(asm("mov [rbx], rax"),
+                 init=_init(rbx=oracle.MEM_BASE, rax=0xCAFEBABEDEADBEEF),
+                 flags=(), mem=_MEM)
+    oracle.check(asm("mov [rbx+8], eax"),
+                 init=_init(rbx=oracle.MEM_BASE, rax=0x11223344AABBCCDD),
+                 flags=(), mem=_MEM)
+
+
+def test_alu_with_memory_source():
+    for op in ("add", "sub", "and", "or", "xor"):
+        oracle.check(asm(f"{op} rax, [rbx]"),
+                     init=_init(rax=0x0F0F0F0F0F0F0F0F, rbx=oracle.MEM_BASE),
+                     mem=_MEM)
+    oracle.check(asm("cmp rax, [rbx]"),
+                 init=_init(rax=0x0102030405060708, rbx=oracle.MEM_BASE),
+                 mem=_MEM)
+    oracle.check(asm("add eax, [rbx+4]"),
+                 init=_init(rax=100, rbx=oracle.MEM_BASE), mem=_MEM)
+
+
+def test_imul_with_memory_source():
+    oracle.check(asm("imul rax, [rbx]"),
+                 init=_init(rax=7, rbx=oracle.MEM_BASE),
+                 flags=("CF", "OF"), mem=_MEM)
+
+
+def test_mem_load_store_roundtrip():
+    oracle.check(asm("mov rax, [rbx]; mov [rbx+32], rax"),
+                 init=_init(rbx=oracle.MEM_BASE), flags=(), mem=_MEM)
+
+
+def test_fuzz_mem_ops():
+    rng = random.Random(0x4D454D)
+    ops = ["add", "sub", "and", "or", "xor", "mov"]
+    regs = ["rax", "rcx", "rdx", "rsi", "rdi"]
+    for _ in range(200):
+        lines = []
+        for _ in range(rng.randint(1, 4)):
+            op = rng.choice(ops)
+            disp = rng.randrange(0, 200, 8)         # 8 bytes stays within 256
+            reg = rng.choice(regs)
+            if op == "mov" and rng.random() < 0.5:
+                lines.append(f"mov [rbx+{disp}], {reg}")     # store
+            else:
+                lines.append(f"{op} {reg}, [rbx+{disp}]")    # load / ALU source
+        init = [rng.getrandbits(64) for _ in range(16)]
+        init[L.GPR_NAMES.index("rbx")] = oracle.MEM_BASE
+        # mov never sets flags and every ALU here defines all four, so the final
+        # flag state is identical in both engines.
+        oracle.check(asm("; ".join(lines)), init=init, mem=_MEM)
+
+
 @pytest.mark.parametrize("src", [
-    "mov rax, [rbx]",       # memory source (64-bit)
-    "mov [rbx], rax",       # memory dest (64-bit)
     "call rax",             # call
     "movsb",                # string op
-    # -- cut 3 adds lea/imul/sar/rol/ror + shift-by-CL, but these forms of them
-    #    stay out of the faithful subset and must still bail --
+    # 1-operand mul/div (implicit rdx:rax / 128-bit) stay out of scope
     "imul rbx",             # 1-operand imul (128-bit rdx:rax)
     "imul ebx",             # 1-operand imul (edx:eax)
     "mul rbx",              # unsigned 1-operand multiply
     "div rcx",              # unsigned division
     "idiv rcx",             # signed division
-    "imul rax, [rbx]",      # imul with a memory source
-    "imul rax, [rbx], 5",   # 3-operand imul with a memory source
+    # lea forms outside the faithful subset
     "lea rax, [rip+0x10]",  # RIP-relative lea
     "lea eax, [rip+8]",     # RIP-relative lea (32-bit dest)
     "lea rax, [ebx+ecx]",   # 32-bit-addressed lea (mod-2^32, not modeled)
     "lea rax, fs:[rbx]",    # segment-overridden lea
-    # -- cut 2 memory forms still bail --
-    "mov eax, [rbx]",       # 32-bit memory source
-    "mov [rbx], eax",       # 32-bit memory dest
-    # -- 8/16-bit sub-registers remain unsupported at any width --
+    # memory forms still outside cut 4's subset
+    "add [rbx], rax",       # ALU with a memory DEST (read-modify-write)
+    "cmp [rbx], rax",       # cmp with a memory dest
+    "mov qword ptr [rbx], 5",   # mov [mem], imm (needs the memory-operand size)
+    "mov rax, fs:[rbx]",    # segment-overridden load
+    # 8/16-bit sub-registers remain unsupported at any width
     "mov al, 5",            # 8-bit sub-register
     "mov ax, 5",            # 16-bit sub-register
     "add al, bl",           # 8-bit ALU

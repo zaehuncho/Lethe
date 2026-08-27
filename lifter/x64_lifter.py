@@ -180,6 +180,10 @@ class _Lifter:
             if width == 32:                   # 32-bit dst -> 32-bit immediate
                 v &= MASK32
             self.push_imm(v)
+        elif k == OpKind.MEMORY:
+            # memory source: effective address -> load at the operation width.
+            self._emit_effective_address(instr)
+            self.a(f"load{width}")
         else:
             raise LiftUnsupported(f"operand kind {k!r}")
 
@@ -258,8 +262,18 @@ class _Lifter:
             self.flags_logical(signbit=signbit)
 
     def _mov(self, instr) -> None:
+        if instr.op_kind(0) == OpKind.MEMORY:
+            # store: mov [mem], reg  (mov [mem], imm bails -- would need the
+            # memory-operand size, deferred). store{w} pops [addr, val].
+            if instr.op_kind(1) != OpKind.REGISTER:
+                raise LiftUnsupported("mov [mem], <non-register> not supported")
+            _, width = self._reg_info(instr.op_register(1))
+            self._emit_effective_address(instr)      # -> [addr]
+            self.push_operand(instr, 1, width)        # -> [addr, val]
+            self.a(f"store{width}")
+            return
         dst, width = self.require_reg(instr, 0)
-        self.push_operand(instr, 1, width)
+        self.push_operand(instr, 1, width)            # reg / imm / memory source
         self.wr_reg(dst)
 
     def _unary(self, instr, vmop: str) -> None:
@@ -462,6 +476,31 @@ class _Lifter:
             self.rd_local(SB); self.a(f"jz {skip}")
             emit_cf()
             self.a.label(skip)
+
+    def _emit_effective_address(self, instr) -> None:
+        """Push the effective address of the instruction's memory operand.
+        Used by memory load (push_operand) and store (_mov). Bails on
+        RIP-relative, segment overrides, or a non-64-bit base/index (32-bit
+        addressing computes mod 2^32, which our 64-bit arithmetic would not
+        reproduce)."""
+        if instr.is_ip_rel_memory_operand:
+            raise LiftUnsupported("RIP-relative memory operand")
+        if instr.segment_prefix != Register.NONE:
+            raise LiftUnsupported("segment-overridden memory operand")
+        base = instr.memory_base
+        index = instr.memory_index
+        scale = instr.memory_index_scale
+        disp = instr.memory_displacement & MASK64
+        if base != Register.NONE and base not in REG_OFF:
+            raise LiftUnsupported("memory base is not a supported 64-bit GPR")
+        if index != Register.NONE and index not in REG_OFF:
+            raise LiftUnsupported("memory index is not a supported 64-bit GPR")
+        self.push_imm(disp)
+        if base != Register.NONE:
+            self.rd_reg(base); self.a("add")
+        if index != Register.NONE:
+            self.rd_reg(index); self.push_imm(scale & MASK64)
+            self.a("mul"); self.a("add")
 
     def _lea(self, instr) -> None:
         # lea reg, [base + index*scale + disp] -- computes the effective address

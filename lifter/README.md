@@ -20,12 +20,21 @@ else + a **differential oracle** that proves every lift correct.
 - Interpreter facts the lifting relies on: `cmp_lt/gt/ge` are **unsigned**;
   `shr` is **logical**; `store64` pops `[addr, val]`; shift counts mask by 63.
 
-## Cut 1 coverage (proven)
-`mov, add, sub, and, or, xor, cmp, test, inc, dec, neg, not, shl, shr (imm), jmp,
-jcc, ret, nop` — **64-bit register + immediate** operands only. Everything else
-**bails** (memory operands, calls, `mul/div`, `sar/rol/ror`, 32/16/8-bit sub-
-registers, SIMD, string ops, indirect/external branches). Bailed functions are
-left native by the packer — correctness over coverage.
+## Coverage (proven by the oracle)
+- **Cut 1** — `mov, add, sub, and, or, xor, cmp, test, inc, dec, neg, not,
+  shl, shr, jmp, jcc, ret, nop`, 64-bit register + immediate.
+- **Cut 2** — 32-bit register operands (`eax..r15d`); reads mask low-32, writes
+  zero-extend the parent; flags at bit 31.
+- **Cut 3** — `lea` (address arithmetic), `imul` (2/3-operand, with the
+  128-bit-product CF/OF), `sar`, `rol`/`ror`, and shift/rotate by `CL`.
+- **Cut 4** — **memory operands**: `mov` load/store (32/64-bit) and ALU/`imul`
+  with a memory **source**, over `[base + index*scale + disp]`. Verified against
+  Unicorn on registers, flags, **and a shared memory region**.
+
+Still **bails** (left native — correctness over coverage): `call`/`ret`,
+`mul`/`div` and 1-operand `imul` (rdx:rax), ALU with a memory **dest**
+(read-modify-write), `mov [mem], imm`, RIP-relative/segment memory, 8/16-bit
+sub-registers, `movzx`/`movsx`, SIMD, string ops, indirect/external branches.
 
 ## Extending it (the fan-out contract)
 To add an instruction:
@@ -38,10 +47,14 @@ To add an instruction:
 3. For undefined-flag cases (e.g. `shl` by n≠1 leaves OF undefined), restrict the
    test's `flags=(...)` to the defined ones.
 
-## Cut 2 (next)
-32-bit operands (zero-extend on write), memory operands (needs the VM to address
-real process memory + a safety model), `call`/`ret` with Win64-ABI glue, `lea`,
-`mul/imul`, `sar`, rotates. Each gated behind an oracle pass.
+## Next
+`call`/`ret` with Win64-ABI glue (the last big lifter piece), then the runtime
+C thunk below. ALU-with-memory-dest (read-modify-write) and `mov [mem], imm` are
+small follow-ons. Each gated behind an oracle pass.
+
+The oracle models a writable memory region: `oracle.check(code, init, flags,
+mem=<initial bytes>)` maps it in both Unicorn and the reference VM (via the
+additive `RefVM(mem=..., mem_base=...)` param) and compares the final bytes.
 
 ## Runtime integration (build-time C, not in this Python reference)
 The packer replaces a lifted function with a thunk that loads the incoming
