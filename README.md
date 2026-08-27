@@ -1,208 +1,164 @@
-# Lethe — custom x64 Windows PE packer / protector
+# Lethe
 
-Lethe is an **internal, build-time** software-protection tool for Orion's own
-first-party Windows binaries (EXEs **and** DLLs). It transforms an x64 PE into a
-protected PE that runs identically, using the *Aggressive* protection tier:
-per-section **zlib (deflate) compression + AES-256-GCM encryption**, **import
-elision** (the original import table is hidden inside the encrypted payload),
-reloc / TLS / x64-exception handling, a **code-hash-bound key** (tamper ⇒ wrong
-key ⇒ decrypt fails), **gated, AV-clean anti-debug**, and an **anti-dump layer**
-(see *Honest limitations* below). Compression is deflate, not LZMA: the stub's
-bundled miniz can only decode deflate.
+**A custom, AV-clean software protector for your own first-party x64 Windows
+binaries.** Lethe transforms an EXE or DLL into a protected PE that runs
+identically, while making it genuinely expensive to reverse-engineer or tamper
+with — with its own cipher, its own virtual machine, and a from-scratch
+x64→bytecode lifter, all built from the ground up and test-verified.
 
-It is a tool that *produces* the shipping product — it is **never shipped to
-customers**, and it never touches the license/entitlement server (your real
-enforcement lives there, in native C++). Lethe fills the packer slot the IP
-pipeline already reserves: `tools/security/pack_lethe_release.py` invokes any
-packer through a `--packer-command "<cmd> {input} {output}"` template, and this
-tool matches that contract exactly.
+It is a **build-time** tool: you run it on binaries you own to produce the
+shipping artifact. It is not a general-purpose packer-for-hire and it deliberately
+excludes AV/EDR-evasion tricks — it is defensive IP protection and security
+research, tuned to stay clean on Windows Defender.
 
-> **Status:** the container ABI (`packer/container.py`) is complete and tested
-> now. The native stub, some builder modules, and the frozen GUI are landed by
-> sibling work; the round-trip harness auto-skips until the stub is built.
+> **Honest framing up front:** no client-side packer makes code unbreakable — and
+> that's not an engineering gap, it's provable (see [Scope & limits](#scope--limits)).
+> Lethe is a *cost multiplier*, deliberately maxed out for what an offline
+> protector can be. The only true wall is server-side enforcement, which packing
+> complements rather than replaces.
 
-## Two front-ends, one core
+## The suite
 
-Both front-ends are thin wrappers over the single core function
-`packer.orchestrator.pack_file()` (with `PackOptions` / `PackResult`), so they
-never drift:
+Lethe is the umbrella brand; the engines have their own codenames so each stays a
+clean, separable component.
 
-- **CLI** — `lethe.py`. The pipeline drop-in.
-- **GUI** — `gui/app.py`, frozen to `Lethe.exe` (PySide6 + Nuitka) for
-  manual, clickable use.
+| Component | What it is |
+|-----------|------------|
+| **Lethe** (`packer/`, `stub/`) | The PE packer: per-section deflate + **AES-256-GCM**, **import elision** (FNV-1a hashing + PEB/Ldr walk — no plaintext `GetProcAddress`), a **code-hash-bound key** (tamper ⇒ wrong key ⇒ decrypt fails), reloc/TLS/`.pdata`/`.rsrc` handling, gated **AV-clean anti-debug**, **anti-dump** (in-memory header wipe), and an opt-in VEH **memory-guard**. Freestanding, no-CRT, kernel32-only stub. |
+| **Kalypso** (`cipher/`) | A custom **ChaCha20-Poly1305 AEAD** (RFC 8439) with a per-build sigma + word-permutation. Proven **bit-identical to RFC 8439** and cross-checked against the `cryptography` library. |
+| **Daedalus** (`daedalus/`, `stub/src/daedalus_*`) | A custom stack-machine **VM** that virtualizes the protector's crypto-critical routines (key derivation, license/lease checks). Hardened with **rolling self-decrypting bytecode**, per-build **opcode shuffle**, and **observation-poison** (debugging corrupts the decode). |
+| **x64 lifter** (`lifter/`) | A from-scratch **x64 → Daedalus** lifter for on-demand function virtualization. Covers the register + memory integer subset; **every instruction proven bit-exact against a Unicorn differential oracle**. Bails to native on anything it can't reproduce faithfully — it never bricks a function. |
+| **Obfuscation** (`obfuscation/`) | A custom LLVM pass plugin (control-flow flattening + opaque predicates + MBA + bogus control flow, per-build randomized). *Drafted, not yet compiled — needs an LLVM toolchain; see its README.* |
+| **bind** (`bind/`) | Hash-pin a packed EXE's first-party dependency DLLs so they can't be swapped, without fragile single-EXE bundling. |
+| **tracing** (`tracing/`) | Per-customer build variance + **traitor tracing**: each customer gets a uniquely-morphed binary, and a leaked build can be traced back to its buyer. |
+| **bounty** (`bounty/`) | A money-grade "recover the flag" challenge generator (Argon2id + AES-256-GCM) with a leak-audit gate — for a public break-it bounty. |
 
-## Layout
+## Highlights
 
-```
-lethe.py            CLI front-end (pipeline drop-in)
-packer/container.py     THE ABI — struct layouts, magic, constants (mirror of pack_info.h)
-packer/pe_analyze.py    LIEF PE extraction (sections, imports, relocs, TLS, .pdata, .rsrc)
-packer/payload.py       per-section LZMA + AES-GCM, blob serialize, keygen + code-hash bind
-packer/assemble.py      output PE construction, PackInfo patch          (landed by sibling work)
-packer/orchestrator.py  pack_file()/PackOptions/PackResult — the one core API (sibling work)
-gui/app.py              PySide6 GUI; gui/build_gui.ps1 freezes it to Lethe.exe
-stub/src/*.c,*.h        native C stub (manual PE loader + crypto + anti-*), pack_info.h = ABI mirror
-stub/build_stub.ps1     builds the stub -> stub/prebuilt/stub_x64.bin (sibling work)
-stub/prebuilt/stub_x64.bin  checked-in compiled stub the builder grafts in (pack-time needs no compiler)
-tests/                  round-trip harness + sample PEs + additional ABI unit tests
-tests/test_lethe_container_abi.py   container.py <-> pack_info.h agreement (runs now)
-README.md / RUNBOOK.md
-```
+- **Custom crypto, done right.** Kalypso is not homemade magic — its core is
+  ChaCha20 with the proven rotations, verified against the RFC 8439 test vectors,
+  with a per-build twist that's provably security-neutral.
+- **A real virtual machine + a real lifter.** Daedalus runs the crown-jewel logic
+  as opaque bytecode; the lifter turns native x64 into that bytecode, and its
+  correctness is enforced by a differential oracle (Unicorn is ground truth) over
+  thousands of fuzzed sequences.
+- **Per-build polymorphism.** Every build differs (sigma, opcode shuffle, rolling
+  state, key), so a crack doesn't transfer — and per-customer builds make that a
+  distribution-layer weapon plus a traitor-tracing signal.
+- **AV-clean by construction.** No `ThreadHideFromDebugger`, no `int 2d`/`int 3`,
+  no self-modifying `.text`, no RWX, no static system-crypto import.
 
-The gate-registered container round-trip test lives at repo root:
-`tests/test_lethe_container.py` (see RUNBOOK).
-
-## Build the stub
-
-The builder consumes a **prebuilt** stub PE, so packing itself needs no compiler
-— but you rebuild the stub whenever any `stub/src/*` file changes:
+## Quickstart
 
 ```powershell
-# Standalone CMake project (VS2022 / x64, C, minimal CRT, no Qt),
-# mirroring installer/OrionSetup/CMakeLists.txt's hardening spirit.
-powershell stub\build_stub.ps1
-# -> refreshes stub\prebuilt\stub_x64.bin
+# pack a binary (auto-detects EXE vs DLL from the header)
+python lethe.py yourapp.exe yourapp.packed.exe
+
+# GUI (QML front-end): batch queue, options, presets, post-pack validation, reports
+python gui/venice.py            # or the widgets twin: python gui/app.py
+
+# run the test suite
+python -m pytest -m "not slow"
 ```
 
-Under the hood this is roughly:
+The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packing
+itself needs **no compiler**. Rebuild the stub only when `stub/src/*` changes
+(VS2022 / MSVC, see `RUNBOOK.md`).
+
+## CLI
+
+```
+python lethe.py INPUT [OUTPUT] [--dll] [--anti-debug {on,off}]
+                               [--memory-guard] [--level N] [--verbose]
+```
+
+| flag | default | meaning |
+|------|---------|---------|
+| `OUTPUT` | `<input>.packed<ext>` | packed output path |
+| `--dll` | auto-detect | force DLL packing |
+| `--anti-debug` | `on` | gated, AV-clean debugger checks |
+| `--memory-guard` | off | opt-in on-demand page decryption — **AV-test first** |
+| `--level N` | `9` | deflate compression level (0–9) |
+| `--verbose` | off | stream builder/stub progress |
+
+Managed/.NET assemblies are **refused** up front (packing them the native way
+would silently break them).
+
+## Repo layout
+
+```
+lethe.py            CLI front-end
+packer/             the packer core (container ABI, PE analysis, payload, assemble, orchestrator)
+stub/               native no-CRT C stub (manual PE loader + crypto + anti-* + Daedalus VM)
+cipher/             Kalypso (kalypso.py/.c/.h) + the red-team crackme generators
+daedalus/           the Daedalus VM: assembler, disassembler, reference interpreter, MBA, rolling, shuffle
+lifter/             x64 -> Daedalus lifter + the Unicorn differential oracle
+obfuscation/        custom LLVM obfuscation pass plugin (draft, uncompiled)
+bind/               dependency hash-pinning
+tracing/            per-customer variance + traitor tracing
+bounty/             money-grade break-it challenge + audit
+gui/                PySide6 front-ends (QML "Venice" + widgets) + build script
+tests/              pytest suite (packer ABI, cipher, VM, lifter, bind, tracing, bounty, report)
+docs/               runbooks, security notes, loader-coverage audit
+```
+
+Component deep-dives live in `lifter/README.md`, `obfuscation/README.md`, and
+`bounty/README.md`.
+
+## Scope & limits
+
+**No client-side packer can make code unbreakable — this is provable, not
+unsolved.** Any implementation must present real instructions to a CPU the
+adversary controls, and a passive hypervisor/Intel-PT observer can read them
+without tripping any defense (cf. Barak et al., *On the (Im)possibility of
+Obfuscating Programs*, 2001). So Lethe's job is to be an expensive **cost
+multiplier**, and the one true wall is **server-side** (release the decryption
+key / critical code per session, bound to a license) — which the packer
+complements.
+
+Concrete, honest limitations of the offline layer:
+
+- **Base packing is dumpable once unpacked in RAM.** Anti-dump erases PE headers
+  right after section decryption, so there's no clean single-breakpoint dump, but
+  a determined analyst can still reconstruct from the headerless mapped image.
+- **Memory-guard** (opt-in) keeps code pages encrypted + `PAGE_NOACCESS` and
+  decrypts per-page on first touch, so no single snapshot holds the whole
+  program — at a page-fault cost and possible AV suspicion. A/B it on a Defender
+  VM before shipping.
+- **Packing drops CFG enforcement** on the packed image (the OS never builds a
+  CFG bitmap for dynamically-materialized code). The stub itself is `/guard:cf`.
+  Weigh per binary — fine for game/UI/license logic, worse for network-reachable
+  code.
+- **Packing disables crash-dump/support triage** on protected binaries. Pack last,
+  after live sign-off, and canary an unpacked build before packed goes wide.
+- **The code-hash key binding raises cost, not certainty** — a debugger can still
+  recover the key at runtime.
+- **Status of components:** the packer core, Kalypso, Daedalus, and the lifter are
+  test-verified in this repo; the LLVM obfuscation layer is a **drafted,
+  uncompiled** first cut (needs an LLVM box + oracle validation); the lifter's
+  runtime C thunk (`call`/`ret` + Win64-ABI glue) is future work.
+
+## AV / Authenticode
+
+- **AV posture:** tuned to stay clean on Windows Defender — persistent false
+  positives are a release blocker. Known red flags are excluded on purpose (see
+  above). Always AV-smoke packed output on a clean Defender VM before shipping.
+- **Authenticode:** Lethe does **not** sign — sign *after* packing. `.rsrc`
+  (icon, version info, manifest) is preserved as real bytes at its original RVA so
+  the OS, Authenticode, and SmartScreen can read it.
+
+## Development
 
 ```powershell
-cmake -S stub -B <build> -G "Visual Studio 17 2022" -A x64
-cmake --build <build> --config Release
+python -m pytest -m "not slow"      # full suite
 ```
 
-The stub is compiled with the same hardening as the real binaries
-(`/guard:cf /DYNAMICBASE /NXCOMPAT`) and links only `kernel32` (pure C crypto
-eliminates any system crypto import; `BCryptGenRandom` is resolved dynamically
-at runtime for CSPRNG entropy only). It must **never** load or touch
-`libcrypto-3-x64.dll` (hash-pinned for Ed25519, `Ed25519.cpp:122-160`).
+The lifter tests need `iced-x86`, `unicorn`, and `keystone-engine`
+(`pip install iced-x86 unicorn keystone-engine`); the cipher/bounty tests need
+`cryptography` (and `argon2-cffi` for the bounty). Tests `importorskip` optional
+deps, so the suite stays green where they're absent.
 
-## Use the CLI
+## License
 
-```
-python lethe.py INPUT [OUTPUT]
-                    [--dll] [--anti-debug {on,off}] [--memory-guard]
-                    [--level N] [--verbose]
-```
-
-| flag             | default                | meaning                                                   |
-|------------------|------------------------|-----------------------------------------------------------|
-| `OUTPUT`         | `<input>.packed<ext>`  | where to write the packed PE                              |
-| `--dll`          | auto-detect            | force DLL packing (otherwise read from the PE header)     |
-| `--anti-debug`   | `on`                   | gated, AV-clean debugger checks in the stub               |
-| `--memory-guard` | off                    | opt-in on-demand page decryption — **AV-test first**      |
-| `--level N`      | `9`                    | zlib (deflate) compression level (0–9)                    |
-| `--verbose`      | off                    | stream builder/stub progress + raw `PackResult` fields    |
-
-Exit codes: **0** success · **1** packing ran but failed · **2** bad args /
-missing input / core import failure.
-
-```powershell
-# examples
-python lethe.py OrionOwner.exe OrionOwner.packed.exe
-python lethe.py SecurityCore.dll SecurityCore.packed.dll --dll
-python lethe.py OrionNative.exe out.exe --memory-guard --anti-debug on --verbose
-```
-
-**Pipeline contract:** the pipeline calls exactly `lethe.py {input} {output}`,
-so `--packer-command "python lethe.py {input} {output}"`
-drops in with zero pipeline changes.
-
-## Use the GUI
-
-```powershell
-# run from source during development
-python gui\app.py
-
-# freeze to a clickable Lethe.exe (bundles the packer lib + LIEF + stub_x64.bin)
-powershell gui\build_gui.ps1
-```
-
-Workflow: **Add PEs** (button / drag-drop, multi-select) → each row shows the
-auto-detected type (EXE/DLL from the header), arch and size → set **Options**
-(output folder, anti-debug on/off, memory-guard on/off with an *"opt-in, AV-test
-first"* note, compression level; global with per-row override) → **Pack**. Each
-file is packed on a worker thread (the UI stays responsive) with a live log and a
-per-file result row (✓/✗, sizes, ratio, time, inline errors).
-
-## Tests & round-trip harness
-
-```powershell
-# container ABI round-trips (no third-party deps — pass NOW)
-python -m pytest tests\test_lethe_container.py
-python -m pytest tests\test_lethe_container_abi.py
-
-# end-to-end acceptance: build samples -> pack -> run original vs packed ->
-# assert identical stdout/exit + host-loads-packed-DLL. SKIPS cleanly (exit 2)
-# until lethe.py + stub_x64.bin exist; needs MSVC (cl.exe) to build samples.
-powershell tests\roundtrip.ps1
-```
-
-`roundtrip.ps1` encodes plan Verification **#2** (EXE round-trip) and **#4** (DLL
-round-trip). The remaining verification steps (PE-viewer entropy/imports checks,
-ASLR/DEP, signability, AV smoke, anti-dump, memory-guard, GUI) are manual — see
-RUNBOOK.
-
----
-
-## Honest limitations (state these plainly)
-
-**No packer makes code unbreakable.** Lethe is *one layer* of a
-defense-in-depth stack (obfuscation + packing + anti-dump + optional
-virtualization); your real teeth are the **server-enforced license/entitlement
-gate**, which a client-side dump does **not** bypass.
-
-- **Base packing is dumpable once unpacked in RAM.** The anti-dump layer
-  erases PE headers immediately after section decryption (before imports,
-  relocs, or TLS are processed), so there is no single breakpoint that yields
-  a perfect dump with intact headers. A determined analyst can still
-  reconstruct from the headerless mapped sections.
-- **Anti-dump — on by default (`antidump.c`), AV-clean:** in-memory PE **header
-  erasure** (MZ/PE signature + section table wiped after load), **payload +
-  loader wipe** (the compressed/encrypted blob and decrypt scratch are zeroed
-  after use, so a dump reveals no second copy and no unpack logic), and
-  **anti-injection** via `SetProcessMitigationPolicy` (blocks non-Microsoft /
-  unsigned DLL loads, stopping Scylla-style dumper/injector DLLs). This moves
-  dumping from *trivial* to *expensive* — a determined expert with
-  kernel/hypervisor tooling can still eventually win.
-- **Memory-guard — opt-in (`memguard.c`, `--memory-guard`), OFF by default:** a
-  VEH page-fault decryptor keeps code pages AES-encrypted + `PAGE_NOACCESS` and
-  decrypts a page only on first touch, so **no single snapshot holds the whole
-  program**. Costs page-fault perf, complexity, and possible AV suspicion —
-  hence opt-in and **A/B it on a Defender VM before shipping**.
-- **Packing drops CFG enforcement on the packed image (§6).** The original code
-  is materialized at runtime and made executable by the stub, so Windows Control
-  Flow Guard is *not* enforced on those pages (the OS never populated a CFG
-  valid-target bitmap for dynamically-produced code). The **stub itself** is
-  built `/guard:cf`, but the protected payload loses CFG. Weigh this per binary.
-- **Packing disables crash-dump / support triage** on protected binaries
-  (erased headers + encrypted/wiped payload make minidumps unusable). This is why
-  `RELEASE_SECURITY.md:126-156` **defers packing until after live sign-off** —
-  pack last, once you no longer need field crash telemetry from that build.
-- **The code-hash key binding raises cost, not certainty.** Patching the stub
-  changes its `.text` hash ⇒ the derived key is wrong ⇒ decryption fails; but a
-  debugger can still recover the key at runtime.
-
-## AV / Authenticode / CFG notes
-
-- **AV posture (Aggressive-but-clean):** the tier is tuned to stay clean on a
-  Windows Defender VM — "persistent AV false positives" is a release blocker in
-  the IP plan. The anti-debug set includes 13 checks at startup plus 4
-  scattered tripwires (PEB, NtGlobalFlag, RDTSC, hardware breakpoints) at
-  different loader stages, each independently wiping key material. Known AV red
-  flags are **excluded on purpose**: `ThreadHideFromDebugger`, `int 2d`/`int 3`
-  tricks, self-modifying code. Import resolution uses FNV-1a hashing + PEB/
-  export-table walking (no `GetProcAddress` with plaintext names). Use
-  `--anti-debug off` to A/B the Defender impact per release. **Always AV-smoke
-  packed output on a clean Defender VM before shipping** (plan Verification #6).
-- **Authenticode:** Lethe does **not** sign. Signing is the pipeline's job
-  and runs **after** packing (`signtool` between pack and manifest-hash, per
-  `IP_PROTECTION_PLAN.md:279-286`). Packed EXEs/DLLs must remain signable —
-  `.rsrc` (icon, `RT_VERSION`, `RT_MANIFEST` for UAC/DPI) is preserved as real
-  bytes at its original RVA so the OS, Authenticode, SmartScreen and the
-  installer can read it. v1 does not encrypt resources (metadata, not
-  crown-jewel code).
-- **CFG:** see the *Honest limitations* CFG bullet — packed payload loses CFG
-  enforcement; the stub is `/guard:cf`. Verify `DYNAMICBASE` + `NXCOMPAT` survive
-  on the packed image (plan Verification #3) and that there are **no RWX pages**
-  at any point (the stub `VirtualProtect`s to final RX/R/RW perms after writing).
+Choose a license before publishing. This is proprietary IP-protection software;
+pick terms deliberately (all-rights-reserved, source-available, or open-core).
