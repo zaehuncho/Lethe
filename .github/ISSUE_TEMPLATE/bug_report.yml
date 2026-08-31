@@ -1,0 +1,48 @@
+name: Bug report
+description: Report reproducible Lethe behavior that is not security-sensitive.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Security vulnerabilities must be reported privately through the Security tab.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Exact Git commit or release tag.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Packer / CLI
+        - Native stub
+        - GUI
+        - Tests / build
+        - Documentation
+        - Experimental feature
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal authorized reproduction with secrets and personal data removed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows, Python, MSVC/CMake, and relevant target-PE details.
+    validations:
+      required: true

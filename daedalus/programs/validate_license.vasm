@@ -1,0 +1,240 @@
+; DVM_PROG_VALIDATE_LICENSE -- virtualizes SecurityManager::validateLicenseKeyFormat()
+;
+; Hand-compiled DFA for the regex: ^[A-Z0-9][A-Z0-9\-]{9,95}$
+; applied to trimmed+uppercased input.
+;
+; C++ original:
+;   static const QRegularExpression re("^[A-Z0-9][A-Z0-9\\-]{9,95}$");
+;   return re.match(key.trimmed().toUpper()).hasMatch();
+;
+; Args:
+;   [0] = string_ptr    const char* (UTF-8 byte buffer)
+;   [1] = string_len    uint32_t (byte count, NOT null-terminated)
+;
+; Locals usage:
+;   [0..7]   start_pos  (index of first non-whitespace byte)
+;   [8..15]  end_pos    (one past last non-whitespace byte)
+;
+; Contract: PREDICATE — 1=valid, 0=invalid
+; Return: halt 1 = valid format, halt 0 = invalid format
+;
+; No shim calls -- pure bytecode using load8, cmp_*, jz/jnz loops.
+; Character classes tested after in-place uppercase conversion.
+
+.code
+  ; ================================================================
+  ; Phase 1: Trim leading whitespace (bytes <= 0x20)
+  ; Find first index i where string[i] > 0x20
+  ; ================================================================
+  push_imm8 0                  ; i = 0
+
+trim_lead:
+  ; bounds check: i < len
+  dup                          ; [i, i]
+  push_arg 1                   ; [i, i, len]
+  cmp_lt                       ; [i, (i < len)]
+  jz invalid                   ; all whitespace -> invalid
+
+  ; whitespace test: string[i] > 0x20?
+  dup                          ; [i, i]
+  push_arg 0                   ; [i, i, ptr]
+  add                          ; [i, &str[i]]
+  load8                        ; [i, ch]
+  push_imm8 0x20
+  cmp_gt                       ; [i, (ch > 0x20)]
+  jnz found_start              ; non-whitespace found
+  push_imm8 1
+  add                          ; [i+1]
+  jmp trim_lead
+
+found_start:
+  ; stack: [start_pos]
+  ; save to locals[0]
+  local_addr 0
+  swap
+  store64                      ; locals[0] = start_pos
+
+  ; ================================================================
+  ; Phase 2: Trim trailing whitespace
+  ; Scan backward from len to find last non-whitespace
+  ; ================================================================
+  push_arg 1                   ; [end = len]
+
+trim_trail:
+  ; end must be > start
+  dup                          ; [end, end]
+  local_addr 0
+  load64                       ; [end, end, start]
+  cmp_gt                       ; [end, (end > start)]
+  jz invalid                   ; end <= start -> empty after trim
+
+  ; whitespace test: string[end - 1] > 0x20?
+  dup                          ; [end, end]
+  push_imm8 1
+  sub                          ; [end, end-1]
+  push_arg 0
+  add                          ; [end, &str[end-1]]
+  load8                        ; [end, ch]
+  push_imm8 0x20
+  cmp_gt                       ; [end, (ch > 0x20)]
+  jnz found_end                ; non-whitespace at tail
+  push_imm8 1
+  sub                          ; [end-1]
+  jmp trim_trail
+
+found_end:
+  ; stack: [end_pos]
+  ; save to locals[8]
+  local_addr 8
+  swap
+  store64                      ; locals[8] = end_pos
+
+  ; ================================================================
+  ; Phase 3: Length check -- trimmed_len must be 10..96
+  ; ================================================================
+  local_addr 8
+  load64                       ; [end]
+  local_addr 0
+  load64                       ; [end, start]
+  sub                          ; [trimmed_len = end - start]
+
+  ; trimmed_len >= 10?
+  dup
+  push_imm8 10
+  cmp_lt                       ; [tlen, (tlen < 10)]
+  jnz invalid                  ; too short
+
+  ; trimmed_len <= 96?
+  dup
+  push_imm8 97
+  cmp_lt                       ; [tlen, (tlen < 97)]
+  jz invalid                   ; tlen >= 97 -> too long
+  pop                          ; discard tlen
+
+  ; ================================================================
+  ; Phase 4: First character -- must be [A-Z0-9] after uppercase
+  ; ================================================================
+  local_addr 0
+  load64                       ; [start]
+  push_arg 0
+  add                          ; [&str[start]]
+  load8                        ; [ch]
+  call to_upper                ; [CH] (uppercased)
+
+  ; CH in '0'-'9' (0x30-0x39)?
+  dup
+  push_imm8 0x30
+  cmp_lt
+  jnz invalid                  ; CH < '0' -> reject
+
+  dup
+  push_imm8 0x3A
+  cmp_lt
+  jnz first_ok                 ; '0'-'9' -> accept
+
+  ; CH in 'A'-'Z' (0x41-0x5A)?
+  dup
+  push_imm8 0x41
+  cmp_lt
+  jnz invalid                  ; 0x3A-0x40 gap -> reject
+
+  dup
+  push_imm8 0x5B
+  cmp_lt
+  jnz first_ok                 ; 'A'-'Z' -> accept
+
+  jmp invalid                   ; CH > 'Z' -> reject
+
+first_ok:
+  pop                           ; discard CH
+
+  ; ================================================================
+  ; Phase 5: Remaining chars -- must be [A-Z0-9\-] after uppercase
+  ; Loop from start+1 to end-1 (inclusive)
+  ; ================================================================
+  local_addr 0
+  load64                       ; [start]
+  push_imm8 1
+  add                          ; [i = start + 1]
+
+check_loop:
+  ; bounds: i < end?
+  dup                          ; [i, i]
+  local_addr 8
+  load64                       ; [i, i, end]
+  cmp_lt                       ; [i, (i < end)]
+  jz valid                     ; all chars checked -> valid
+
+  ; load and uppercase char at position i
+  dup                          ; [i, i]
+  push_arg 0
+  add                          ; [i, &str[i]]
+  load8                        ; [i, ch]
+  call to_upper                ; [i, CH]
+
+  ; CH == '-' (0x2D)?
+  dup
+  push_imm8 0x2D
+  cmp_eq
+  jnz char_ok                  ; '-' -> accept
+
+  ; CH in '0'-'9'?
+  dup
+  push_imm8 0x30
+  cmp_lt
+  jnz invalid                  ; CH < '0' -> reject
+
+  dup
+  push_imm8 0x3A
+  cmp_lt
+  jnz char_ok                  ; '0'-'9' -> accept
+
+  ; CH in 'A'-'Z'?
+  dup
+  push_imm8 0x41
+  cmp_lt
+  jnz invalid                  ; 0x3A-0x40 gap -> reject
+
+  dup
+  push_imm8 0x5B
+  cmp_lt
+  jnz char_ok                  ; 'A'-'Z' -> accept
+
+  jmp invalid                   ; CH > 'Z' -> reject
+
+char_ok:
+  pop                           ; discard CH
+  push_imm8 1
+  add                           ; i++
+  jmp check_loop
+
+  ; ================================================================
+  ; Outcomes
+  ; ================================================================
+valid:
+  pop                           ; discard i
+  push_imm8 1
+  halt                          ; return 1 (valid)
+
+invalid:
+  push_imm8 0
+  halt                          ; return 0 (invalid)
+
+  ; ================================================================
+  ; Subroutine: to_upper
+  ; Converts TOS byte to uppercase if in 'a'-'z' (0x61-0x7A).
+  ; Stack effect: [ch] -> [CH]
+  ; ================================================================
+to_upper:
+  dup
+  push_imm8 0x61               ; 'a'
+  cmp_lt
+  jnz to_upper_done            ; ch < 'a' -> not lowercase
+  dup
+  push_imm8 0x7B               ; 'z' + 1
+  cmp_lt
+  jz to_upper_done             ; ch > 'z' -> not lowercase
+  push_imm8 0x20
+  sub                          ; ch - 0x20 = uppercase
+to_upper_done:
+  ret

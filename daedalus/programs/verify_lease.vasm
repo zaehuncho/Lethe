@@ -1,0 +1,482 @@
+; DVM_PROG_VERIFY_LEASE -- virtualizes LeaseGate::verifyLeaseSignature()
+;
+; Verifies an Ed25519 signature over the message:
+;   upper(trim(licenseKey)) + ":" + trim(machineId) + ":" + decimal(epoch)
+;
+; CRITICAL: machineId is trimmed but NOT uppercased (asymmetric with licenseKey).
+;
+; args[0] = &VmExternals       (function pointer table, see shim layout)
+; args[1] = &VerifyLeaseArgs   (struct, all fields u64-aligned)
+;
+; VerifyLeaseArgs layout (offsets in bytes):
+;   +0  : const uint8_t* public_key       (32-byte Ed25519 public key)
+;   +8  : const char*    license_key       (UTF-8 string)
+;   +16 : uint64_t       license_key_len
+;   +24 : const char*    machine_id        (UTF-8 string)
+;   +32 : uint64_t       machine_id_len
+;   +40 : int64_t        lease_expires_epoch_s  (always >= 0)
+;   +48 : const char*    signature_b64url
+;   +56 : uint64_t       signature_b64url_len
+;
+; VmExternals offsets used:
+;   64 = base64url_decode(in, in_len, out, out_max) -> bytes, -1=fail
+;   72 = ed25519_verify(pk, msg, msg_len, sig)      -> 1=valid, 0=invalid
+;
+; Locals memory map:
+;   [0..63]     sig_decoded   64 bytes (base64url-decoded signature)
+;   [64..319]   msg_buf       256 bytes (message string being built)
+;   [320..343]  digit_buf     24 bytes (epoch digits in reverse order)
+;   [344..351]  msg_pos       u64 (write offset within msg_buf)
+;   [352..359]  src_ptr       u64 (current source read pointer)
+;   [360..367]  src_end       u64 (one-past-end source pointer)
+;   [368..375]  digit_count   u64 (number of extracted epoch digits)
+;
+; Contract: PREDICATE — 1=valid, 0=invalid
+; Return: halt 1 = valid signature, halt 0 = invalid
+
+.code
+  ; ============================================================
+  ; Phase A: null-check public_key
+  ; ============================================================
+  push_arg 1
+  load64                    ; args->public_key (offset 0)
+  push_imm8 0
+  cmp_eq
+  jnz fail                  ; public_key == NULL -> invalid
+
+  ; ============================================================
+  ; Phase B: decode base64url signature into locals[0..63]
+  ; ============================================================
+  ; base64url_decode(sig_b64url, sig_b64url_len, &locals[0], 64)
+  push_arg 1
+  push_imm8 48
+  add
+  load64                    ; sig_b64url ptr
+  push_arg 1
+  push_imm8 56
+  add
+  load64                    ; sig_b64url_len
+  local_addr 0              ; out = &sig_decoded
+  push_imm8 64              ; out_max
+  push_imm8 4               ; argc
+  push_arg 0
+  push_imm8 64              ; VmExternals offset: base64url_decode
+  add
+  load64
+  n_call_ptr                ; -> bytes decoded
+  push_imm8 64
+  cmp_ne
+  jnz fail                  ; decoded != 64 bytes -> invalid
+
+  ; ============================================================
+  ; Phase C: build message string in locals[64..319]
+  ; ============================================================
+
+  ; Initialize msg_pos = 0
+  local_addr 344
+  push_imm8 0
+  store64
+
+  ; ---- C1: copy license_key (trimmed + uppercased) ----
+
+  ; src_ptr = license_key
+  local_addr 352
+  push_arg 1
+  push_imm8 8
+  add
+  load64                    ; license_key ptr
+  store64
+
+  ; src_end = license_key + license_key_len
+  local_addr 360
+  push_arg 1
+  push_imm8 8
+  add
+  load64                    ; license_key
+  push_arg 1
+  push_imm8 16
+  add
+  load64                    ; license_key_len
+  add
+  store64
+
+  ; -- trim leading whitespace (chars <= 0x20) --
+lk_trim_lead:
+  local_addr 352
+  load64
+  local_addr 360
+  load64
+  cmp_lt                    ; src_ptr < src_end?
+  jz lk_copy_done           ; empty after trim
+  local_addr 352
+  load64
+  load8                     ; *src_ptr
+  push_imm8 0x21
+  cmp_lt                    ; ch < 0x21? (whitespace)
+  jz lk_trim_lead_done      ; not whitespace -> stop trimming
+  ; advance src_ptr
+  local_addr 352
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+  jmp lk_trim_lead
+
+lk_trim_lead_done:
+  ; -- trim trailing whitespace --
+lk_trim_trail:
+  local_addr 360
+  load64
+  local_addr 352
+  load64
+  cmp_gt                    ; src_end > src_ptr?
+  jz lk_copy_done           ; nothing left
+  local_addr 360
+  load64
+  push_imm8 1
+  sub
+  load8                     ; *(src_end - 1)
+  push_imm8 0x21
+  cmp_lt                    ; ch < 0x21?
+  jz lk_copy_done           ; not whitespace -> done trimming
+  ; shrink src_end
+  local_addr 360
+  dup
+  load64
+  push_imm8 1
+  sub
+  store64
+  jmp lk_trim_trail
+
+lk_copy_done:
+  ; -- copy chars with uppercase: a-z -> A-Z --
+lk_copy_loop:
+  local_addr 352
+  load64
+  local_addr 360
+  load64
+  cmp_lt                    ; src_ptr < src_end?
+  jz lk_done
+
+  ; load char
+  local_addr 352
+  load64
+  load8                     ; ch
+
+  ; uppercase check: (ch - 0x61) < 26 means lowercase ASCII
+  dup
+  push_imm8 0x61
+  sub                       ; unsigned (ch - 'a'); wraps for ch < 'a'
+  push_imm8 26
+  cmp_lt                    ; in range [a..z]?
+  jz lk_not_lower
+  push_imm8 0x20
+  sub                       ; ch -= 0x20 -> uppercase
+lk_not_lower:
+
+  ; store char at msg_buf[msg_pos]
+  local_addr 64
+  local_addr 344
+  load64
+  add                       ; &msg_buf[msg_pos]
+  swap
+  store8
+
+  ; msg_pos++
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; src_ptr++
+  local_addr 352
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+  jmp lk_copy_loop
+
+lk_done:
+  ; -- append ':' separator --
+  local_addr 64
+  local_addr 344
+  load64
+  add
+  push_imm8 0x3A            ; ':'
+  store8
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; ---- C2: copy machine_id (trimmed, NOT uppercased) ----
+
+  ; src_ptr = machine_id
+  local_addr 352
+  push_arg 1
+  push_imm8 24
+  add
+  load64
+  store64
+
+  ; src_end = machine_id + machine_id_len
+  local_addr 360
+  push_arg 1
+  push_imm8 24
+  add
+  load64
+  push_arg 1
+  push_imm8 32
+  add
+  load64
+  add
+  store64
+
+  ; -- trim leading --
+mid_trim_lead:
+  local_addr 352
+  load64
+  local_addr 360
+  load64
+  cmp_lt
+  jz mid_copy_done
+  local_addr 352
+  load64
+  load8
+  push_imm8 0x21
+  cmp_lt
+  jz mid_trim_lead_done
+  local_addr 352
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+  jmp mid_trim_lead
+
+mid_trim_lead_done:
+  ; -- trim trailing --
+mid_trim_trail:
+  local_addr 360
+  load64
+  local_addr 352
+  load64
+  cmp_gt
+  jz mid_copy_done
+  local_addr 360
+  load64
+  push_imm8 1
+  sub
+  load8
+  push_imm8 0x21
+  cmp_lt
+  jz mid_copy_done
+  local_addr 360
+  dup
+  load64
+  push_imm8 1
+  sub
+  store64
+  jmp mid_trim_trail
+
+mid_copy_done:
+  ; -- copy chars as-is (no uppercase) --
+mid_copy_loop:
+  local_addr 352
+  load64
+  local_addr 360
+  load64
+  cmp_lt
+  jz mid_done
+
+  ; load char
+  local_addr 352
+  load64
+  load8
+
+  ; store at msg_buf[msg_pos]
+  local_addr 64
+  local_addr 344
+  load64
+  add
+  swap
+  store8
+
+  ; msg_pos++
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; src_ptr++
+  local_addr 352
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+  jmp mid_copy_loop
+
+mid_done:
+  ; -- append ':' separator --
+  local_addr 64
+  local_addr 344
+  load64
+  add
+  push_imm8 0x3A
+  store8
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; ---- C3: convert epoch to decimal ASCII and append ----
+
+  ; Load epoch (int64_t, always >= 0)
+  push_arg 1
+  push_imm8 40
+  add
+  load64                    ; epoch value on stack
+
+  ; Handle epoch == 0 specially
+  dup
+  push_imm8 0
+  cmp_eq
+  jz epoch_nonzero          ; jz: TOS==0 means epoch is NOT zero
+  pop                       ; discard epoch (it is zero)
+  ; write single '0'
+  local_addr 64
+  local_addr 344
+  load64
+  add
+  push_imm8 0x30
+  store8
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+  jmp epoch_done
+
+epoch_nonzero:
+  ; epoch is on stack, nonzero
+  ; Extract digits via div/mod 10, store in digit_buf in reverse order
+
+  ; digit_count = 0
+  local_addr 368
+  push_imm8 0
+  store64
+
+epoch_div_loop:
+  ; TOS = remaining epoch value
+  dup
+  push_imm8 0
+  cmp_eq
+  jnz epoch_reverse         ; epoch == 0 -> done extracting
+
+  ; digit = epoch % 10
+  dup
+  push_imm8 10
+  mod
+  push_imm8 0x30
+  add                       ; ascii_digit = '0' + (epoch % 10)
+
+  ; store at digit_buf[digit_count]
+  local_addr 320
+  local_addr 368
+  load64
+  add                       ; &digit_buf[digit_count]
+  swap
+  store8
+
+  ; digit_count++
+  local_addr 368
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  ; epoch = epoch / 10
+  push_imm8 10
+  div
+  jmp epoch_div_loop
+
+epoch_reverse:
+  pop                       ; discard the zero epoch remainder
+
+  ; Copy digit_buf in reverse order (MSB first) to msg_buf
+  local_addr 368
+  load64                    ; count = digit_count (loop variable on stack)
+
+epoch_rev_loop:
+  ; TOS = remaining count
+  dup
+  push_imm8 0
+  cmp_eq
+  jnz epoch_rev_done        ; count == 0 -> done
+
+  ; index = count - 1
+  push_imm8 1
+  sub                       ; index (also becomes new count for next iteration)
+
+  ; load digit_buf[index]
+  dup
+  local_addr 320
+  add
+  load8                     ; digit_char
+
+  ; store at msg_buf[msg_pos]
+  local_addr 64
+  local_addr 344
+  load64
+  add
+  swap
+  store8
+
+  ; msg_pos++
+  local_addr 344
+  dup
+  load64
+  push_imm8 1
+  add
+  store64
+
+  jmp epoch_rev_loop
+
+epoch_rev_done:
+  pop                       ; discard the zero count
+
+epoch_done:
+  ; ============================================================
+  ; Phase D: call ed25519_verify
+  ; ============================================================
+  ; ed25519_verify(public_key, msg_ptr, msg_len, sig_ptr) -> 1=valid
+  push_arg 1
+  load64                    ; public_key ptr (struct offset 0)
+  local_addr 64             ; msg = &msg_buf
+  local_addr 344
+  load64                    ; msg_len = msg_pos
+  local_addr 0              ; sig = &sig_decoded
+  push_imm8 4               ; argc
+  push_arg 0                ; &VmExternals
+  push_imm8 72              ; offset 72 = ed25519_verify
+  add
+  load64
+  n_call_ptr                ; -> 1 valid, 0 invalid
+  halt
+
+fail:
+  push_imm8 0
+  halt

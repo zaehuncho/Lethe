@@ -1,0 +1,42 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.codex-test-tmp*/
+.test-tmp*/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.ppk
+*.jks
+*.keystore
+*.crt
+*.cer
+
+# Generated bounty challenge artifact (safe to share, but not a repo file)
+challenge.json
+
+# Build outputs (CMake, Nuitka, MSVC, regenerable sample fixtures under */build/)
+build/
+*.log
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.tlog
+
+# OS cruft
+Thumbs.db
+.DS_Store

@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: |
+          python -m pip install uv==0.11.29
+          uv sync --frozen --group dev
+      - name: Core Python tests
+        run: uv run pytest -q -p no:cacheprovider --ignore=tests/test_lifter.py
+      - name: Lifter oracle tests
+        # Unicorn uses handled Windows access violations internally. Pytest's
+        # faulthandler turns those into megabytes of false-fatal diagnostics.
+        run: uv run pytest tests/test_lifter.py -q -p no:cacheprovider -p no:faulthandler
+
+  native-roundtrip:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: |
+          python -m pip install uv==0.11.29
+          uv sync --frozen --group dev
+      - name: Build native stub without modifying tracked prebuilt files
+        shell: powershell
+        run: >-
+          .\stub\build_stub.ps1 -Clean -Config Release
+          -ShuffleSeed 00112233445566778899aabbccddeeff
+      - name: Build shard bootstrap
+        shell: powershell
+        run: |
+          cmake -S bootstrap -B bootstrap/build -G "Visual Studio 17 2022" -A x64
+          cmake --build bootstrap/build --config Release
+      - name: Build native fixtures
+        shell: powershell
+        run: .\tests\build_samples.ps1
+      - name: EXE and DLL round trips using freshly built stub
+        shell: powershell
+        run: >-
+          .\tests\roundtrip.ps1
+          -StubPath .\stub\build\Release\lethe_stub_x64.dll
+          -PythonExe .\.venv\Scripts\python.exe
+      - name: Generated source must remain unchanged
+        run: git diff --exit-code -- daedalus/daedalus_opcodes_shuffled.py stub/prebuilt
+      - name: Public release policy
+        run: .\.venv\Scripts\python.exe .\tools\release_check.py

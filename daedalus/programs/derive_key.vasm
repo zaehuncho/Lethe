@@ -1,0 +1,80 @@
+; Contract: STATUS — 0=success, nonzero=error
+; DVM_PROG_DERIVE_KEY -- replaces crypto_derive_key()
+;
+; args[0] = pi          (const PackInfo *)
+; args[1] = image_base  (const void *)
+; args[2] = out_key     (uint8_t[32])
+; locals: [0..31] digest   [32..63] mask   [64..75] info ("Lethe-v1")
+; data:   [0..11] info_enc = "Lethe-v1" XOR 0xA5
+;
+; PackInfo offsets: stub_text_rva=160  stub_text_size=164
+;                   kdf_salt=144       aes_key_enc=112
+
+.data
+  info_enc: db 0x2F, 0x99, 0xA4, 0x52, 0x37, 0x10, 0xC8, 0x41, 0xB4, 0xAF, 0xDA, 0xF6
+
+.code
+  ; -- copy info_enc -> local info buffer --
+  local_addr 64
+  data_addr 0
+  push_imm8 12
+  n_copy_mem
+
+  ; -- decrypt info: XOR with 0xA5 -> "Lethe-v1" --
+  local_addr 64
+  push_imm8 12
+  push_imm8 0xA5
+  n_xor_const
+
+  ; -- SHA256(text_section) -> digest --
+  push_arg 1
+  push_arg 0
+  push_imm32 160
+  add
+  load32
+  add
+  push_arg 0
+  push_imm32 164
+  add
+  load32
+  local_addr 0
+  n_sha256
+  jnz error
+
+  ; -- HKDF(digest, salt, info) -> mask --
+  local_addr 0
+  push_imm8 32
+  push_arg 0
+  push_imm32 144
+  add
+  push_imm8 16
+  local_addr 64
+  push_imm8 12
+  local_addr 32
+  push_imm8 32
+  n_hkdf
+  jnz error
+
+  ; -- out_key = aes_key_enc ^ mask --
+  push_arg 2
+  push_arg 0
+  push_imm32 112
+  add
+  local_addr 32
+  push_imm8 32
+  n_xor_buf
+
+  ; -- cleanup and return success --
+  local_addr 0
+  push_imm8 76
+  n_zero_mem
+  push_imm8 0
+  halt
+
+error:
+  ; -- cleanup and return failure --
+  local_addr 0
+  push_imm8 76
+  n_zero_mem
+  push_imm8 1
+  halt

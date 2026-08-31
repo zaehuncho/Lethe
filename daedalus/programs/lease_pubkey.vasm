@@ -1,0 +1,29 @@
+; DVM_PROG_LEASE_PUBKEY -- virtualizes LeaseGate::leaseVerifyPublicKey()
+;
+; Copies the Ed25519 public key used for lease signature verification.
+; The raw 32-byte key is pre-decoded from base64 at assembly time and
+; embedded in the .data section.
+;
+; Base64 source: "nKx5ximQYHX1/eMB9m7tzcPtO/gtSBIaCDd4BiT4itw="
+;
+; args[0] = out_buf   (uint8_t*, caller-allocated, >= 32 bytes)
+; locals:  (none)
+; data:    [0..31] raw Ed25519 public key (32 bytes)
+; Contract: STATUS — 0=success, nonzero=error
+; return:  halt 0 (always succeeds)
+
+.data
+  pubkey: db 0x9C, 0xAC, 0x79, 0xC6, 0x29, 0x90, 0x60, 0x75
+  db 0xF5, 0xFD, 0xE3, 0x01, 0xF6, 0x6E, 0xED, 0xCD
+  db 0xC3, 0xED, 0x3B, 0xF8, 0x2D, 0x48, 0x12, 0x1A
+  db 0x08, 0x37, 0x78, 0x06, 0x24, 0xF8, 0x8A, 0xDC
+
+.code
+  ; copy 32 raw key bytes from data section to caller buffer
+  push_arg 0              ; dst = out_buf
+  data_addr 0             ; src = &pubkey_data
+  push_imm8 32            ; len = 32
+  n_copy_mem
+
+  push_imm8 0             ; success
+  halt
