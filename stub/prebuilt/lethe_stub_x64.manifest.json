@@ -1,0 +1,18 @@
+{
+    "schema":  1,
+    "artifact":  "lethe_stub_x64.dll",
+    "sha256":  "8c70a6811e9dc44e0d03b718c0e8a89932bcccd8d0ddbc59465bf9c729152a19",
+    "size_bytes":  65024,
+    "source_commit":  "a14d5a10d6b16483f5f686ccbb89407015facd25",
+    "source_dirty":  false,
+    "configuration":  "Release",
+    "cmake_generator":  "Visual Studio 17 2022",
+    "cmake_version":  "4.4.0",
+    "python_version":  "3.12.10",
+    "dvm_shuffle_seed":  "00112233445566778899aabbccddeeff",
+    "dvm_rolling":  false,
+    "memguard_kalypso":  true,
+    "native_roundtrip":  "passed-9-of-9",
+    "validation_utc":  "2026-08-31T22:15:42.5108994Z",
+    "provenance_status":  "clean"
+}
