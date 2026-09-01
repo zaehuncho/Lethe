@@ -52,13 +52,6 @@ target_link_options(lethe_stub_x64 PRIVATE
     /EXPORT:daedalus_x64_enter_common
 )
 
-# Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer),
-# lower warning level (we don't own this code).
-set_source_files_properties(src/miniz.c PROPERTIES
-    COMPILE_OPTIONS "/W3;/WX-"
-    COMPILE_DEFINITIONS "LETHE_FREESTANDING_ALLOC;MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
-)
-
 # Key-binding integrity: the builder hashes .text to derive the AES key.
 # /guard:cf inserts extra call-site checks that change .text content and
 # require relocations inside .text, breaking both the hash and the
@@ -74,6 +67,15 @@ else()
         COMPILE_OPTIONS "/W4;/WX;/GS-;/Oi;/O2"
     )
 endif()
+
+# Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer).
+# Apply this after the shared C-source properties so its warning policy is not
+# overwritten. NDEBUG is source-local and mandatory because the stub is linked
+# without the CRT, so assert() must never emit _wassert references.
+set_source_files_properties(src/miniz.c PROPERTIES
+    COMPILE_OPTIONS "/W3;/WX-;/GS-;/Oi;/O2"
+    COMPILE_DEFINITIONS "NDEBUG;LETHE_FREESTANDING_ALLOC;MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+)
 
 # Strip /guard:cf that CMake may inject via CMAKE_C_FLAGS or toolchain files.
 foreach(_flag CMAKE_C_FLAGS CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_RELWITHDEBINFO)

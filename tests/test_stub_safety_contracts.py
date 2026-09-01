@@ -67,6 +67,18 @@ def test_cmake_sources_exist_and_rng_dependency_is_loader_resolved() -> None:
     assert "LoadLibraryA" not in crypto and "GetProcAddress" not in crypto
 
 
+def test_freestanding_miniz_disables_crt_assertions_after_shared_flags() -> None:
+    cmake = _read(STUB_ROOT / "CMakeLists.txt")
+    shared_flags = cmake.index("set_source_files_properties(${_C_SOURCES}")
+    miniz_flags = cmake.index("set_source_files_properties(src/miniz.c")
+    miniz_block = cmake[miniz_flags:cmake.index("\n)", miniz_flags) + 2]
+
+    assert shared_flags < miniz_flags
+    assert "NDEBUG" in miniz_block
+    assert "LETHE_FREESTANDING_ALLOC" in miniz_block
+    assert "/W3;/WX-;/GS-;/Oi;/O2" in miniz_block
+
+
 def test_memguard_relocation_recipe_is_staged_fail_closed() -> None:
     header = _read(SRC / "stub_hooks.h")
     guard = _read(SRC / "memguard.c")
