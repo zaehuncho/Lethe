@@ -11,7 +11,7 @@ builder (`packer/`) handle, so real packed EXEs still run.*
 | Base relocations (`.reloc`) | **OK** | `apply_relocs` handles `DIR64`/`ABSOLUTE`; eager + memguard-deferred passes, filtered by exec/non-exec (`pe_loader.c:446`, applied `:884`). |
 | Imports (normal IAT) | **OK** | Import blob resolved at load; import elision hides the table. |
 | **Forwarded exports** | **EXPERIMENTAL** | Runtime resolution exists, but packed DLLs are not release-approved and static consumers cannot resolve the encrypted export table before `DllMain`. |
-| TLS callbacks + data | **OK WITH SCOPE LIMITS** | The protected template (up to 4096 bytes) and callback RVA recipe persist for the module lifetime. The main thread receives `PROCESS_ATTACH`/`PROCESS_DETACH`; threads created after unpack receive a fresh template followed by `THREAD_ATTACH`, then `THREAD_DETACH` before their reserved block is wiped. A packed DLL loaded with `LoadLibrary` does **not** retrofit protected TLS into threads that already existed before the load. Abrupt `TerminateThread`/`TerminateProcess` does not deliver detach callbacks. |
+| TLS callbacks + data | **OK WITH SCOPE LIMITS** | The protected template (up to 4096 bytes) and callback RVA recipe persist for the module lifetime. The main thread receives `PROCESS_ATTACH`/`PROCESS_DETACH`; threads created after unpack receive a fresh template followed by `THREAD_ATTACH`, then `THREAD_DETACH` before their reserved block is wiped. For a dynamically loaded DLL, pre-existing threads receive the native raw TLS initializer from the outer anchor without a synthetic `THREAD_ATTACH`, matching Windows. That initializer is necessarily loader-visible plaintext. Abrupt `TerminateThread`/`TerminateProcess` does not deliver detach callbacks. |
 | Exceptions (x64 `.pdata`) | **OK** | `RtlAddFunctionTable(pdata_rva, pdata_count)` so C++/SEH unwinding works after unpack (`:912`). |
 | Resources (`.rsrc`) | **OK** | Preserved **plaintext** at `rsrc_rva` so `FindResource`/dialogs/version-info/manifest work (`payload.py:348`). |
 | Section page protections | **OK** | Per-section `VirtualProtect`, **never RWX** ("drop W when X", `:41, :984`) — good for AV posture too. |
@@ -25,7 +25,7 @@ builder (`packer/`) handle, so real packed EXEs still run.*
 ## Top compatibility risks (ranked)
 
 1. **DLL initialization and static exports.** Full unpacking can load dependencies under loader lock, and the original export table is unavailable to static import resolution before `DllMain`. DLL mode is therefore experimental and prohibited for releases.
-2. **Pre-existing threads and dynamically loaded packed DLLs.** The loading thread and workers created after `LoadLibrary` are covered. Threads that predate the load retain the anchor's zero template and must not call protected TLS-using exports; their later detach does not synthesize a callback that never attached.
+2. **Static TLS confidentiality.** Windows must read a DLL's raw TLS initializer before its entry point, including for threads that predate `LoadLibrary`. Lethe mirrors up to 4096 bytes into the outer TLS anchor for correctness; do not treat that initializer as encrypted payload data.
 3. **Delay-load imports (UNVERIFIED).** Build a sample that delay-loads a DLL, pack it, and confirm the delayed call resolves at runtime.
 4. **TLS > 4096 bytes** is refused rather than emitted as a broken artifact. Forced thread/process termination also bypasses detach callbacks, matching Windows notification semantics.
 5. **Load-config preservation is not implemented.** Every input carrying a load-config directory, including GuardCF inputs, is rejected before packing until the emitted directory, guard-pointer initialization, and runtime target registration are proven.
@@ -33,7 +33,7 @@ builder (`packer/`) handle, so real packed EXEs still run.*
 ## Verification still owed
 
 - Force a nonzero relocation delta and exercise anti-debug/memory-guard variants on supported Windows versions.
-- Round-trip `/DELAYLOAD`, large-TLS, and resource-heavy EXE fixtures. Native EXE and DLL callback fixtures now cover the loading/main thread plus a worker created after unpack/`LoadLibrary`; they deliberately do not claim pre-existing-thread coverage.
+- Round-trip `/DELAYLOAD`, large-TLS, and resource-heavy EXE fixtures. Native EXE and DLL callback fixtures cover the loading/main thread, a worker created after unpack/`LoadLibrary`, and a thread predating dynamic DLL load.
 - Redesign DLL initialization outside loader lock and add both static-import and dynamic-load hosts before promoting DLL support.
 
 ## TLS and anti-dump visibility

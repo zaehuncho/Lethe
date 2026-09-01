@@ -249,6 +249,19 @@ def test_generated_dvm_provenance_binds_seed_and_native_map(tmp_path: Path) -> N
         promote_stub.inspect_generated_dvm_provenance(tmp_path, seed)
 
 
+def test_promotion_pins_nonincremental_link_and_inspects_aligned_veneers() -> None:
+    source = Path(promote_stub.__file__).read_text(encoding="utf-8")
+
+    assert "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO" in source
+    assert 'required_link = ("/Brepro", "/INCREMENTAL:NO")' in source
+    assert "def inspect_stub_entrypoints(" in source
+    assert 'image.find_export_rva("StubExeEntry")' in source
+    assert 'image.find_export_rva("StubDllMain")' in source
+    assert "rva % 16" in source
+    assert "veneer[0] != 0xE9" in source
+    assert "terminator != 0" in source
+
+
 def test_legacy_build_script_cannot_update_tracked_prebuilt() -> None:
     source = (promote_stub.ROOT / "stub" / "build_stub.ps1").read_text(encoding="utf-8")
 

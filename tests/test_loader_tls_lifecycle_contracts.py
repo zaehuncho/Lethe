@@ -233,6 +233,18 @@ def test_tls_alignment_is_authenticated_and_emitted_on_outer_directory() -> None
     assert "__declspec(align(64))" in SAMPLE_DLL
 
 
+def test_outer_tls_anchor_preseeds_native_template_for_existing_threads() -> None:
+    assembler = (ROOT / "packer" / "assemble.py").read_text(encoding="utf-8")
+
+    assert "_STUB_TLS_PROTECTED_CAPACITY = 4096" in assembler
+    assert "source TLS initializer" in assembler
+    assert "pe_analyze._slice_at_rva(" in assembler
+    assert "anchor_start_va, anchor_end_va" in assembler
+    assert "img.write(anchor_start_rva, bytes(_STUB_TLS_PROTECTED_CAPACITY))" in assembler
+    assert "img.write(anchor_start_rva, source_template)" in assembler
+    assert "threads that predate LoadLibrary" in assembler
+
+
 def test_stub_tracks_encoded_null_oep_and_attach_rejection_explicitly() -> None:
     stash = _function(STUB_MAIN, "__declspec(noinline) static int stash_oep(",
                       "__declspec(noinline) static uint32_t invoke_exe_oep(")
@@ -252,7 +264,8 @@ def test_stub_tracks_encoded_null_oep_and_attach_rejection_explicitly() -> None:
 def test_loader_audit_states_exact_tls_support_boundary() -> None:
     assert "OK WITH SCOPE LIMITS" in AUDIT
     assert "threads created after unpack" in AUDIT
-    assert "does **not** retrofit protected TLS" in AUDIT
+    assert "pre-existing threads receive the native raw TLS initializer" in AUDIT
+    assert "loader-visible plaintext" in AUDIT
     assert "TerminateThread" in AUDIT
     assert "TerminateProcess" in AUDIT
     assert "ERROR_BAD_EXE_FORMAT" in AUDIT

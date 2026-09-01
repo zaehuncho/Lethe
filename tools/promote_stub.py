@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tomllib
@@ -277,15 +278,70 @@ def inspect_cmake_toolchain(build_dir: Path) -> dict[str, str]:
     combined_compile = f"{c_flags} {release_flags}"
     if any(flag.lower() not in combined_compile.lower() for flag in required_compile):
         raise PromotionError("fresh stub build is not enforcing /W4 /WX /Brepro")
-    if "/brepro" not in shared_link_flags.lower():
-        raise PromotionError("fresh stub link is not enforcing /Brepro")
+    required_link = ("/Brepro", "/INCREMENTAL:NO")
+    if any(flag.lower() not in shared_link_flags.lower() for flag in required_link):
+        raise PromotionError(
+            "fresh stub link is not enforcing /Brepro /INCREMENTAL:NO")
     return {
         "cmake_generator": generator,
         "cmake_platform": platform,
         "compiler_id": compiler_id,
         "compiler_version": compiler_version,
         "compile_policy": "/W4 /WX /Brepro",
-        "link_policy": "/Brepro",
+        "link_policy": "/Brepro /INCREMENTAL:NO",
+    }
+
+
+def inspect_stub_entrypoints(stub: Path) -> dict[str, int | str]:
+    from packer import assemble
+
+    image = assemble._StubImage(stub.read_bytes())
+    executable = 0x20000000
+
+    def validate_veneer(rva: int | None, name: str) -> int:
+        if rva is None or rva <= 0 or rva % 16:
+            raise PromotionError(f"{name} is missing or not 16-byte aligned")
+        section = image.section_containing(rva)
+        if section is None or not section.characteristics & executable:
+            raise PromotionError(f"{name} is outside executable stub code")
+        veneer = image.read_at_rva(rva, 5)
+        if len(veneer) != 5 or veneer[0] != 0xE9:
+            raise PromotionError(f"{name} is not a direct rel32 veneer")
+        destination = rva + 5 + struct.unpack_from("<i", veneer, 1)[0]
+        target_section = image.section_containing(destination)
+        if target_section is None or not target_section.characteristics & executable:
+            raise PromotionError(f"{name} veneer destination is not executable")
+        return destination
+
+    exe_rva = image.find_export_rva("StubExeEntry")
+    dll_rva = image.find_export_rva("StubDllMain")
+    exe_target = validate_veneer(exe_rva, "StubExeEntry")
+    dll_target = validate_veneer(dll_rva, "StubDllMain")
+
+    tls_rva, tls_size = image.dir(assemble.DIR_TLS)
+    if tls_rva <= 0 or tls_size < 40:
+        raise PromotionError("stub has no complete TLS anchor directory")
+    callbacks_va = struct.unpack_from("<Q", image.read_at_rva(tls_rva, 40), 24)[0]
+    if not image.image_base <= callbacks_va < image.image_base + 0x1_0000_0000:
+        raise PromotionError("stub TLS callback array VA is outside the image")
+    callbacks_rva = callbacks_va - image.image_base
+    first_va, terminator = struct.unpack(
+        "<QQ", image.read_at_rva(callbacks_rva, 16))
+    if not image.image_base <= first_va < image.image_base + 0x1_0000_0000:
+        raise PromotionError("stub TLS callback VA is outside the image")
+    if terminator != 0:
+        raise PromotionError("stub TLS callback array is not singly terminated")
+    tls_callback_rva = first_va - image.image_base
+    tls_target = validate_veneer(tls_callback_rva, "TLS anchor callback")
+
+    return {
+        "artifact_sha256": sha256_file(stub),
+        "stub_exe_entry_rva": exe_rva,
+        "stub_exe_target_rva": exe_target,
+        "stub_dll_entry_rva": dll_rva,
+        "stub_dll_target_rva": dll_target,
+        "tls_callback_rva": tls_callback_rva,
+        "tls_callback_target_rva": tls_target,
     }
 
 
@@ -539,7 +595,7 @@ def execute(args: argparse.Namespace) -> Path | None:
             f"-DDVM_SHUFFLE_SEED={shuffle_seed}",
             "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
             "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
-            "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro",
+            "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO",
             "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
         ],
         name="fresh-cmake-configure",
@@ -560,6 +616,11 @@ def execute(args: argparse.Namespace) -> Path | None:
     if not built_stub.is_file():
         raise PromotionError(f"fresh build did not produce {built_stub}")
     artifact_hash = sha256_file(built_stub)
+    entrypoint_evidence_path = records_dir / "stub-entrypoints.json"
+    atomic_write_json(
+        entrypoint_evidence_path,
+        {"schema": 1, **inspect_stub_entrypoints(built_stub)},
+    )
     dvm_provenance = inspect_generated_dvm_provenance(build_dir, shuffle_seed)
 
     ctest_list = run_recorded(
@@ -676,6 +737,7 @@ def execute(args: argparse.Namespace) -> Path | None:
     shutil.copyfile(built_stub, staged_stub)
     _require_unchanged_artifact(staged_stub, artifact_hash, "staging copy")
     evidence_paths = [path for path, _record_item in records]
+    evidence_paths.append(entrypoint_evidence_path)
     evidence_paths.append(corpus_evidence_path)
     manifest = build_manifest(
         staged_stub=staged_stub,

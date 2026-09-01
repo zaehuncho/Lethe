@@ -41,7 +41,9 @@ RVA-bearing tables need rewriting:
 
 The output header carries the stub's import, base-reloc, and minimal TLS-anchor
 directories. The anchor lets Windows reserve a real static-TLS slot on every
-thread; the stub fills that block from the encrypted original TLS recipe.
+thread. Its loader-visible initializer mirrors the protected template so DLLs
+loaded after worker creation preserve native pre-existing-thread semantics; the
+authenticated recipe drives callbacks and later thread initialization.
 The original exception directory remains absent and is registered at runtime.
 """
 
@@ -108,6 +110,7 @@ IMAGE_REL_BASED_DIR64    = 10
 
 IMAGE_ORDINAL_FLAG64 = 0x8000000000000000
 MASK64 = (1 << 64) - 1
+_STUB_TLS_PROTECTED_CAPACITY = 4096
 
 # HKDF ``info`` strings are defined in container.py (the canonical ABI source);
 # use container.HKDF_INFO_CODEHASH / container.HKDF_INFO_SHARD here.
@@ -982,9 +985,47 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     tls_rva, tls_size = stub.dir(DIR_TLS)
     if tls_rva and (flags & container.FLAG_HAS_TLS):
         source_tls = _get(parsed, "tls")
+        source_raw_start = int(_get(source_tls, "raw_start_rva"))
+        source_raw_end = int(_get(source_tls, "raw_end_rva"))
+        source_zero_fill = int(_get(source_tls, "zero_fill", default=0))
         source_tls_characteristics = int(
             _get(source_tls, "characteristics", default=0))
-        img.write(tls_rva + graft_delta + 36,
+        if source_raw_end < source_raw_start:
+            raise AssembleError("source TLS raw-data range is reversed")
+        source_raw_size = source_raw_end - source_raw_start
+        source_total_size = source_raw_size + source_zero_fill
+        if source_total_size > _STUB_TLS_PROTECTED_CAPACITY:
+            raise AssembleError(
+                "source TLS template exceeds the stub anchor capacity")
+
+        grafted_tls_rva = tls_rva + graft_delta
+        anchor_start_va, anchor_end_va = struct.unpack(
+            "<QQ", img.read(grafted_tls_rva, 16))
+        if (anchor_start_va < out_base or anchor_end_va < anchor_start_va or
+                anchor_end_va - anchor_start_va < _STUB_TLS_PROTECTED_CAPACITY):
+            raise AssembleError("stub TLS anchor raw-data geometry is invalid")
+        anchor_start_rva = anchor_start_va - out_base
+        if (anchor_start_rva >= 0x1_0000_0000 or
+                not img.contains(anchor_start_rva,
+                                 _STUB_TLS_PROTECTED_CAPACITY)):
+            raise AssembleError("stub TLS anchor initializer is outside the graft")
+
+        source_template = b""
+        if source_raw_size:
+            source_template = pe_analyze._slice_at_rva(
+                _get(parsed, "sections"), source_raw_start, source_raw_size,
+                what="source TLS initializer")
+            if len(source_template) != source_raw_size:
+                raise AssembleError("source TLS initializer is truncated")
+
+        # Windows initializes static TLS for threads that predate LoadLibrary
+        # directly from this loader-visible range and sends them no THREAD_ATTACH.
+        # Preseed the protected portion so their first native TLS access matches
+        # the original DLL. Runtime state begins after this capacity and stays zero.
+        img.write(anchor_start_rva, bytes(_STUB_TLS_PROTECTED_CAPACITY))
+        if source_template:
+            img.write(anchor_start_rva, source_template)
+        img.write(grafted_tls_rva + 36,
                   struct.pack("<I", source_tls_characteristics))
     stub_entry_rva, stub_guard_targets = _grafted_stub_guard_targets(
         stub, img, graft_delta=graft_delta, image_base=out_base, is_dll=is_dll)
