@@ -416,7 +416,11 @@ def _print_summary(result, verbose: bool) -> None:
 # entry point
 # ---------------------------------------------------------------------------
 
-def main(argv: "list[str] | None" = None) -> int:
+def main(
+    argv: "list[str] | None" = None,
+    *,
+    _allow_unverified_stub_for_tests: bool = False,
+) -> int:
     args = build_parser().parse_args(argv)
 
     # Friendly pre-flight: a clear message beats a stack trace from the core.
@@ -518,6 +522,7 @@ def main(argv: "list[str] | None" = None) -> int:
         acknowledge_unproven_indirect_targets=(
             args.acknowledge_unproven_indirect_targets
         ),
+        _allow_unverified_stub_for_tests=_allow_unverified_stub_for_tests,
     )
 
     def _progress(line: str) -> None:

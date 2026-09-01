@@ -45,7 +45,9 @@ def test_native_server_shard_rejects_missing_and_wrong_gate(tmp_path,
     stub = _configured_fixture("LETHE_NATIVE_STUB_PATH")
     sample = _configured_fixture("LETHE_NATIVE_SAMPLE_EXE")
     packed = tmp_path / "sample_exe.sharded.exe"
-    options = PackOptions(server_shard=True, stub_path=str(stub))
+    options = PackOptions(
+        server_shard=True, stub_path=str(stub),
+        _allow_unverified_stub_for_tests=True)
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_SERVER_SHARD", "1")
 
     parsed = pe_analyze.analyze_pe(str(sample))
@@ -57,6 +59,7 @@ def test_native_server_shard_rejects_missing_and_wrong_gate(tmp_path,
         input_path=str(sample),
         options=options,
         stub_path=str(stub),
+        allow_unverified_stub_for_tests=True,
     )
     assert assembly.server_shard is not None
     structural = report.validate_packed(str(packed))

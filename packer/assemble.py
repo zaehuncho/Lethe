@@ -57,16 +57,19 @@ import tempfile
 import time
 import zlib
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 # --- container ABI (import only; never edit) -------------------------------
 if __package__:                         # normal: imported as ``packer.assemble``
-    from . import cfg_preservation, container, dll_preload, pe_analyze
+    from . import (cfg_preservation, container, dll_preload, pe_analyze,
+                   release_attestation)
 else:                                   # fallback: flat import / direct run
     import cfg_preservation  # type: ignore
     import container  # type: ignore
     import dll_preload  # type: ignore
     import pe_analyze  # type: ignore
+    import release_attestation  # type: ignore
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -683,71 +686,25 @@ def _release_manifest_path(stub_path: str) -> str:
 
 
 def _validate_release_stub_manifest(stub_path: str, blob: bytes) -> None:
-    """Require integrity and clean-source provenance for the bundled stub."""
-    manifest_path = _release_manifest_path(stub_path)
+    """Require a signed production attestation from a pinned release key."""
+    path = Path(stub_path).absolute()
+    if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(blob).digest():
+        raise AssembleError("release stub changed before attestation verification")
     try:
-        with open(manifest_path, "r", encoding="utf-8-sig") as manifest_file:
-            metadata = json.load(manifest_file)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise AssembleError(
-            f"release stub manifest is missing or invalid: {manifest_path}. "
-            "Stage a clean, fully gated candidate with tools/promote_stub.py.") from exc
-
-    digest = hashlib.sha256(blob).hexdigest()
-    if metadata.get("schema") != 1:
-        raise AssembleError("release stub manifest has an unsupported schema")
-    if metadata.get("artifact") != os.path.basename(stub_path):
-        raise AssembleError("release stub manifest names a different artifact")
-    if metadata.get("size_bytes") != len(blob):
-        raise AssembleError("release stub size does not match its manifest")
-    if metadata.get("sha256") != digest:
-        raise AssembleError("release stub SHA-256 does not match its manifest")
-    if metadata.get("provenance_status") != "clean" or metadata.get("source_dirty") is not False:
-        raise AssembleError(
-            "bundled stub provenance is not release-approved (requires "
-            "provenance_status='clean' and source_dirty=false). Build a fresh "
-            "candidate and pass --stub-path for validation, or stage one with "
-            "tools/promote_stub.py.")
-    if metadata.get("native_roundtrip") != "passed-9-of-9":
-        raise AssembleError(
-            "bundled stub is missing the compatibility round-trip marker; "
-            "stage it through tools/promote_stub.py.")
-
-    actual = metadata.get("native_roundtrip_actual")
-    if not isinstance(actual, dict):
-        raise AssembleError("bundled stub has no actual native round-trip counts")
-    passed = actual.get("passed")
-    total = actual.get("total")
-    if (type(passed) is not int or type(total) is not int or
-            total < 1 or passed != total):
-        raise AssembleError("bundled stub native round-trip is not a full N/N pass")
-    if metadata.get("production_scope") != "all":
-        raise AssembleError("bundled stub is not approved by the all-scope production gate")
-
-    def valid_hex(value, length=None):
-        return (isinstance(value, str) and value and
-                (length is None or len(value) == length) and
-                all(char in "0123456789abcdef" for char in value))
-
-    seed = metadata.get("dvm_shuffle_seed")
-    if not valid_hex(seed) or len(seed) % 2:
-        raise AssembleError("bundled stub has no valid generated DVM shuffle seed")
-    for field in (
-            "dvm_opcode_mapping_sha256",
-            "dvm_handler_variant_sha256",
-            "dvm_python_map_sha256",
-            "dvm_native_map_sha256"):
-        if not valid_hex(metadata.get(field), 64):
-            raise AssembleError(f"bundled stub has no valid {field}")
+        release_attestation.verify_release_bundle(path)
+    except (OSError, release_attestation.ReleaseAttestationError) as exc:
+        raise AssembleError(f"bundled stub release attestation is invalid: {exc}") from exc
 
 
 def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
-               expected_sha256: Optional[str] = None) -> _StubImage:
+               expected_sha256: Optional[str] = None,
+               allow_unverified_stub_for_tests: bool = False) -> _StubImage:
     if not os.path.isfile(stub_path):
         raise AssembleError(
             f"prebuilt stub not found: {stub_path}\n"
             "Build a validation stub with stub/build_stub.ps1 and pass it via "
-            "--stub-path, or stage a release candidate with tools/promote_stub.py.")
+            "--stub-path. Implicit/default use requires a separately attested "
+            "production release.")
     with open(stub_path, "rb") as stub_file:
         blob = stub_file.read()
     if expected_sha256 is not None:
@@ -760,6 +717,14 @@ def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
                 "stub changed after virtualization geometry was computed")
     if require_release_manifest:
         _validate_release_stub_manifest(stub_path, blob)
+    else:
+        if not allow_unverified_stub_for_tests:
+            try:
+                release_attestation.validate_candidate_identity(Path(stub_path))
+            except (OSError, release_attestation.ReleaseAttestationError) as exc:
+                raise AssembleError(
+                    "explicit stub is not a verified candidate bundle; raw native "
+                    "stubs require the test-only opt-out") from exc
 
     # Mandated: load + validate with LIEF. We keep the LIEF surface tiny (parse
     # only) and do field extraction with the version-stable raw reader below,
@@ -808,7 +773,8 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
                     input_path: Optional[str] = None,
                     options=None,
                     stub_path: Optional[str] = None,
-                    expected_stub_sha256: Optional[str] = None) -> AssembleResult:
+                    expected_stub_sha256: Optional[str] = None,
+                    allow_unverified_stub_for_tests: bool = False) -> AssembleResult:
     """Assemble and write the packed output PE. Raises ``AssembleError`` on any
     unrecoverable problem (the orchestrator turns that into ``PackResult.ok=False``)."""
     # -- pull the semantic inputs (tolerant to field-name drift) -------------
@@ -839,7 +805,8 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     resolved_stub_path = stub_path or _default_stub_path()
     stub = _load_stub(
         resolved_stub_path, require_release_manifest=(stub_path is None),
-        expected_sha256=expected_stub_sha256)
+        expected_sha256=expected_stub_sha256,
+        allow_unverified_stub_for_tests=allow_unverified_stub_for_tests)
     stub_packinfo_rva = stub.find_packinfo_rva()
     stub_packinfo_header = stub.read_at_rva(stub_packinfo_rva, 12)
     if len(stub_packinfo_header) != 12:

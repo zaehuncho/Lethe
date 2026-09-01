@@ -39,7 +39,7 @@ $BuildDir   = if ($BuildDir) {
 } else {
     Join-Path $TestsDir 'build'
 }
-$Orionpack  = Join-Path $PackerRoot 'lethe.py'
+$Orionpack  = Join-Path $TestsDir '_lethe_test_cli.py'
 
 if (-not $PythonExe) {
     $VenvPython = Join-Path $PackerRoot '.venv\Scripts\python.exe'

@@ -96,5 +96,5 @@ jobs:
           -EvidencePath .\tests\production-build\production-evidence.json
       - name: Generated source must remain unchanged
         run: git diff --exit-code -- daedalus/daedalus_opcodes_shuffled.py stub/prebuilt
-      - name: Public release policy
-        run: .\.venv\Scripts\python.exe .\tools\release_check.py
+      - name: Validate production matrix contract
+        run: .\.venv\Scripts\python.exe .\tools\production_gate.py --validate-only

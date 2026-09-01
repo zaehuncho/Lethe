@@ -747,6 +747,7 @@ def _pack(source: Path, stub: Path, output: Path, *,
             anti_debug=anti_debug,
             memory_guard=memory_guard,
             process_hardening=process_hardening,
+            _allow_unverified_stub_for_tests=True,
         ),
     )
     assert result.ok, result.error

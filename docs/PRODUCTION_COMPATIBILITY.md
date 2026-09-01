@@ -35,11 +35,17 @@ guarded DLL lifecycle fixtures:
   loaded by that call, explicitly unloaded, and clean over eight reloads.
 
 The DLL lane is no longer blocked on ordinary exports, static consumers,
-loader-preloaded dependencies, TLS, x64 unwind, offset-root resources, or
-DLL delay-load. It remains non-release while the matrix records hardening,
-provenance, and clean-VM rows as non-proven. Generated virtualization thunk
-GFIDs remain fail-closed for XFG-enabled sources because the planner does not
-synthesize the source-compatible 8-byte XFG function hash.
+loader-preloaded dependencies, TLS, x64 unwind, offset-root resources, DLL
+delay-load, or compatibility-preserving anti-dump metadata sanitization. The
+matrix now records process policy, anti-debug, and native executable-page memory
+guard separately: local evidence advances those rows without implying that one
+hardening mode proves the others. Candidate staging binds the complete opt-in
+hardening pytest file to the exact fresh stub hash and rejects skips or partial
+passes. DLL release remains blocked on native anti-debug host behavior,
+provenance, and clean-VM evidence. Selected-function virtualization now keeps
+the original GFID/XFG identity at the source RVA and reaches its generated thunk
+only through the direct entry `E9`; the thunk is never declared as a generated
+GFID. Crafted generated-thunk GFIDs remain fail-closed.
 
 The harness captures the packer's stdout and stderr independently. Runtime
 stdout, stderr, and exit code are recorded in JSON even when the packed process
@@ -70,3 +76,32 @@ and stub hashes. Release approval additionally requires the clean-VM, signing,
 scanner, and application-workflow evidence named in the matrix. The gate must
 remain red until those records exist; changing a status without supplying its
 named evidence is not a valid release action.
+
+Candidate and production release identity are separate. The candidate manifest
+hashes a frozen candidate matrix and promotion evidence. A detached Ed25519
+attestation later binds that candidate, the current green release matrix, the
+release-source commit, and every external evidence record. The verifier trusts
+only active public keys pinned in `packer/release_trust.json` and re-evaluates
+the all-scope gate with the bundled native evidence. Scanner, clean-VM, and
+application documents also require detached Ed25519 provider attestations from
+non-revoked keys authorized by evidence kind in `packer/evidence_trust.json`.
+That separate policy requires accepted Authenticode signer and
+timestamp-authority thumbprints; its checked-in empty state blocks
+production release. Authenticode, scanner, and
+application evidence is subject-bound to the actual packed output and records
+which candidate stub protected it; signing never masquerades as an unchanged
+candidate-DLL hash. Release signing first snapshots every input and performs a
+clean Git-archive rebuild with the candidate's exact seed and toolchain; the
+rebuilt DLL must be byte-identical and must pass replayed CTest, native runtime
+hardening, EXE/DLL roundtrip, and production-corpus gates. External evidence
+uses one shared subject registry that includes both an AMD64 PE32+ EXE and DLL.
+Every subject must pass independently replayed Windows Authenticode validation,
+Defender plus an independent scan, at least two application workflows, and the
+four declared clean-VM cells with machine-image, state, and runner identities.
+Provider signatures bind each canonical document plus its declared hashes.
+Portable contained paths retain the packed subjects, pack reports, protection
+profiles, per-engine scanner output and receipts, per-cell VM logs, and
+structured application result/log pairs so the producer and verifier both
+rehash the underlying evidence.
+Release-signing and evidence-provider key IDs are required to be disjoint,
+including revoked entries, preventing accidental reuse across trust roles.

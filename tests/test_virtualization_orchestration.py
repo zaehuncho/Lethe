@@ -41,7 +41,8 @@ def test_candidate_manifest_uses_dll_adjacent_name_not_promoted_stem(tmp_path):
     promoted_name.write_text("not candidate provenance", encoding="utf-8")
 
     loaded, digest, table, handler_hash, rolling = (
-        orchestrator._load_virtualization_build(str(stub))
+        orchestrator._load_virtualization_build(
+            str(stub), allow_unverified_stub_for_tests=True)
     )
 
     assert loaded == stub_bytes
@@ -56,7 +57,7 @@ def test_promoted_stem_manifest_is_not_silently_used_for_candidate(tmp_path):
     stub.write_bytes(b"stub")
     stub.with_suffix(".manifest.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"\.dll\.manifest\.json"):
+    with pytest.raises(ValueError, match="verified candidate"):
         orchestrator._load_virtualization_build(str(stub))
 
 
@@ -81,7 +82,8 @@ def test_candidate_manifest_rejects_invalid_provenance(
         json.dump(manifest, stream)
 
     with pytest.raises(ValueError, match=expected):
-        orchestrator._load_virtualization_build(str(stub))
+        orchestrator._load_virtualization_build(
+            str(stub), allow_unverified_stub_for_tests=True)
 
 
 def test_assembler_rejects_stub_changed_after_geometry_pin(tmp_path):
@@ -192,6 +194,7 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
                     0x1000, 0x1004, 0x2000, "known tail target"),
             ),
             acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
         ),
         progress.append,
     )
@@ -257,6 +260,7 @@ def test_core_rejects_rolling_stub_for_production_paging(monkeypatch, tmp_path):
                 orchestrator.VirtualizationSpec("Init", 0x1000, 16),
             ),
             acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
         ),
     )
     assert not result.ok

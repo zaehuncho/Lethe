@@ -332,7 +332,6 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
         virtualize, "materialize_selected_functions", capture_materialization
     )
     monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
-    monkeypatch.setenv("LETHE_ALLOW_UNVERIFIED_STUB_FOR_TESTS", "1")
     packed = tmp_path / "real_xfg.packed.exe"
     result = orchestrator.pack_file(
         str(real_msvc_xfg_image),
@@ -347,6 +346,7 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
             ),
             virtualization_gap_acknowledgements=gap_acknowledgements,
             acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
         ),
     )
     assert result.ok, result.error

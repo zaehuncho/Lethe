@@ -76,9 +76,14 @@ The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packin
 itself needs **no compiler**. Ordinary native builds stay under `stub/build` and
 do not overwrite the tracked prebuilt. See
 [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) before promotion.
-The adjacent manifest pins the tracked DLL's hash and provenance. Default packing
-fails closed unless that manifest records a matching clean-source build; use
-`--stub-path` while validating an unpromoted candidate.
+The adjacent schema-2 manifest pins the tracked DLL's candidate hash and
+provenance. Default packing additionally requires a detached Ed25519 release
+attestation whose signer is active in `packer/release_trust.json`, whose current
+release matrix is green, and whose external provider attestations verify under
+`packer/evidence_trust.json`. Both checked-in trust stores start empty and keep
+production use fail-closed until reviewed public identities are pinned.
+A locally staged `candidate-verified` bundle never satisfies that default-use
+contract; pass its exact `--stub-path` while validating it.
 
 ## CLI
 

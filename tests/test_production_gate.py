@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tools import pe_feature_probe, production_gate
+from tools import pe_feature_probe, production_gate, release_check
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,10 +27,27 @@ def test_repository_matrix_is_valid_and_explicitly_red() -> None:
     assert {item["id"] for item in all_result["blockers"]} >= {
         "mitigation.load_config_cfg_xfg",
         "virtualization.selected_functions",
-        "hardening.runtime_layers",
+        "hardening.process_policy",
+        "hardening.antidebug",
+        "hardening.memory_guard_native",
         "provenance.fresh_native_stub",
         "release.clean_vm_matrix",
     }
+
+
+def test_runtime_hardening_rows_have_independent_scope_and_maturity() -> None:
+    matrix = production_gate.load_matrix(MATRIX)
+    by_id = {feature["id"]: feature for feature in matrix["features"]}
+
+    assert "hardening.runtime_layers" not in by_id
+    assert by_id["hardening.antidump_metadata"]["status"] == "proven"
+    assert by_id["hardening.antidump_metadata"]["applies_to"] == ["exe", "dll"]
+    assert by_id["hardening.process_policy"]["status"] == "partial"
+    assert by_id["hardening.process_policy"]["applies_to"] == ["exe"]
+    assert by_id["hardening.antidebug"]["status"] == "experimental"
+    assert by_id["hardening.antidebug"]["applies_to"] == ["exe", "dll"]
+    assert by_id["hardening.memory_guard_native"]["status"] == "experimental"
+    assert by_id["hardening.memory_guard_native"]["applies_to"] == ["exe"]
 
 
 def test_json_cli_result_is_machine_readable(capsys: pytest.CaptureFixture[str]) -> None:
@@ -88,6 +105,15 @@ def test_validate_only_checks_contract_without_false_pass(
     payload = json.loads(capsys.readouterr().out)
     assert payload["validated_only"] is True
     assert payload["ready"] is False
+
+
+def test_public_release_check_does_not_treat_validate_only_as_readiness(
+) -> None:
+    errors: list[str] = []
+
+    release_check._check_production_matrix(errors, {"evidence": []})
+
+    assert errors and "independently evaluate" in errors[0]
 
 
 def test_required_non_proven_entry_needs_actionable_blocker(tmp_path: Path) -> None:

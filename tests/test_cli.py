@@ -58,6 +58,26 @@ def test_cli_defaults_are_release_safe():
     assert orchestrator.PackOptions().virtualization_gap_acknowledgements == ()
     assert orchestrator.PackOptions().virtualization_tail_exit_approvals == ()
     assert orchestrator.PackOptions().acknowledge_unproven_indirect_targets is False
+    assert orchestrator.PackOptions()._allow_unverified_stub_for_tests is False
+    assert "allow-unverified" not in lethe.build_parser().format_help()
+
+
+def test_unverified_stub_capability_is_internal_and_ignores_environment(
+        monkeypatch, tmp_path):
+    input_path = tmp_path / "input.exe"
+    input_path.write_bytes(b"test fixture")
+    observed = []
+
+    def fake_pack(_path, options, progress=None):
+        observed.append(options._allow_unverified_stub_for_tests)
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    monkeypatch.setenv("LETHE_ALLOW_UNVERIFIED_STUB_FOR_TESTS", "1")
+    assert lethe.main([str(input_path)]) == lethe.EXIT_OK
+    assert lethe.main(
+        [str(input_path)], _allow_unverified_stub_for_tests=True) == lethe.EXIT_OK
+    assert observed == [False, True]
 
 
 def test_virtualization_specs_accept_decimal_and_hex():

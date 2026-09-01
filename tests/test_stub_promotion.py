@@ -107,6 +107,58 @@ def test_roundtrip_evidence_requires_same_hash_and_full_summary() -> None:
         promote_stub.validate_roundtrip_record(red, digest)
 
 
+def test_command_environment_overrides_inherit_without_recording_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    monkeypatch.setenv("LETHE_TEST_SECRET_SENTINEL", "do-not-record")
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(promote_stub.subprocess, "run", fake_run)
+    record = promote_stub._run(
+        ["probe"],
+        name="environment-test",
+        source_commit="a" * 40,
+        env_overrides={
+            "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+            "LETHE_NATIVE_RUNTIME_STUB_PATH": r"C:\candidate\stub.dll",
+        },
+    )
+
+    assert captured["env"]["LETHE_TEST_SECRET_SENTINEL"] == "do-not-record"
+    assert captured["env"]["LETHE_RUN_NATIVE_RUNTIME_STRESS"] == "1"
+    assert captured["env"]["LETHE_NATIVE_RUNTIME_STUB_PATH"].endswith("stub.dll")
+    assert "do-not-record" not in json.dumps(record.__dict__, sort_keys=True)
+    assert os.environ["LETHE_TEST_SECRET_SENTINEL"] == "do-not-record"
+
+
+def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
+    digest = "a" * 64
+    passing = promote_stub.CommandRecord(
+        name="runtime-hardening",
+        argv=["python", "-m", "pytest"],
+        exit_code=0,
+        stdout="...                                                                      [100%]\n"
+               "3 passed in 42.00s\n",
+        stderr="",
+        source_commit="b" * 40,
+        artifact_sha256=digest,
+    )
+
+    assert promote_stub.validate_runtime_hardening_record(passing, digest) == 3
+    with pytest.raises(promote_stub.PromotionError, match="different artifact"):
+        promote_stub.validate_runtime_hardening_record(passing, "c" * 64)
+    skipped = promote_stub.CommandRecord(
+        **{**passing.__dict__, "stdout": "2 passed, 1 skipped in 1.00s\n"}
+    )
+    with pytest.raises(promote_stub.PromotionError, match="skipped"):
+        promote_stub.validate_runtime_hardening_record(skipped, digest)
+
+
 def test_corpus_evidence_is_bound_to_commit_and_artifact(tmp_path: Path) -> None:
     stub = tmp_path / "candidate.dll"
     stub.write_bytes(b"candidate")
@@ -166,6 +218,73 @@ def test_all_scope_gate_must_be_green() -> None:
         })
 
 
+def _known_candidate_gate() -> dict:
+    blockers = [
+        {"id": blocker_id, "status": status}
+        for blocker_id, status in promote_stub.CANDIDATE_ALLOWED_BLOCKERS.items()
+    ]
+    return {
+        "schema": 1,
+        "scope": "all",
+        "ready": False,
+        "blocker_count": len(blockers),
+        "blockers": blockers,
+    }
+
+
+def test_candidate_policy_matches_every_declared_nonproven_feature() -> None:
+    matrix = json.loads(promote_stub.PRODUCTION_MATRIX.read_text(encoding="utf-8"))
+    declared = {
+        feature["id"]: feature["status"]
+        for feature in matrix["features"]
+        if feature["required"] and feature["status"] != "proven"
+    }
+
+    assert declared == promote_stub.CANDIDATE_ALLOWED_BLOCKERS
+
+
+def test_candidate_gate_accepts_only_the_pinned_production_blockers() -> None:
+    blockers = promote_stub.validate_candidate_gate_payload(_known_candidate_gate())
+
+    assert blockers == [
+        {"id": blocker_id, "status": status}
+        for blocker_id, status in sorted(
+            promote_stub.CANDIDATE_ALLOWED_BLOCKERS.items())
+    ]
+
+    green = {
+        "schema": 1,
+        "scope": "all",
+        "ready": True,
+        "blocker_count": 0,
+        "blockers": [],
+    }
+    assert promote_stub.validate_candidate_gate_payload(green) == []
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda payload: payload["blockers"].append(
+            {"id": "loader.unknown", "status": "partial"}), "not candidate-eligible"),
+        (lambda payload: payload["blockers"].__setitem__(
+            0, {**payload["blockers"][0], "status": "evidence-missing"}),
+         "not candidate-eligible"),
+        (lambda payload: payload.__setitem__("blocker_count", 0), "count"),
+        (lambda payload: payload["blockers"].append(payload["blockers"][0]), "duplicate"),
+    ],
+)
+def test_candidate_gate_rejects_unknown_evidence_and_malformed_blockers(
+    mutate,
+    message: str,
+) -> None:
+    payload = _known_candidate_gate()
+    mutate(payload)
+
+    with pytest.raises(promote_stub.PromotionError, match=message):
+        promote_stub.validate_candidate_gate_payload(payload)
+
+
 def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
     tmp_path: Path,
 ) -> None:
@@ -177,7 +296,10 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
         staged_stub=staged_stub,
         source={
             "source_commit": "f" * 40,
-            "locked_files": {"uv.lock": "1" * 64},
+            "locked_files": {
+                "pyproject.toml": "0" * 64,
+                "uv.lock": "1" * 64,
+            },
         },
         host={
             "python_version": "3.12.10",
@@ -194,18 +316,26 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
             "link_policy": "/Brepro",
         },
         dvm_provenance={
-            "dvm_shuffle_seed": "00112233",
+            "dvm_shuffle_seed": "00" * 32,
             "dvm_opcode_mapping_sha256": "2" * 64,
             "dvm_handler_variant_sha256": "3" * 64,
             "dvm_python_map_sha256": "4" * 64,
             "dvm_native_map_sha256": "5" * 64,
+            "dvm_rolling": True,
+            "dvm_paged_runtime": True,
         },
         roundtrip_counts=(11, 11),
         ctest_count=4,
         evidence_paths=[evidence],
         stage_dir=tmp_path,
+        gate_payload=_known_candidate_gate(),
     )
 
+    assert manifest["schema"] == 2
+    assert manifest["artifact_status"] == "candidate-verified"
+    assert manifest["production_ready"] is False
+    assert manifest["candidate_scope"] == "all"
+    assert "production_scope" not in manifest
     assert manifest["native_roundtrip"] == "passed-9-of-9"
     assert manifest["native_roundtrip_actual"] == {"passed": 11, "total": 11}
     assert manifest["dvm_handler_variant_sha256"] == "3" * 64
@@ -213,10 +343,107 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
         "path": "evidence/roundtrip.json",
         "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
     }]
+    assert manifest["release_blockers"] == promote_stub.validate_candidate_gate_payload(
+        _known_candidate_gate())
+    assert manifest["production_matrix_sha256"] == promote_stub.sha256_file(
+        promote_stub.PRODUCTION_MATRIX)
+    assert manifest["promotion_tool_sha256"] == promote_stub.sha256_file(
+        Path(promote_stub.__file__))
+    assert manifest["candidate_policy_sha256"] == promote_stub.candidate_policy_sha256()
+
+
+def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_status(
+    tmp_path: Path,
+) -> None:
+    staged_stub = tmp_path / "lethe_stub_x64.dll"
+    staged_stub.write_bytes(b"candidate")
+    evidence_paths = []
+    for relative in sorted(promote_stub.REQUIRED_CANDIDATE_EVIDENCE):
+        evidence_path = tmp_path / relative
+        if relative.endswith("candidate-policy.json"):
+            promote_stub.atomic_write_json(
+                evidence_path, promote_stub.candidate_policy_payload())
+        elif relative.endswith("candidate-production-matrix.json"):
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_bytes(promote_stub.PRODUCTION_MATRIX.read_bytes())
+        elif relative.endswith("candidate-promoter.py"):
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_bytes(Path(promote_stub.__file__).read_bytes())
+        else:
+            promote_stub.atomic_write_json(evidence_path, {"ready": True})
+        evidence_paths.append(evidence_path)
+    promote_stub._record(
+        tmp_path / "evidence" / "runtime-hardening.json",
+        promote_stub.CommandRecord(
+            name="candidate-bound-native-runtime-hardening",
+            argv=[
+                "python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                str(promote_stub.ROOT / "tests" /
+                    "test_native_runtime_hardening_stress.py"),
+            ],
+            exit_code=0,
+            stdout="3 passed in 42.00s\n",
+            stderr="",
+            source_commit="f" * 40,
+            artifact_sha256=hashlib.sha256(staged_stub.read_bytes()).hexdigest(),
+        ),
+    )
+    evidence = tmp_path / "evidence" / "roundtrip.json"
+    manifest = promote_stub.build_manifest(
+        staged_stub=staged_stub,
+        source={
+            "source_commit": "f" * 40,
+            "locked_files": {
+                "pyproject.toml": "0" * 64,
+                "uv.lock": "1" * 64,
+            },
+        },
+        host={
+            "python_version": "3.12.10",
+            "uv_version": "0.11.29",
+            "cmake_version": "4.4.0",
+            "ctest_version": "4.4.0",
+        },
+        toolchain={
+            "cmake_generator": promote_stub.SUPPORTED_GENERATOR,
+            "cmake_platform": promote_stub.SUPPORTED_PLATFORM,
+            "compiler_id": "MSVC",
+            "compiler_version": "19.44.35219.0",
+            "compile_policy": "/W4 /WX /Brepro",
+            "link_policy": "/Brepro /INCREMENTAL:NO",
+        },
+        dvm_provenance={
+            "dvm_shuffle_seed": "00" * 32,
+            "dvm_opcode_mapping_sha256": "2" * 64,
+            "dvm_handler_variant_sha256": "3" * 64,
+            "dvm_python_map_sha256": "4" * 64,
+            "dvm_native_map_sha256": "5" * 64,
+            "dvm_rolling": True,
+            "dvm_paged_runtime": True,
+        },
+        roundtrip_counts=(11, 11),
+        ctest_count=4,
+        evidence_paths=evidence_paths,
+        stage_dir=tmp_path,
+        gate_payload=_known_candidate_gate(),
+    )
+    manifest_path = tmp_path / "lethe_stub_x64.manifest.json"
+    promote_stub.atomic_write_json(manifest_path, manifest)
+
+    evidence.write_text('{"ready": false}\n', encoding="utf-8")
+    with pytest.raises(promote_stub.PromotionError, match="evidence SHA-256"):
+        promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
+
+    promote_stub.atomic_write_json(evidence, {"ready": True})
+    manifest["artifact_status"] = "production-released"
+    manifest["production_ready"] = True
+    promote_stub.atomic_write_json(manifest_path, manifest)
+    with pytest.raises(promote_stub.PromotionError, match="candidate-verified"):
+        promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
 
 
 def test_generated_dvm_provenance_binds_seed_and_native_map(tmp_path: Path) -> None:
-    seed = "00112233"
+    seed = "00" * 32
     mapping = "a" * 64
     handlers = "b" * 64
     (tmp_path / "daedalus_opcodes_shuffled.py").write_text(
@@ -228,6 +455,10 @@ def test_generated_dvm_provenance_binds_seed_and_native_map(tmp_path: Path) -> N
     (tmp_path / "daedalus_opcodes_shuffled.h").write_text(
         f'#define DVM_OPCODE_MAPPING_SHA256 "{mapping}"\n'
         f'#define DVM_HANDLER_VARIANT_SHA256 "{handlers}"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "CMakeCache.txt").write_text(
+        "DVM_SHUFFLE_OPCODES:BOOL=ON\nDVM_ROLLING:BOOL=ON\n",
         encoding="utf-8",
     )
 
@@ -268,3 +499,22 @@ def test_legacy_build_script_cannot_update_tracked_prebuilt() -> None:
     assert "Direct prebuilt promotion is disabled" in source
     assert "Move-Item -LiteralPath $DllStage" not in source
     assert "Tracked prebuilt files were not modified" in source
+
+
+def test_candidate_workflow_stages_outside_checkout_and_cannot_lose_evidence() -> None:
+    workflow = (
+        promote_stub.ROOT / ".github" / "workflows" / "release-candidate.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "${{ runner.temp }}\\lethe-native-candidate" in workflow
+    assert "if-no-files-found: error" in workflow
+    assert "--stage-dir .\\.test-release-candidate" not in workflow
+
+
+def test_ordinary_ci_validates_contract_without_demanding_a_release() -> None:
+    workflow = (
+        promote_stub.ROOT / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "tools\\production_gate.py --validate-only" in workflow
+    assert "tools\\release_check.py" not in workflow

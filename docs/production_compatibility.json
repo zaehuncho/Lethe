@@ -239,12 +239,12 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF and exact suppressed/export-suppressed GFIDs pass natively and the outer load-config is authenticated, but XFG-enabled sources fail preflight when virtualization would add a generated thunk GFID without its source-compatible 8-byte function hash.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, and one real direct-only XFG selected-function signature pass natively, but broader XFG signature coverage and clean-VM compatibility evidence remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
           "path": "tests/test_cfg_preservation.py",
-          "claim": "The current preservation plan inventories targets and fails closed."
+          "claim": "The preservation plan retains source GFID identities, omits direct-only virtualization thunks, and rejects forged generated thunk targets."
         },
         {
           "type": "native",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "A real MSVC /guard:xfg executable runs natively, exposes global XFG with zero per-target flag bytes, and is refused before output when generated thunk GFIDs are requested."
+          "claim": "A real MSVC /guard:cf /guard:xfg indirect call retains its source GFID, reaches a direct-only virtualized thunk with native parity, emits no thunk GFID, and rejects a forged generated-GFID path before output."
         }
       ]
     },
@@ -279,17 +279,105 @@
       ]
     },
     {
-      "id": "hardening.runtime_layers",
-      "title": "Release-safe layered runtime hardening",
+      "id": "hardening.antidump_metadata",
+      "title": "Anti-dump metadata sanitization and protection transitions",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": [
+        "exe.core.runtime",
+        "dll.dynamic.runtime"
+      ],
+      "evidence": [
+        {
+          "type": "native-pytest",
+          "path": "tests/test_antidump_native.py",
+          "claim": "Native fault injection proves header and metadata protection transitions restore protections and fail closed."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_stub_safety_contracts.py",
+          "claim": "Source contracts require checked header erasure, metadata sanitization, protection restoration, and ordering before protected TLS callbacks."
+        },
+        {
+          "type": "native",
+          "path": "tests/production_corpus.ps1",
+          "claim": "Packed EXE and DLL fixtures execute after anti-dump sanitization while loader-visible resources, exports, and mitigation metadata remain usable."
+        }
+      ]
+    },
+    {
+      "id": "hardening.process_policy",
+      "title": "Process mitigation and DLL search policy",
+      "applies_to": ["exe"],
+      "required": true,
+      "status": "partial",
+      "blocker": "Pre-import ordering, current-directory DLL planting rejection, and process-policy API fail-closed injections are candidate-bound, but clean-VM representative-application compatibility is not recorded.",
+      "evidence": [
+        {
+          "type": "native-pytest",
+          "path": "tests/test_native_runtime_hardening_stress.py",
+          "claim": "An unhardened packed EXE loads a probe DLL from its launch directory while process hardening rejects it before the protected import or entrypoint executes; deterministic process-mitigation and DLL-search-policy API failures also stop before the entrypoint."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_stub_safety_contracts.py",
+          "claim": "The process policy runs before the first protected LoadLibrary import resolution and remains rejected for DLL payloads."
+        },
+        {
+          "type": "promotion",
+          "path": "tools/promote_stub.py",
+          "claim": "Candidate staging runs the opt-in native hardening file with the exact freshly built stub path and records artifact-bound evidence."
+        }
+      ]
+    },
+    {
+      "id": "hardening.antidebug",
+      "title": "Anti-debug detection and host-safe failure",
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "experimental",
-      "blocker": "Anti-debug and native executable-page memory guard are not approved release defaults and still require supported-Windows compatibility and concurrency stress evidence.",
+      "blocker": "A positive DEBUG_PROCESS EXE launch is detected locally, but native DLL-host detection behavior and clean-VM debugger/tool compatibility evidence are missing.",
       "evidence": [
+        {
+          "type": "native-pytest",
+          "path": "tests/test_native_runtime_hardening_stress.py",
+          "claim": "A DEBUG_PROCESS control reaches the protected entrypoint while the anti-debug variant exits before its entrypoint marker."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_stub_safety_contracts.py",
+          "claim": "DLL anti-debug paths return failure to the host without ExitProcess and use reliable debug-port checks."
+        },
+        {
+          "type": "promotion",
+          "path": "tools/promote_stub.py",
+          "claim": "Candidate staging binds the positive DEBUG_PROCESS EXE proof to the exact freshly built stub hash."
+        }
+      ]
+    },
+    {
+      "id": "hardening.memory_guard_native",
+      "title": "Native executable-page memory guard",
+      "applies_to": ["exe"],
+      "required": true,
+      "status": "experimental",
+      "blocker": "Forced-ASLR executable DIR64 relocation and 24-thread concurrent first-touch are candidate-bound, but still lack a long soak and clean-VM coverage.",
+      "evidence": [
+        {
+          "type": "native-pytest",
+          "path": "tests/test_native_runtime_hardening_stress.py",
+          "claim": "The opt-in native matrix forces a non-preferred base, exercises an executable DIR64 pointer, and synchronizes 24 threads on first access to one protected page."
+        },
         {
           "type": "pytest",
           "path": "tests/test_memguard_fault_hardening.py",
-          "claim": "Known memory-guard fault paths have source-level regression checks."
+          "claim": "Known memory-guard fault, tamper, recursion, and protection-transition paths have regression checks."
+        },
+        {
+          "type": "promotion",
+          "path": "tools/promote_stub.py",
+          "claim": "Candidate staging runs the native memory-guard matrix with the exact freshly built stub and hashes its evidence record into the manifest."
         }
       ]
     },

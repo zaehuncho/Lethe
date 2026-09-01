@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build, prove, and stage a Lethe native-stub release candidate.
+"""Build, prove, and stage a locally verified Lethe native-stub candidate.
 
 This tool never updates ``stub/prebuilt``. It emits a transactionally written
-candidate manifest only after every source, toolchain, CTest, round-trip,
-corpus, and production-compatibility gate has passed for one artifact hash.
+candidate manifest only after every local source, toolchain, CTest, round-trip,
+and corpus gate has passed for one artifact hash. A fixed set of declared
+production blockers may remain; the resulting bundle is never a production
+release and cannot authorize the default bundled stub.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import tomllib
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,14 +33,45 @@ from tools import production_gate
 ROOT = Path(__file__).resolve().parents[1]
 PREBUILT = ROOT / "stub" / "prebuilt" / "lethe_stub_x64.dll"
 PREBUILT_MANIFEST = PREBUILT.with_name("lethe_stub_x64.manifest.json")
+PRODUCTION_MATRIX = ROOT / "docs" / "production_compatibility.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SEED_RE = re.compile(r"[0-9a-f]+\Z")
 ROUNDTRIP_RE = re.compile(r"(?m)^\s*(\d+)/(\d+) passed -- PASS\s*$")
+PYTEST_PASSED_RE = re.compile(r"(?m)(\d+) passed(?:,| in )")
 SUPPORTED_PYTHON = (3, 12)
 SUPPORTED_UV = "0.11.29"
 SUPPORTED_GENERATOR = "Visual Studio 17 2022"
 SUPPORTED_PLATFORM = "x64"
 REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
+CANDIDATE_POLICY_ID = "lethe-native-candidate-v1"
+CANDIDATE_ALLOWED_BLOCKERS = {
+    "mitigation.load_config_cfg_xfg": "partial",
+    "virtualization.selected_functions": "partial",
+    "hardening.process_policy": "partial",
+    "hardening.antidebug": "experimental",
+    "hardening.memory_guard_native": "experimental",
+    "provenance.fresh_native_stub": "blocked",
+    "release.clean_vm_matrix": "unverified",
+}
+REQUIRED_CANDIDATE_EVIDENCE = frozenset({
+    "evidence/candidate-policy.json",
+    "evidence/candidate-production-matrix.json",
+    "evidence/candidate-promoter.py",
+    "evidence/uv-sync.json",
+    "evidence/cmake-configure.json",
+    "evidence/cmake-build.json",
+    "evidence/stub-entrypoints.json",
+    "evidence/ctest-inventory.json",
+    "evidence/ctest.json",
+    "evidence/runtime-hardening.json",
+    "evidence/roundtrip-fixture-build.json",
+    "evidence/roundtrip.json",
+    "evidence/production-corpus-build.json",
+    "evidence/production-corpus.json",
+    "evidence/production-evidence.json",
+    "evidence/production-gate.json",
+})
 
 
 class PromotionError(RuntimeError):
@@ -64,6 +97,32 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def candidate_policy_payload() -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "policy_id": CANDIDATE_POLICY_ID,
+        "allowed_blockers": CANDIDATE_ALLOWED_BLOCKERS,
+        "python": ".".join(map(str, SUPPORTED_PYTHON)),
+        "uv": SUPPORTED_UV,
+        "cmake_generator": SUPPORTED_GENERATOR,
+        "cmake_platform": SUPPORTED_PLATFORM,
+        "compile_policy": "/W4 /WX /Brepro",
+        "link_policy": "/Brepro /INCREMENTAL:NO",
+        "required_evidence": sorted(REQUIRED_CANDIDATE_EVIDENCE),
+    }
+
+
+def candidate_policy_sha256() -> str:
+    return _canonical_sha256(candidate_policy_payload())
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -85,11 +144,23 @@ def _run(
     source_commit: str,
     artifact_sha256: str | None = None,
     cwd: Path = ROOT,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> CommandRecord:
     command = [os.fspath(part) for part in argv]
+    recorded_overrides: dict[str, str] = {}
+    command_environment = None
+    if env_overrides is not None:
+        for key, value in env_overrides.items():
+            if (not isinstance(key, str) or not key or "=" in key or "\0" in key
+                    or not isinstance(value, str) or "\0" in value):
+                raise PromotionError("command environment overrides must be valid strings")
+            recorded_overrides[key] = value
+        command_environment = os.environ.copy()
+        command_environment.update(recorded_overrides)
     completed = subprocess.run(
         command,
         cwd=cwd,
+        env=command_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -390,17 +461,51 @@ def inspect_generated_dvm_provenance(
         raise PromotionError("generated Daedalus provenance hashes are malformed")
     if mapping_hash != native_mapping_hash or handler_hash != native_handler_hash:
         raise PromotionError("Python and native Daedalus opcode maps disagree")
+    cache = (build_dir / "CMakeCache.txt").read_text(
+        encoding="utf-8", errors="replace")
+    for option in ("DVM_SHUFFLE_OPCODES", "DVM_ROLLING"):
+        if re.search(rf"(?m)^{option}:BOOL=ON\r?$", cache) is None:
+            raise PromotionError(f"fresh candidate did not enable {option}")
     return {
         "dvm_shuffle_seed": effective_seed,
         "dvm_opcode_mapping_sha256": mapping_hash,
         "dvm_handler_variant_sha256": handler_hash,
         "dvm_python_map_sha256": sha256_file(python_map),
         "dvm_native_map_sha256": sha256_file(native_map),
+        "dvm_rolling": True,
+        "dvm_paged_runtime": True,
     }
 
 
 def _record(path: Path, record: CommandRecord) -> None:
-    atomic_write_json(path, {"schema": 1, **asdict(record)})
+    payload = asdict(record)
+    portable_argv: list[str] = []
+    root = ROOT.resolve()
+    candidate_root = path.resolve().parent.parent
+
+    def portable_path(value: str, *, executable: bool) -> str:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            return value
+        for prefix, base in (("repo://", root), ("candidate://", candidate_root)):
+            try:
+                relative = candidate.resolve().relative_to(base)
+            except (OSError, ValueError):
+                continue
+            return prefix + relative.as_posix()
+        scheme = "tool://" if executable else "external://"
+        return scheme + candidate.name
+
+    for index, argument in enumerate(payload["argv"]):
+        if "=" in argument:
+            prefix, value = argument.split("=", 1)
+            normalized = portable_path(value, executable=False)
+            argument = prefix + "=" + normalized
+        else:
+            argument = portable_path(argument, executable=index == 0)
+        portable_argv.append(argument)
+    payload["argv"] = portable_argv
+    atomic_write_json(path, {"schema": 1, **payload})
 
 
 def _require_unchanged_artifact(stub: Path, expected_hash: str, gate: str) -> None:
@@ -423,6 +528,27 @@ def validate_roundtrip_record(record: CommandRecord, expected_hash: str) -> tupl
     if total < 1 or passed != total:
         raise PromotionError("round-trip summary is not fully passing")
     return passed, total
+
+
+def validate_runtime_hardening_record(
+    record: CommandRecord,
+    expected_hash: str,
+    *,
+    minimum_tests: int = 3,
+) -> int:
+    if record.artifact_sha256 != expected_hash:
+        raise PromotionError(
+            "runtime-hardening evidence names a different artifact SHA-256")
+    if record.exit_code != 0:
+        raise PromotionError(
+            f"candidate-bound native runtime hardening failed with exit {record.exit_code}")
+    if re.search(r"\b\d+ skipped\b", record.stdout):
+        raise PromotionError("candidate-bound native runtime hardening skipped tests")
+    match = PYTEST_PASSED_RE.search(record.stdout)
+    if match is None or int(match.group(1)) < minimum_tests:
+        raise PromotionError(
+            "candidate-bound native runtime hardening has no complete pass summary")
+    return int(match.group(1))
 
 
 def validate_corpus_evidence(
@@ -454,6 +580,61 @@ def validate_gate_payload(payload: dict[str, Any]) -> None:
         raise PromotionError(f"production compatibility gate is red: {ids or 'unknown blockers'}")
 
 
+def validate_candidate_gate_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Accept a green all-scope gate or only the pinned candidate blockers."""
+    if not isinstance(payload, dict):
+        raise PromotionError("candidate compatibility result root is malformed")
+    if payload.get("schema") != 1 or payload.get("scope") != "all":
+        raise PromotionError("candidate compatibility result is malformed or not all-scope")
+    ready = payload.get("ready")
+    blockers = payload.get("blockers")
+    blocker_count = payload.get("blocker_count")
+    if type(ready) is not bool or not isinstance(blockers, list):
+        raise PromotionError("candidate compatibility readiness/blockers are malformed")
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, blocker in enumerate(blockers):
+        if not isinstance(blocker, dict):
+            raise PromotionError(f"candidate blocker[{index}] is malformed")
+        blocker_id = blocker.get("id")
+        status = blocker.get("status")
+        if not isinstance(blocker_id, str) or not isinstance(status, str):
+            raise PromotionError(f"candidate blocker[{index}] has no valid id/status")
+        if blocker_id in seen:
+            raise PromotionError(f"candidate compatibility gate has duplicate blocker: {blocker_id}")
+        seen.add(blocker_id)
+        expected_status = CANDIDATE_ALLOWED_BLOCKERS.get(blocker_id)
+        if status != expected_status:
+            raise PromotionError(
+                f"production blocker is not candidate-eligible: {blocker_id} [{status}]"
+            )
+        normalized.append({"id": blocker_id, "status": status})
+
+    if type(blocker_count) is not int or blocker_count != len(blockers):
+        raise PromotionError("candidate compatibility blocker count is inconsistent")
+    if ready is (len(blockers) != 0):
+        raise PromotionError("candidate compatibility ready state is inconsistent")
+    return sorted(normalized, key=lambda item: item["id"])
+
+
+def _toolchain_binding(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "configuration": manifest.get("configuration"),
+        "cmake_generator": manifest.get("cmake_generator"),
+        "cmake_platform": manifest.get("cmake_platform"),
+        "compiler_id": manifest.get("compiler_id"),
+        "compiler_version": manifest.get("compiler_version"),
+        "warning_policy": manifest.get("warning_policy"),
+        "reproducible_link": manifest.get("reproducible_link"),
+        "python_version": manifest.get("python_version"),
+        "uv_version": manifest.get("uv_version"),
+        "cmake_version": manifest.get("cmake_version"),
+        "ctest_version": manifest.get("ctest_version"),
+        "dependency_locks": manifest.get("dependency_locks"),
+    }
+
+
 def build_manifest(
     *,
     staged_stub: Path,
@@ -465,17 +646,27 @@ def build_manifest(
     ctest_count: int,
     evidence_paths: Iterable[Path],
     stage_dir: Path,
+    gate_payload: dict[str, Any],
 ) -> dict[str, Any]:
     artifact_hash = sha256_file(staged_stub)
     passed, total = roundtrip_counts
+    release_blockers = validate_candidate_gate_payload(gate_payload)
     evidence = []
     for path in evidence_paths:
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(stage_dir.resolve()).as_posix()
+        except ValueError as exc:
+            raise PromotionError(f"candidate evidence escapes the stage directory: {path}") from exc
         evidence.append({
-            "path": path.relative_to(stage_dir).as_posix(),
-            "sha256": sha256_file(path),
+            "path": relative,
+            "sha256": sha256_file(resolved),
         })
-    return {
-        "schema": 1,
+    manifest = {
+        "schema": 2,
+        "artifact_status": "candidate-verified",
+        "production_ready": False,
+        "candidate_scope": "all",
         "artifact": staged_stub.name,
         "sha256": artifact_hash,
         "size_bytes": staged_stub.stat().st_size,
@@ -497,23 +688,299 @@ def build_manifest(
         "native_roundtrip": "passed-9-of-9",
         "native_roundtrip_actual": {"passed": passed, "total": total},
         "ctest": {"passed": ctest_count, "total": ctest_count},
-        "production_scope": "all",
         "provenance_status": "clean",
-        "evidence": evidence,
+        "release_gate": {
+            "schema": 1,
+            "scope": "all",
+            "ready": not release_blockers,
+            "blocker_count": len(release_blockers),
+            "blockers": release_blockers,
+        },
+        "release_blockers": release_blockers,
+        "production_matrix_sha256": sha256_file(PRODUCTION_MATRIX),
+        "promotion_tool_sha256": sha256_file(Path(__file__)),
+        "candidate_policy_id": CANDIDATE_POLICY_ID,
+        "candidate_policy_sha256": candidate_policy_sha256(),
+        "evidence": sorted(evidence, key=lambda item: item["path"]),
     }
+    manifest["toolchain_binding_sha256"] = _canonical_sha256(
+        _toolchain_binding(manifest))
+    return manifest
 
 
-def _validate_staged_pair(stub: Path, manifest_path: Path) -> dict[str, Any]:
+def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PromotionError(f"cannot read staged manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != 2:
+        raise PromotionError("staged candidate manifest must use schema 2")
+    if manifest.get("artifact_status") != "candidate-verified":
+        raise PromotionError("staged manifest is not candidate-verified evidence")
+    if manifest.get("production_ready") is not False:
+        raise PromotionError("candidate manifest must never claim production readiness")
+    if manifest.get("candidate_scope") != "all" or "production_scope" in manifest:
+        raise PromotionError("candidate manifest has invalid candidate/production scope")
     if manifest.get("artifact") != stub.name:
         raise PromotionError("staged manifest names a different artifact")
+    if manifest.get("size_bytes") != stub.stat().st_size:
+        raise PromotionError("staged manifest size does not match the artifact")
     if manifest.get("sha256") != sha256_file(stub):
         raise PromotionError("staged manifest SHA-256 does not match the artifact")
     if manifest.get("source_dirty") is not False or manifest.get("provenance_status") != "clean":
-        raise PromotionError("staged manifest is not clean-source release evidence")
+        raise PromotionError("staged manifest is not clean-source candidate evidence")
+    if COMMIT_RE.fullmatch(str(manifest.get("source_commit", ""))) is None:
+        raise PromotionError("candidate manifest has no full source commit")
+    if manifest.get("candidate_policy_id") != CANDIDATE_POLICY_ID:
+        raise PromotionError("candidate manifest policy id is unsupported")
+    stage_dir = manifest_path.parent.resolve()
+    policy_snapshot = stage_dir / "evidence" / "candidate-policy.json"
+    matrix_snapshot = stage_dir / "evidence" / "candidate-production-matrix.json"
+    promoter_snapshot = stage_dir / "evidence" / "candidate-promoter.py"
+    try:
+        policy_payload = json.loads(policy_snapshot.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError(f"candidate policy snapshot is invalid: {exc}") from exc
+    if (manifest.get("candidate_policy_sha256") != _canonical_sha256(policy_payload)
+            or policy_payload != candidate_policy_payload()):
+        raise PromotionError("candidate policy snapshot binding is invalid")
+    if (not matrix_snapshot.is_file()
+            or manifest.get("production_matrix_sha256") != sha256_file(matrix_snapshot)):
+        raise PromotionError("candidate matrix snapshot binding is invalid")
+    if (not promoter_snapshot.is_file()
+            or manifest.get("promotion_tool_sha256") != sha256_file(promoter_snapshot)):
+        raise PromotionError("candidate promoter snapshot binding is invalid")
+    if manifest.get("toolchain_binding_sha256") != _canonical_sha256(
+            _toolchain_binding(manifest)):
+        raise PromotionError("candidate manifest toolchain binding is inconsistent")
+    if (manifest.get("configuration") != "Release"
+            or manifest.get("cmake_generator") != SUPPORTED_GENERATOR
+            or str(manifest.get("cmake_platform", "")).lower() != SUPPORTED_PLATFORM
+            or manifest.get("compiler_id") != "MSVC"
+            or not str(manifest.get("compiler_version", "")).startswith("19.")
+            or manifest.get("warning_policy") != "/W4 /WX /Brepro"
+            or manifest.get("reproducible_link") != "/Brepro /INCREMENTAL:NO"
+            or manifest.get("uv_version") != SUPPORTED_UV
+            or not str(manifest.get("python_version", "")).startswith("3.12.")):
+        raise PromotionError("candidate manifest toolchain is outside the pinned policy")
+    locks = manifest.get("dependency_locks")
+    if (not isinstance(locks, dict)
+            or set(locks) != set(REQUIRED_LOCKED_FILES)
+            or any(SHA256_RE.fullmatch(str(value)) is None for value in locks.values())):
+        raise PromotionError("candidate manifest dependency locks are incomplete")
+    seed = manifest.get("dvm_shuffle_seed")
+    if (not isinstance(seed, str)
+            or re.fullmatch(r"[0-9a-f]{64}", seed) is None):
+        raise PromotionError(
+            "candidate manifest DVM shuffle seed must encode exactly 32 bytes")
+    if (manifest.get("dvm_rolling") is not True
+            or manifest.get("dvm_paged_runtime") is not True):
+        raise PromotionError("candidate manifest lacks the production DVM runtime")
+    for field in (
+        "dvm_opcode_mapping_sha256",
+        "dvm_handler_variant_sha256",
+        "dvm_python_map_sha256",
+        "dvm_native_map_sha256",
+    ):
+        if SHA256_RE.fullmatch(str(manifest.get(field, ""))) is None:
+            raise PromotionError(f"candidate manifest has no valid {field}")
+
+    release_blockers = validate_candidate_gate_payload(manifest.get("release_gate", {}))
+    if manifest.get("release_blockers") != release_blockers:
+        raise PromotionError("candidate manifest release blockers disagree with its gate")
+
+    actual = manifest.get("native_roundtrip_actual")
+    if (manifest.get("native_roundtrip") != "passed-9-of-9"
+            or not isinstance(actual, dict)
+            or type(actual.get("passed")) is not int
+            or type(actual.get("total")) is not int
+            or actual["total"] < 1
+            or actual["passed"] != actual["total"]):
+        raise PromotionError("candidate manifest has no full native round-trip result")
+    ctest = manifest.get("ctest")
+    if (not isinstance(ctest, dict)
+            or type(ctest.get("passed")) is not int
+            or type(ctest.get("total")) is not int
+            or ctest["total"] < 1
+            or ctest["passed"] != ctest["total"]):
+        raise PromotionError("candidate manifest has no full CTest result")
+
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, list):
+        raise PromotionError("candidate manifest evidence must be a list")
+    seen: set[str] = set()
+    for index, record in enumerate(evidence):
+        if not isinstance(record, dict):
+            raise PromotionError(f"candidate evidence[{index}] is malformed")
+        relative = record.get("path")
+        expected_hash = record.get("sha256")
+        if (not isinstance(relative, str) or not relative
+                or SHA256_RE.fullmatch(str(expected_hash)) is None):
+            raise PromotionError(f"candidate evidence[{index}] has invalid path/hash")
+        if relative in seen:
+            raise PromotionError(f"candidate manifest repeats evidence path: {relative}")
+        seen.add(relative)
+        evidence_path = (stage_dir / relative).resolve()
+        try:
+            evidence_path.relative_to(stage_dir)
+        except ValueError as exc:
+            raise PromotionError(f"candidate evidence path escapes the bundle: {relative}") from exc
+        if not evidence_path.is_file():
+            raise PromotionError(f"candidate evidence is missing: {relative}")
+        if sha256_file(evidence_path) != expected_hash:
+            raise PromotionError(f"candidate evidence SHA-256 mismatch: {relative}")
+    missing = REQUIRED_CANDIDATE_EVIDENCE - seen
+    if missing:
+        raise PromotionError(
+            "candidate manifest omits required evidence: " + ", ".join(sorted(missing))
+        )
+    unexpected = seen - REQUIRED_CANDIDATE_EVIDENCE
+    if unexpected:
+        raise PromotionError(
+            "candidate manifest contains undeclared evidence: "
+            + ", ".join(sorted(unexpected))
+        )
+
+    def load_command(
+        filename: str,
+        name: str,
+        *,
+        artifact_bound: bool,
+        allowed_exit_codes: tuple[int, ...] = (0,),
+    ) -> dict[str, Any]:
+        command_path = stage_dir / "evidence" / filename
+        try:
+            payload = json.loads(command_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PromotionError(f"candidate command evidence is invalid: {filename}: {exc}") from exc
+        required_keys = {
+            "schema", "name", "argv", "exit_code", "stdout", "stderr",
+            "source_commit", "artifact_sha256",
+        }
+        if (not isinstance(payload, dict) or set(payload) != required_keys
+                or payload.get("schema") != 1 or payload.get("name") != name
+                or not isinstance(payload.get("argv"), list) or not payload["argv"]
+                or not all(isinstance(item, str) and item for item in payload["argv"])
+                or type(payload.get("exit_code")) is not int
+                or payload["exit_code"] not in allowed_exit_codes
+                or not isinstance(payload.get("stdout"), str)
+                or not isinstance(payload.get("stderr"), str)
+                or payload.get("source_commit") != manifest["source_commit"]):
+            raise PromotionError(f"candidate command evidence is malformed or red: {filename}")
+        expected_artifact = manifest["sha256"] if artifact_bound else None
+        if payload.get("artifact_sha256") != expected_artifact:
+            raise PromotionError(f"candidate command evidence artifact binding is invalid: {filename}")
+        for argument in payload["argv"]:
+            raw_value = argument.split("=", 1)[-1]
+            if Path(raw_value).is_absolute() or re.search(r"(?i)^[a-z]:[\\/]", raw_value):
+                raise PromotionError(f"candidate command evidence is machine-local: {filename}")
+        return payload
+
+    command_specs = (
+        ("uv-sync.json", "locked-dependency-sync", False),
+        ("cmake-configure.json", "fresh-cmake-configure", False),
+        ("cmake-build.json", "fresh-w4-wx-stub-build", False),
+        ("ctest-inventory.json", "ctest-inventory", True),
+        ("ctest.json", "ctest", True),
+        ("roundtrip-fixture-build.json", "roundtrip-fixture-build", True),
+        ("roundtrip.json", "exe-dll-roundtrip", True),
+        ("production-corpus-build.json", "production-corpus-build", True),
+        ("production-corpus.json", "production-corpus", True),
+    )
+    commands = {
+        filename: load_command(filename, name, artifact_bound=artifact_bound)
+        for filename, name, artifact_bound in command_specs
+    }
+    try:
+        inventory = json.loads(commands["ctest-inventory.json"]["stdout"])
+    except json.JSONDecodeError as exc:
+        raise PromotionError("candidate CTest inventory output is invalid") from exc
+    if (not isinstance(inventory, dict) or not isinstance(inventory.get("tests"), list)
+            or len(inventory["tests"]) != ctest["total"]):
+        raise PromotionError("candidate CTest inventory disagrees with its manifest")
+    roundtrip_payload = commands["roundtrip.json"]
+    roundtrip_record = CommandRecord(
+        name=roundtrip_payload["name"], argv=roundtrip_payload["argv"],
+        exit_code=roundtrip_payload["exit_code"], stdout=roundtrip_payload["stdout"],
+        stderr=roundtrip_payload["stderr"], source_commit=roundtrip_payload["source_commit"],
+        artifact_sha256=roundtrip_payload["artifact_sha256"],
+    )
+    if validate_roundtrip_record(roundtrip_record, manifest["sha256"]) != (
+            actual["passed"], actual["total"]):
+        raise PromotionError("candidate round-trip evidence disagrees with its manifest")
+
+    entrypoint_path = stage_dir / "evidence" / "stub-entrypoints.json"
+    try:
+        entrypoint_payload = json.loads(entrypoint_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError(f"candidate entrypoint evidence is invalid: {exc}") from exc
+    if entrypoint_payload != {"schema": 1, **inspect_stub_entrypoints(stub)}:
+        raise PromotionError("candidate entrypoint evidence disagrees with the artifact")
+
+    native_evidence_path = stage_dir / "evidence" / "production-evidence.json"
+    try:
+        native_evidence = production_gate.load_evidence(
+            native_evidence_path, artifact_path=stub)
+        candidate_matrix = production_gate.load_matrix(matrix_snapshot)
+        evaluated_gate = production_gate.evaluate(candidate_matrix, "all", native_evidence)
+    except production_gate.MatrixError as exc:
+        raise PromotionError(f"candidate production evidence is invalid: {exc}") from exc
+    if (native_evidence["source_commit"] != manifest["source_commit"]
+            or native_evidence["tracked_source_dirty"]
+            or native_evidence["ready"] is not True):
+        raise PromotionError("candidate production evidence is stale, dirty, or red")
+    if validate_candidate_gate_payload(evaluated_gate) != release_blockers:
+        raise PromotionError("candidate matrix/evidence evaluation disagrees with its manifest")
+
+    gate_payload = load_command(
+        "production-gate.json", "all-scope-production-gate",
+        artifact_bound=True, allowed_exit_codes=(0, 1),
+    )
+    try:
+        recorded_gate = json.loads(gate_payload["stdout"])
+    except json.JSONDecodeError as exc:
+        raise PromotionError("candidate production-gate output is invalid") from exc
+    if validate_candidate_gate_payload(recorded_gate) != release_blockers:
+        raise PromotionError("candidate production-gate output disagrees with its manifest")
+    expected_gate_exit = 0 if recorded_gate.get("ready") is True else 1
+    if gate_payload["exit_code"] != expected_gate_exit:
+        raise PromotionError("candidate production-gate exit code disagrees with its output")
+
+    runtime_path = stage_dir / "evidence" / "runtime-hardening.json"
+    try:
+        runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PromotionError(f"cannot read runtime-hardening evidence: {exc}") from exc
+    if (not isinstance(runtime_payload, dict)
+            or runtime_payload.get("schema") != 1
+            or runtime_payload.get("name") != "candidate-bound-native-runtime-hardening"
+            or runtime_payload.get("source_commit") != manifest["source_commit"]
+            or not isinstance(runtime_payload.get("argv"), list)
+            or not all(isinstance(item, str) for item in runtime_payload["argv"])
+            or type(runtime_payload.get("exit_code")) is not int
+            or not isinstance(runtime_payload.get("stdout"), str)
+            or not isinstance(runtime_payload.get("stderr"), str)):
+        raise PromotionError("runtime-hardening evidence record is malformed")
+    if set(runtime_payload) != {
+            "schema", "name", "argv", "exit_code", "stdout", "stderr",
+            "source_commit", "artifact_sha256"}:
+        raise PromotionError("runtime-hardening evidence has unexpected fields")
+    expected_runtime_argv = [
+        "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "repo://tests/test_native_runtime_hardening_stress.py",
+    ]
+    if runtime_payload["argv"][1:] != expected_runtime_argv:
+        raise PromotionError("runtime-hardening evidence names an unexpected command")
+    runtime_record = CommandRecord(
+        name=runtime_payload["name"],
+        argv=runtime_payload["argv"],
+        exit_code=runtime_payload["exit_code"],
+        stdout=runtime_payload["stdout"],
+        stderr=runtime_payload["stderr"],
+        source_commit=runtime_payload["source_commit"],
+        artifact_sha256=runtime_payload.get("artifact_sha256"),
+    )
+    validate_runtime_hardening_record(runtime_record, manifest["sha256"])
     return manifest
 
 
@@ -530,8 +997,8 @@ def _load_json_output(record: CommandRecord, label: str) -> dict[str, Any]:
 def execute(args: argparse.Namespace) -> Path | None:
     source_commit = args.source_commit.strip()
     shuffle_seed = args.shuffle_seed.lower()
-    if SEED_RE.fullmatch(shuffle_seed) is None or len(shuffle_seed) % 2:
-        raise PromotionError("--shuffle-seed must contain an even number of hex digits")
+    if re.fullmatch(r"[0-9a-f]{64}", shuffle_seed) is None:
+        raise PromotionError("--shuffle-seed must encode exactly 32 bytes as 64 hex digits")
 
     source = inspect_repository(ROOT, source_commit)
     host = inspect_host(ROOT)
@@ -564,12 +1031,14 @@ def execute(args: argparse.Namespace) -> Path | None:
         name: str,
         path_name: str,
         artifact_hash: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> CommandRecord:
         record = _run(
             argv,
             name=name,
             source_commit=source_commit,
             artifact_sha256=artifact_hash,
+            env_overrides=env_overrides,
         )
         path = records_dir / path_name
         _record(path, record)
@@ -643,6 +1112,26 @@ def execute(args: argparse.Namespace) -> Path | None:
         failures.append(f"CTest failed with exit {ctest.exit_code}")
     _require_unchanged_artifact(built_stub, artifact_hash, "CTest")
 
+    runtime_hardening = run_recorded(
+        [
+            host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            ROOT / "tests" / "test_native_runtime_hardening_stress.py",
+        ],
+        name="candidate-bound-native-runtime-hardening",
+        path_name="runtime-hardening.json",
+        artifact_hash=artifact_hash,
+        env_overrides={
+            "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+            "LETHE_NATIVE_RUNTIME_STUB_PATH": str(built_stub.resolve()),
+        },
+    )
+    try:
+        validate_runtime_hardening_record(runtime_hardening, artifact_hash)
+    except PromotionError as exc:
+        failures.append(str(exc))
+    _require_unchanged_artifact(
+        built_stub, artifact_hash, "candidate-bound native runtime hardening")
+
     sample_build = run_recorded(
         [host["powershell"], "-NoProfile", "-File", ROOT / "tests" / "build_samples.ps1", "-OutDir", ROOT / "tests" / "build"],
         name="roundtrip-fixture-build",
@@ -707,13 +1196,18 @@ def execute(args: argparse.Namespace) -> Path | None:
         path_name="production-gate.json",
         artifact_hash=artifact_hash,
     )
+    gate_payload: dict[str, Any] | None = None
+    release_blockers: list[dict[str, str]] = []
     try:
         gate_payload = _load_json_output(gate, "production compatibility gate")
-        validate_gate_payload(gate_payload)
+        release_blockers = validate_candidate_gate_payload(gate_payload)
+        expected_gate_exit = 0 if gate_payload["ready"] else 1
+        if gate.exit_code != expected_gate_exit:
+            failures.append(
+                "production compatibility gate exit code disagrees with its payload"
+            )
     except PromotionError as exc:
         failures.append(str(exc))
-    if gate.exit_code != 0 and not any("production compatibility gate" in item for item in failures):
-        failures.append(f"production compatibility gate failed with exit {gate.exit_code}")
 
     try:
         inspect_repository(ROOT, source_commit)
@@ -724,19 +1218,30 @@ def execute(args: argparse.Namespace) -> Path | None:
     result_path = stage_dir / "promotion-result.json"
     if failures:
         atomic_write_json(result_path, {
-            "schema": 1,
-            "ready": False,
+            "schema": 2,
+            "artifact_status": "candidate-rejected",
+            "candidate_verified": False,
+            "production_ready": False,
             "published": False,
             "source_commit": source_commit,
             "artifact_sha256": artifact_hash,
             "failures": failures,
         })
         raise PromotionError("; ".join(failures))
+    if gate_payload is None:
+        raise PromotionError("production compatibility gate produced no candidate result")
 
     staged_stub = stage_dir / PREBUILT.name
     shutil.copyfile(built_stub, staged_stub)
     _require_unchanged_artifact(staged_stub, artifact_hash, "staging copy")
+    policy_snapshot = records_dir / "candidate-policy.json"
+    matrix_snapshot = records_dir / "candidate-production-matrix.json"
+    promoter_snapshot = records_dir / "candidate-promoter.py"
+    atomic_write_json(policy_snapshot, candidate_policy_payload())
+    shutil.copyfile(PRODUCTION_MATRIX, matrix_snapshot)
+    shutil.copyfile(Path(__file__), promoter_snapshot)
     evidence_paths = [path for path, _record_item in records]
+    evidence_paths.extend((policy_snapshot, matrix_snapshot, promoter_snapshot))
     evidence_paths.append(entrypoint_evidence_path)
     evidence_paths.append(corpus_evidence_path)
     manifest = build_manifest(
@@ -749,20 +1254,31 @@ def execute(args: argparse.Namespace) -> Path | None:
         ctest_count=ctest_count,
         evidence_paths=evidence_paths,
         stage_dir=stage_dir,
+        gate_payload=gate_payload,
     )
     staged_manifest = stage_dir / PREBUILT_MANIFEST.name
     atomic_write_json(staged_manifest, manifest)
-    _validate_staged_pair(staged_stub, staged_manifest)
+    try:
+        validate_candidate_bundle(staged_stub, staged_manifest)
+        inspect_repository(ROOT, source_commit)
+        _require_unchanged_artifact(staged_stub, artifact_hash, "bundle validation")
+    except (OSError, PromotionError):
+        staged_manifest.unlink(missing_ok=True)
+        raise
 
     atomic_write_json(result_path, {
-        "schema": 1,
-        "ready": True,
+        "schema": 2,
+        "artifact_status": "candidate-verified",
+        "candidate_verified": True,
+        "production_ready": False,
         "published": False,
         "source_commit": source_commit,
         "artifact_sha256": artifact_hash,
         "manifest_sha256": sha256_file(staged_manifest),
+        "release_blockers": release_blockers,
     })
-    print(f"Release candidate staged at {stage_dir}")
+    print(f"Locally verified candidate staged at {stage_dir}")
+    print(f"Production ready: no ({len(release_blockers)} recorded release blockers)")
     print("Tracked prebuilt was not modified.")
     return stage_dir
 

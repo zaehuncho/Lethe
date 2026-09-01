@@ -13,11 +13,13 @@ param(
     [string]$StubPath,
     [string]$PythonExe = '',
     [string]$BuildDir = '',
-    [string]$EvidencePath = ''
+    [string]$EvidencePath = '',
+    [string]$SourceCommit = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path $PSScriptRoot -Parent
+$TestPacker = Join-Path $PSScriptRoot '_lethe_test_cli.py'
 $BuildDir = if ($BuildDir) {
     [System.IO.Path]::GetFullPath($BuildDir)
 } else {
@@ -181,7 +183,7 @@ try {
         'original core fixture contract' -Process $coreOriginal
 
     $corePack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-        (Join-Path $Root 'lethe.py'), $CoreExe, $CorePacked,
+        $TestPacker, $CoreExe, $CorePacked,
         '--stub-path', $StubPath)
     $corePackPassed = $corePack.exit_code -eq 0 -and (Test-Path -LiteralPath $CorePacked)
     Add-Result 'exe.core.pack' $corePackPassed 'pack core fixture' -Process $corePack
@@ -212,7 +214,7 @@ try {
         'original delay-import fixture contract' -Process $delayOriginal
 
     $delayPack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-        (Join-Path $Root 'lethe.py'), $DelayExe, $DelayPacked,
+        $TestPacker, $DelayExe, $DelayPacked,
         '--stub-path', $StubPath)
     $delayPackPassed = $delayPack.exit_code -eq 0 -and (Test-Path -LiteralPath $DelayPacked)
     Add-Result 'exe.delay.pack' $delayPackPassed `
@@ -236,7 +238,7 @@ try {
     Add-Result 'dll.resource.offset_root.shape' $resourceShape `
         'resource DataDirectory begins 0x40 bytes inside its owner section'
     $resourcePack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-        (Join-Path $Root 'lethe.py'), $ResourceOffsetDll,
+        $TestPacker, $ResourceOffsetDll,
         $ResourceOffsetPackedDll, '--enable-experimental-dll',
         '--stub-path', $StubPath)
     $resourcePackPassed = $resourcePack.exit_code -eq 0 -and
@@ -283,7 +285,7 @@ try {
     Add-Result 'dll.delay.shape' $delayDllShape `
         'guarded DLL has a real delay-import directory'
     $delayDllPack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-        (Join-Path $Root 'lethe.py'), $DelayDll, $DelayPackedDll,
+        $TestPacker, $DelayDll, $DelayPackedDll,
         '--enable-experimental-dll', '--stub-path', $StubPath)
     $delayDllPackPassed = $delayDllPack.exit_code -eq 0 -and
         (Test-Path -LiteralPath $DelayPackedDll)
@@ -315,7 +317,7 @@ try {
         'guarded DLL has active GuardCF load-config metadata'
 
     $dllPack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-        (Join-Path $Root 'lethe.py'), $GuardedDll, $GuardedPackedDll,
+        $TestPacker, $GuardedDll, $GuardedPackedDll,
         '--enable-experimental-dll', '--stub-path', $StubPath)
     $dllPackPassed = $dllPack.exit_code -eq 0 -and
         (Test-Path -LiteralPath $GuardedPackedDll)
@@ -399,7 +401,7 @@ try {
             $auxPackedDll = Join-Path $BuildDir $case.Packed
             $auxHost = Join-Path $BuildDir $case.Host
             $auxPack = Invoke-Captured -FilePath $PythonExe -Arguments @(
-                (Join-Path $Root 'lethe.py'), $auxOriginalDll, $auxPackedDll,
+                $TestPacker, $auxOriginalDll, $auxPackedDll,
                 '--enable-experimental-dll', '--stub-path', $StubPath)
             if ($auxPack.exit_code -ne 0 -or
                 -not (Test-Path -LiteralPath $auxPackedDll)) {
@@ -444,9 +446,17 @@ finally {
 
 $stubHash = (Get-FileHash -LiteralPath $StubPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host 'Collecting source provenance...'
-$commit = (& git -C $Root rev-parse HEAD 2>$null).Trim()
-$dirty = [bool]((& git -C $Root status --porcelain --untracked-files=no 2>$null) |
-    Select-Object -First 1)
+if ($SourceCommit) {
+    if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'SourceCommit must be a full lowercase Git commit id'
+    }
+    $commit = $SourceCommit
+    $dirty = $false
+} else {
+    $commit = (& git -C $Root rev-parse HEAD 2>$null).Trim()
+    $dirty = [bool]((& git -C $Root status --porcelain --untracked-files=no 2>$null) |
+        Select-Object -First 1)
+}
 $passed = @($script:Results | Where-Object { $_.status -eq 'passed' }).Count
 $evidence = [pscustomobject][ordered]@{
     schema = 1

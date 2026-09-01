@@ -120,7 +120,11 @@ def load_matrix(path: Path) -> dict[str, Any]:
     return matrix
 
 
-def load_evidence(path: Path) -> dict[str, Any]:
+def load_evidence(
+    path: Path,
+    *,
+    artifact_path: Path | None = None,
+) -> dict[str, Any]:
     try:
         evidence = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -148,7 +152,12 @@ def load_evidence(path: Path) -> dict[str, Any]:
         and re.fullmatch(r"[0-9a-f]{64}", stub_sha256) is not None,
         "native evidence stub_sha256 must be lowercase SHA-256",
     )
-    stub_path = Path(stub_path_value)
+    # Bundled evidence is portable: an attestor may supply the exact artifact
+    # whose digest must match instead of trusting a stale machine-local path.
+    # Without an override, relative identities resolve beside the evidence.
+    stub_path = artifact_path.resolve() if artifact_path is not None else Path(stub_path_value)
+    if artifact_path is None and not stub_path.is_absolute():
+        stub_path = (path.resolve().parent / stub_path).resolve()
     _require(stub_path.is_file(), f"native evidence stub is missing: {stub_path}")
     actual_stub_sha256 = hashlib.sha256(stub_path.read_bytes()).hexdigest()
     _require(

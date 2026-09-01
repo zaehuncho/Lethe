@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       shuffle_seed:
-        description: Even-length hexadecimal Daedalus shuffle seed
+        description: Exact 64-character lowercase hexadecimal Daedalus shuffle seed
         required: true
         type: string
 
@@ -18,7 +18,7 @@ permissions:
 jobs:
   stage:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -38,18 +38,18 @@ jobs:
           if ($actual -cne '${{ inputs.source_commit }}') {
             throw "Checkout mismatch: expected ${{ inputs.source_commit }}, got $actual"
           }
-      - name: Build and stage fully gated candidate
+      - name: Stage candidate under pinned blocker policy
         shell: powershell
         run: >-
           .\.venv\Scripts\python.exe .\tools\promote_stub.py
           --source-commit '${{ inputs.source_commit }}'
           --shuffle-seed '${{ inputs.shuffle_seed }}'
-          --stage-dir .\.test-release-candidate
+          --stage-dir '${{ runner.temp }}\lethe-native-candidate'
       - name: Retain staging evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lethe-native-candidate-${{ inputs.source_commit }}
-          path: .test-release-candidate
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}\lethe-native-candidate
+          if-no-files-found: error
           retention-days: 14

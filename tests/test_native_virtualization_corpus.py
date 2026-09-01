@@ -410,7 +410,8 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
         stub = _build_stub(work)
         (_stub_bytes, _stub_sha256, opcode_table,
          handler_variant_sha256, rolling) = (
-            orchestrator._load_virtualization_build(str(stub))
+            orchestrator._load_virtualization_build(
+                str(stub), allow_unverified_stub_for_tests=True)
         )
         shuffled = shuffle_opcodes.generate_shuffle(bytes.fromhex(_SHUFFLE_SEED))
         assert not opcode_table.is_canonical
@@ -444,6 +445,7 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
                 ),
                 virtualization_gap_acknowledgements=gap_acknowledgements,
                 acknowledge_unproven_indirect_targets=True,
+                _allow_unverified_stub_for_tests=True,
             ),
             progress.append,
         )

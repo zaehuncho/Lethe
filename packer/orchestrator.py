@@ -27,6 +27,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
@@ -112,6 +113,8 @@ class PackOptions:
         VirtualizationTailExitApproval, ...
     ] = ()
     acknowledge_unproven_indirect_targets: bool = False
+    # Internal harness capability. The public CLI never exposes or derives it.
+    _allow_unverified_stub_for_tests: bool = False
 
 
 @dataclass
@@ -587,16 +590,43 @@ def _validate_virtualization_controls(
     return tuple(sorted(normalized_gaps)), tuple(sorted(normalized_tails))
 
 
-def _load_virtualization_build(stub_path: str):
+def _load_virtualization_build(
+    stub_path: str,
+    *,
+    allow_unverified_stub_for_tests: bool = False,
+):
     """Load one exact candidate stub and reconstruct its immutable opcode map."""
-    manifest_path = stub_path + ".manifest.json"
-    try:
-        with open(manifest_path, "r", encoding="utf-8-sig") as manifest_file:
-            metadata = json.load(manifest_file)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "experimental virtualization requires the adjacent fresh-build "
-            f"manifest: {manifest_path}") from exc
+    if __package__:
+        from . import release_attestation
+    else:
+        import release_attestation  # type: ignore
+    candidate_path = Path(stub_path).with_suffix(".manifest.json")
+    runtime_path = Path(stub_path + ".manifest.json")
+    verified_candidate = False
+    if candidate_path.is_file():
+        try:
+            metadata = release_attestation.validate_candidate_identity(
+                Path(stub_path), candidate_path)
+            verified_candidate = True
+        except release_attestation.ReleaseAttestationError as exc:
+            if not allow_unverified_stub_for_tests or not runtime_path.is_file():
+                raise ValueError(f"verified candidate manifest is invalid: {exc}") from exc
+            metadata = None
+    else:
+        metadata = None
+    if not verified_candidate:
+        if not allow_unverified_stub_for_tests:
+            raise ValueError(
+                "experimental virtualization requires a verified schema-2 "
+                f"candidate manifest: {candidate_path}")
+        if metadata is None:
+            try:
+                with runtime_path.open("r", encoding="utf-8-sig") as manifest_file:
+                    metadata = json.load(manifest_file)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "test-only virtualization requires the adjacent fresh-build "
+                    f"manifest: {runtime_path}") from exc
     if not isinstance(metadata, dict):
         raise ValueError("virtualization stub manifest root must be an object")
 
@@ -607,7 +637,8 @@ def _load_virtualization_build(stub_path: str):
         raise ValueError(f"cannot read virtualization stub: {stub_path}") from exc
 
     stub_sha256 = hashlib.sha256(stub_bytes).hexdigest()
-    if metadata.get("schema") != 1:
+    expected_schema = 2 if verified_candidate else 1
+    if metadata.get("schema") != expected_schema:
         raise ValueError("virtualization stub manifest has an unsupported schema")
     if metadata.get("artifact") != os.path.basename(stub_path):
         raise ValueError("virtualization stub manifest names a different artifact")
@@ -845,7 +876,11 @@ def pack_file(input_path: str, options: PackOptions,
             )
             (stub_bytes, expected_stub_sha256, opcode_table,
              handler_variant_sha256, rolling) = \
-                _load_virtualization_build(eff.stub_path)
+                _load_virtualization_build(
+                    eff.stub_path,
+                    allow_unverified_stub_for_tests=(
+                        eff._allow_unverified_stub_for_tests),
+                )
             if rolling:
                 raise ValueError(
                     "production selected-function virtualization requires "
@@ -903,7 +938,10 @@ def pack_file(input_path: str, options: PackOptions,
         asm_result = assemble.build_output_pe(
             parsed, artifacts, stage_path, input_path=source_snapshot_path,
             options=eff,
-            stub_path=eff.stub_path, **assembly_pins)
+            stub_path=eff.stub_path,
+            allow_unverified_stub_for_tests=(
+                eff._allow_unverified_stub_for_tests),
+            **assembly_pins)
 
         # Reject a corrupt, truncated, or unpopulated staged PE before deriving
         # an external identifier, uploading a shard, or replacing an existing

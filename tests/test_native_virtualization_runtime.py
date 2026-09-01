@@ -225,7 +225,8 @@ def test_packed_executable_calls_virtualized_leaf(
 
         stub = _build_stub(work)
         _stub_bytes, _stub_hash, opcode_table, _handler_hash, rolling = (
-            orchestrator._load_virtualization_build(str(stub))
+            orchestrator._load_virtualization_build(
+                str(stub), allow_unverified_stub_for_tests=True)
         )
         assert not opcode_table.is_canonical
         assert rolling is False
@@ -259,6 +260,7 @@ def test_packed_executable_calls_virtualized_leaf(
                 ),
                 virtualization_gap_acknowledgements=gap_acknowledgements,
                 acknowledge_unproven_indirect_targets=True,
+                _allow_unverified_stub_for_tests=True,
             ),
             progress.append,
         )
