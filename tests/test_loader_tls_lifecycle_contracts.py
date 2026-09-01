@@ -49,7 +49,7 @@ def test_anchor_has_a_real_null_terminated_dispatcher() -> None:
         re.DOTALL,
     )
     callback = _function(
-        ANCHOR, "static void NTAPI lethe_stub_tls_callback(",
+        ANCHOR, "void NTAPI lethe_stub_tls_callback_impl(",
         "__declspec(allocate(\".tls$AAA\"))")
     assert "pe_loader_tls_anchor_dispatch(module, reason, reserved);" in callback
 
@@ -127,7 +127,7 @@ def test_dll_detach_preserves_native_dllmain_then_tls_order() -> None:
     assert process_detach.index("invoke_dll_oep") < process_detach.index(
         "release_dll_runtime")
     cleanup = _function(STUB_MAIN, "static void release_dll_runtime(",
-                        "__declspec(dllexport)\nvoid __cdecl StubExeEntry(")
+                        "void __cdecl StubExeEntryImpl(")
     assert cleanup.index("pe_loader_tls_dll_detach") < cleanup.index(
         "memguard_shutdown")
     assert thread_detach.index("invoke_dll_oep") < thread_detach.index(

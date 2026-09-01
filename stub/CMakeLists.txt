@@ -20,6 +20,7 @@ add_library(lethe_stub_x64 SHARED
     src/antidump.c
     src/memguard.c
     src/daedalus_vm.c
+    src/stub_entrypoints.asm
     src/daedalus_trampoline.asm
     src/daedalus_x64_thunk.asm
     src/miniz.c
@@ -46,9 +47,12 @@ endif()
 target_link_options(lethe_stub_x64 PRIVATE
     /NODEFAULTLIB
     /NOENTRY
+    /INCREMENTAL:NO
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
+    /EXPORT:StubExeEntry
+    /EXPORT:StubDllMain
     /EXPORT:daedalus_x64_enter_common
 )
 

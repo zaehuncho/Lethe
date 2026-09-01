@@ -79,6 +79,28 @@ def test_freestanding_miniz_disables_crt_assertions_after_shared_flags() -> None
     assert "/W3;/WX-;/GS-;/Oi;/O2" in miniz_block
 
 
+def test_os_entrypoints_use_aligned_masm_veneers() -> None:
+    cmake = _read(STUB_ROOT / "CMakeLists.txt")
+    entrypoints = _read(SRC / "stub_entrypoints.asm")
+    entry = _read(SRC / "stub_main.c")
+    tls = _read(SRC / "tls_anchor.c")
+
+    assert "src/stub_entrypoints.asm" in cmake
+    assert "/INCREMENTAL:NO" in cmake
+    for name in ("StubExeEntry", "StubDllMain"):
+        assert f"/EXPORT:{name}" in cmake
+        assert f"PUBLIC {name}" in entrypoints
+        assert re.search(rf"ALIGN 16\s+{name} PROC", entrypoints)
+        assert f"jmp {name}Impl" in entrypoints
+    assert "void __cdecl StubExeEntryImpl(void)" in entry
+    assert "BOOL WINAPI StubDllMainImpl(" in entry
+    assert "__declspec(dllexport)\nvoid __cdecl StubExeEntry" not in entry
+    assert re.search(
+        r"ALIGN 16\s+lethe_stub_tls_callback PROC", entrypoints)
+    assert "jmp lethe_stub_tls_callback_impl" in entrypoints
+    assert "void NTAPI lethe_stub_tls_callback_impl(" in tls
+
+
 def test_memguard_relocation_recipe_is_staged_fail_closed() -> None:
     header = _read(SRC / "stub_hooks.h")
     guard = _read(SRC / "memguard.c")
@@ -119,7 +141,7 @@ def test_paged_vm_owns_scattered_key_until_module_teardown() -> None:
     )
     assert "release_dll_runtime(hInst, reason, reserved);" in entry
     cleanup = entry[entry.index("static void release_dll_runtime("):
-                    entry.index("__declspec(dllexport)\nvoid __cdecl")]
+                    entry.index("void __cdecl StubExeEntryImpl(")]
     assert "key_scatter_destroy();" in cleanup
     assert re.search(r"fail:.*?key_scatter_destroy\(\);", loader, re.DOTALL)
 

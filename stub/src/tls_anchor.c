@@ -19,8 +19,10 @@
 #pragma section(".tls$ZZZ", long, read, write)
 #pragma section(".rdata$T", long, read)
 
-static void NTAPI lethe_stub_tls_callback(PVOID module, DWORD reason,
-                                          PVOID reserved)
+void NTAPI lethe_stub_tls_callback(PVOID module, DWORD reason, PVOID reserved);
+
+void NTAPI lethe_stub_tls_callback_impl(PVOID module, DWORD reason,
+                                        PVOID reserved)
 {
     pe_loader_tls_anchor_dispatch(module, reason, reserved);
 }
