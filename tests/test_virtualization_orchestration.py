@@ -133,7 +133,7 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
     source = tmp_path / "app.exe"
     output = tmp_path / "app.packed.exe"
     source.write_bytes(b"source")
-    stub, stub_bytes, _manifest = _write_candidate(tmp_path, rolling=False)
+    stub, stub_bytes, _manifest = _write_candidate(tmp_path, rolling=True)
     source_parsed = SimpleNamespace(is_dll=False)
     materialized_parsed = SimpleNamespace(is_dll=False, materialized=True)
     captures = {}
@@ -227,44 +227,7 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
     assert any("2 direct transfer" in line and "1 coverage gap" in line
                and "1 indirect transfer" in line for line in progress)
     assert any("virtualized 1 selected function" in line for line in progress)
-
-
-def test_core_rejects_rolling_stub_for_production_paging(monkeypatch, tmp_path):
-    source = tmp_path / "app.exe"
-    output = tmp_path / "app.packed.exe"
-    source.write_bytes(b"source")
-    stub, _stub_bytes, _manifest = _write_candidate(tmp_path, rolling=True)
-    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
-    monkeypatch.setattr(
-        pe_analyze,
-        "analyze_pe",
-        lambda _path: SimpleNamespace(is_dll=False),
-    )
-    monkeypatch.setattr(
-        direct_control_flow,
-        "analyze_direct_control_flow",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            direct_transfers=(),
-            coverage_gaps=(),
-            acknowledged_coverage_gaps=(),
-            indirect_transfers=(),
-        ),
-    )
-    result = orchestrator.pack_file(
-        str(source),
-        orchestrator.PackOptions(
-            output_path=str(output),
-            is_dll=False,
-            stub_path=str(stub),
-            virtualization_specs=(
-                orchestrator.VirtualizationSpec("Init", 0x1000, 16),
-            ),
-            acknowledge_unproven_indirect_targets=True,
-            _allow_unverified_stub_for_tests=True,
-        ),
-    )
-    assert not result.ok
-    assert "rolling stub builds are incompatible" in result.error
+    assert any("rolling-capable VM stub verified" in line for line in progress)
 
 
 def test_core_virtualization_gate_failure_is_transactional(monkeypatch, tmp_path):

@@ -26,6 +26,17 @@ clean, separable component.
 | **Kalypso** (`cipher/`) | A custom **ChaCha20-Poly1305 AEAD** (RFC 8439) with a per-build sigma + word-permutation, checked against RFC vectors and the `cryptography` library. |
 | **Daedalus** (`daedalus/`, `stub/src/daedalus_*`) | A custom stack-machine **VM** for protector routines and explicitly selected application functions. Production-selected programs use independently authenticated AES-GCM bytecode pages, a one-page plaintext cache, per-build opcode shuffle, and build-bound handler variants. Rolling bytecode remains a separate mode for hand-authored VM programs. |
 | **x64 lifter** (`lifter/`) | A from-scratch **x64 → Daedalus** lifter for selected-function virtualization. Its supported scalar register/memory subset is checked against a Unicorn differential oracle; unsupported instructions reject the whole selected function. A read-only discovery/report tool inventories exact candidates and coverage gaps without auto-selecting code. |
+
+Release-candidate stubs compile both Daedalus capabilities: rolling support for
+internal hand-authored VM programs and authenticated paging for lifted selected
+functions. Promotion and deterministic rebuilds pin `DVM_ROLLING=ON` with
+`DVM_ROLL_POISON=OFF`; selected-function materialization remains
+`rolling=False` and `paged=True`, so enabling the capability does not silently
+turn on debugger-sensitive poison behavior.
+Candidate promotion and release replay run the exact rolling-capable DLL through
+the native selected-function paged-v1 E2E gate in both eager and memory-guard
+modes. Any skip, output mismatch, non-paged program, or test count below five
+rejects the candidate/release replay.
 | **Obfuscation** (`obfuscation/`) | A custom LLVM pass plugin (control-flow flattening + opaque predicates + MBA + bogus control flow, per-build randomized). *Drafted, not yet compiled — needs an LLVM toolchain; see its README.* |
 | **bind** (`bind/`) | Hash-pin a packed EXE's first-party dependency DLLs so they can't be swapped, without fragile single-EXE bundling. |
 | **tracing** (`tracing/`) | Per-customer build variance and issuance-side identifiers for investigating leaked builds. |

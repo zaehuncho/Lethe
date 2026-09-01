@@ -882,9 +882,10 @@ def pack_file(input_path: str, options: PackOptions,
                         eff._allow_unverified_stub_for_tests),
                 )
             if rolling:
-                raise ValueError(
-                    "production selected-function virtualization requires "
-                    "authenticated bytecode paging; rolling stub builds are incompatible"
+                _emit(
+                    progress,
+                    "rolling-capable VM stub verified; selected functions use "
+                    "authenticated paged bytecode",
                 )
             pack_master_key = secrets.token_bytes(payload.AES_KEY_LEN)
             materialized = virtualize.materialize_selected_functions(

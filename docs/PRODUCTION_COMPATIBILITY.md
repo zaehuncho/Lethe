@@ -47,6 +47,20 @@ the original GFID/XFG identity at the source RVA and reaches its generated thunk
 only through the direct entry `E9`; the thunk is never declared as a generated
 GFID. Crafted generated-thunk GFIDs remain fail-closed.
 
+The release stub deliberately contains both VM execution capabilities. Internal
+hand-authored programs may use history-keyed rolling containers, while lifted
+selected functions remain independently encrypted and authenticated per page.
+Candidate promotion and release rebuild configure `DVM_ROLLING=ON` and
+`DVM_ROLL_POISON=OFF`; the latter is explicit so an `anti_debug=off` pack remains
+compatible with `DEBUG_PROCESS` control. A rolling-capable stub is therefore not
+a reason to reject paged selected-function materialization, which continues to
+pass `rolling=False` and `paged=True`.
+The candidate-bound runtime command is mandatory during promotion and release
+replay. It runs `test_native_runtime_hardening_stress.py` together with
+`test_native_virtualization_runtime.py` against the exact rebuilt artifact,
+requires all five native cases without skips, and proves the selected leaf emits
+a paged-v1 program whose eager and memory-guard packed outputs match the original.
+
 The harness captures the packer's stdout and stderr independently. Runtime
 stdout, stderr, and exit code are recorded in JSON even when the packed process
 fails before `main`.

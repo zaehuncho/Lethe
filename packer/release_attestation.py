@@ -338,6 +338,9 @@ def validate_candidate_identity(
             "candidate manifest DVM shuffle seed must encode exactly 32 bytes")
     if manifest.get("dvm_rolling") is not True:
         raise ReleaseAttestationError("candidate manifest lacks rolling DVM support")
+    if manifest.get("dvm_roll_poison") is not False:
+        raise ReleaseAttestationError(
+            "candidate manifest does not disable DVM rolling poison")
     if manifest.get("dvm_paged_runtime") is not True:
         raise ReleaseAttestationError("candidate manifest lacks authenticated DVM paging")
     evidence = manifest.get("evidence")
@@ -581,6 +584,11 @@ def _validate_semantic_evidence(
                 or not isinstance(document.get("dvm_shuffle_seed"), str)
                 or re.fullmatch(r"[0-9a-f]{64}", document["dvm_shuffle_seed"]) is None):
             raise ReleaseAttestationError("release rebuild provenance is malformed")
+        if (document.get("dvm_rolling") is not True
+                or document.get("dvm_roll_poison") is not False
+                or document.get("dvm_paged_runtime") is not True):
+            raise ReleaseAttestationError(
+                "release rebuild does not preserve the production DVM policy")
         replay = document.get("replay_commands")
         if not isinstance(replay, list) or len(replay) != len(
                 REQUIRED_RELEASE_REPLAY_IDS):
@@ -1051,6 +1059,9 @@ def verify_release_bundle(
         "promotion_tool_sha256": manifest["promotion_tool_sha256"],
         "candidate_matrix_sha256": manifest["production_matrix_sha256"],
         "toolchain_binding_sha256": manifest["toolchain_binding_sha256"],
+        "dvm_rolling": manifest["dvm_rolling"],
+        "dvm_roll_poison": manifest["dvm_roll_poison"],
+        "dvm_paged_runtime": manifest["dvm_paged_runtime"],
     }
     if candidate != expected_candidate:
         raise ReleaseAttestationError("release attestation candidate binding is invalid")
@@ -1195,7 +1206,10 @@ def verify_release_bundle(
         raise ReleaseAttestationError("bundled release matrix disagrees with its attestation")
     rebuild = evidence_documents["release-rebuild"]
     if (rebuild.get("dvm_shuffle_seed") != manifest["dvm_shuffle_seed"]
-            or rebuild.get("toolchain_binding_sha256") != manifest["toolchain_binding_sha256"]):
+            or rebuild.get("toolchain_binding_sha256") != manifest["toolchain_binding_sha256"]
+            or rebuild.get("dvm_rolling") != manifest["dvm_rolling"]
+            or rebuild.get("dvm_roll_poison") != manifest["dvm_roll_poison"]
+            or rebuild.get("dvm_paged_runtime") != manifest["dvm_paged_runtime"]):
         raise ReleaseAttestationError("release rebuild disagrees with candidate provenance")
     try:
         from tools import production_gate

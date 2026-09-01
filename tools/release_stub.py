@@ -129,6 +129,24 @@ def _run_build(argv: list[str], *, cwd: Path, label: str) -> None:
         raise ReleaseError(f"deterministic candidate {label} failed: {detail}")
 
 
+def _release_configure_argv(
+    host: dict[str, Any],
+    candidate: dict[str, Any],
+    source: Path,
+    build: Path,
+) -> list[str]:
+    return [
+        host["cmake"], "-S", str(source / "stub"), "-B", str(build),
+        "-G", candidate["cmake_generator"], "-A", candidate["cmake_platform"],
+        "-DBUILD_TESTING=ON", f"-DPython3_EXECUTABLE={host['python']}",
+        *promote_stub.release_dvm_configure_args(candidate["dvm_shuffle_seed"]),
+        "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
+        "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
+        "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO",
+        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
+    ]
+
+
 def _rebuild_candidate_stub(
     candidate: dict[str, Any],
     rebuild_root: Path,
@@ -150,16 +168,7 @@ def _rebuild_candidate_stub(
     for field, actual in host_bindings.items():
         if candidate.get(field) != actual:
             raise ReleaseError(f"release rebuild {field} differs from the candidate")
-    configure = [
-        host["cmake"], "-S", str(source / "stub"), "-B", str(build),
-        "-G", candidate["cmake_generator"], "-A", candidate["cmake_platform"],
-        "-DBUILD_TESTING=ON", f"-DPython3_EXECUTABLE={host['python']}",
-        f"-DDVM_SHUFFLE_SEED={candidate['dvm_shuffle_seed']}",
-        "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
-        "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
-        "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO",
-        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
-    ]
+    configure = _release_configure_argv(host, candidate, source, build)
     _run_build(configure, cwd=source, label="configure")
     try:
         toolchain = promote_stub.inspect_cmake_toolchain(build)
@@ -191,7 +200,8 @@ def _rebuild_candidate_stub(
     for field in (
         "dvm_shuffle_seed", "dvm_opcode_mapping_sha256",
         "dvm_handler_variant_sha256", "dvm_python_map_sha256",
-        "dvm_native_map_sha256", "dvm_rolling", "dvm_paged_runtime",
+        "dvm_native_map_sha256", "dvm_rolling", "dvm_roll_poison",
+        "dvm_paged_runtime",
     ):
         if dvm.get(field) != candidate.get(field):
             raise ReleaseError(f"release rebuild {field} differs from the candidate")
@@ -271,19 +281,24 @@ def _replay_rebuilt_candidate(
     test_environment = {
         "PYTHONPATH": str(source),
         "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+        "LETHE_RUN_NATIVE_VM_E2E": "1",
         "LETHE_NATIVE_RUNTIME_STUB_PATH": str(rebuilt_stub),
     }
     runtime = run(
         [host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         source / "tests" / "test_native_runtime_hardening_stress.py"],
+         *(source / "tests" / name
+           for name in promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS)],
         name="candidate-bound-native-runtime-hardening",
         portable_argv=["tool://python", "-m", "pytest", "-q", "-p",
                        "no:cacheprovider",
-                       "repo://tests/test_native_runtime_hardening_stress.py"],
+                       *(f"repo://tests/{name}"
+                         for name in promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS)],
         env_overrides=test_environment,
     )
     try:
-        promote_stub.validate_runtime_hardening_record(runtime, artifact_hash)
+        promote_stub.validate_runtime_hardening_record(
+            runtime, artifact_hash,
+            minimum_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     except promote_stub.PromotionError as exc:
         raise ReleaseError(f"release runtime-hardening replay is invalid: {exc}") from exc
 
@@ -812,6 +827,9 @@ def _create_release_bundle_from_snapshot(
             "byte_identical": rebuilt == candidate_bytes,
             "toolchain_binding_sha256": candidate["toolchain_binding_sha256"],
             "dvm_shuffle_seed": candidate["dvm_shuffle_seed"],
+            "dvm_rolling": candidate["dvm_rolling"],
+            "dvm_roll_poison": candidate["dvm_roll_poison"],
+            "dvm_paged_runtime": candidate["dvm_paged_runtime"],
             "replay_commands": replay_records,
         })
         signed_records.append({
@@ -839,6 +857,9 @@ def _create_release_bundle_from_snapshot(
                 "promotion_tool_sha256": candidate["promotion_tool_sha256"],
                 "candidate_matrix_sha256": candidate["production_matrix_sha256"],
                 "toolchain_binding_sha256": candidate["toolchain_binding_sha256"],
+                "dvm_rolling": candidate["dvm_rolling"],
+                "dvm_roll_poison": candidate["dvm_roll_poison"],
+                "dvm_paged_runtime": candidate["dvm_paged_runtime"],
             },
             "release_matrix_sha256": release_attestation.sha256_file(release_matrix),
             "release_source_commit": release_source_commit,

@@ -97,10 +97,10 @@ endforeach()
 option(DVM_ROLLING "Compile+emit history-keyed rolling-bytecode virtualization" OFF)
 # Observation-poison: fold an anti-instrumentation signal into the rolling
 # accumulator so a debugger silently mis-keys (zero-FP on clean runs). Kill-
-# switch; default ON when rolling is on.
-# NOTE: keep DVM_ROLLING/DVM_ROLL_POISON OFF for any build you intend to attach a
-# debugger to yourself -- the poison's failure mode is an opaque decrypt failure,
-# not a clean exit, so a self-debug session would look like corruption.
+# switch; default ON when rolling is on. Production and candidate builds compile
+# rolling support but explicitly set DVM_ROLL_POISON=OFF: rolling containers are
+# debugger-compatible without the poison signal, while selected-function pages
+# continue to use the independent authenticated paging runtime.
 option(DVM_ROLL_POISON "Fold anti-instrumentation poison into rolling decode" ON)
 if(DVM_ROLLING)
     target_sources(lethe_stub_x64 PRIVATE src/daedalus_rolling.c)

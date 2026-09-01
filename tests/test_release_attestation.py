@@ -109,16 +109,20 @@ def _candidate(tmp_path: Path) -> tuple[Path, Path, dict]:
         )
 
     command("locked-dependency-sync", "uv-sync.json", bound=False)
-    command("fresh-cmake-configure", "cmake-configure.json", bound=False)
+    command(
+        "fresh-cmake-configure", "cmake-configure.json", bound=False,
+        argv=["tool://cmake.exe", *promote_stub.release_dvm_configure_args("22" * 32)],
+    )
     command("fresh-w4-wx-stub-build", "cmake-build.json", bound=False)
     command("ctest-inventory", "ctest-inventory.json", bound=True,
             stdout=json.dumps({"tests": [{"name": str(i)} for i in range(4)]}))
     command("ctest", "ctest.json", bound=True)
     command("candidate-bound-native-runtime-hardening", "runtime-hardening.json",
-            bound=True, stdout="3 passed in 1.00s\n",
+            bound=True, stdout="5 passed in 1.00s\n",
             argv=["tool://python.exe", "-m", "pytest", "-q", "-p",
                   "no:cacheprovider",
-                  "repo://tests/test_native_runtime_hardening_stress.py"])
+                  "repo://tests/test_native_runtime_hardening_stress.py",
+                  "repo://tests/test_native_virtualization_runtime.py"])
     command("roundtrip-fixture-build", "roundtrip-fixture-build.json", bound=True)
     command("exe-dll-roundtrip", "roundtrip.json", bound=True,
             stdout="11/11 passed -- PASS\n")
@@ -148,7 +152,8 @@ def _candidate(tmp_path: Path) -> tuple[Path, Path, dict]:
                         "dvm_handler_variant_sha256": "3" * 64,
                         "dvm_python_map_sha256": "4" * 64,
                         "dvm_native_map_sha256": "5" * 64,
-                        "dvm_rolling": True, "dvm_paged_runtime": True},
+                        "dvm_rolling": True, "dvm_roll_poison": False,
+                        "dvm_paged_runtime": True},
         roundtrip_counts=(11, 11), ctest_count=4,
         evidence_paths=evidence_paths, stage_dir=candidate, gate_payload=gate,
     )
@@ -512,6 +517,14 @@ def test_signed_release_accepts_different_green_release_matrix(
         matrix_path=matrix)
     assert payload["production_ready"] is True
     assert payload["candidate"]["candidate_matrix_sha256"] != payload["release_matrix_sha256"]
+    assert payload["candidate"]["dvm_rolling"] is True
+    assert payload["candidate"]["dvm_roll_poison"] is False
+    assert payload["candidate"]["dvm_paged_runtime"] is True
+    rebuild = json.loads((output / "release-evidence/release-rebuild.json").read_text(
+        encoding="utf-8"))
+    assert rebuild["dvm_rolling"] is True
+    assert rebuild["dvm_roll_poison"] is False
+    assert rebuild["dvm_paged_runtime"] is True
 
     monkeypatch.setattr(release_attestation, "DEFAULT_TRUST_STORE", trust)
     monkeypatch.setattr(
@@ -542,6 +555,56 @@ def test_unsigned_claim_wrong_key_revocation_and_tampering_fail(
     envelope["payload"]["production_ready"] = False
     _json(attestation, envelope)
     with pytest.raises(release_attestation.ReleaseAttestationError, match="signature"):
+        release_attestation.verify_release_bundle(
+            stub, trust_store_path=trust,
+            evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+
+
+def test_resigned_release_cannot_change_candidate_roll_poison_policy(
+    tmp_path: Path,
+) -> None:
+    output, trust, matrix, key, evidence_trust = _release(tmp_path)
+    stub = output / "lethe_stub_x64.dll"
+    attestation = output / "lethe_stub_x64.release.json"
+    envelope = json.loads(attestation.read_text(encoding="utf-8"))
+    envelope["payload"]["candidate"]["dvm_roll_poison"] = True
+    envelope["signature_base64"] = base64.b64encode(key.sign(
+        release_attestation.canonical_json_bytes(envelope["payload"]))).decode("ascii")
+    _json(attestation, envelope)
+
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError,
+        match="candidate binding",
+    ):
+        release_attestation.verify_release_bundle(
+            stub, trust_store_path=trust,
+            evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+
+
+def test_resigned_release_rebuild_cannot_enable_roll_poison(
+    tmp_path: Path,
+) -> None:
+    output, trust, matrix, key, evidence_trust = _release(tmp_path)
+    stub = output / "lethe_stub_x64.dll"
+    rebuild_path = output / "release-evidence/release-rebuild.json"
+    rebuild = json.loads(rebuild_path.read_text(encoding="utf-8"))
+    rebuild["dvm_roll_poison"] = True
+    _json(rebuild_path, rebuild)
+
+    attestation = output / "lethe_stub_x64.release.json"
+    envelope = json.loads(attestation.read_text(encoding="utf-8"))
+    rebuild_record = next(
+        record for record in envelope["payload"]["evidence"]
+        if record["kind"] == "release-rebuild")
+    rebuild_record["sha256"] = release_attestation.sha256_file(rebuild_path)
+    envelope["signature_base64"] = base64.b64encode(key.sign(
+        release_attestation.canonical_json_bytes(envelope["payload"]))).decode("ascii")
+    _json(attestation, envelope)
+
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError,
+        match="production DVM policy",
+    ):
         release_attestation.verify_release_bundle(
             stub, trust_store_path=trust,
             evidence_trust_store_path=evidence_trust, matrix_path=matrix)
@@ -672,6 +735,55 @@ def test_release_signing_requires_byte_identical_clean_source_rebuild(
             release_matrix_path=matrix_path,
         )
     assert not (tmp_path / "release").exists()
+
+
+def test_release_rebuild_configure_matches_rolling_candidate_capabilities(
+    tmp_path: Path,
+) -> None:
+    seed = "cd" * 32
+    argv = release_stub._release_configure_argv(
+        {"cmake": "cmake", "python": "python"},
+        {
+            "cmake_generator": promote_stub.SUPPORTED_GENERATOR,
+            "cmake_platform": promote_stub.SUPPORTED_PLATFORM,
+            "dvm_shuffle_seed": seed,
+        },
+        tmp_path / "source",
+        tmp_path / "build",
+    )
+
+    assert f"-DDVM_SHUFFLE_SEED={seed}" in argv
+    assert argv.count("-DDVM_ROLLING=ON") == 1
+    assert argv.count("-DDVM_ROLL_POISON=OFF") == 1
+    assert "-DBUILD_TESTING=ON" in argv
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [None, "-DDVM_ROLL_POISON=ON", "-DDVM_ROLLING=OFF"],
+)
+def test_candidate_configure_evidence_pins_rolling_and_disables_poison(
+    tmp_path: Path, replacement: str | None,
+) -> None:
+    stub, manifest_path, manifest = _candidate(tmp_path)
+    configure_path = stub.parent / "evidence/cmake-configure.json"
+    configure = json.loads(configure_path.read_text(encoding="utf-8"))
+    if replacement is None:
+        configure["argv"].remove("-DDVM_ROLL_POISON=OFF")
+    elif replacement.endswith("POISON=ON"):
+        index = configure["argv"].index("-DDVM_ROLL_POISON=OFF")
+        configure["argv"][index] = replacement
+    else:
+        index = configure["argv"].index("-DDVM_ROLLING=ON")
+        configure["argv"][index] = replacement
+    _json(configure_path, configure)
+    next(item for item in manifest["evidence"]
+         if item["path"] == "evidence/cmake-configure.json")["sha256"] = (
+             release_attestation.sha256_file(configure_path))
+    _json(manifest_path, manifest)
+
+    with pytest.raises(promote_stub.PromotionError, match="configure evidence does not pin"):
+        promote_stub.validate_candidate_bundle(stub, manifest_path)
 
 
 def test_candidate_promoter_snapshot_must_match_tracked_candidate_commit(

@@ -158,6 +158,22 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
     with pytest.raises(promote_stub.PromotionError, match="skipped"):
         promote_stub.validate_runtime_hardening_record(skipped, digest)
 
+    incomplete_release_gate = promote_stub.CommandRecord(
+        **{**passing.__dict__, "stdout": "4 passed in 1.00s\n"}
+    )
+    with pytest.raises(promote_stub.PromotionError, match="complete pass summary"):
+        promote_stub.validate_runtime_hardening_record(
+            incomplete_release_gate, digest,
+            minimum_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+
+
+def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS == (
+        "test_native_runtime_hardening_stress.py",
+        "test_native_virtualization_runtime.py",
+    )
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 5
+
 
 def test_corpus_evidence_is_bound_to_commit_and_artifact(tmp_path: Path) -> None:
     stub = tmp_path / "candidate.dll"
@@ -322,6 +338,7 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
             "dvm_python_map_sha256": "4" * 64,
             "dvm_native_map_sha256": "5" * 64,
             "dvm_rolling": True,
+            "dvm_roll_poison": False,
             "dvm_paged_runtime": True,
         },
         roundtrip_counts=(11, 11),
@@ -339,6 +356,7 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
     assert manifest["native_roundtrip"] == "passed-9-of-9"
     assert manifest["native_roundtrip_actual"] == {"passed": 11, "total": 11}
     assert manifest["dvm_handler_variant_sha256"] == "3" * 64
+    assert manifest["dvm_roll_poison"] is False
     assert manifest["evidence"] == [{
         "path": "evidence/roundtrip.json",
         "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
@@ -419,6 +437,7 @@ def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_statu
             "dvm_python_map_sha256": "4" * 64,
             "dvm_native_map_sha256": "5" * 64,
             "dvm_rolling": True,
+            "dvm_roll_poison": False,
             "dvm_paged_runtime": True,
         },
         roundtrip_counts=(11, 11),
@@ -435,6 +454,12 @@ def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_statu
         promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
 
     promote_stub.atomic_write_json(evidence, {"ready": True})
+    manifest["dvm_roll_poison"] = True
+    promote_stub.atomic_write_json(manifest_path, manifest)
+    with pytest.raises(promote_stub.PromotionError, match="roll poison disabled"):
+        promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
+
+    manifest["dvm_roll_poison"] = False
     manifest["artifact_status"] = "production-released"
     manifest["production_ready"] = True
     promote_stub.atomic_write_json(manifest_path, manifest)
@@ -458,7 +483,9 @@ def test_generated_dvm_provenance_binds_seed_and_native_map(tmp_path: Path) -> N
         encoding="utf-8",
     )
     (tmp_path / "CMakeCache.txt").write_text(
-        "DVM_SHUFFLE_OPCODES:BOOL=ON\nDVM_ROLLING:BOOL=ON\n",
+        "DVM_SHUFFLE_OPCODES:BOOL=ON\n"
+        "DVM_ROLLING:BOOL=ON\n"
+        "DVM_ROLL_POISON:BOOL=OFF\n",
         encoding="utf-8",
     )
 
@@ -467,6 +494,9 @@ def test_generated_dvm_provenance_binds_seed_and_native_map(tmp_path: Path) -> N
     assert result["dvm_shuffle_seed"] == seed
     assert result["dvm_opcode_mapping_sha256"] == mapping
     assert result["dvm_handler_variant_sha256"] == handlers
+    assert result["dvm_rolling"] is True
+    assert result["dvm_roll_poison"] is False
+    assert result["dvm_paged_runtime"] is True
 
     with pytest.raises(promote_stub.PromotionError, match="requested seed"):
         promote_stub.inspect_generated_dvm_provenance(tmp_path, "deadbeef")
@@ -491,6 +521,17 @@ def test_promotion_pins_nonincremental_link_and_inspects_aligned_veneers() -> No
     assert "rva % 16" in source
     assert "veneer[0] != 0xE9" in source
     assert "terminator != 0" in source
+
+
+def test_promotion_configure_enables_rolling_without_debug_poison(tmp_path: Path) -> None:
+    seed = "ab" * 32
+    argv = promote_stub._promotion_configure_argv(
+        {"cmake": "cmake", "python": "python"}, tmp_path / "build", seed)
+
+    assert f"-DDVM_SHUFFLE_SEED={seed}" in argv
+    assert argv.count("-DDVM_ROLLING=ON") == 1
+    assert argv.count("-DDVM_ROLL_POISON=OFF") == 1
+    assert not any(str(argument).startswith("-DDVM_ROLL_POISON=ON") for argument in argv)
 
 
 def test_legacy_build_script_cannot_update_tracked_prebuilt() -> None:

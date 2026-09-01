@@ -215,7 +215,19 @@ existing output directory. Before signing, it snapshots all candidate, matrix,
 trust-store, and external-evidence inputs into an isolated directory. It then
 rebuilds the native stub from a Git archive of the candidate commit with the
 candidate's exact seed and toolchain and requires byte-for-byte identity. The
-candidate promoter, compatibility matrix, and dependency-lock hashes are read
+promotion configure evidence and rebuild must both contain exactly one
+`-DDVM_ROLLING=ON` and one `-DDVM_ROLL_POISON=OFF`; the generated provenance,
+candidate manifest, signed candidate identity, and release-rebuild evidence must
+also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
+`dvm_paged_runtime=true`. Conflicting or omitted
+values invalidate the candidate. Rolling support serves internal VM programs,
+while selected-function virtualization continues to use authenticated paging.
+The candidate-bound native runtime record must name both the hardening stress
+file and the selected-function virtualization E2E file. It must report at least
+five passes with zero skips against the exact candidate hash; the E2E pair must
+execute paged-v1 output in eager and memory-guard modes. Release replay repeats
+that same command against the byte-identical rebuilt stub.
+The candidate promoter, compatibility matrix, and dependency-lock hashes are read
 back from that tracked Git commit rather than trusted from candidate snapshots.
 The rebuilt bytes then rerun CTest, candidate-bound native runtime hardening,
 EXE/DLL roundtrip, and the production corpus; portable command and output hashes

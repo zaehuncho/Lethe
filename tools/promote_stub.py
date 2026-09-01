@@ -44,6 +44,11 @@ SUPPORTED_UV = "0.11.29"
 SUPPORTED_GENERATOR = "Visual Studio 17 2022"
 SUPPORTED_PLATFORM = "x64"
 REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
+REQUIRED_NATIVE_RUNTIME_TESTS = (
+    "test_native_runtime_hardening_stress.py",
+    "test_native_virtualization_runtime.py",
+)
+REQUIRED_NATIVE_RUNTIME_PASS_COUNT = 5
 CANDIDATE_POLICY_ID = "lethe-native-candidate-v1"
 CANDIDATE_ALLOWED_BLOCKERS = {
     "mitigation.load_config_cfg_xfg": "partial",
@@ -87,6 +92,34 @@ class CommandRecord:
     stderr: str
     source_commit: str
     artifact_sha256: str | None = None
+
+
+def release_dvm_configure_args(shuffle_seed: str) -> list[str]:
+    if re.fullmatch(r"[0-9a-f]{64}", shuffle_seed) is None:
+        raise PromotionError("DVM shuffle seed must encode exactly 32 bytes")
+    return [
+        f"-DDVM_SHUFFLE_SEED={shuffle_seed}",
+        "-DDVM_ROLLING=ON",
+        "-DDVM_ROLL_POISON=OFF",
+    ]
+
+
+def _promotion_configure_argv(
+    host: Mapping[str, str],
+    build_dir: Path,
+    shuffle_seed: str,
+) -> list[str | os.PathLike[str]]:
+    return [
+        host["cmake"], "-S", ROOT / "stub", "-B", build_dir,
+        "-G", SUPPORTED_GENERATOR, "-A", SUPPORTED_PLATFORM,
+        "-DBUILD_TESTING=ON",
+        f"-DPython3_EXECUTABLE={host['python']}",
+        *release_dvm_configure_args(shuffle_seed),
+        "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
+        "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
+        "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO",
+        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
+    ]
 
 
 def sha256_file(path: Path) -> str:
@@ -463,9 +496,14 @@ def inspect_generated_dvm_provenance(
         raise PromotionError("Python and native Daedalus opcode maps disagree")
     cache = (build_dir / "CMakeCache.txt").read_text(
         encoding="utf-8", errors="replace")
-    for option in ("DVM_SHUFFLE_OPCODES", "DVM_ROLLING"):
-        if re.search(rf"(?m)^{option}:BOOL=ON\r?$", cache) is None:
-            raise PromotionError(f"fresh candidate did not enable {option}")
+    for option, expected in (
+        ("DVM_SHUFFLE_OPCODES", "ON"),
+        ("DVM_ROLLING", "ON"),
+        ("DVM_ROLL_POISON", "OFF"),
+    ):
+        if re.search(rf"(?m)^{option}:BOOL={expected}\r?$", cache) is None:
+            raise PromotionError(
+                f"fresh candidate did not configure {option}={expected}")
     return {
         "dvm_shuffle_seed": effective_seed,
         "dvm_opcode_mapping_sha256": mapping_hash,
@@ -473,6 +511,7 @@ def inspect_generated_dvm_provenance(
         "dvm_python_map_sha256": sha256_file(python_map),
         "dvm_native_map_sha256": sha256_file(native_map),
         "dvm_rolling": True,
+        "dvm_roll_poison": False,
         "dvm_paged_runtime": True,
     }
 
@@ -774,8 +813,11 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         raise PromotionError(
             "candidate manifest DVM shuffle seed must encode exactly 32 bytes")
     if (manifest.get("dvm_rolling") is not True
+            or manifest.get("dvm_roll_poison") is not False
             or manifest.get("dvm_paged_runtime") is not True):
-        raise PromotionError("candidate manifest lacks the production DVM runtime")
+        raise PromotionError(
+            "candidate manifest lacks the production DVM rolling/paging policy "
+            "with roll poison disabled")
     for field in (
         "dvm_opcode_mapping_sha256",
         "dvm_handler_variant_sha256",
@@ -891,6 +933,13 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         filename: load_command(filename, name, artifact_bound=artifact_bound)
         for filename, name, artifact_bound in command_specs
     }
+    configure_argv = commands["cmake-configure.json"]["argv"]
+    for expected in release_dvm_configure_args(manifest["dvm_shuffle_seed"]):
+        option = expected.split("=", 1)[0] + "="
+        matches = [argument for argument in configure_argv if argument.startswith(option)]
+        if matches != [expected]:
+            raise PromotionError(
+                f"candidate configure evidence does not pin {expected}")
     try:
         inventory = json.loads(commands["ctest-inventory.json"]["stdout"])
     except json.JSONDecodeError as exc:
@@ -967,7 +1016,7 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         raise PromotionError("runtime-hardening evidence has unexpected fields")
     expected_runtime_argv = [
         "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        "repo://tests/test_native_runtime_hardening_stress.py",
+        *(f"repo://tests/{name}" for name in REQUIRED_NATIVE_RUNTIME_TESTS),
     ]
     if runtime_payload["argv"][1:] != expected_runtime_argv:
         raise PromotionError("runtime-hardening evidence names an unexpected command")
@@ -980,7 +1029,9 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         source_commit=runtime_payload["source_commit"],
         artifact_sha256=runtime_payload.get("artifact_sha256"),
     )
-    validate_runtime_hardening_record(runtime_record, manifest["sha256"])
+    validate_runtime_hardening_record(
+        runtime_record, manifest["sha256"],
+        minimum_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     return manifest
 
 
@@ -1056,17 +1107,7 @@ def execute(args: argparse.Namespace) -> Path | None:
 
     build_dir = stage_dir / "build"
     configure = run_recorded(
-        [
-            host["cmake"], "-S", ROOT / "stub", "-B", build_dir,
-            "-G", SUPPORTED_GENERATOR, "-A", SUPPORTED_PLATFORM,
-            "-DBUILD_TESTING=ON",
-            f"-DPython3_EXECUTABLE={host['python']}",
-            f"-DDVM_SHUFFLE_SEED={shuffle_seed}",
-            "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
-            "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
-            "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro /INCREMENTAL:NO",
-            "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
-        ],
+        _promotion_configure_argv(host, build_dir, shuffle_seed),
         name="fresh-cmake-configure",
         path_name="cmake-configure.json",
     )
@@ -1115,18 +1156,21 @@ def execute(args: argparse.Namespace) -> Path | None:
     runtime_hardening = run_recorded(
         [
             host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            ROOT / "tests" / "test_native_runtime_hardening_stress.py",
+            *(ROOT / "tests" / name for name in REQUIRED_NATIVE_RUNTIME_TESTS),
         ],
         name="candidate-bound-native-runtime-hardening",
         path_name="runtime-hardening.json",
         artifact_hash=artifact_hash,
         env_overrides={
             "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+            "LETHE_RUN_NATIVE_VM_E2E": "1",
             "LETHE_NATIVE_RUNTIME_STUB_PATH": str(built_stub.resolve()),
         },
     )
     try:
-        validate_runtime_hardening_record(runtime_hardening, artifact_hash)
+        validate_runtime_hardening_record(
+            runtime_hardening, artifact_hash,
+            minimum_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     except PromotionError as exc:
         failures.append(str(exc))
     _require_unchanged_artifact(

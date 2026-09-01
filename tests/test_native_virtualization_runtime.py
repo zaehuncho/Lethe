@@ -1,4 +1,8 @@
-"""Opt-in native proof for the selected-function virtualization pipeline."""
+"""Native release gate for selected-function paged-v1 virtualization.
+
+Candidate promotion and release replay supply the exact rolling-capable stub and
+enable this gate. Direct ordinary pytest runs remain lightweight.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -19,6 +23,7 @@ from packer import assemble, bytecode_pages, orchestrator, pe_analyze, virtualiz
 
 ROOT = Path(__file__).resolve().parents[1]
 _RUN_GATE = "LETHE_RUN_NATIVE_VM_E2E"
+_STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
 _SHUFFLE_SEED = "3141592653589793238462643383279502884197169399375105820974944592"
 _LEAF_BYTES = bytes.fromhex("b82a000000c3")
@@ -128,7 +133,7 @@ def _build_stub(work: Path) -> Path:
             "cmake", "-S", str(ROOT / "stub"), "-B", str(build),
             "-G", "Visual Studio 17 2022", "-A", "x64",
             f"-DDVM_SHUFFLE_SEED={_SHUFFLE_SEED}",
-            "-DDVM_ROLLING=OFF",
+            "-DDVM_ROLLING=ON",
             "-DDVM_ROLL_POISON=OFF",
             "-DBUILD_TESTING=OFF",
         ],
@@ -148,7 +153,7 @@ def _build_stub(work: Path) -> Path:
         "sha256": hashlib.sha256(stub_bytes).hexdigest(),
         "dvm_shuffle_seed": _SHUFFLE_SEED,
         "dvm_handler_variant_sha256": generated["HANDLER_VARIANT_SHA256"],
-        "dvm_rolling": False,
+        "dvm_rolling": True,
         "dvm_paged_runtime": True,
     }
     Path(str(stub) + ".manifest.json").write_text(
@@ -156,6 +161,39 @@ def _build_stub(work: Path) -> Path:
         encoding="ascii",
     )
     return stub
+
+
+def _candidate_stub_or_build(work: Path) -> Path:
+    configured = os.environ.get(_STUB_PATH_ENV)
+    if not configured:
+        return _build_stub(work)
+    source_stub = Path(configured).resolve()
+    assert source_stub.is_file(), f"{_STUB_PATH_ENV} does not name a file: {source_stub}"
+    build = source_stub.parent.parent
+    cache = (build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    assert "DVM_ROLLING:BOOL=ON" in cache
+    assert "DVM_ROLL_POISON:BOOL=OFF" in cache
+    generated = runpy.run_path(str(build / "daedalus_opcodes_shuffled.py"))
+    candidate = work / "candidate_stub" / source_stub.name
+    candidate.parent.mkdir()
+    shutil.copyfile(source_stub, candidate)
+    stub_bytes = candidate.read_bytes()
+    manifest = {
+        "schema": 1,
+        "artifact": candidate.name,
+        "size_bytes": len(stub_bytes),
+        "sha256": hashlib.sha256(stub_bytes).hexdigest(),
+        "dvm_shuffle_seed": generated["BUILD_SEED"],
+        "dvm_handler_variant_sha256": generated["HANDLER_VARIANT_SHA256"],
+        "dvm_rolling": True,
+        "dvm_paged_runtime": True,
+    }
+    Path(str(candidate) + ".manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    assert candidate.read_bytes() == source_stub.read_bytes()
+    return candidate
 
 
 def _run(executable: Path) -> subprocess.CompletedProcess:
@@ -223,13 +261,13 @@ def test_packed_executable_calls_virtualized_leaf(
             for gap in discovery.coverage_gaps
         )
 
-        stub = _build_stub(work)
+        stub = _candidate_stub_or_build(work)
         _stub_bytes, _stub_hash, opcode_table, _handler_hash, rolling = (
             orchestrator._load_virtualization_build(
                 str(stub), allow_unverified_stub_for_tests=True)
         )
         assert not opcode_table.is_canonical
-        assert rolling is False
+        assert rolling is True
 
         captured = {}
         materialize = virtualize.materialize_selected_functions
@@ -270,6 +308,7 @@ def test_packed_executable_calls_virtualized_leaf(
 
         materialized = captured["result"]
         function = materialized.manifest.functions[0]
+        assert function.program_format == "paged-v1"
         generated = function.generated_executable_ranges[0]
         entry = _slice(materialized.parsed, leaf_rva, leaf_size)
         assert entry[0] == 0xE9
