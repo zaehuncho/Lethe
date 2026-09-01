@@ -253,6 +253,13 @@ def test_process_hardening_precedes_first_protected_import_resolution() -> None:
     assert "SetDefaultDllDirectories govern the first" in loader
 
 
+def test_process_hardening_policy_fault_injection_is_fail_closed() -> None:
+    antidump = _read(SRC / "antidump.c")
+    assert "LETHE_ANTIDUMP_TEST_FAIL_PROCESS_MITIGATION" in antidump
+    assert "LETHE_ANTIDUMP_TEST_FAIL_DLL_SEARCH_POLICY" in antidump
+    assert antidump.count("if (GetCurrentProcessId() != 0u)") >= 2
+
+
 def test_dll_antidebug_detection_returns_failure_without_killing_host() -> None:
     antidebug = _read(SRC / "antidebug.c")
     loader = _read(SRC / "pe_loader.c")

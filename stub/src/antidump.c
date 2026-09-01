@@ -260,6 +260,11 @@ static int harden_process_mitigations(void)
     DWORD flags;
     DWORD effective;
 
+#if defined(LETHE_ANTIDUMP_TEST_FAIL_PROCESS_MITIGATION)
+    if (GetCurrentProcessId() != 0u)
+        return 1;
+#endif
+
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32)
         return 1;
@@ -318,6 +323,11 @@ static int harden_dll_search_order(void)
 {
     HMODULE k32;
     SetDefaultDllDirs_t fn;
+
+#if defined(LETHE_ANTIDUMP_TEST_FAIL_DLL_SEARCH_POLICY)
+    if (GetCurrentProcessId() != 0u)
+        return 1;
+#endif
 
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32) return 1;

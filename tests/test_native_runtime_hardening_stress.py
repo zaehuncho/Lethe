@@ -18,6 +18,7 @@ from tools import handler_shape_audit
 
 ROOT = Path(__file__).resolve().parents[1]
 _RUN_GATE = "LETHE_RUN_NATIVE_RUNTIME_STRESS"
+_STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 _SHUFFLE_SEED = (
     "2718281828459045235360287471352662497757247093699959574966967627"
 )
@@ -334,6 +335,15 @@ def _build_stub(work: Path, *, name: str = "stub_build",
     stub = build / "Release/lethe_stub_x64.dll"
     assert stub.is_file()
     return stub
+
+
+def _candidate_stub_or_build(work: Path, *, name: str) -> Path:
+    configured = os.environ.get(_STUB_PATH_ENV)
+    if configured:
+        stub = Path(configured).resolve()
+        assert stub.is_file(), f"{_STUB_PATH_ENV} does not name a file: {stub}"
+        return stub
+    return _build_stub(work, name=name)
 
 
 def _run_packed(executable: Path, *, memory_guard: bool,
@@ -772,7 +782,7 @@ def test_native_exe_hardening_matrix_repeated_and_fail_closed(
         executable_reloc_section.rva + executable_reloc_section.virtual_size
         for relocation in parsed.dir64_relocations
     )
-    stub = _build_stub(tmp_path)
+    stub = _candidate_stub_or_build(tmp_path, name="stub_build")
 
     packed_by_flags: dict[tuple[bool, bool, bool], Path] = {}
     for anti_debug, memory_guard, process_hardening in itertools.product(
@@ -831,6 +841,16 @@ def test_native_exe_hardening_matrix_repeated_and_fail_closed(
             "LETHE_PE_LOADER_TEST_FAIL_WIPE_RESTORE",
             False,
         ),
+        (
+            "stub_fail_process_mitigation",
+            "LETHE_ANTIDUMP_TEST_FAIL_PROCESS_MITIGATION",
+            False,
+        ),
+        (
+            "stub_fail_dll_search_policy",
+            "LETHE_ANTIDUMP_TEST_FAIL_DLL_SEARCH_POLICY",
+            False,
+        ),
     )
     for name, compile_definition, memory_guard in fault_builds:
         fault_stub = _build_stub(
@@ -871,7 +891,7 @@ def test_antidebug_detects_positive_debug_process_launch(
         pytest.skip("CMake plus the Visual Studio x64 toolchain are required")
 
     source = _build_fixture(tmp_path)
-    stub = _build_stub(tmp_path, name="debug_process_stub")
+    stub = _candidate_stub_or_build(tmp_path, name="debug_process_stub")
     control = tmp_path / "debug_process_control.exe"
     protected = tmp_path / "debug_process_protected.exe"
     _pack(source, stub, control, anti_debug=False)
@@ -917,7 +937,7 @@ def test_process_hardening_excludes_current_directory_from_first_import(
         pytest.skip("CMake plus the Visual Studio x64 toolchain are required")
 
     source, probe = _build_cwd_probe_fixture(tmp_path)
-    stub = _build_stub(tmp_path, name="cwd_probe_stub")
+    stub = _candidate_stub_or_build(tmp_path, name="cwd_probe_stub")
     application_dir = tmp_path / "cwd_probe_application"
     launch_dir = tmp_path / "cwd_probe_launch"
     application_dir.mkdir()
