@@ -579,6 +579,21 @@ ApplicationWindow {
 
                                             ToggleSwitch {
                                                 Layout.fillWidth: true
+                                                text: "Process hardening"
+                                                description: "EXE only — irreversible process policies"
+                                                checked: venice.processHardening
+                                                enabled: !venice.isPacking
+                                                onToggled: function(checked) { venice.processHardening = checked }
+                                            }
+
+                                            Rectangle {
+                                                Layout.fillWidth: true
+                                                implicitHeight: 1
+                                                color: Theme.border
+                                            }
+
+                                            ToggleSwitch {
+                                                Layout.fillWidth: true
                                                 text: "Validate output"
                                                 description: "structural round-trip check (no run)"
                                                 checked: venice.validateAfterPack

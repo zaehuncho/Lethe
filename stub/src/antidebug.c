@@ -63,6 +63,7 @@
 #include <stdint.h>
 
 #include "stub_hooks.h"
+#include "key_scatter.h"
 #include "daedalus_strings.h"
 #include "daedalus_str_data.h"
 
@@ -584,6 +585,7 @@ static void wipe_master_key(void)
        clean void* (drops the volatile qualifier without a C4090 diagnostic);
        SecureZeroMemory / RtlSecureZeroMemory is a FORCEINLINE volatile byte
        loop in winnt.h, so the wipe is never elided and needs no CRT/import. */
+    key_scatter_invalidate();
     SecureZeroMemory((void *)(uintptr_t)g_packinfo.aes_key_enc,
                      sizeof(g_packinfo.aes_key_enc));
     SecureZeroMemory((void *)(uintptr_t)g_packinfo.kdf_salt,
@@ -594,7 +596,7 @@ static void wipe_master_key(void)
  * ---- Scattered tripwire checks (defense-in-depth) -------------------------
  *
  * Each tripwire uses a DIFFERENT anti-debug technique and independently wipes
- * key material + calls ExitProcess on detection. Called at multiple points
+ * key material + returns detection to its caller. Called at multiple points
  * during the unpack flow (pe_loader.c, stub_main.c) so that NOP'ing the main
  * antidbg_check() prologue ("xor eax,eax; ret") does NOT defeat all detection.
  *
@@ -604,30 +606,32 @@ static void wipe_master_key(void)
  */
 
 /* Tripwire 1: PEB->BeingDebugged (placed after section decryption). */
-__declspec(noinline) void antidbg_tripwire_peb(void)
+__declspec(noinline) int antidbg_tripwire_peb(void)
 {
     const uint8_t *peb = (const uint8_t *)__readgsqword(0x60);
     if (peb && peb[PEB_BEINGDEBUGGED_OFF] != 0) {
         wipe_master_key();
-        ExitProcess(0);
+        return 1;
     }
+    return 0;
 }
 
 /* Tripwire 2: NtGlobalFlag heap-debug bits (placed after import resolution). */
-__declspec(noinline) void antidbg_tripwire_ntgf(void)
+__declspec(noinline) int antidbg_tripwire_ntgf(void)
 {
     const uint8_t *peb = (const uint8_t *)__readgsqword(0x60);
     if (peb) {
         uint32_t flags = *(const uint32_t *)(peb + PEB_NTGLOBALFLAG_OFF);
         if (flags & NTGLOBALFLAG_HEAP_DEBUG_BITS) {
             wipe_master_key();
-            ExitProcess(0);
+            return 1;
         }
     }
+    return 0;
 }
 
 /* Tripwire 3: RDTSC timing gate (placed before OEP transfer in stub_main). */
-__declspec(noinline) void antidbg_tripwire_rdtsc(void)
+__declspec(noinline) int antidbg_tripwire_rdtsc(void)
 {
     uint64_t best = ~0ull;
     int i;
@@ -647,21 +651,23 @@ __declspec(noinline) void antidbg_tripwire_rdtsc(void)
     }
     if (best > RDTSC_THRESHOLD) {
         wipe_master_key();
-        ExitProcess(0);
+        return 1;
     }
+    return 0;
 }
 
 /* Tripwire 4: Hardware breakpoints DR0-DR3 (placed after relocation). */
-__declspec(noinline) void antidbg_tripwire_hwbp(void)
+__declspec(noinline) int antidbg_tripwire_hwbp(void)
 {
     CONTEXT ctx;
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (GetThreadContext(GetCurrentThread(), &ctx)) {
         if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
             wipe_master_key();
-            ExitProcess(0);
+            return 1;
         }
     }
+    return 0;
 }
 
 /*

@@ -1,0 +1,55 @@
+name: stage native release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full committed source SHA to reproduce
+        required: true
+        type: string
+      shuffle_seed:
+        description: Even-length hexadecimal Daedalus shuffle seed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install locked environment
+        run: |
+          python -m pip install uv==0.11.29
+          uv sync --frozen --group dev
+      - name: Verify exact checkout
+        shell: powershell
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -cne '${{ inputs.source_commit }}') {
+            throw "Checkout mismatch: expected ${{ inputs.source_commit }}, got $actual"
+          }
+      - name: Build and stage fully gated candidate
+        shell: powershell
+        run: >-
+          .\.venv\Scripts\python.exe .\tools\promote_stub.py
+          --source-commit '${{ inputs.source_commit }}'
+          --shuffle-seed '${{ inputs.shuffle_seed }}'
+          --stage-dir .\.test-release-candidate
+      - name: Retain staging evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lethe-native-candidate-${{ inputs.source_commit }}
+          path: .test-release-candidate
+          if-no-files-found: ignore
+          retention-days: 14

@@ -26,29 +26,49 @@ volatile PackInfo g_packinfo = {
     /* remaining fields zero-initialized */
 };
 
-typedef void  (__cdecl *ExeEntry_t)(void);
+typedef uint32_t (__cdecl *ExeEntry_t)(void);
 typedef BOOL  (WINAPI  *DllMain_t)(HINSTANCE, DWORD, LPVOID);
 
 static volatile int       s_unpacked = 0;
 static volatile void     *s_oep      = NULL;
 static volatile uintptr_t s_oep_key  = 0;
+static volatile int       s_has_oep  = 0;
 static volatile uint32_t  s_pdata_rva   = 0;
 static volatile uint32_t  s_pdata_count = 0;
 
-__declspec(noinline) static void stash_oep(void *raw)
+/* Builder/runtime capability handshake. Packed DLLs require an outer import
+ * table plus pre-decrypt IAT capture; refusing older stubs prevents silently
+ * falling back to LoadLibrary while Windows holds the loader lock. */
+__declspec(dllexport) const char lethe_dll_preload_abi[] = "1";
+
+__declspec(noinline) static int stash_oep(void *raw)
 {
     volatile uintptr_t k = 0;
-    crypto_csprng((void *)&k, sizeof(k));
+    if (!raw) {
+        s_oep = NULL;
+        s_oep_key = 0;
+        s_has_oep = 0;
+        return 0;
+    }
+    if (crypto_csprng((void *)&k, sizeof(k)) != 0 || k == 0) {
+        s_oep = NULL;
+        s_oep_key = 0;
+        s_has_oep = 0;
+        return 1;
+    }
     s_oep_key = k;
     s_oep = (void *)((uintptr_t)raw ^ k);
+    s_has_oep = 1;
+    return 0;
 }
 
-__declspec(noinline) static void invoke_exe_oep(void)
+__declspec(noinline) static uint32_t invoke_exe_oep(void)
 {
     volatile uintptr_t addr = (uintptr_t)s_oep ^ s_oep_key;
     volatile ExeEntry_t fn = (ExeEntry_t)(void *)addr;
     if ((GetCurrentProcessId() | 1) != 0)
-        fn();
+        return fn();
+    return 1;
 }
 
 __declspec(noinline) static BOOL invoke_dll_oep(HINSTANCE h, DWORD r,
@@ -59,6 +79,23 @@ __declspec(noinline) static BOOL invoke_dll_oep(HINSTANCE h, DWORD r,
     if ((GetCurrentProcessId() | 1) != 0)
         return fn(h, r, res);
     return FALSE;
+}
+
+static void release_dll_runtime(HINSTANCE hInst, DWORD reason, LPVOID reserved)
+{
+    pe_loader_tls_dll_detach(reason, reserved);
+    memguard_shutdown();
+    if (s_pdata_rva && s_pdata_count) {
+        RtlDeleteFunctionTable(
+            (PRUNTIME_FUNCTION)((uint8_t *)hInst + s_pdata_rva));
+    }
+    key_scatter_destroy();
+    s_unpacked = 0;
+    s_oep = NULL;
+    s_oep_key = 0;
+    s_has_oep = 0;
+    s_pdata_rva = 0;
+    s_pdata_count = 0;
 }
 
 __declspec(dllexport)
@@ -83,14 +120,14 @@ void __cdecl StubExeEntry(void)
         volatile uint8_t *p = (volatile uint8_t *)&g_packinfo;
         int j; for (j = 0; j < (int)sizeof(g_packinfo); j++) p[j] = 0;
     }
-    stash_oep(oep_tmp);
+    if (stash_oep(oep_tmp) != 0)
+        ExitProcess(1);
 
     /* Tripwire: scattered RDTSC timing check before OEP transfer */
-    if (antidebug_on)
-        antidbg_tripwire_rdtsc();
+    if (antidebug_on && antidbg_tripwire_rdtsc())
+        ExitProcess(0);
 
-    invoke_exe_oep();
-    ExitProcess(0);
+    ExitProcess(invoke_exe_oep());
 }
 
 __declspec(dllexport)
@@ -118,48 +155,50 @@ BOOL WINAPI StubDllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
             volatile uint8_t *p = (volatile uint8_t *)&g_packinfo;
             int j; for (j = 0; j < (int)sizeof(g_packinfo); j++) p[j] = 0;
         }
-        stash_oep(oep_tmp);
         s_unpacked = 1;
+        if (stash_oep(oep_tmp) != 0) {
+            /* Returning FALSE makes the Windows loader immediately send the
+             * outer entry point PROCESS_DETACH, which owns rollback. */
+            return FALSE;
+        }
 
         /* Tripwire: scattered RDTSC timing check before OEP transfer */
-        if (antidebug_on)
-            antidbg_tripwire_rdtsc();
+        if (antidebug_on && antidbg_tripwire_rdtsc())
+            return FALSE;
 
-        if (!oep_tmp)
+        if (!s_has_oep)
             return TRUE;   /* no DllMain (entry point 0) — load succeeds */
-        return invoke_dll_oep(hInst, reason, reserved);
+        if (!invoke_dll_oep(hInst, reason, reserved)) {
+            /* Keep state live: Windows immediately calls this outer entry
+             * point with PROCESS_DETACH after a rejected PROCESS_ATTACH. */
+            return FALSE;
+        }
+        return TRUE;
     }
 
     if (reason == DLL_PROCESS_DETACH && s_unpacked) {
         BOOL result = TRUE;
-        if (s_oep)
+        if (s_has_oep)
             result = invoke_dll_oep(hInst, reason, reserved);
-        pe_loader_tls_thread_free();
-        memguard_shutdown();
-        if (s_pdata_rva && s_pdata_count) {
-            RtlDeleteFunctionTable(
-                (PRUNTIME_FUNCTION)((uint8_t *)hInst + s_pdata_rva));
-        }
-        key_scatter_destroy();
-        s_unpacked = 0;
-        s_oep = NULL;
-        s_oep_key = 0;
+        /* Native detach order is DllMain, then TLS callbacks. Dispatch while
+         * protected code and its function table are still live. */
+        release_dll_runtime(hInst, reason, reserved);
         return result;
     }
 
     if (reason == DLL_THREAD_ATTACH && s_unpacked) {
-        if (pe_loader_tls_thread_init() != 0)
-            return FALSE;
-        if (s_oep)
+        /* The OS TLS anchor initialized the thread and dispatched protected
+         * TLS callbacks before entering StubDllMain. */
+        if (s_has_oep)
             return invoke_dll_oep(hInst, reason, reserved);
         return TRUE;
     }
 
     if (reason == DLL_THREAD_DETACH && s_unpacked) {
         BOOL result = TRUE;
-        if (s_oep)
+        if (s_has_oep)
             result = invoke_dll_oep(hInst, reason, reserved);
-        pe_loader_tls_thread_free();
+        pe_loader_tls_dll_detach(reason, reserved);
         return result;
     }
 

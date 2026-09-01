@@ -22,10 +22,10 @@ clean, separable component.
 
 | Component | What it is |
 |-----------|------------|
-| **Lethe** (`packer/`, `stub/`) | The PE packer: per-section deflate + **AES-256-GCM**, a **code-hash-bound key**, reloc/TLS/`.pdata`/`.rsrc` handling, optional anti-debug checks, **anti-dump** (in-memory header wipe), and an experimental VEH **memory-guard**. The supported release path is unmanaged x64 EXEs. |
+| **Lethe** (`packer/`, `stub/`) | The PE packer: per-section deflate + **AES-256-GCM**, a **code-hash-bound key**, reloc/TLS/`.pdata`/`.rsrc` handling, optional anti-debug checks, compatibility-preserving **anti-dump** metadata sanitization, and an experimental VEH **memory-guard**. The supported release path is unmanaged x64 EXEs. |
 | **Kalypso** (`cipher/`) | A custom **ChaCha20-Poly1305 AEAD** (RFC 8439) with a per-build sigma + word-permutation, checked against RFC vectors and the `cryptography` library. |
-| **Daedalus** (`daedalus/`, `stub/src/daedalus_*`) | A custom stack-machine **VM** that virtualizes the protector's crypto-critical routines (key derivation, license/lease checks). Hardened with **rolling self-decrypting bytecode**, per-build **opcode shuffle**, and **observation-poison** (debugging corrupts the decode). |
-| **x64 lifter** (`lifter/`) | A from-scratch **x64 → Daedalus** lifter for on-demand function virtualization. Its supported register/memory integer subset is checked against a Unicorn differential oracle; unsupported instructions bail to native handling. |
+| **Daedalus** (`daedalus/`, `stub/src/daedalus_*`) | A custom stack-machine **VM** for protector routines and explicitly selected application functions. Production-selected programs use independently authenticated AES-GCM bytecode pages, a one-page plaintext cache, per-build opcode shuffle, and build-bound handler variants. Rolling bytecode remains a separate mode for hand-authored VM programs. |
+| **x64 lifter** (`lifter/`) | A from-scratch **x64 → Daedalus** lifter for selected-function virtualization. Its supported scalar register/memory subset is checked against a Unicorn differential oracle; unsupported instructions reject the whole selected function. A read-only discovery/report tool inventories exact candidates and coverage gaps without auto-selecting code. |
 | **Obfuscation** (`obfuscation/`) | A custom LLVM pass plugin (control-flow flattening + opaque predicates + MBA + bogus control flow, per-build randomized). *Drafted, not yet compiled — needs an LLVM toolchain; see its README.* |
 | **bind** (`bind/`) | Hash-pin a packed EXE's first-party dependency DLLs so they can't be swapped, without fragile single-EXE bundling. |
 | **tracing** (`tracing/`) | Per-customer build variance and issuance-side identifiers for investigating leaked builds. |
@@ -36,10 +36,11 @@ clean, separable component.
 - **Crypto with explicit test oracles.** Kalypso's ChaCha20-Poly1305 behavior is
   checked against RFC 8439 vectors and the `cryptography` implementation. Those
   checks are strong regression evidence, not a formal proof or external audit.
-- **A real virtual machine + a real lifter.** Daedalus runs the crown-jewel logic
-  as opaque bytecode; the lifter turns native x64 into that bytecode, and its
-  correctness is enforced by a differential oracle (Unicorn is ground truth) over
-  thousands of fuzzed sequences.
+- **A real virtual machine + a real lifter.** Daedalus runs selected scalar x64
+  bodies as VM bytecode. Production materialization replaces the complete native
+  extent with a Win64 thunk and stores bytecode in authenticated 256-byte pages;
+  wrong keys, page swaps, truncation, descriptor mismatch, and modified page
+  metadata fail closed. Unicorn differential tests remain the semantic oracle.
 - **Per-build variance.** Keys, optional opcode mappings, and customer-specific
   issuance metadata can differ between builds. Treat this as traceability and
   defense-in-depth, not as a guarantee that analysis will not transfer.
@@ -53,12 +54,22 @@ clean, separable component.
 # pack a supported unmanaged x64 EXE
 python lethe.py yourapp.exe yourapp.packed.exe
 
+# inventory exact function candidates and lift blockers without modifying input
+python tools/virtualization_report.py yourapp.exe --format table
+
 # GUI (QML front-end): batch queue, options, presets, post-pack validation, reports
 python gui/venice.py            # or the widgets twin: python gui/app.py
 
 # install the locked toolchain and run the core suite
 uv sync --frozen --group dev
-uv run pytest -q -p no:cacheprovider --ignore=tests/test_lifter.py
+uv run pytest -q -p no:cacheprovider `
+  --ignore=tests/test_lifter.py `
+  --ignore=tests/test_lifter_internal_calls.py `
+  --ignore=tests/test_lifter_native_runtime.py `
+  --ignore=tests/test_lifter_scalar_batch.py
+uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
+  tests/test_lifter_native_runtime.py tests/test_lifter_scalar_batch.py `
+  -q -p no:cacheprovider -p no:faulthandler
 ```
 
 The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packing
@@ -73,7 +84,10 @@ fails closed unless that manifest records a matching clean-source build; use
 
 ```
 python lethe.py INPUT [OUTPUT] [--anti-debug {on,off}]
-                               [--memory-guard] [--level N]
+                               [--memory-guard] [--process-hardening]
+                               [--level N]
+                               [--virtualize-function NAME:RVA:SIZE]
+                               [--enable-experimental-virtualization]
                                [--stub-path PATH] [--verbose]
 ```
 
@@ -83,14 +97,19 @@ python lethe.py INPUT [OUTPUT] [--anti-debug {on,off}]
 | `--dll` | off | force DLL mode; requires `--enable-experimental-dll` and is not release-approved |
 | `--anti-debug` | `off` | experimental debugger checks; enable only for targeted validation |
 | `--memory-guard` | off | experimental on-demand page decryption; not release-approved |
+| `--process-hardening` | off | opt in to irreversible EXE process mitigations and restricted default DLL search directories; unavailable for DLL mode |
+| `--virtualize-function NAME:RVA:SIZE` | none | select one exact first-party function extent; repeatable |
+| `--enable-experimental-virtualization` | off | acknowledge the selected-function path; requires an explicit fresh `--stub-path` |
 | `--level N` | `9` | deflate compression level (0–9) |
 | `--stub-path PATH` | tracked prebuilt | use a fresh stub without promoting it |
 | `--verbose` | off | stream builder/stub progress |
 
 Managed/.NET assemblies are refused up front. DLL packing is disabled unless the
-caller supplies the explicit experimental acknowledgment; the current DLL path
-performs initialization under Windows loader lock and does not support static
-import consumers. Experimental behavior must not be used for release artifacts.
+caller supplies the explicit experimental acknowledgment. The guarded DLL path
+supports dynamic and static import consumers plus tested TLS, unwind, attach,
+detach, unload, and reload lifecycles, but is not release-approved until every
+required DLL compatibility row is proven. Experimental behavior must not be used
+for release artifacts.
 
 ### Server shard mode
 
@@ -137,16 +156,24 @@ secure update design, or platform mitigations.
 
 Concrete, honest limitations of the offline layer:
 
-- **Base packing is dumpable once unpacked in RAM.** Anti-dump erases PE headers
-  right after section decryption, so there's no clean single-breakpoint dump, but
-  a determined analyst can still reconstruct from the headerless mapped image.
-- **Memory-guard** (opt-in) keeps code pages encrypted + `PAGE_NOACCESS` and
-  decrypts per-page on first touch, so no single snapshot holds the whole
-  program — at a page-fault cost and possible AV suspicion. A/B it on a Defender
-  VM before shipping.
-- **Packing drops CFG enforcement** on dynamically materialized payload code.
-  The current hash-bound native stub is also built without Guard CF. Treat this
-  as a concrete mitigation regression when deciding which binaries may be packed.
+- **Base packing is dumpable once unpacked in RAM.** Anti-dump now preserves the
+  loader-facing PE/section geometry required by resources, exports, and host APIs,
+  while clearing nonessential import/debug/bound-import/IAT metadata. A determined analyst
+  can still reconstruct executable pages after they activate.
+- **Native memory-guard activation is monotonic.** First touch briefly inflates an
+  executable section, immediately re-wraps untouched pages, and leaves activated
+  pages immutable RX. This avoids corrupting concurrent execution; a long-running
+  process can eventually expose every native page. Selected VM bytecode uses the
+  stronger authenticated one-page cache because the interpreter owns every fetch.
+- **Supported GuardCF load-configs are preserved, not downgraded.** The output
+  publishes a loader-visible load config, relocations, GFIDs, restored support
+  slots, volatile metadata, CastGuard/GuardMemcpy slots, and runtime target
+  registration. Current MSVC GuardCF/XFG-slot and delay-import fixtures run with
+  exact behavior parity. Dynamic-value-relocation, CHPE, CodeIntegrity, return-flow
+  guard, hotpatch, enclave, UMA, suppressed GFIDs, and CET-specific metadata remain
+  fail-closed rather than silently stripped. Selected-function virtualization of
+  an XFG-enabled input also fails preflight until generated thunk GFIDs can carry
+  source-compatible 8-byte XFG function hashes.
 - **Packing disables crash-dump/support triage** on protected binaries. Pack last,
   after live sign-off, and canary an unpacked build before packed goes wide.
 - **The code-hash key binding raises cost, not certainty** — a debugger can still
@@ -154,7 +181,11 @@ Concrete, honest limitations of the offline layer:
 - **Status of components:** the included tests cover the implemented packer core,
   Kalypso, Daedalus, and supported lifter subset. They do not establish universal
   PE compatibility. The LLVM obfuscation layer is a **drafted, uncompiled** first
-  cut; the lifter's runtime C thunk (`call`/`ret` + Win64-ABI glue) is future work.
+  cut. Selected scalar functions have a native Win64 thunk and VM entry path;
+  direct non-recursive calls within one selected extent preserve ASLR-correct
+  stack return addresses and use shadow-validated VM returns. Native/external or
+  indirect calls, SIMD/FP, exception-bearing selected bodies, and indirect target
+  closure remain unsupported.
 
 ## AV / Authenticode
 
@@ -168,14 +199,21 @@ Concrete, honest limitations of the offline layer:
 
 ```powershell
 uv sync --frozen --group dev
-uv run pytest -q -p no:cacheprovider --ignore=tests/test_lifter.py
-uv run pytest tests/test_lifter.py -q -p no:cacheprovider -p no:faulthandler
+uv run pytest -q -p no:cacheprovider `
+  --ignore=tests/test_lifter.py `
+  --ignore=tests/test_lifter_internal_calls.py `
+  --ignore=tests/test_lifter_native_runtime.py `
+  --ignore=tests/test_lifter_scalar_batch.py
+uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
+  tests/test_lifter_native_runtime.py tests/test_lifter_scalar_batch.py `
+  -q -p no:cacheprovider -p no:faulthandler
 ```
 
 Python 3.12 is the supported tooling runtime. Dependencies are recorded in
 `pyproject.toml` and locked in `uv.lock`. Unicorn intentionally handles Windows
-access violations internally; disabling pytest's faulthandler for the lifter file
-prevents misleading megabytes of fatal-exception diagnostics.
+access violations internally; disabling pytest's faulthandler for these four
+Unicorn-backed files prevents misleading megabytes of fatal-exception diagnostics
+without dropping coverage.
 
 ## License
 

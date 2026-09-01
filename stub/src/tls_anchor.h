@@ -12,6 +12,9 @@
 #include <windows.h>
 
 #define ORION_STUB_TLS_CAPACITY 4096u
+#define ORION_STUB_TLS_STATE_SIZE 16u
+#define ORION_STUB_TLS_ALLOCATION_SIZE \
+    (ORION_STUB_TLS_CAPACITY + ORION_STUB_TLS_STATE_SIZE)
 
 DWORD lethe_stub_tls_index(void);
 

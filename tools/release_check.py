@@ -22,6 +22,11 @@ REQUIRED_FILES = (
     "CHANGELOG.md",
     "pyproject.toml",
     "uv.lock",
+    "docs/PRODUCTION_COMPATIBILITY.md",
+    "docs/production_compatibility.json",
+    "tools/production_gate.py",
+    "tools/promote_stub.py",
+    ".github/workflows/release-candidate.yml",
 )
 PRIVATE_FILES = {
     ".env",
@@ -84,6 +89,32 @@ def _check_manifest(errors: list[str]) -> None:
             errors.append(
                 f"prebuilt manifest {key!r} is {metadata.get(key)!r}, expected {wanted!r}")
 
+    actual_roundtrip = metadata.get("native_roundtrip_actual")
+    if not isinstance(actual_roundtrip, dict):
+        errors.append("prebuilt manifest has no actual native round-trip counts")
+    else:
+        passed = actual_roundtrip.get("passed")
+        total = actual_roundtrip.get("total")
+        if (type(passed) is not int or type(total) is not int or
+                total < 1 or passed != total):
+            errors.append("prebuilt manifest native round-trip counts are not full N/N")
+
+    if metadata.get("production_scope") != "all":
+        errors.append("prebuilt manifest is not bound to the all-scope production gate")
+    seed = metadata.get("dvm_shuffle_seed")
+    if (not isinstance(seed, str) or not re.fullmatch(r"[0-9a-f]+", seed) or
+            len(seed) % 2):
+        errors.append("prebuilt manifest has no valid generated DVM shuffle seed")
+    for key in (
+        "dvm_opcode_mapping_sha256",
+        "dvm_handler_variant_sha256",
+        "dvm_python_map_sha256",
+        "dvm_native_map_sha256",
+    ):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            errors.append(f"prebuilt manifest has no valid {key}")
+
     source_commit = metadata.get("source_commit")
     if not isinstance(source_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         errors.append("prebuilt manifest has no full source_commit")
@@ -104,6 +135,20 @@ def _check_workflow_pins(errors: list[str]) -> None:
             match = re.search(r"\buses:\s*[^\s@]+@([^\s#]+)", line)
             if match and not re.fullmatch(r"[0-9a-f]{40}", match.group(1)):
                 errors.append(f"{workflow.relative_to(ROOT)}:{line_no}: action is not SHA-pinned")
+
+
+def _check_production_matrix(errors: list[str]) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "production_gate.py"), "--validate-only"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        errors.append(f"production compatibility matrix is invalid: {detail}")
 
 
 def main() -> int:
@@ -141,6 +186,7 @@ def main() -> int:
 
     _check_manifest(errors)
     _check_workflow_pins(errors)
+    _check_production_matrix(errors)
 
     if errors:
         print("Public release check: FAILED", file=sys.stderr)

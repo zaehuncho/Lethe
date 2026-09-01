@@ -101,12 +101,15 @@ def _parse_int(s):
     return int(s)
 
 
-def assemble(source):
+def assemble(source, opcodes=None):
     """
     Two-pass assembly of Daedalus .vasm source.
 
-    Returns bytes: [u16_LE data_size][data_bytes][code_bytes]
+    Returns bytes: [u16_LE data_size][data_bytes][code_bytes]. ``opcodes`` may
+    supply an immutable per-build mnemonic mapping; the module canonical table
+    is only the backward-compatible default and is never mutated here.
     """
+    opcode_table = OPCODES if opcodes is None else opcodes
     lines = source.split('\n')
     constants = {}
     data_bytes = bytearray()
@@ -172,7 +175,7 @@ def assemble(source):
             mnemonic = parts[0].lower()
             operand = parts[1].strip() if len(parts) > 1 else None
 
-            if mnemonic not in OPCODES:
+            if mnemonic not in opcode_table:
                 raise SyntaxError(f"line {ln}: unknown opcode '{mnemonic}'")
 
             code_items.append(('inst', mnemonic, operand, ln))
@@ -191,7 +194,7 @@ def assemble(source):
             code_labels[name] = offset
         else:
             _, mnemonic, _, _ = item
-            _, width, _ = OPCODES[mnemonic]
+            _, width, _ = opcode_table[mnemonic]
             offset += 1 + width
 
     # ---- Pass 2: emit code bytes -----------------------------------------
@@ -201,7 +204,7 @@ def assemble(source):
             continue
 
         _, mnemonic, operand_str, ln = item
-        opcode, width, kind = OPCODES[mnemonic]
+        opcode, width, kind = opcode_table[mnemonic]
 
         code.append(opcode)
 
@@ -241,11 +244,12 @@ def assemble(source):
     return bytes(blob)
 
 
-def _format_header(blob, name):
+def _format_header(blob, name, opcodes=None):
     """Render blob as a C static-const uint8_t array."""
+    opcode_table = OPCODES if opcodes is None else opcodes
     # Reverse-lookup table: opcode_byte -> operand width
     op_width = {}
-    for _, (opc, w, _) in OPCODES.items():
+    for _, (opc, w, _) in opcode_table.items():
         op_width[opc] = w
 
     ds = struct.unpack_from('<H', blob, 0)[0]
@@ -298,14 +302,16 @@ def main():
                     help='Path to daedalus_opcodes_shuffled.py for per-build opcode randomization')
     args = ap.parse_args()
 
-    if args.shuffled_map:
-        global OPCODES
-        OPCODES = _load_shuffled_opcodes(args.shuffled_map)
+    opcode_table = (
+        _load_shuffled_opcodes(args.shuffled_map)
+        if args.shuffled_map
+        else OPCODES
+    )
 
     with open(args.input, 'r') as f:
         source = f.read()
 
-    blob = assemble(source)
+    blob = assemble(source, opcodes=opcode_table)
 
     if args.format == 'bin':
         if args.output:
@@ -318,7 +324,7 @@ def main():
         if name is None:
             base = os.path.splitext(os.path.basename(args.input))[0].upper()
             name = 'DVM_PROG_' + base
-        text = _format_header(blob, name)
+        text = _format_header(blob, name, opcodes=opcode_table)
         if args.output:
             with open(args.output, 'w') as f:
                 f.write(text)

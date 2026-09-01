@@ -1,0 +1,377 @@
+{
+  "schema": 1,
+  "product": "Lethe",
+  "platform": "Windows x64 unmanaged PE32+",
+  "status_values": [
+    "proven",
+    "failing",
+    "blocked",
+    "partial",
+    "experimental",
+    "unverified"
+  ],
+  "features": [
+    {
+      "id": "input.unmanaged_pe32_plus",
+      "title": "Unmanaged AMD64 PE32+ input contract",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_pe_preflight_strict.py",
+          "claim": "Architecture and managed-image rejection are fail-closed."
+        }
+      ]
+    },
+    {
+      "id": "output.transactional_validation",
+      "title": "Transactional output publication and keyed validation",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_release_safety.py",
+          "claim": "Invalid or failed staging never replaces the existing output."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_keyed_validation.py",
+          "claim": "The staged container is authenticated before publication."
+        }
+      ]
+    },
+    {
+      "id": "loader.normal_imports",
+      "title": "Normal imports and IAT reconstruction",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["exe.core.runtime", "dll.dynamic.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/roundtrip.ps1",
+          "claim": "Native fixtures call imported Windows and CRT functions."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_pe_inventories.py",
+          "claim": "Import inventory is bounded and structurally validated."
+        }
+      ]
+    },
+    {
+      "id": "loader.dir64_aslr",
+      "title": "DIR64 relocations at a non-preferred ASLR base",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["exe.core.shape", "exe.core.runtime", "dll.dynamic.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/compat_core_exe.c",
+          "claim": "The packed fixture reports reloc=1 and aslr=1 at runtime."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_loader_relocation_contracts.py",
+          "claim": "Relocation parser and native loader contracts are fail-closed."
+        }
+      ]
+    },
+    {
+      "id": "loader.resources_after_hardening",
+      "title": "Win32 resource lookup after anti-dump hardening",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": [
+        "exe.core.shape",
+        "exe.core.runtime",
+        "dll.resource.offset_root.shape",
+        "dll.resource.offset_root.geometry",
+        "dll.resource.offset_root.runtime"
+      ],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/compat_core_exe.c",
+          "claim": "FindResourceW, LoadResource, and LockResource are checked from protected code."
+        },
+        {
+          "type": "native-harness",
+          "path": "tests/production_corpus.ps1",
+          "claim": "A DLL whose resource root begins 0x40 bytes inside its owner section preserves the exact DataDirectory pair and byte-matches FindResourceW/LoadResource runtime output."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_resource_directory_preservation.py",
+          "claim": "Analyzer-to-assembler resource owner storage stays distinct from the exact resource directory RVA and size."
+        }
+      ]
+    },
+    {
+      "id": "loader.tls_lifecycle_exe",
+      "title": "EXE static TLS data and callback lifecycle",
+      "applies_to": ["exe"],
+      "required": true,
+      "status": "proven",
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/roundtrip.ps1",
+          "claim": "The packed EXE proves main-thread and post-start worker TLS callback/data isolation."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_loader_tls_lifecycle_contracts.py",
+          "claim": "TLS lifecycle source contracts are inspected."
+        }
+      ]
+    },
+    {
+      "id": "loader.tls_lifecycle_dll",
+      "title": "DLL static TLS data and callback lifecycle",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["dll.dynamic.runtime", "dll.tls.preexisting"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/roundtrip.ps1",
+          "claim": "Loading-thread, post-load worker, pre-existing worker, callback, and 64-byte alignment behavior are compared with the original DLL."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_loader_tls_lifecycle_contracts.py",
+          "claim": "TLS lifecycle source contracts are inspected."
+        }
+      ]
+    },
+    {
+      "id": "loader.exceptions_unwind_exe",
+      "title": "EXE x64 exception and unwind registration",
+      "applies_to": ["exe"],
+      "required": true,
+      "status": "proven",
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/sample_exe.c",
+          "claim": "A packed C++ throw/catch returns caught=-1 with exact exit parity."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_loader_unwind_contracts.py",
+          "claim": "Runtime function-table registration contracts are inspected."
+        }
+      ]
+    },
+    {
+      "id": "loader.exceptions_unwind_dll",
+      "title": "DLL x64 exception and unwind registration",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["dll.unwind.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/unwind_dll.cpp",
+          "claim": "A guarded DLL export throws and catches through x64 unwind metadata across eight load/call/unload cycles."
+        }
+      ]
+    },
+    {
+      "id": "loader.delay_imports",
+      "title": "Delay-load import resolution",
+      "applies_to": ["exe"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/compat_exe.c",
+          "claim": "A real /DELAYLOAD dependency call is checked after process startup."
+        },
+        {
+          "type": "native-harness",
+          "path": "tests/production_corpus.ps1",
+          "claim": "A modern GuardCF delay-load input is packed and byte-compared at runtime."
+        }
+      ]
+    },
+    {
+      "id": "loader.delay_imports_dll",
+      "title": "DLL delay-load import resolution",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": [
+        "dll.delay.shape",
+        "dll.delay.pack",
+        "dll.delay.runtime"
+      ],
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_delay_import_preservation.py",
+          "claim": "Only bounded RVA-based delay descriptors are accepted and the outer PE preserves the helper-visible directory pair."
+        },
+        {
+          "type": "native",
+          "path": "tests/sample/compat_delay_dll_host.c",
+          "claim": "The dependency is absent before the first delayed call, present afterward, explicitly unloaded, and remains clean over eight DLL reload cycles."
+        }
+      ]
+    },
+    {
+      "id": "mitigation.load_config_cfg_xfg",
+      "title": "Load-config, CFG, XFG, CastGuard, and volatile metadata",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "partial",
+      "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
+      "blocker": "GuardCF and exact suppressed/export-suppressed GFIDs pass natively and the outer load-config is authenticated, but XFG-enabled sources fail preflight when virtualization would add a generated thunk GFID without its source-compatible 8-byte function hash.",
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_cfg_preservation.py",
+          "claim": "The current preservation plan inventories targets and fails closed."
+        },
+        {
+          "type": "native",
+          "path": "tests/build_samples.ps1",
+          "claim": "Current MSVC fixtures carry modern GuardCF/XFG load-config variants."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_xfg_virtualization_preflight.py",
+          "claim": "A real MSVC /guard:xfg executable runs natively, exposes global XFG with zero per-target flag bytes, and is refused before output when generated thunk GFIDs are requested."
+        }
+      ]
+    },
+    {
+      "id": "virtualization.selected_functions",
+      "title": "Selected-function virtualization with authenticated paging",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "partial",
+      "blocker": "Only an explicit scalar function subset is liftable; DIV/IDIV fault delivery, native calls, SIMD/FP, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/test_native_virtualization_corpus.py",
+          "claim": "Five selected first-party functions, including one-operand MUL/IMUL with RDX:RAX results, execute identically after virtualization."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_bytecode_pages.py",
+          "claim": "Authenticated bytecode page construction and tamper rejection are covered."
+        }
+      ]
+    },
+    {
+      "id": "hardening.runtime_layers",
+      "title": "Release-safe layered runtime hardening",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "experimental",
+      "blocker": "Anti-debug and native executable-page memory guard are not approved release defaults and still require supported-Windows compatibility and concurrency stress evidence.",
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_memguard_fault_hardening.py",
+          "claim": "Known memory-guard fault paths have source-level regression checks."
+        }
+      ]
+    },
+    {
+      "id": "dll.loader_lock_initialization",
+      "title": "DLL loader-lock dependency initialization",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["dll.dynamic.runtime", "dll.noentry.runtime", "dll.reject.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/roundtrip.ps1",
+          "claim": "All protected imports are represented in the outer import table and captured before DllMain; native hosts cover success, no-entry, and rejected attach cleanup."
+        }
+      ]
+    },
+    {
+      "id": "dll.dynamic_exports",
+      "title": "Dynamic-load exports and unload/reload lifecycle",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["dll.dynamic.runtime", "dll.reload.runtime", "dll.noentry.runtime", "dll.reject.runtime", "dll.tlsfree.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/host.c",
+          "claim": "One dynamic host resolves and calls the test exports."
+        }
+      ]
+    },
+    {
+      "id": "dll.static_import_exports",
+      "title": "Static-import consumers of packed DLL exports",
+      "applies_to": ["dll"],
+      "required": true,
+      "status": "proven",
+      "native_checks": ["dll.static.runtime"],
+      "evidence": [
+        {
+          "type": "native",
+          "path": "tests/sample/static_host.c",
+          "claim": "A native static-import host resolves the authenticated plaintext export snapshot before StubDllMain."
+        }
+      ]
+    },
+    {
+      "id": "provenance.fresh_native_stub",
+      "title": "Clean-source native stub provenance",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "blocked",
+      "blocker": "The tracked prebuilt manifest is legacy-unverified and cannot be used for a release artifact.",
+      "evidence": [
+        {
+          "type": "pytest",
+          "path": "tests/test_prebuilt_manifest.py",
+          "claim": "Legacy or mismatched native prebuilts are rejected."
+        },
+        {
+          "type": "manifest",
+          "path": "stub/prebuilt/lethe_stub_x64.manifest.json",
+          "claim": "The tracked prebuilt records legacy-unverified provenance."
+        }
+      ]
+    },
+    {
+      "id": "release.clean_vm_matrix",
+      "title": "Clean-VM Windows compatibility, signing, and scanner evidence",
+      "applies_to": ["exe", "dll"],
+      "required": true,
+      "status": "unverified",
+      "blocker": "No recorded clean-VM matrix proves current Windows versions, Authenticode signing/timestamping, Defender scanning, and real application workflows.",
+      "evidence": [
+        {
+          "type": "checklist",
+          "path": "docs/RELEASE_CHECKLIST.md",
+          "claim": "The required external release evidence is defined but not recorded."
+        }
+      ]
+    }
+  ]
+}

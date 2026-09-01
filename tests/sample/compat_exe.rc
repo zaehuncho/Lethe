@@ -1,0 +1,7 @@
+#include <windows.h>
+
+201 RCDATA
+BEGIN
+    "LETHE_COMPAT_RESOURCE_V1"
+    0
+END

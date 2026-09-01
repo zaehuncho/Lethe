@@ -62,6 +62,13 @@ def test_clean_matching_manifest_is_release_approved(tmp_path):
         "source_dirty": False,
         "provenance_status": "clean",
         "native_roundtrip": "passed-9-of-9",
+        "native_roundtrip_actual": {"passed": 11, "total": 11},
+        "production_scope": "all",
+        "dvm_shuffle_seed": "00112233",
+        "dvm_opcode_mapping_sha256": "1" * 64,
+        "dvm_handler_variant_sha256": "2" * 64,
+        "dvm_python_map_sha256": "3" * 64,
+        "dvm_native_map_sha256": "4" * 64,
     }), encoding="utf-8")
 
     assemble._validate_release_stub_manifest(str(stub), blob)
@@ -102,4 +109,24 @@ def test_clean_manifest_without_roundtrip_evidence_is_rejected(tmp_path):
     }), encoding="utf-8")
 
     with pytest.raises(assemble.AssembleError, match="round-trip"):
+        assemble._validate_release_stub_manifest(str(stub), blob)
+
+
+def test_compatibility_marker_cannot_replace_actual_roundtrip_counts(tmp_path):
+    stub = tmp_path / "lethe_stub_x64.dll"
+    manifest = tmp_path / "lethe_stub_x64.manifest.json"
+    blob = b"marker-only candidate"
+    stub.write_bytes(blob)
+    manifest.write_text(json.dumps({
+        "schema": 1,
+        "artifact": stub.name,
+        "size_bytes": len(blob),
+        "sha256": hashlib.sha256(blob).hexdigest(),
+        "source_dirty": False,
+        "provenance_status": "clean",
+        "native_roundtrip": "passed-9-of-9",
+        "native_roundtrip_actual": {"passed": 10, "total": 11},
+    }), encoding="utf-8")
+
+    with pytest.raises(assemble.AssembleError, match="full N/N"):
         assemble._validate_release_stub_manifest(str(stub), blob)

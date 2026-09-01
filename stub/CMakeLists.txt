@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(lethe_stub C ASM_MASM)
 
+include(CTest)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(lethe_stub_x64 SHARED
     src/stub_main.c
     src/pe_loader.c
+    src/load_config_binding.c
     src/crypto.c
+    src/bytecode_pages.c
+    src/metadata_aad.c
     src/key_scatter.c
     src/tls_anchor.c
     src/stubrt.c
@@ -16,12 +21,26 @@ add_library(lethe_stub_x64 SHARED
     src/memguard.c
     src/daedalus_vm.c
     src/daedalus_trampoline.asm
+    src/daedalus_x64_thunk.asm
     src/miniz.c
     src/chkstk.asm
 )
 
 target_include_directories(lethe_stub_x64 PRIVATE src)
-target_link_libraries(lethe_stub_x64 PRIVATE kernel32)
+target_link_libraries(lethe_stub_x64 PRIVATE kernel32 bcrypt)
+target_compile_definitions(lethe_stub_x64 PRIVATE DVM_PAGED_RUNTIME)
+
+if(BUILD_TESTING)
+    add_executable(LetheMetadataAADTest
+        tests/metadata_aad_test.c
+        src/metadata_aad.c
+    )
+    target_include_directories(LetheMetadataAADTest PRIVATE src)
+    if(MSVC)
+        target_compile_options(LetheMetadataAADTest PRIVATE /W4 /WX /O2)
+    endif()
+    add_test(NAME LetheMetadataAADVector COMMAND LetheMetadataAADTest)
+endif()
 
 # Freestanding: no CRT, no default libs, no DLL entry point.
 target_link_options(lethe_stub_x64 PRIVATE
@@ -30,6 +49,7 @@ target_link_options(lethe_stub_x64 PRIVATE
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
+    /EXPORT:daedalus_x64_enter_common
 )
 
 # Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer),

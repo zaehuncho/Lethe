@@ -4,9 +4,11 @@ Use this checklist for a candidate intended to leave the development machine.
 Passing it establishes a recorded release gate, not universal security or
 compatibility.
 
-The release-supported payload is an unmanaged x64 EXE with anti-debug and
-memory-guard disabled. DLL and server-shard modes are experimental and must not
-be used in a release candidate.
+The currently releasable envelope remains an unmanaged x64 EXE with anti-debug,
+process hardening, and memory guard disabled. Guarded DLL packing now has native
+dynamic/static consumer, TLS, unwind, export-suppression, attach-failure, and
+unload/reload proof, but it remains behind the experimental CLI gate until every
+required DLL matrix row is green. Server-shard mode remains experimental.
 
 ## 1. Establish provenance
 
@@ -15,6 +17,9 @@ be used in a release candidate.
 - Use Python 3.12, VS2022 x64/MSVC, and the committed `uv.lock`.
 - Do not release the inherited prebuilt while its manifest says
   `legacy-unverified`; replace it through the clean promotion flow below.
+- Supply the full intended commit to the staging tool. Abbreviated commits,
+  tracked changes, untracked files, a mismatched checkout, or an unlocked
+  interpreter fail before any build starts.
 - Keep builder tokens and PEM material in the shell's secret source. Do not put
   real values in `.env.example`, command history, manifests, or logs.
 
@@ -22,8 +27,14 @@ be used in a release candidate.
 
 ```powershell
 uv sync --frozen --group dev
-uv run pytest -q -p no:cacheprovider --ignore=tests/test_lifter.py
-uv run pytest tests/test_lifter.py -q -p no:cacheprovider -p no:faulthandler
+uv run pytest -q -p no:cacheprovider `
+  --ignore=tests/test_lifter.py `
+  --ignore=tests/test_lifter_internal_calls.py `
+  --ignore=tests/test_lifter_native_runtime.py `
+  --ignore=tests/test_lifter_scalar_batch.py
+uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
+  tests/test_lifter_native_runtime.py tests/test_lifter_scalar_batch.py `
+  -q -p no:cacheprovider -p no:faulthandler
 ```
 
 Record the command output and exact pass/skip counts. A skipped optional
@@ -35,26 +46,36 @@ Run the publication policy gate on the exact candidate commit:
 uv run python tools/release_check.py
 ```
 
-## 3. Build and test the native stub
+## 3. Preflight the native candidate
 
 Choose and record a hexadecimal opcode-shuffle seed so the candidate can be
-reproduced during investigation.
+reproduced during investigation. The preflight is read-only.
 
 ```powershell
-.\stub\build_stub.ps1 -Clean -Config Release `
-  -ShuffleSeed <recorded-hex-seed>
-.\tests\build_samples.ps1
-.\tests\roundtrip.ps1 `
-  -StubPath .\stub\build\Release\lethe_stub_x64.dll
+$commit = (git rev-parse HEAD).Trim()
+.\.venv\Scripts\python.exe .\tools\promote_stub.py `
+  --source-commit $commit `
+  --shuffle-seed <recorded-even-length-hex-seed> `
+  --dry-run
 ```
 
-Archive `lethe_stub_x64.dll.manifest.json` with the test evidence. Confirm the
-manifest hash matches the DLL under test. Build the shard bootstrap separately:
+The full staging run creates a new, previously nonexistent staging directory.
+It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
+MSVC and the committed Python 3.12 lock, runs non-empty CTest, runs the complete
+EXE/DLL round trip and native production corpus against one immutable stub
+SHA-256, and evaluates the `all` production matrix.
 
 ```powershell
-cmake -S bootstrap -B bootstrap/build -G "Visual Studio 17 2022" -A x64
-cmake --build bootstrap/build --config Release
+.\.venv\Scripts\python.exe .\tools\promote_stub.py `
+  --source-commit $commit `
+  --shuffle-seed <same-recorded-even-length-hex-seed> `
+  --stage-dir .test-release-candidate
 ```
+
+Each command result is stored under `evidence/` with the source commit and
+artifact SHA-256. The candidate manifest is written atomically only after every
+gate passes and hashes every evidence record. Failed gates leave diagnostics,
+but no approved candidate manifest.
 
 ## 4. Validate the real application
 
@@ -63,7 +84,11 @@ cmake --build bootstrap/build --config Release
 - Exercise startup, shutdown, worker threads, exceptions, resources, updates,
   and application-specific workflows.
 - Inspect the output's architecture, imports, section protections, signature
-  state, and mitigation flags. Lethe currently drops CFG on the payload and stub.
+  state, and mitigation flags. Basic GuardCF tables, including exact
+  suppressed/export-suppressed GFID metadata, must remain present and pass the
+  native negative test. Unsupported load-config families, XFG metadata for
+  generated thunks, and any unbound outer mitigation clone must fail the release
+  matrix; a successful pack must never imply that CFG was silently removed.
 - Test anti-debug on/off. Test memory guard only if it is part of the candidate.
 - Retain an unpacked, symbolized canary for support and rollback.
 
@@ -72,23 +97,25 @@ cmake --build bootstrap/build --config Release
 - Confirm the release command does not use `--enable-experimental-dll`,
   `--enable-experimental-server-shard`, `--memory-guard`, or
   `--anti-debug on`.
-- Treat the DLL round-trip in CI as regression research, not evidence that DLLs
-  are release-supported.
+- Treat DLL native evidence as proof only for the declared guarded fixture
+  envelope. Do not call DLL release-supported until generated-thunk XFG
+  coverage, clean provenance, and the clean-VM matrix are green. Offset-root
+  resources and DLL delay imports are covered only by the declared native
+  fixtures and still require real-application validation.
 - Do not ship server-shard mode until its backend contract, TLS policy, signed
   launcher, denial paths, and signed application launch pass an external
   end-to-end acceptance gate.
 
-## 6. Promote, sign, and scan
+## 6. Stage, review, sign, and scan
 
-After the tree and candidate pass the prior gates:
-
-```powershell
-.\stub\build_stub.ps1 -Clean -Config Release `
-  -ShuffleSeed <same-recorded-hex-seed> -Promote `
-  -PythonExe .\.venv\Scripts\python.exe
-```
-
-- Review the prebuilt DLL and its provenance manifest as intentional changes.
+- The staging tool and CI workflow never modify
+  `stub/prebuilt/lethe_stub_x64.dll` or its tracked manifest. The legacy
+  `build_stub.ps1 -Promote` switch fails closed.
+- The complete `all` matrix must be green. A green EXE subset cannot bypass a
+  red DLL lane, and `--validate-only` is never promotion evidence.
+- Review the staged DLL, manifest, and hashed evidence as one indivisible unit.
+- Publication remains a separate reviewed operation and is unavailable while
+  any matrix row is blocked, partial, experimental, failing, or unverified.
 - Pack the application, then Authenticode-sign the packed output and launcher.
 - Verify signatures and timestamp chains on a clean machine.
 - Run current Windows Defender scans and launch/runtime smoke tests on a clean VM.

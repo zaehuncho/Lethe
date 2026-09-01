@@ -10,8 +10,10 @@ two front-ends never drift:
 * :func:`validate_packed` -- a *structural* round-trip check that never executes
   the output: it confirms the file is a valid PE, locates the embedded Lethe
   container by magic, parses the 192-byte :class:`~packer.container.PackInfo`, and
-  sanity-checks it. Catches a corrupt/short/mis-keyed pack without the risk (or
-  the AV noise) of actually running a freshly packed binary.
+  sanity-checks it. Catches a corrupt, short, or unpopulated container without
+  the risk (or the AV noise) of actually running a freshly packed binary. It
+  does not authenticate or decrypt payload bytes; ``packer.keyed_validation``
+  owns that separate builder-only gate.
 """
 from __future__ import annotations
 
@@ -91,6 +93,8 @@ class _RawSection:
 class _PELayout:
     is_dll: bool
     image_size: int
+    export_rva: int
+    export_size: int
     sections: List[_RawSection]
 
     def section_for_file_range(self, offset: int, size: int) -> Optional[_RawSection]:
@@ -121,11 +125,12 @@ def _parse_pe_layout(data: bytes) -> _PELayout:
 
     optional = coff + 20
     optional_end = optional + opt_size
-    if opt_size < 0x70 or optional_end > len(data):
+    if opt_size < 0x78 or optional_end > len(data):
         raise ValueError("output has a truncated PE32+ optional header")
     if struct.unpack_from("<H", data, optional)[0] != _PE32_PLUS:
         raise ValueError("output is not PE32+ (x64)")
     image_size = struct.unpack_from("<I", data, optional + 0x38)[0]
+    export_rva, export_size = struct.unpack_from("<II", data, optional + 0x70)
     if image_size == 0:
         raise ValueError("output has a zero SizeOfImage")
 
@@ -145,7 +150,8 @@ def _parse_pe_layout(data: bytes) -> _PELayout:
         sections.append(_RawSection(
             rva, virtual_size, raw_size, raw_ptr, section_chars))
     return _PELayout(
-        bool(characteristics & _IMAGE_FILE_DLL), image_size, sections)
+        bool(characteristics & _IMAGE_FILE_DLL), image_size,
+        export_rva, export_size, sections)
 
 
 def _parse_sections(data: bytes) -> List[SectionInfo]:
@@ -231,10 +237,36 @@ def _candidate_is_live(info: container.PackInfo, offset: int,
     allowed_flags = (
         container.FLAG_HAS_TLS | container.FLAG_HAS_EXCEPTIONS
         | container.FLAG_ANTIDEBUG | container.FLAG_MEMGUARD
+        | container.FLAG_PAGED_DVM | container.FLAG_LOAD_CONFIG
+        | container.FLAG_DLL_PRELOAD_IAT | container.FLAG_PROCESS_HARDENING
     )
     if info.flags & ~allowed_flags:
         return False
     if info.is_dll not in (0, 1) or bool(info.is_dll) != layout.is_dll:
+        return False
+    if bool(info.flags & container.FLAG_DLL_PRELOAD_IAT) != layout.is_dll:
+        return False
+    if layout.is_dll:
+        if (info.dll_export_rva, info.dll_export_size) != (
+                layout.export_rva, layout.export_size):
+            return False
+        if info.dll_export_rva == 0 or info.dll_export_size == 0:
+            if (info.dll_export_rva != 0 or info.dll_export_size != 0 or
+                    any(info.dll_export_sha256_128)):
+                return False
+        else:
+            if (info.dll_export_size < 40 or
+                    info.dll_export_rva + info.dll_export_size >
+                    info.original_size_of_image or
+                    not any(info.dll_export_sha256_128)):
+                return False
+            export_owner = layout.section_for_rva_range(
+                info.dll_export_rva, info.dll_export_size, raw=True)
+            if (export_owner is None or
+                    not (export_owner.characteristics & _SCN_MEM_READ)):
+                return False
+    elif (info.dll_export_rva != 0 or info.dll_export_size != 0 or
+          any(info.dll_export_sha256_128)):
         return False
     if not (1 <= info.section_count <= _MAX_SECTIONS):
         return False
@@ -269,7 +301,7 @@ def _candidate_is_live(info: container.PackInfo, offset: int,
     )
     if any(off + size > meta_size for off, size in ranges):
         return False
-    if (info.flags & container.FLAG_HAS_TLS) and info.tls_off + 20 > meta_size:
+    if (info.flags & container.FLAG_HAS_TLS) and info.tls_off + 24 > meta_size:
         return False
     if info.flags & container.FLAG_HAS_EXCEPTIONS:
         if not info.pdata_rva or not info.pdata_count:

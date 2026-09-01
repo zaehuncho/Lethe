@@ -23,7 +23,7 @@ Usage
 -----
     python lethe.py INPUT [OUTPUT]
                         [--anti-debug {on,off}] [--memory-guard]
-                        [--level N] [--verbose]
+                        [--process-hardening] [--level N] [--verbose]
 
 The release-supported input is an unmanaged x64 EXE. DLL and server-shard
 paths require explicit experimental acknowledgments and are not release-ready.
@@ -117,6 +117,91 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _virtualization_spec(value: str) -> tuple[str, int, int]:
+    parts = value.split(":")
+    if len(parts) != 3 or not parts[0].strip():
+        raise argparse.ArgumentTypeError(
+            "function must use NAME:RVA:SIZE (for example Init:0x1200:64)")
+
+    def _integer(label: str, token: str) -> int:
+        token = token.strip()
+        base = 16 if token.lower().startswith("0x") else 10
+        try:
+            return int(token, base)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"function {label} must be decimal or 0x-prefixed hexadecimal")
+
+    name = parts[0].strip()
+    rva = _integer("RVA", parts[1])
+    size = _integer("size", parts[2])
+    if len(name) > 128 or "\0" in name:
+        raise argparse.ArgumentTypeError("function name must be 1..128 characters")
+    if rva < 0 or size < 5 or rva + size > 0x1_0000_0000:
+        raise argparse.ArgumentTypeError(
+            "function RVA/size must describe a 5-byte-or-larger uint32 RVA range")
+    return name, rva, size
+
+
+def _virtualization_integer(label: str, token: str) -> int:
+    token = token.strip()
+    base = 16 if token.lower().startswith("0x") else 10
+    try:
+        parsed = int(token, base)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{label} must be decimal or 0x-prefixed hexadecimal")
+    if parsed <= 0 or parsed >= 0x1_0000_0000:
+        raise argparse.ArgumentTypeError(
+            f"{label} must be a nonzero uint32 value")
+    return parsed
+
+
+def _virtualization_gap(value: str) -> tuple[int, int, str]:
+    parts = value.split(":", 2)
+    if len(parts) != 3 or not parts[2].strip() or "\0" in parts[2]:
+        raise argparse.ArgumentTypeError(
+            "gap must use RVA:SIZE:RATIONALE with a nonempty rationale")
+    rva = _virtualization_integer("gap RVA", parts[0])
+    size = _virtualization_integer("gap size", parts[1])
+    if rva + size > 0x1_0000_0000:
+        raise argparse.ArgumentTypeError("gap RVA and size exceed the uint32 RVA space")
+    return rva, size, parts[2].strip()
+
+
+def _virtualization_tail_exit(value: str) -> tuple[int, int, int, str]:
+    parts = value.split(":", 3)
+    if len(parts) != 4 or not parts[3].strip() or "\0" in parts[3]:
+        raise argparse.ArgumentTypeError(
+            "tail exit must use "
+            "FUNCTION_RVA:INSTRUCTION_RVA:TARGET_RVA:RATIONALE")
+    return (
+        _virtualization_integer("tail-exit function RVA", parts[0]),
+        _virtualization_integer("tail-exit instruction RVA", parts[1]),
+        _virtualization_integer("tail-exit target RVA", parts[2]),
+        parts[3].strip(),
+    )
+
+
+def _validate_cli_virtualization_specs(
+        raw_specs: list[tuple[str, int, int]]) -> tuple[tuple[str, int, int], ...]:
+    names: set[str] = set()
+    starts: set[int] = set()
+    ordered = sorted(raw_specs, key=lambda item: item[1])
+    for name, rva, _size in ordered:
+        if name in names or rva in starts:
+            raise ValueError(
+                f"duplicate --virtualize-function name or entry RVA: {name!r}")
+        names.add(name)
+        starts.add(rva)
+    for left, right in zip(ordered, ordered[1:]):
+        if left[1] + left[2] > right[1]:
+            raise ValueError(
+                f"overlapping --virtualize-function ranges: {left[0]!r} and "
+                f"{right[0]!r}")
+    return tuple(ordered)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lethe",
@@ -152,6 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--memory-guard",
         action="store_true",
         help="EXPERIMENTAL opt-in page guard (not release-approved)",
+    )
+    parser.add_argument(
+        "--process-hardening",
+        action="store_true",
+        help=("opt in to irreversible EXE process mitigations and restricted "
+              "default DLL search directories"),
     )
     parser.add_argument(
         "--level",
@@ -228,6 +319,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="override the prebuilt native stub (CI/release validation)",
+    )
+    parser.add_argument(
+        "--virtualize-function",
+        action="append",
+        type=_virtualization_spec,
+        default=[],
+        metavar="NAME:RVA:SIZE",
+        help=("explicit whole function to virtualize; repeatable, with decimal "
+              "or 0x-prefixed RVA/size"),
+    )
+    parser.add_argument(
+        "--enable-experimental-virtualization",
+        action="store_true",
+        help=("acknowledge the experimental explicit-function virtualization "
+              "path; requires --stub-path and --virtualize-function"),
+    )
+    parser.add_argument(
+        "--virtualization-gap",
+        action="append",
+        type=_virtualization_gap,
+        default=[],
+        metavar="RVA:SIZE:RATIONALE",
+        help=("acknowledge one exact executable coverage gap; repeatable, and "
+              "does not prove the gap contains no entry references"),
+    )
+    parser.add_argument(
+        "--virtualization-tail-exit",
+        action="append",
+        type=_virtualization_tail_exit,
+        default=[],
+        metavar="FUNCTION_RVA:INSTRUCTION_RVA:TARGET_RVA:RATIONALE",
+        help="approve one exact selected-function direct JMP tail edge",
+    )
+    parser.add_argument(
+        "--acknowledge-unproven-indirect-targets",
+        action="store_true",
+        help=("acknowledge that indirect and address-taken target closure remains "
+              "unproven; required for selected-function virtualization"),
     )
     parser.add_argument(
         "--verbose",
@@ -307,11 +436,46 @@ def main(argv: "list[str] | None" = None) -> int:
         print("error: --enable-experimental-server-shard requires --server-shard",
               file=sys.stderr)
         return EXIT_USAGE
+    if args.virtualize_function and not args.enable_experimental_virtualization:
+        print("error: --virtualize-function requires "
+              "--enable-experimental-virtualization", file=sys.stderr)
+        return EXIT_USAGE
+    if args.enable_experimental_virtualization and not args.virtualize_function:
+        print("error: --enable-experimental-virtualization requires at least one "
+              "--virtualize-function", file=sys.stderr)
+        return EXIT_USAGE
+    if args.virtualize_function and not args.stub_path:
+        print("error: --virtualize-function requires an explicit fresh "
+              "--stub-path", file=sys.stderr)
+        return EXIT_USAGE
+    if ((args.virtualization_gap or args.virtualization_tail_exit
+         or args.acknowledge_unproven_indirect_targets)
+            and not args.virtualize_function):
+        print("error: virtualization proof acknowledgements require at least one "
+              "--virtualize-function", file=sys.stderr)
+        return EXIT_USAGE
+    if (args.virtualize_function
+            and not args.acknowledge_unproven_indirect_targets):
+        print("error: --virtualize-function requires "
+              "--acknowledge-unproven-indirect-targets", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        virtualization_specs = _validate_cli_virtualization_specs(
+            args.virtualize_function)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
 
     # Import the shared core lazily so sys.path (set above) is in effect and any
     # failure produces a clean message rather than a traceback at import time.
     try:
-        from packer.orchestrator import PackOptions, pack_file
+        from packer.orchestrator import (
+            PackOptions,
+            VirtualizationGapAcknowledgement,
+            VirtualizationSpec,
+            VirtualizationTailExitApproval,
+            pack_file,
+        )
     except Exception as exc:  # noqa: BLE001 - report any import failure cleanly
         print(f"error: cannot import the Lethe core (packer.orchestrator): {exc}",
               file=sys.stderr)
@@ -322,6 +486,7 @@ def main(argv: "list[str] | None" = None) -> int:
     options = PackOptions(
         anti_debug=(args.anti_debug == "on"),
         memory_guard=args.memory_guard,
+        process_hardening=args.process_hardening,
         compression_level=args.level,
         output_path=output_path,
         is_dll=(True if args.dll else None),  # None => auto-detect from the header
@@ -336,6 +501,23 @@ def main(argv: "list[str] | None" = None) -> int:
         shard_pin_pem=(args.shard_pin_pem
                        or os.environ.get("LETHE_SHARD_PIN_PEM")),
         stub_path=args.stub_path,
+        virtualization_specs=tuple(
+            VirtualizationSpec(name, rva, size)
+            for name, rva, size in virtualization_specs
+        ),
+        virtualization_gap_acknowledgements=tuple(
+            VirtualizationGapAcknowledgement(rva, size, rationale)
+            for rva, size, rationale in args.virtualization_gap
+        ),
+        virtualization_tail_exit_approvals=tuple(
+            VirtualizationTailExitApproval(
+                function_rva, instruction_rva, target_rva, rationale)
+            for function_rva, instruction_rva, target_rva, rationale
+            in args.virtualization_tail_exit
+        ),
+        acknowledge_unproven_indirect_targets=(
+            args.acknowledge_unproven_indirect_targets
+        ),
     )
 
     def _progress(line: str) -> None:
@@ -345,6 +527,8 @@ def main(argv: "list[str] | None" = None) -> int:
         "LETHE_ENABLE_EXPERIMENTAL_DLL": args.enable_experimental_dll,
         "LETHE_ENABLE_EXPERIMENTAL_SERVER_SHARD":
             args.enable_experimental_server_shard,
+        "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION":
+            args.enable_experimental_virtualization,
     }
     previous_env = {name: os.environ.get(name) for name in feature_env}
     try:
