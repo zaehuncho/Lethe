@@ -53,7 +53,7 @@ int  antidbg_check_extended(const void *image_base, uint32_t text_rva,
 int antidbg_tripwire_peb(void);    /* PEB->BeingDebugged              */
 int antidbg_tripwire_ntgf(void);   /* PEB->NtGlobalFlag heap bits     */
 int antidbg_tripwire_rdtsc(void);  /* RDTSC timing gate               */
-int antidbg_tripwire_hwbp(void);   /* Hardware breakpoints (DR0-DR3)  */
+int antidbg_tripwire_debug_port(void); /* NtQIP ProcessDebugPort recheck */
 
 /*
  * Post-load hardening (late phase).

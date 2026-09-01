@@ -23,16 +23,15 @@
  *   2.  PEB->NtGlobalFlag heap bits     (PEB + 0xBC, mask 0x70)
  *   3.  PEB->ProcessHeap Flags/ForceFlags (heap debug bits)
  *   4.  CheckRemoteDebuggerPresent(GetCurrentProcess())
- *   5.  Hardware breakpoints            (DR0-DR3 via GetThreadContext)
- *   6.  NtQueryInformationProcess(ProcessDebugPort)        [dynamic resolve]
- *   7.  NtQueryInformationProcess(ProcessDebugObjectHandle)[dynamic resolve]
- *   8.  DBI / instrumentation modules   (Frida/Pin/DynamoRIO/x64dbg/ScyllaHide)
- *   9.  Parent process is a known debugger (NtQIP(ProcessBasicInformation) ->
+ *   5.  NtQueryInformationProcess(ProcessDebugPort)        [dynamic resolve]
+ *   6.  NtQueryInformationProcess(ProcessDebugObjectHandle)[dynamic resolve]
+ *   7.  DBI / instrumentation modules   (Frida/Pin/DynamoRIO/x64dbg/ScyllaHide)
+ *   8.  Parent process is a known debugger (NtQIP(ProcessBasicInformation) ->
  *       parent PID -> QueryFullProcessImageNameA -> basename match)
- *   10. RDTSC timing gate around a trivial op          (min-of-N)
- *   11. RDTSC timing gate around a GetTickCount64 call  (min-of-N)
- *   12. QueryPerformanceCounter wall-clock gate         (min-of-N)
- *   13. RDTSC vs QPC crosscheck (catches a spoofed/hooked single clock)
+ *   9.  RDTSC timing gate around a trivial op          (min-of-N)
+ *   10. RDTSC timing gate around a GetTickCount64 call  (min-of-N)
+ *   11. QueryPerformanceCounter wall-clock gate         (min-of-N)
+ *   12. RDTSC vs QPC crosscheck (catches a spoofed/hooked single clock)
  *
  * DELIBERATELY EXCLUDED (AV red flags):
  *   NtSetInformationThread(ThreadHideFromDebugger), int 2d / int 3 tricks,
@@ -189,24 +188,6 @@ static int check_remote_debugger(void)
     if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &present) && present) {
         return 1;
     }
-    return 0;
-}
-
-/*
- * Hardware breakpoint detection: DR0-DR3 hold linear addresses of HW
- * breakpoints. Analysts use these to break on specific API calls without
- * patching INT3 (bypasses software-BP scans). If any DR0-DR3 is nonzero,
- * a hardware breakpoint is set. (CONTEXT is __declspec(align(16)); a stack
- * instance is correctly aligned for GetThreadContext.)
- */
-static int check_hardware_breakpoints(void)
-{
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(GetCurrentThread(), &ctx))
-        return 0;
-    if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3)
-        return 1;
     return 0;
 }
 
@@ -656,16 +637,12 @@ __declspec(noinline) int antidbg_tripwire_rdtsc(void)
     return 0;
 }
 
-/* Tripwire 4: Hardware breakpoints DR0-DR3 (placed after relocation). */
-__declspec(noinline) int antidbg_tripwire_hwbp(void)
+/* Tripwire 4: kernel debug-port recheck (placed after relocation). */
+__declspec(noinline) int antidbg_tripwire_debug_port(void)
 {
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), &ctx)) {
-        if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
-            wipe_master_key();
-            return 1;
-        }
+    if (check_debug_port()) {
+        wipe_master_key();
+        return 1;
     }
     return 0;
 }
@@ -685,7 +662,6 @@ int antidbg_check(void)
     else if (check_ntglobalflag(peb))       detected = 1;
     else if (check_heap_flags(peb))         detected = 1;
     else if (check_remote_debugger())       detected = 1;
-    else if (check_hardware_breakpoints())  detected = 1;
     else if (check_debug_port())            detected = 1;
     else if (check_debug_object())          detected = 1;
     else if (check_instrumentation())       detected = 1;

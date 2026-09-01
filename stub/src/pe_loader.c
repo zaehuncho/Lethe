@@ -1651,6 +1651,14 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
             goto fail;
     }
 
+    /* Apply authenticated host-wide mitigations before resolving any protected
+       EXE import. This makes SetDefaultDllDirectories govern the first
+       LoadLibraryA call instead of only later application loads. DLL inputs are
+       rejected above because these policies are process-global. */
+    if ((cpi->flags & LETHE_FLAG_PROCESS_HARDENING) &&
+        antidump_harden_early(cpi->is_dll) != 0)
+        goto fail;
+
     /* 6. resolve imports */
     if (cpi->imports_size > 0 &&
         !(cpi->flags & LETHE_FLAG_DLL_PRELOAD_IAT)) {
@@ -1660,12 +1668,6 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
             goto fail;
     }
     DIAG(6);
-
-    /* Apply authenticated host-wide mitigations only after EXE fallback
-       imports are loaded. DLL inputs are rejected above. */
-    if ((cpi->flags & LETHE_FLAG_PROCESS_HARDENING) &&
-        antidump_harden_early(cpi->is_dll) != 0)
-        goto fail;
 
     /* Tripwire: scattered NtGlobalFlag check after import resolution */
     if ((cpi->flags & LETHE_FLAG_ANTIDEBUG) && antidbg_tripwire_ntgf())
@@ -1694,7 +1696,8 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
     DIAG(71);
 
     /* Tripwire: scattered HW breakpoint check after relocation */
-    if ((cpi->flags & LETHE_FLAG_ANTIDEBUG) && antidbg_tripwire_hwbp())
+    if ((cpi->flags & LETHE_FLAG_ANTIDEBUG) &&
+        antidbg_tripwire_debug_port())
         goto fail;
 
     /* 8. TLS */

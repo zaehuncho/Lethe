@@ -84,7 +84,7 @@ def test_successful_dll_lifecycle_owns_detach_cleanup() -> None:
         "if (reason == DLL_PROCESS_DETACH"):STUB_MAIN.index(
             "if (reason == DLL_THREAD_ATTACH")]
     cleanup = STUB_MAIN[STUB_MAIN.index("static void release_dll_runtime("):
-                        STUB_MAIN.index("__declspec(dllexport)\nvoid __cdecl")]
+                        STUB_MAIN.index("void __cdecl StubExeEntryImpl(")]
     assert "release_dll_runtime(hInst, reason, reserved);" in process_detach
     assert "RtlDeleteFunctionTable(" in cleanup
     assert "(PRUNTIME_FUNCTION)((uint8_t *)hInst + s_pdata_rva)" in cleanup

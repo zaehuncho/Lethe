@@ -244,6 +244,15 @@ def test_packed_dll_does_not_mutate_process_wide_loader_policy() -> None:
     assert "LETHE_FLAG_PROCESS_HARDENING)))" in loader
 
 
+def test_process_hardening_precedes_first_protected_import_resolution() -> None:
+    loader = _read(SRC / "pe_loader.c")
+    hardening = loader.index("antidump_harden_early(cpi->is_dll)")
+    imports = loader.index("resolve_imports(base, meta_buf + cpi->imports_off")
+
+    assert hardening < imports
+    assert "SetDefaultDllDirectories govern the first" in loader
+
+
 def test_dll_antidebug_detection_returns_failure_without_killing_host() -> None:
     antidebug = _read(SRC / "antidebug.c")
     loader = _read(SRC / "pe_loader.c")
@@ -252,8 +261,14 @@ def test_dll_antidebug_detection_returns_failure_without_killing_host() -> None:
     tripwire_region = antidebug[antidebug.index("/* Tripwire 1:"):
                                 antidebug.index("int antidbg_check(void)")]
     assert "ExitProcess(" not in tripwire_region
-    for name in ("peb", "ntgf", "rdtsc", "hwbp"):
+    for name in ("peb", "ntgf", "rdtsc", "debug_port"):
         assert f"int antidbg_tripwire_{name}(void)" in antidebug
+    assert "GetThreadContext(GetCurrentThread()" not in antidebug
+    debug_port_tripwire = antidebug[antidebug.index(
+        "int antidbg_tripwire_debug_port(void)"):antidebug.index(
+            "int antidbg_check(void)")]
+    assert "check_debug_port()" in debug_port_tripwire
+    assert "wipe_master_key();" in debug_port_tripwire
     assert "ExitProcess(" not in loader
     assert re.search(
         r"if \(antidebug_on && antidbg_tripwire_rdtsc\(\)\)\s*"
