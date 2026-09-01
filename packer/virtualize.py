@@ -566,6 +566,16 @@ def _validate_function_artifacts(
         raise _fail(f"function {function.name!r} unwind ABI is invalid")
     if function.unwind.begin_rva != generated.rva or function.unwind.end_rva != generated.rva + generated.size:
         raise _fail(f"function {function.name!r} unwind range is invalid")
+    if (
+        not isinstance(function.capabilities, dict)
+        or function.capabilities.get("direct_only_thunk") is not True
+        or function.capabilities.get("cfg_target_declared") is not False
+        or function.capabilities.get("xfg_function_hash_emitted") is not False
+        or function.cfg_target_rvas
+    ):
+        raise _fail(
+            f"function {function.name!r} direct-only CFG/XFG contract is invalid"
+        )
 
     patch = function.target_entry_patch
     expected_displacement = generated.rva - (function.target_rva + plan.TARGET_ENTRY_PATCH_SIZE)
@@ -614,6 +624,72 @@ def _validate_function_artifacts(
     if function.required_relocations != expected_relocations:
         raise _fail(f"function {function.name!r} relocation contract is invalid")
     return generated.rva
+
+
+def _validate_direct_only_references(
+    parsed: pe_analyze.ParsedPE,
+    manifest: plan.VirtualizationManifest,
+) -> None:
+    """Prove each generated thunk has only its direct entry and unwind owner.
+
+    Native indirect callers retain the source GFID/XFG identity at the original
+    function RVA.  The generated thunk is reached solely through that entry's
+    E9 patch and must never acquire a generated Guard CF table entry.
+    """
+    parsed_targets = tuple(getattr(parsed, "generated_cfg_targets", ()))
+    exception = manifest.exception_table
+    generated_records = tuple(exception.generated)
+    if len(generated_records) != len(manifest.functions):
+        raise _fail("direct-only thunk/unwind ownership count is inconsistent")
+    expected_merged = tuple(sorted(
+        (*exception.retained, *generated_records),
+        key=lambda record: (
+            record.begin_rva,
+            record.end_rva,
+            record.unwind_info_rva,
+            record.origin,
+        ),
+    ))
+    if exception.merged != expected_merged:
+        raise _fail("direct-only thunk exception-table views are inconsistent")
+    for function in manifest.functions:
+        if len(function.generated_executable_ranges) != 1:
+            raise _fail(
+                f"function {function.name!r} must have exactly one direct-only thunk"
+            )
+        thunk = function.generated_executable_ranges[0]
+        if any(thunk.rva <= target.rva < thunk.rva + thunk.size
+               for target in parsed_targets):
+            raise _fail(
+                f"function {function.name!r} direct-only thunk appears in "
+                "generated CFG inventory"
+            )
+        inbound = tuple(
+            candidate.target_entry_patch.patch_rva
+            for candidate in manifest.functions
+            if candidate.target_entry_patch.destination_rva == thunk.rva
+        )
+        if inbound != (function.target_rva,):
+            raise _fail(
+                f"function {function.name!r} direct-only thunk has invalid "
+                "entry references"
+            )
+        unwind_owners = tuple(
+            record
+            for record in manifest.exception_table.generated
+            if record.begin_rva == thunk.rva
+        )
+        if (
+            len(unwind_owners) != 1
+            or unwind_owners[0].function_name != function.name
+            or unwind_owners[0].end_rva != function.unwind.end_rva
+            or unwind_owners[0].unwind_info_rva != function.unwind.unwind_info_rva
+            or unwind_owners[0].record_rva != function.unwind.runtime_function_rva
+        ):
+            raise _fail(
+                f"function {function.name!r} direct-only thunk has invalid "
+                "unwind references"
+            )
 
 
 def _build_generated_sections(
@@ -735,6 +811,11 @@ def _commit_manifest(
         raise _fail(
             "materialization requires explicit acknowledgement that no external entry targets the overwritten function bodies"
         )
+    if manifest.version != plan.MANIFEST_VERSION:
+        raise _fail(
+            f"unsupported virtualization manifest version {manifest.version}"
+        )
+    _validate_direct_only_references(parsed, manifest)
     cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed, manifest)
     if not cfg_plan.preservation_supported:
         raise VirtualizationCfgPreservationError(cfg_plan)
@@ -749,6 +830,17 @@ def _commit_manifest(
         pe_analyze.ParsedGuardTarget(item.rva, item.metadata)
         for item in cfg_plan.generated_thunk_targets
     )
+    direct_only_ranges = tuple(
+        generated
+        for function in manifest.functions
+        for generated in function.generated_executable_ranges
+    )
+    if any(
+        generated.rva <= target.rva < generated.rva + generated.size
+        for generated in direct_only_ranges
+        for target in result.generated_cfg_targets
+    ):
+        raise _fail("direct-only thunk was materialized as a generated CFG target")
     _patch_selected_functions(result, manifest)
     text, data, generated_dir64 = _build_generated_sections(result, manifest)
     result.sections.extend(

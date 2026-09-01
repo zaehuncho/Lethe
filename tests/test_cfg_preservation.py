@@ -63,12 +63,23 @@ def _manifest():
     return SimpleNamespace(functions=(SimpleNamespace(
         target_rva=0x1000,
         target_size=0x20,
-        cfg_target_rvas=(0x5000,),
+        cfg_target_rvas=(),
         generated_executable_ranges=(SimpleNamespace(rva=0x5000, size=0x40),),
+        capabilities={"direct_only_thunk": True},
     ),))
 
 
-def test_cfg_plan_merges_generated_thunk_and_removes_tombstoned_interior() -> None:
+def _indirect_target_manifest():
+    return SimpleNamespace(functions=(SimpleNamespace(
+        target_rva=0x1000,
+        target_size=0x20,
+        cfg_target_rvas=(0x5000,),
+        generated_executable_ranges=(SimpleNamespace(rva=0x5000, size=0x40),),
+        capabilities={"direct_only_thunk": False},
+    ),))
+
+
+def test_cfg_plan_retains_source_entry_without_declaring_direct_only_thunk() -> None:
     plan = cfg_preservation.build_cfg_preservation_plan(_parsed(), _manifest())
 
     assert [target.rva for target in plan.source_targets] == [
@@ -77,10 +88,9 @@ def test_cfg_plan_merges_generated_thunk_and_removes_tombstoned_interior() -> No
         0x1000, 0x2000]
     assert [target.rva for target in plan.removed_tombstoned_interior_targets] == [
         0x1010]
-    assert [target.rva for target in plan.generated_thunk_targets] == [0x5000]
+    assert plan.generated_thunk_targets == ()
     assert [target.rva for target in plan.merged_declared_targets] == [
-        0x1000, 0x2000, 0x5000]
-    assert plan.generated_thunk_targets[0].metadata == b"\0"
+        0x1000, 0x2000]
     assert plan.preservation_supported is False
     assert any("tombstoned interiors" in blocker for blocker in plan.blockers)
 
@@ -112,7 +122,7 @@ def test_non_guard_source_does_not_invent_cfg_activation() -> None:
     plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
 
     assert plan.source_guard_cf_enabled is False
-    assert [target.rva for target in plan.generated_thunk_targets] == [0x5000]
+    assert plan.generated_thunk_targets == ()
     assert plan.preservation_supported is True
     assert plan.live_load_config_emitted is False
 
@@ -137,7 +147,7 @@ def test_present_non_guard_load_config_is_not_silently_dropped() -> None:
     assert cfg_preservation.require_cfg_preservation_supported(parsed) == plan
 
 
-def test_global_xfg_generated_thunk_fails_closed_without_synthesized_hash() -> None:
+def test_global_xfg_preserves_source_identity_for_direct_only_thunk() -> None:
     load_config = replace(
         _load_config(interior=False),
         xfg_present=True,
@@ -151,8 +161,65 @@ def test_global_xfg_generated_thunk_fails_closed_without_synthesized_hash() -> N
 
     plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
 
+    assert plan.preservation_supported is True
+    assert plan.generated_thunk_targets == ()
+    assert [target.rva for target in plan.merged_declared_targets] == [
+        0x1000, 0x2000]
+    assert plan.blockers == ()
+
+
+def test_direct_only_xfg_retains_selected_source_metadata_byte_exact() -> None:
+    source_targets = (
+        pe_analyze.ParsedGuardTarget(0x1000, b"\x08"),
+        pe_analyze.ParsedGuardTarget(0x2000, b"\x02"),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = replace(
+        parsed.load_config,
+        xfg_present=True,
+        guard_cf_targets=source_targets,
+    )
+
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
+
+    assert plan.preservation_supported is True
+    assert plan.source_targets == tuple(
+        cfg_preservation.PlannedCfgTarget(target.rva, target.metadata, "source")
+        for target in source_targets
+    )
+    assert plan.retained_source_targets == plan.source_targets
+    assert plan.merged_declared_targets == plan.source_targets
+    assert plan.generated_thunk_targets == ()
+
+
+def test_global_xfg_crafted_generated_gfid_fails_closed() -> None:
+    load_config = replace(
+        _load_config(interior=False),
+        xfg_present=True,
+        guard_cf_targets=(
+            pe_analyze.ParsedGuardTarget(0x1000, b"\0"),
+            pe_analyze.ParsedGuardTarget(0x2000, b"\0"),
+        ),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = load_config
+
+    plan = cfg_preservation.build_cfg_preservation_plan(
+        parsed, _indirect_target_manifest())
+
     assert plan.preservation_supported is False
+    assert [target.rva for target in plan.generated_thunk_targets] == [0x5000]
     assert any("8-byte XFG function hashes" in blocker for blocker in plan.blockers)
+
+
+def test_direct_only_thunk_rejects_sideband_generated_cfg_inventory() -> None:
+    parsed = _parsed(interior=False)
+    parsed.generated_cfg_targets = (
+        pe_analyze.ParsedGuardTarget(0x5000, b"\0"),
+    )
+
+    with pytest.raises(ValueError, match="direct-only.*generated CFG inventory"):
+        cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
 
 
 def test_suppressed_source_targets_are_preserved_by_outer_loader_metadata() -> None:
@@ -228,14 +295,14 @@ def test_live_load_config_merges_outer_targets_and_shadows_os_slots() -> None:
     table_va = int.from_bytes(live.data[128:136], "little")
     table_rva = table_va - parsed.image_base
     count = int.from_bytes(live.data[136:144], "little")
-    assert count == 4
+    assert count == 3
     table_offset = table_rva - live.section_rva
     entries = [
         int.from_bytes(live.data[table_offset + i * 5:table_offset + i * 5 + 4],
                        "little")
         for i in range(count)
     ]
-    assert entries == [0x1000, 0x2000, 0x5000, 0x8000]
+    assert entries == [0x1000, 0x2000, 0x8000]
     assert [copy.source_rva for copy in live.runtime_slot_copies] == [
         0x3400, 0x3410, 0x3418]
     assert live.directory_rva == 0x7000

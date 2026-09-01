@@ -265,6 +265,9 @@ def test_fresh_stub_materialization_round_trips_through_keyed_output(
 
     function = result.manifest.functions[0]
     thunk_rva = function.generated_executable_ranges[0].rva
+    assert function.cfg_target_rvas == ()
+    assert function.capabilities["direct_only_thunk"] is True
+    assert result.parsed.generated_cfg_targets == ()
     assert _slice(result.parsed, 0x1000, len(selected)) == function.target_entry_patch.patch
     assert function.target_entry_patch.patch[5:] == b"\xCC" * (len(selected) - 5)
     call_displacement, = struct.unpack(
@@ -354,6 +357,7 @@ def test_fresh_stub_materialization_round_trips_through_keyed_output(
         input_path=None,
         options=options,
         stub_path=str(stub_path),
+        allow_unverified_stub_for_tests=True,
     )
     assert assembly.graft_delta == result.stub.graft_delta
     structural = report.validate_packed(str(output))
@@ -553,3 +557,61 @@ def test_plain_descriptor_legacy_size_and_image_base_fail_closed() -> None:
                 ),
                 manifest,
             )
+
+
+def test_direct_only_thunk_rejects_generated_cfg_identity(
+    fresh_stub,
+) -> None:
+    _rolling, _stub_path, stub_bytes, table, handler_hash = fresh_stub
+    parsed, selected = _parsed()
+    result = virtualize.materialize_selected_functions(
+        parsed,
+        (plan.FunctionSpec("answer", 0x1000, len(selected)),),
+        stub_bytes=stub_bytes,
+        opcode_table=table,
+        expected_handler_variant_sha256=handler_hash,
+        page_master_key=_PAGE_MASTER_KEY,
+        acknowledge_no_interior_entries=True,
+    )
+    function = result.manifest.functions[0]
+    thunk_rva = function.generated_executable_ranges[0].rva
+
+    forged_function = dataclasses.replace(
+        function,
+        cfg_target_rvas=(thunk_rva,),
+        capabilities={
+            **function.capabilities,
+            "cfg_target_declared": True,
+        },
+    )
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="direct-only CFG/XFG contract",
+    ):
+        virtualize._validate_function_artifacts(
+            forged_function, result.manifest
+        )
+
+    forged_source = copy.deepcopy(parsed)
+    forged_source.generated_cfg_targets = (
+        pe_analyze.ParsedGuardTarget(thunk_rva, b""),
+    )
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="direct-only thunk appears in generated CFG inventory",
+    ):
+        virtualize.apply_virtualization_manifest(
+            forged_source,
+            result.manifest,
+            acknowledge_no_interior_entries=True,
+        )
+
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="unsupported virtualization manifest version 1",
+    ):
+        virtualize.apply_virtualization_manifest(
+            parsed,
+            dataclasses.replace(result.manifest, version=1),
+            acknowledge_no_interior_entries=True,
+        )

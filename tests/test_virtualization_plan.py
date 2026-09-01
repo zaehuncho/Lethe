@@ -105,7 +105,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
     manifest = _compile(raw)
     function = manifest.functions[0]
 
-    assert manifest.version == 1
+    assert manifest.version == plan.MANIFEST_VERSION == 2
     assert function.target_rva == 0x1000
     assert function.target_size == len(raw)
     assert function.original_sha256 == hashlib.sha256(raw).hexdigest()
@@ -150,7 +150,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
     generated = function.generated_executable_ranges[0]
     assert generated.rva == 0x5000
     assert generated.size == win64_thunk.THUNK_CODE_SIZE
-    assert function.cfg_target_rvas == (generated.rva,)
+    assert function.cfg_target_rvas == ()
     assert function.unwind.unwind_info == win64_thunk.THUNK_UNWIND_INFO
     assert struct.unpack("<III", function.unwind.runtime_function) == (
         generated.rva,
@@ -182,7 +182,8 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
     assert relocations[3].add_image_base is True
     assert function.capabilities == {
         "cet_shadow_stack_balanced": True,
-        "cfg_target_declared": True,
+        "cfg_target_declared": False,
+        "direct_only_thunk": True,
         "exception_handlers_supported": False,
         "external_calls_supported": False,
         "external_interior_entries_supported": False,

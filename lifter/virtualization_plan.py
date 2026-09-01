@@ -32,7 +32,7 @@ except ImportError:  # standalone tests put daedalus/ directly on sys.path
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 DESCRIPTOR_VERSION_PLAIN = 3
 DESCRIPTOR_VERSION_PAGED = 4
 TARGET_ENTRY_PATCH_SIZE = 5
@@ -1196,7 +1196,8 @@ def compile_virtualization_manifest(
         has_internal_calls = bool(item.call_analysis.internal_call_rvas)
         capabilities = {
             "cet_shadow_stack_balanced": True,
-            "cfg_target_declared": True,
+            "cfg_target_declared": False,
+            "direct_only_thunk": True,
             "exception_handlers_supported": False,
             "external_calls_supported": False,
             "external_interior_entries_supported": False,
@@ -1243,7 +1244,10 @@ def compile_virtualization_manifest(
                         size=win64_thunk.THUNK_CODE_SIZE,
                     ),
                 ),
-                cfg_target_rvas=(thunk_rva,),
+                # Every native caller continues to target the original RVA.
+                # That entry performs a direct E9 transfer to this thunk, so
+                # the thunk is deliberately not an indirect CFG/XFG target.
+                cfg_target_rvas=(),
                 unwind=UnwindPlan(
                     begin_rva=thunk_rva,
                     end_rva=end_rva,
@@ -1333,6 +1337,7 @@ __all__ = [
     "FunctionSpec",
     "GeneratedExecutableRange",
     "IMAGE_SCN_MEM_EXECUTE",
+    "MANIFEST_VERSION",
     "OpcodeTable",
     "PlannedRuntimeFunction",
     "RelocationRequirement",

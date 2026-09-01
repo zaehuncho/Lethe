@@ -123,9 +123,24 @@ def _generated_targets(manifest: Any, parsed: Any,
         try:
             targets = tuple(function.cfg_target_rvas)
             ranges = tuple(function.generated_executable_ranges)
+            capabilities = getattr(function, "capabilities", {})
+            if not isinstance(capabilities, dict):
+                raise TypeError("capabilities must be a dictionary")
+            direct_only = capabilities.get("direct_only_thunk") is True
         except (AttributeError, TypeError) as exc:
             raise ValueError(
                 "virtualization function lacks generated CFG target metadata") from exc
+        if direct_only:
+            if targets:
+                raise ValueError(
+                    "direct-only virtualization thunk must not declare a generated "
+                    "CFG target")
+            for target in generated:
+                if any(item.rva <= target.rva < item.rva + item.size
+                       for item in ranges):
+                    raise ValueError(
+                        f"direct-only virtualization thunk RVA 0x{target.rva:X} "
+                        "appears in generated CFG inventory")
         for target in targets:
             if type(target) is not int or not 0 < target < 0x1_0000_0000:
                 raise ValueError("generated CFG target RVA is invalid")

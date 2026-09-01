@@ -163,7 +163,7 @@ blob, descriptor, and fixed 40-byte `thunk_template` at the declared RVAs; fill
 its zeroed `REL32`/`DIR64` holes, including the descriptor's program pointer and
 image-base pointer (using the recorded numeric common RVA, never a
 PDB or link-map symbol); merge/register the emitted `RUNTIME_FUNCTION`
-records; add every declared CFG target; then apply each deterministic full-extent
+records; preserve every declared source CFG target; then apply each deterministic full-extent
 `target_entry_patch` only after all validation succeeds. That replacement is an
 `E9 rel32` entry followed by one-byte `INT3` tombstones at every remaining RVA,
 so the original tail is scrubbed and an interior entry faults. A selected extent
@@ -194,9 +194,11 @@ The materializer now merges unwind records and the loader registers the restored
 exception table. Supported modern MSVC GuardCF inputs retain a live outer load
 config, merged target tables/relocations, restored support slots, and runtime
 target registration; unsupported load-config families fail closed. CET-specific
-metadata remains future validation work. XFG-enabled inputs fail preflight when
-selected-function virtualization would add a generated thunk GFID: the thunk
-does not yet carry the source-compatible 8-byte function hash required by XFG.
+metadata remains future validation work. A selected function keeps its original
+GFID and XFG hash identity at the source RVA. That RVA is patched with a direct
+`E9 rel32` transfer, while the generated thunk is explicitly direct-only and is
+never added to the Guard CF function table. Crafted manifests or sideband state
+that attempt to declare a generated thunk GFID fail before materialization.
 
 ## Dependencies (builder-side, test-only here)
 `iced-x86` (decode), `unicorn` + `keystone` (oracle/tests). The tests
