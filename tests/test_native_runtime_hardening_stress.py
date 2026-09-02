@@ -23,6 +23,8 @@ _SHUFFLE_SEED = (
     "2718281828459045235360287471352662497757247093699959574966967627"
 )
 _LAUNCH_REPETITIONS = 3
+_SOAK_SECONDS = 60.0
+_SOAK_MIN_LAUNCHES = 64
 
 
 def _run_checked(command: list[str], *, cwd: Path, timeout: int = 180) -> None:
@@ -706,6 +708,120 @@ target_link_libraries(cwd_probe_fixture PRIVATE cwd_probe kernel32.lib)
     return executable, probe
 
 
+def _build_dll_antidebug_fixture(work: Path) -> tuple[Path, Path]:
+    source = work / "dll_antidebug_source"
+    build = work / "dll_antidebug_build"
+    source.mkdir()
+    (source / "fixture.c").write_text(
+        r'''
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+typedef int (__cdecl *ProbeFn)(void);
+
+__declspec(dllexport) int __cdecl dll_probe_value(void)
+{
+    return 4080;
+}
+
+__declspec(dllexport) ProbeFn dll_probe_reloc_anchor = dll_probe_value;
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
+{
+    (void)instance;
+    (void)reason;
+    (void)reserved;
+    return TRUE;
+}
+'''.lstrip(),
+        encoding="ascii",
+    )
+    (source / "host.c").write_text(
+        r'''
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+typedef int (__cdecl *ProbeFn)(void);
+
+static void emit(const char *message, DWORD size)
+{
+    DWORD written = 0;
+    (void)WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, size,
+                    &written, NULL);
+}
+
+int __cdecl host_entry(void)
+{
+    static const char loaded[] = "dll-host: LOADED\r\n";
+    static const char rejected[] = "dll-host: REJECTED\r\n";
+    static const char failed[] = "dll-host: FAILED\r\n";
+    wchar_t path[MAX_PATH];
+    DWORD length = GetEnvironmentVariableW(
+        L"LETHE_DLL_ANTIDEBUG_TARGET", path, MAX_PATH);
+    HMODULE module;
+    ProbeFn probe;
+
+    if (length == 0u || length >= MAX_PATH) {
+        emit(failed, (DWORD)(sizeof(failed) - 1u));
+        return 91;
+    }
+    module = LoadLibraryW(path);
+    if (!module) {
+        emit(rejected, (DWORD)(sizeof(rejected) - 1u));
+        return 0;
+    }
+    probe = (ProbeFn)GetProcAddress(module, "dll_probe_value");
+    if (!probe || probe() != 4080 || !FreeLibrary(module)) {
+        emit(failed, (DWORD)(sizeof(failed) - 1u));
+        return 92;
+    }
+    emit(loaded, (DWORD)(sizeof(loaded) - 1u));
+    return 0;
+}
+'''.lstrip(),
+        encoding="ascii",
+    )
+    (source / "CMakeLists.txt").write_text(
+        """
+cmake_minimum_required(VERSION 3.20)
+project(lethe_dll_antidebug_fixture C)
+add_library(dll_antidebug_fixture SHARED fixture.c)
+target_compile_options(dll_antidebug_fixture PRIVATE /W4 /WX /O2 /GS-)
+target_link_options(dll_antidebug_fixture PRIVATE
+    /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA
+    /FIXED:NO /NODEFAULTLIB /ENTRY:DllMain)
+target_link_libraries(dll_antidebug_fixture PRIVATE kernel32.lib)
+add_executable(dll_antidebug_host host.c)
+target_compile_options(dll_antidebug_host PRIVATE /W4 /WX /O2 /GS-)
+target_link_options(dll_antidebug_host PRIVATE
+    /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA
+    /NODEFAULTLIB /ENTRY:host_entry /SUBSYSTEM:CONSOLE)
+target_link_libraries(dll_antidebug_host PRIVATE kernel32.lib)
+""".lstrip(),
+        encoding="ascii",
+    )
+    _run_checked(
+        [
+            "cmake", "-S", str(source), "-B", str(build),
+            "-G", "Visual Studio 17 2022", "-A", "x64",
+        ],
+        cwd=work,
+    )
+    _run_checked(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        cwd=work,
+    )
+    dll = build / "Release/dll_antidebug_fixture.dll"
+    host = build / "Release/dll_antidebug_host.exe"
+    assert dll.is_file()
+    assert host.is_file()
+    return dll, host
+
+
 def _raw_section_range(blob: bytes, name: bytes) -> tuple[int, int]:
     if len(blob) < 0x40 or blob[:2] != b"MZ":
         raise AssertionError("packed fixture has no DOS header")
@@ -737,12 +853,12 @@ def _tamper_payload(source: Path, destination: Path) -> None:
 
 def _pack(source: Path, stub: Path, output: Path, *,
           anti_debug: bool = False, memory_guard: bool = False,
-          process_hardening: bool = False) -> None:
+          process_hardening: bool = False, is_dll: bool = False) -> None:
     result = orchestrator.pack_file(
         str(source),
         orchestrator.PackOptions(
             output_path=str(output),
-            is_dll=False,
+            is_dll=is_dll,
             stub_path=str(stub),
             anti_debug=anti_debug,
             memory_guard=memory_guard,
@@ -925,6 +1041,87 @@ def test_antidebug_detects_positive_debug_process_launch(
     )
     assert b"runtime-hardening:" not in protected_run.stdout
     assert protected_run.stderr == b""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
+def test_dll_host_antidebug_rejects_load_without_terminating_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.environ.get(_RUN_GATE) != "1":
+        pytest.skip(f"set {_RUN_GATE}=1 to run the native hardening stress proof")
+    pytest.importorskip("lief")
+    if not shutil.which("cmake") or handler_shape_audit.find_msvc() is None:
+        pytest.skip("CMake plus the Visual Studio x64 toolchain are required")
+
+    source, host = _build_dll_antidebug_fixture(tmp_path)
+    stub = _candidate_stub_or_build(tmp_path, name="dll_antidebug_stub")
+    control = host.parent / "dll_antidebug_control.dll"
+    protected = host.parent / "dll_antidebug_protected.dll"
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+    _pack(source, stub, control, anti_debug=False, is_dll=True)
+    _pack(source, stub, protected, anti_debug=True, is_dll=True)
+
+    cases = (
+        (control, False, b"dll-host: LOADED\r\n"),
+        (protected, False, b"dll-host: LOADED\r\n"),
+        (control, True, b"dll-host: LOADED\r\n"),
+        (protected, True, b"dll-host: REJECTED\r\n"),
+    )
+    for target, debugged, expected in cases:
+        monkeypatch.setenv("LETHE_DLL_ANTIDEBUG_TARGET", str(target))
+        for _ in range(_LAUNCH_REPETITIONS):
+            ran = _run_packed_forced_aslr(
+                host,
+                memory_guard=False,
+                process_hardening=False,
+                debugged=debugged,
+            )
+            assert ran.returncode == 0, (
+                target.name, debugged, ran.returncode, ran.stdout, ran.stderr
+            )
+            assert ran.stdout == expected
+            assert ran.stderr == b""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
+def test_memory_guard_forced_aslr_repeated_process_long_soak(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get(_RUN_GATE) != "1":
+        pytest.skip(f"set {_RUN_GATE}=1 to run the native hardening stress proof")
+    pytest.importorskip("lief")
+    if not shutil.which("cmake") or handler_shape_audit.find_msvc() is None:
+        pytest.skip("CMake plus the Visual Studio x64 toolchain are required")
+
+    source = _build_fixture(tmp_path)
+    stub = _candidate_stub_or_build(tmp_path, name="long_soak_stub")
+    packed = tmp_path / "runtime_hardening_long_soak.exe"
+    _pack(
+        source,
+        stub,
+        packed,
+        anti_debug=True,
+        memory_guard=True,
+        process_hardening=True,
+    )
+
+    started = time.monotonic()
+    deadline = started + _SOAK_SECONDS
+    launches = 0
+    while launches < _SOAK_MIN_LAUNCHES or time.monotonic() < deadline:
+        ran = _run_packed_forced_aslr(
+            packed,
+            memory_guard=True,
+            process_hardening=True,
+        )
+        assert ran.returncode == 0, (
+            launches, ran.returncode, ran.stdout, ran.stderr
+        )
+        assert ran.stdout == b"runtime-hardening: PASS\r\n"
+        assert ran.stderr == b""
+        launches += 1
+    assert launches >= _SOAK_MIN_LAUNCHES
+    assert time.monotonic() - started >= _SOAK_SECONDS
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")

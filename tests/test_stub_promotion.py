@@ -161,10 +161,17 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
     incomplete_release_gate = promote_stub.CommandRecord(
         **{**passing.__dict__, "stdout": "4 passed in 1.00s\n"}
     )
-    with pytest.raises(promote_stub.PromotionError, match="complete pass summary"):
+    with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             incomplete_release_gate, digest,
-            minimum_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+            expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+    oversized_release_gate = promote_stub.CommandRecord(
+        **{**passing.__dict__, "stdout": "8 passed in 1.00s\n"}
+    )
+    with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
+        promote_stub.validate_runtime_hardening_record(
+            oversized_release_gate, digest,
+            expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
 
 
 def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
@@ -172,7 +179,7 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_runtime_hardening_stress.py",
         "test_native_virtualization_runtime.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 5
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 7
 
 
 def test_corpus_evidence_is_bound_to_commit_and_artifact(tmp_path: Path) -> None:

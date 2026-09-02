@@ -298,7 +298,7 @@ def _replay_rebuilt_candidate(
     try:
         promote_stub.validate_runtime_hardening_record(
             runtime, artifact_hash,
-            minimum_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+            expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     except promote_stub.PromotionError as exc:
         raise ReleaseError(f"release runtime-hardening replay is invalid: {exc}") from exc
 

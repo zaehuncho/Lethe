@@ -48,7 +48,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_runtime_hardening_stress.py",
     "test_native_virtualization_runtime.py",
 )
-REQUIRED_NATIVE_RUNTIME_PASS_COUNT = 5
+REQUIRED_NATIVE_RUNTIME_PASS_COUNT = 7
 CANDIDATE_POLICY_ID = "lethe-native-candidate-v1"
 CANDIDATE_ALLOWED_BLOCKERS = {
     "mitigation.load_config_cfg_xfg": "partial",
@@ -573,7 +573,7 @@ def validate_runtime_hardening_record(
     record: CommandRecord,
     expected_hash: str,
     *,
-    minimum_tests: int = 3,
+    expected_tests: int = 3,
 ) -> int:
     if record.artifact_sha256 != expected_hash:
         raise PromotionError(
@@ -584,9 +584,9 @@ def validate_runtime_hardening_record(
     if re.search(r"\b\d+ skipped\b", record.stdout):
         raise PromotionError("candidate-bound native runtime hardening skipped tests")
     match = PYTEST_PASSED_RE.search(record.stdout)
-    if match is None or int(match.group(1)) < minimum_tests:
+    if match is None or int(match.group(1)) != expected_tests:
         raise PromotionError(
-            "candidate-bound native runtime hardening has no complete pass summary")
+            "candidate-bound native runtime hardening has no exact pass summary")
     return int(match.group(1))
 
 
@@ -1031,7 +1031,7 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
     )
     validate_runtime_hardening_record(
         runtime_record, manifest["sha256"],
-        minimum_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+        expected_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     return manifest
 
 
@@ -1170,7 +1170,7 @@ def execute(args: argparse.Namespace) -> Path | None:
     try:
         validate_runtime_hardening_record(
             runtime_hardening, artifact_hash,
-            minimum_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+            expected_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     except PromotionError as exc:
         failures.append(str(exc))
     _require_unchanged_artifact(

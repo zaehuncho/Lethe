@@ -22,7 +22,7 @@ clean, separable component.
 
 | Component | What it is |
 |-----------|------------|
-| **Lethe** (`packer/`, `stub/`) | The PE packer: per-section deflate + **AES-256-GCM**, a **code-hash-bound key**, reloc/TLS/`.pdata`/`.rsrc` handling, optional anti-debug checks, compatibility-preserving **anti-dump** metadata sanitization, and an experimental VEH **memory-guard**. The supported release path is unmanaged x64 EXEs. |
+| **Lethe** (`packer/`, `stub/`) | The PE packer: per-section deflate + **AES-256-GCM**, a **code-hash-bound key**, reloc/TLS/`.pdata`/`.rsrc` handling, optional anti-debug checks, compatibility-preserving **anti-dump** metadata sanitization, and an experimental VEH **memory-guard**. Candidate verification covers unmanaged AMD64 PE32+ EXEs and DLLs; public release remains gated by the production matrix. |
 | **Kalypso** (`cipher/`) | A custom **ChaCha20-Poly1305 AEAD** (RFC 8439) with a per-build sigma + word-permutation, checked against RFC vectors and the `cryptography` library. |
 | **Daedalus** (`daedalus/`, `stub/src/daedalus_*`) | A custom stack-machine **VM** for protector routines and explicitly selected application functions. Production-selected programs use independently authenticated AES-GCM bytecode pages, a one-page plaintext cache, per-build opcode shuffle, and build-bound handler variants. Rolling bytecode remains a separate mode for hand-authored VM programs. |
 | **x64 lifter** (`lifter/`) | A from-scratch **x64 → Daedalus** lifter for selected-function virtualization. Its supported scalar register/memory subset is checked against a Unicorn differential oracle; unsupported instructions reject the whole selected function. A read-only discovery/report tool inventories exact candidates and coverage gaps without auto-selecting code. |
@@ -35,7 +35,7 @@ functions. Promotion and deterministic rebuilds pin `DVM_ROLLING=ON` with
 turn on debugger-sensitive poison behavior.
 Candidate promotion and release replay run the exact rolling-capable DLL through
 the native selected-function paged-v1 E2E gate in both eager and memory-guard
-modes. Any skip, output mismatch, non-paged program, or test count below five
+modes. Any skip, output mismatch, non-paged program, or test count other than seven
 rejects the candidate/release replay.
 | **Obfuscation** (`obfuscation/`) | A custom LLVM pass plugin (control-flow flattening + opaque predicates + MBA + bogus control flow, per-build randomized). *Drafted, not yet compiled — needs an LLVM toolchain; see its README.* |
 | **bind** (`bind/`) | Hash-pin a packed EXE's first-party dependency DLLs so they can't be swapped, without fragile single-EXE bundling. |

@@ -239,7 +239,7 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, and one real direct-only XFG selected-function signature pass natively, but broader XFG signature coverage and clean-VM compatibility evidence remain incomplete.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, and real EXE/DLL direct-only XFG selected functions across three integer signature shapes pass natively, but wider ABI signatures and clean-VM compatibility evidence remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "A real MSVC /guard:cf /guard:xfg indirect call retains its source GFID, reaches a direct-only virtualized thunk with native parity, emits no thunk GFID, and rejects a forged generated-GFID path before output."
+          "claim": "Real MSVC /guard:cf /guard:xfg EXE and DLL indirect calls retain each source GFID across three integer signature shapes, reach direct-only virtualized thunks with native parity, emit no thunk GFIDs, and reject forged generated-GFID paths before output."
         }
       ]
     },
@@ -337,12 +337,12 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "experimental",
-      "blocker": "A positive DEBUG_PROCESS EXE launch is detected locally, but native DLL-host detection behavior and clean-VM debugger/tool compatibility evidence are missing.",
+      "blocker": "Positive DEBUG_PROCESS behavior is proven locally for an EXE and for host-safe protected-DLL rejection, but clean-VM debugger/tool and representative-host compatibility evidence are missing.",
       "evidence": [
         {
           "type": "native-pytest",
           "path": "tests/test_native_runtime_hardening_stress.py",
-          "claim": "A DEBUG_PROCESS control reaches the protected entrypoint while the anti-debug variant exits before its entrypoint marker."
+          "claim": "A DEBUG_PROCESS control reaches the protected EXE entrypoint while its anti-debug variant exits before the marker; a debugged host rejects an anti-debug protected DLL without terminating the host."
         },
         {
           "type": "pytest",
@@ -362,12 +362,12 @@
       "applies_to": ["exe"],
       "required": true,
       "status": "experimental",
-      "blocker": "Forced-ASLR executable DIR64 relocation and 24-thread concurrent first-touch are candidate-bound, but still lack a long soak and clean-VM coverage.",
+      "blocker": "Forced-ASLR DIR64 relocation, 24-thread concurrent first-touch, and a bounded one-minute minimum-64-launch process soak are candidate-bound, but multi-hour and clean-VM coverage remain missing.",
       "evidence": [
         {
           "type": "native-pytest",
           "path": "tests/test_native_runtime_hardening_stress.py",
-          "claim": "The opt-in native matrix forces a non-preferred base, exercises an executable DIR64 pointer, and synchronizes 24 threads on first access to one protected page."
+          "claim": "The opt-in native matrix forces a non-preferred base, exercises an executable DIR64 pointer, synchronizes 24 threads on first access to one protected page, and repeats at least 64 protected launches for at least one minute."
         },
         {
           "type": "pytest",

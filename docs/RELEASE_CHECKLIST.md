@@ -223,8 +223,8 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
 The candidate-bound native runtime record must name both the hardening stress
-file and the selected-function virtualization E2E file. It must report at least
-five passes with zero skips against the exact candidate hash; the E2E pair must
+file and the selected-function virtualization E2E file. It must report exactly
+seven passes with zero skips against the exact candidate hash; the E2E pair must
 execute paged-v1 output in eager and memory-guard modes. Release replay repeats
 that same command against the byte-identical rebuilt stub.
 The candidate promoter, compatibility matrix, and dependency-lock hashes are read

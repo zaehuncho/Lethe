@@ -58,8 +58,11 @@ pass `rolling=False` and `paged=True`.
 The candidate-bound runtime command is mandatory during promotion and release
 replay. It runs `test_native_runtime_hardening_stress.py` together with
 `test_native_virtualization_runtime.py` against the exact rebuilt artifact,
-requires all five native cases without skips, and proves the selected leaf emits
+requires all seven native cases without skips, and proves the selected leaf emits
 a paged-v1 program whose eager and memory-guard packed outputs match the original.
+The hardening side also runs a bounded one-minute, minimum-64-launch forced-ASLR
+memory-guard soak and proves that a debugged host rejects an anti-debug protected
+DLL without terminating the host process.
 
 The harness captures the packer's stdout and stderr independently. Runtime
 stdout, stderr, and exit code are recorded in JSON even when the packed process

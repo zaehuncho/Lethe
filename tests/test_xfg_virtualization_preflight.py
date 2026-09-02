@@ -28,6 +28,7 @@ from packer import (
 ROOT = Path(__file__).resolve().parents[1]
 _SHUFFLE_SEED = "8f" * 32
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
+_DLL_GATE = "LETHE_ENABLE_EXPERIMENTAL_DLL"
 
 
 def _visual_studio_available() -> bool:
@@ -153,6 +154,138 @@ target_link_options(real_xfg PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT
     )
     assert executed.returncode == 0, executed.stdout + executed.stderr
     return output
+
+
+@pytest.fixture(scope="module")
+def real_msvc_xfg_dll_bundle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> SimpleNamespace:
+    if os.name != "nt" or not shutil.which("cmake") or not _visual_studio_available():
+        pytest.skip("CMake + the Visual Studio x64 toolchain are required")
+    work = tmp_path_factory.mktemp("real-msvc-xfg-dll")
+    dll_source = work / "xfg_dll.c"
+    dll_source.write_text(
+        """
+__declspec(dllexport) __declspec(noinline) int __cdecl xfg_i32(int value)
+{
+    return value * 9 + 5;
+}
+
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_u64(
+    unsigned __int64 left,
+    unsigned __int64 right)
+{
+    return ((left << 3) + left) ^ (right + 0x102030405060708ui64);
+}
+
+__declspec(dllexport) __declspec(noinline) int __cdecl xfg_i32x3(
+    int first,
+    int second,
+    int third)
+{
+    return ((first + second) ^ third) + 23;
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    host_source = work / "xfg_dll_host.c"
+    host_source.write_text(
+        """
+#include <windows.h>
+
+typedef int (__cdecl *xfg_i32_fn)(int);
+typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
+typedef int (__cdecl *xfg_i32x3_fn)(int, int, int);
+
+static int run_once(const char *path)
+{
+    HMODULE module = LoadLibraryA(path);
+    xfg_i32_fn i32;
+    xfg_u64_fn u64;
+    xfg_i32x3_fn i32x3;
+    int ok;
+    if (module == NULL) {
+        return 10;
+    }
+    i32 = (xfg_i32_fn)GetProcAddress(module, "xfg_i32");
+    u64 = (xfg_u64_fn)GetProcAddress(module, "xfg_u64");
+    i32x3 = (xfg_i32x3_fn)GetProcAddress(module, "xfg_i32x3");
+    if (i32 == NULL || u64 == NULL || i32x3 == NULL) {
+        FreeLibrary(module);
+        return 11;
+    }
+    ok = i32(41) == 374;
+    ok = ok && u64(0x1122334455667788ui64, 0x8877665544332211ui64)
+        == (((0x1122334455667788ui64 << 3) + 0x1122334455667788ui64)
+            ^ (0x8877665544332211ui64 + 0x102030405060708ui64));
+    ok = ok && i32x3(19, 37, 11) == (((19 + 37) ^ 11) + 23);
+    if (!FreeLibrary(module)) {
+        return 12;
+    }
+    return ok ? 0 : 13;
+}
+
+int main(int argc, char **argv)
+{
+    int cycle;
+    if (argc != 2) {
+        return 2;
+    }
+    for (cycle = 0; cycle < 3; ++cycle) {
+        int result = run_once(argv[1]);
+        if (result != 0) {
+            return result;
+        }
+    }
+    return 0;
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    cmake_source = f"""
+cmake_minimum_required(VERSION 3.20)
+project(lethe_real_xfg_dll_fixture C)
+add_library(real_xfg_dll SHARED "{dll_source.as_posix()}")
+target_compile_options(real_xfg_dll PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg)
+target_link_options(real_xfg_dll PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO)
+add_executable(real_xfg_dll_host "{host_source.as_posix()}")
+target_compile_options(real_xfg_dll_host PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg)
+target_link_options(real_xfg_dll_host PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO)
+""".lstrip()
+    (work / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")
+    build = work / "build"
+    configured = subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(work),
+            "-B",
+            str(build),
+            "-G",
+            "Visual Studio 17 2022",
+            "-A",
+            "x64",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    compiled = subprocess.run(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    dll = build / "Release/real_xfg_dll.dll"
+    host = build / "Release/real_xfg_dll_host.exe"
+    assert dll.is_file() and host.is_file()
+    executed = subprocess.run(
+        [str(host), str(dll)], capture_output=True, text=True, check=False
+    )
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    return SimpleNamespace(dll=dll, host=host)
 
 
 @pytest.fixture(scope="module")
@@ -423,3 +556,152 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
         target.rva != thunk_rva
         for target in packed_targets
     )
+
+
+def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
+    real_msvc_xfg_dll_bundle: SimpleNamespace,
+    xfg_virtualization_stub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("iced_x86")
+    pytest.importorskip("lief")
+    dll = real_msvc_xfg_dll_bundle.dll
+    host = real_msvc_xfg_dll_bundle.host
+    source_image = assemble._StubImage(dll.read_bytes())
+    names = ("xfg_i32", "xfg_u64", "xfg_i32x3")
+    specs: list[virtualization_plan.FunctionSpec] = []
+    for name in names:
+        target_rva = source_image.find_export_rva(name)
+        assert target_rva is not None
+        ret_offset = source_image.read_at_rva(target_rva, 64).find(b"\xC3")
+        assert ret_offset >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
+        specs.append(
+            virtualization_plan.FunctionSpec(name, target_rva, ret_offset + 1)
+        )
+
+    parsed = pe_analyze.analyze_pe(str(dll))
+    assert parsed.is_dll is True
+    assert parsed.load_config is not None
+    assert parsed.load_config.guard_flags & 0x00800000
+    assert parsed.load_config.xfg_present is True
+    source_gfids = {
+        target.rva: target
+        for target in parsed.load_config.guard_cf_targets
+        if target.rva in {spec.rva for spec in specs}
+    }
+    assert set(source_gfids) == {spec.rva for spec in specs}
+
+    discovery = direct_control_flow.analyze_direct_control_flow(
+        parsed, tuple(specs), production=False
+    )
+    gap_acknowledgements = tuple(
+        orchestrator.VirtualizationGapAcknowledgement(
+            gap.rva,
+            gap.size,
+            "exact real-XFG DLL fixture compiler/linker executable gap",
+        )
+        for gap in discovery.coverage_gaps
+    )
+    captured: dict[str, virtualize.MaterializationResult] = {}
+    materialize = virtualize.materialize_selected_functions
+
+    def capture_materialization(*args, **kwargs):
+        result = materialize(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions", capture_materialization
+    )
+    monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+    monkeypatch.setenv(_DLL_GATE, "1")
+    packed = tmp_path / "real_xfg_dll.packed.dll"
+    result = orchestrator.pack_file(
+        str(dll),
+        orchestrator.PackOptions(
+            output_path=str(packed),
+            is_dll=True,
+            stub_path=str(xfg_virtualization_stub),
+            virtualization_specs=tuple(
+                orchestrator.VirtualizationSpec(
+                    spec.name, spec.rva, spec.size
+                )
+                for spec in specs
+            ),
+            virtualization_gap_acknowledgements=gap_acknowledgements,
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ),
+    )
+    assert result.ok, result.error
+    executed = subprocess.run(
+        [str(host), str(packed)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+
+    materialized = captured["result"]
+    assert materialized.parsed.load_config == parsed.load_config
+    assert materialized.parsed.generated_cfg_targets == ()
+    assert len(materialized.manifest.functions) == len(specs)
+    thunk_rvas: set[int] = set()
+    functions_by_name = {
+        function.name: function
+        for function in materialized.manifest.functions
+    }
+    assert set(functions_by_name) == set(names)
+    for spec in specs:
+        function = functions_by_name[spec.name]
+        assert function.target_rva == spec.rva
+        assert function.cfg_target_rvas == ()
+        assert function.capabilities["direct_only_thunk"] is True
+        assert function.capabilities["cfg_target_declared"] is False
+        assert function.capabilities["xfg_function_hash_emitted"] is False
+        thunk_rva = function.generated_executable_ranges[0].rva
+        thunk_rvas.add(thunk_rva)
+        entry = pe_analyze._slice_at_rva(
+            materialized.parsed.sections,
+            spec.rva,
+            spec.size,
+            what=f"materialized direct-only DLL entry {spec.name}",
+        )
+        assert entry[0] == 0xE9
+        displacement = int.from_bytes(entry[1:5], "little", signed=True)
+        assert spec.rva + 5 + displacement == thunk_rva
+
+    preserved_plan = cfg_preservation.build_cfg_preservation_plan(
+        materialized.parsed, materialized.manifest
+    )
+    assert preserved_plan.preservation_supported is True
+    assert preserved_plan.generated_thunk_targets == ()
+    merged = {
+        target.rva: target.metadata for target in preserved_plan.merged_declared_targets
+    }
+    for target_rva, source_gfid in source_gfids.items():
+        assert merged[target_rva] == source_gfid.metadata
+    assert thunk_rvas.isdisjoint(merged)
+
+    packed_image = assemble._StubImage(packed.read_bytes())
+    load_config_rva, load_config_size = packed_image.dir(assemble.DIR_LOAD_CONFIG)
+    packed_load_config = packed_image.read_at_rva(load_config_rva, load_config_size)
+    table_va = int.from_bytes(packed_load_config[128:136], "little")
+    table_count = int.from_bytes(packed_load_config[136:144], "little")
+    guard_flags = int.from_bytes(packed_load_config[144:148], "little")
+    assert guard_flags & 0x00800000
+    metadata_size = (guard_flags >> 28) & 0xF
+    stride = 4 + metadata_size
+    table = packed_image.read_at_rva(
+        table_va - packed_image.image_base, table_count * stride
+    )
+    packed_targets = {
+        int.from_bytes(table[offset:offset + 4], "little"):
+            table[offset + 4:offset + stride]
+        for offset in range(0, len(table), stride)
+    }
+    for target_rva, source_gfid in source_gfids.items():
+        assert packed_targets[target_rva] == source_gfid.metadata
+    assert thunk_rvas.isdisjoint(packed_targets)
