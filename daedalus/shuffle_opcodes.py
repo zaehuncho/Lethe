@@ -11,10 +11,12 @@ This is a BUILD-TIME tool.  It runs once per build and produces:
      - DVM_SHUFFLED_* defines for each opcode's wire byte
      - DVM_OPCODE_UNMAP[256] reverse-lookup table  (wire -> canonical)
      - DVM_DECOY_CASES macro with decoy handler case statements
+     - DVM_HANDLER_VARIANT_* selections for native semantic diversity
   2. A Python dict (imported by daedalus_asm.py) with:
      - SHUFFLED_OPCODES: mnemonic -> (wire_byte, operand_width, operand_kind)
      - DECOY_WIRE_BYTES: list of decoy instruction bytes for noise insertion
      - NOISE_RATIO: assembler noise insertion ratio
+     - HANDLER_VARIANTS plus a stable provenance hash
 
 The interpreter dispatches on OPCODE_UNMAP[wire_byte] so the switch cases stay
 canonical.  The assembler maps mnemonic -> shuffled wire byte.
@@ -28,6 +30,7 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import random
 import secrets
 import sys
@@ -111,6 +114,27 @@ NUM_REAL = len(CANONICAL_OPCODES)       # 56
 NUM_DECOYS = 17                         # ~30% of real count
 DECOY_CANONICAL_BASE = 0x80             # canonical IDs 0x80..0x90
 TRAP_CANONICAL = 0xFF                   # unmap value for trap slots
+
+# Native handler-body diversification is independent from wire-byte shuffling.
+# Each entry names a VM semantic whose C implementation has the given number of
+# bit-exact, machine-code-distinct variants proven by
+# ``tools/handler_shape_audit.py`` under the release MSVC optimizer.  Source
+# formulas that collapse to the same native body count as one variant here. The
+# selected profile is emitted into both generated artifacts and carries its own
+# hash so build provenance can distinguish "same ISA mapping, different
+# handlers" without overstating effective native diversity.
+HANDLER_VARIANT_COUNTS = OrderedDict([
+    ('add', 2),
+    ('sub', 2),
+    ('xor', 2),
+    ('and', 2),
+    ('or', 2),
+    # ``~a + 1`` and ``0 - a`` both become the same x64 NEG instruction at
+    # /O2, so only the canonical form is currently eligible for generation.
+    ('neg', 1),
+    ('cmp_eq', 2),
+    ('cmp_ne', 2),
+])
 
 # ---------------------------------------------------------------------------
 # Decoy handler templates -- semantically no-ops that look like real work.
@@ -213,6 +237,27 @@ assert len(DECOY_TEMPLATES) == NUM_DECOYS, \
 # Shuffle generation
 # ---------------------------------------------------------------------------
 
+def opcode_mapping_sha256(real_map):
+    """Stable hash shared with the planner's immutable OpcodeTable schema."""
+    entries = sorted(
+        [name, wire, CANONICAL_OPCODES[name][1], CANONICAL_OPCODES[name][2]]
+        for name, wire in real_map.items()
+    )
+    encoded = json.dumps(
+        entries, separators=(',', ':'), ensure_ascii=True
+    ).encode('ascii')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def handler_variant_sha256(handler_variants):
+    """Stable identity for the native handler implementation profile."""
+    entries = sorted([name, int(variant)]
+                     for name, variant in handler_variants.items())
+    encoded = json.dumps(
+        entries, separators=(',', ':'), ensure_ascii=True
+    ).encode('ascii')
+    return hashlib.sha256(encoded).hexdigest()
+
 def generate_shuffle(seed_bytes=None):
     """Generate a shuffled opcode mapping.
 
@@ -221,7 +266,8 @@ def generate_shuffle(seed_bytes=None):
                     If None, generates a fresh 32-byte secret.
 
     Returns:
-        dict with keys: seed_hex, real_map, decoy_wire, trap_wire, unmap
+        dict containing the opcode permutation, reverse map, decoys, and the
+        independently hashed native handler-variant profile.
     """
     if seed_bytes is None:
         seed_bytes = secrets.token_bytes(32)
@@ -254,12 +300,20 @@ def generate_shuffle(seed_bytes=None):
     for i, wire in enumerate(decoy_wire):
         unmap[wire] = DECOY_CANONICAL_BASE + i
 
+    handler_variants = OrderedDict(
+        (name, rng.randrange(count))
+        for name, count in HANDLER_VARIANT_COUNTS.items()
+    )
+
     return {
         'seed_hex':   seed_bytes.hex(),
         'real_map':   real_map,
         'decoy_wire': decoy_wire,
         'trap_wire':  trap_wire,
         'unmap':      unmap,
+        'mapping_sha256': opcode_mapping_sha256(real_map),
+        'handler_variants': handler_variants,
+        'handler_variant_sha256': handler_variant_sha256(handler_variants),
     }
 
 # ---------------------------------------------------------------------------
@@ -312,6 +366,20 @@ def emit_c_header(result):
     lines.append("#pragma once")
     lines.append("")
     lines.append("#include <stdint.h>")
+    lines.append("")
+    lines.append(
+        f'#define DVM_OPCODE_MAPPING_SHA256 "{result["mapping_sha256"]}"')
+    lines.append(
+        f'#define DVM_HANDLER_VARIANT_SHA256 "{result["handler_variant_sha256"]}"')
+    lines.append("")
+
+    lines.append(
+        "/* ---- Native semantic handler variants --------------------------- */")
+    lines.append(
+        "/* Values select bit-exact C implementations; they do not change ABI. */")
+    for name, variant in result['handler_variants'].items():
+        lines.append(
+            f"#define DVM_HANDLER_VARIANT_{name.upper():<6} {variant}")
     lines.append("")
 
     # --- Shuffled wire-byte defines ----------------------------------------
@@ -421,6 +489,10 @@ def emit_py_dict(result, noise_ratio):
     # Build seed
     lines.append('# Reproducible build seed (hex)')
     lines.append(f'BUILD_SEED = {seed_hex!r}')
+    lines.append(f'OPCODE_MAPPING_SHA256 = {result["mapping_sha256"]!r}')
+    lines.append(f'HANDLER_VARIANTS = {dict(result["handler_variants"])!r}')
+    lines.append(
+        f'HANDLER_VARIANT_SHA256 = {result["handler_variant_sha256"]!r}')
     lines.append('')
 
     return '\n'.join(lines) + '\n'
@@ -434,7 +506,22 @@ def verify_shuffle(result):
     real_map = result['real_map']
     decoy_wire = result['decoy_wire']
     unmap = result['unmap']
+    handler_variants = result.get('handler_variants')
     errors = []
+
+    if not isinstance(handler_variants, (dict, OrderedDict)):
+        errors.append("FAIL: handler variant profile is missing")
+    else:
+        if tuple(handler_variants) != tuple(HANDLER_VARIANT_COUNTS):
+            errors.append("FAIL: handler variant profile has wrong keys/order")
+        for name, count in HANDLER_VARIANT_COUNTS.items():
+            variant = handler_variants.get(name)
+            if not isinstance(variant, int) or not 0 <= variant < count:
+                errors.append(
+                    f"FAIL: handler variant {name!r} is outside 0..{count - 1}")
+        if result.get('handler_variant_sha256') != handler_variant_sha256(
+                handler_variants):
+            errors.append("FAIL: handler variant profile hash mismatch")
 
     # 1. All 56 real opcodes must have unique wire bytes.
     real_wires = list(real_map.values())

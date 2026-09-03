@@ -4,9 +4,10 @@
  * Dynamic key-fragment scattering. After the runtime AES key is derived it is
  * split into 8 fragments that are scattered across independent, randomly-offset
  * VirtualAlloc'd pages (each fragment XOR-masked with its own pad, buried in a
- * page of random noise). The fragment table itself is kept XOR-encrypted at
- * rest. The intent: no single contiguous memory dump ever captures the whole
- * 32-byte key in the clear, and the fragments relocate between section decrypts.
+ * page of random noise). Fragment-bearing hardware pages are VirtualLock'd so
+ * they cannot enter the pagefile, and the descriptor table is XOR-encrypted at
+ * rest. The intent: no single contiguous memory dump captures the whole key,
+ * and the fragments relocate between section decrypts.
  *
  * Freestanding / no-CRT: implemented with Win32 (VirtualAlloc/VirtualFree),
  * bcrypt (BCryptGenRandom) and MSVC intrinsics (__stosb/__movsb) only.
@@ -33,6 +34,10 @@ void key_scatter_migrate(void);
 
 /* Destroy all fragments: zero pages, free memory, wipe state. */
 void key_scatter_destroy(void);
+
+/* Permanently revoke this process instance's scattered key and release all
+   backing pages. Subsequent get/init calls fail; repeated calls are safe. */
+void key_scatter_invalidate(void);
 
 #ifdef __cplusplus
 }

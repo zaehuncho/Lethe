@@ -16,13 +16,17 @@
 
 #define LETHE_MAGIC            "LETHE01"      /* 7 chars + implicit NUL = 8 bytes */
 #define LETHE_MAGIC_LEN        8u
-#define LETHE_FORMAT_VERSION   1u
+#define LETHE_FORMAT_VERSION   2u
 
 /* PackInfo.flags bits */
 #define LETHE_FLAG_HAS_TLS        0x01u
 #define LETHE_FLAG_HAS_EXCEPTIONS 0x02u
 #define LETHE_FLAG_ANTIDEBUG      0x04u
 #define LETHE_FLAG_MEMGUARD       0x08u
+#define LETHE_FLAG_PAGED_DVM      0x10u
+#define LETHE_FLAG_LOAD_CONFIG    0x20u
+#define LETHE_FLAG_DLL_PRELOAD_IAT 0x40u
+#define LETHE_FLAG_PROCESS_HARDENING 0x80u
 
 /* Import func entry: hint_or_ordinal == LETHE_IMPORT_BY_HASH means the function
  * is resolved by FNV-1a hash of its name (walking the export table); any other
@@ -61,7 +65,9 @@ typedef struct PackInfo {
     uint8_t  kdf_salt[16];
     uint32_t stub_text_rva;             /* region hashed for the key binding */
     uint32_t stub_text_size;
-    uint8_t  reserved[24];
+    uint32_t dll_export_rva;            /* loader-visible export snapshot */
+    uint32_t dll_export_size;
+    uint8_t  dll_export_sha256_128[16]; /* authenticated SHA-256 prefix */
 } PackInfo;                             /* 192 bytes */
 
 typedef struct SectionDesc {
@@ -81,13 +87,6 @@ typedef struct SectionDesc {
 typedef char _lethe_assert_packinfo[(sizeof(PackInfo)   == 192) ? 1 : -1];
 typedef char _lethe_assert_section [(sizeof(SectionDesc) ==  52) ? 1 : -1];
 
-/* AAD width guard: pe_loader binds the flags word into the metadata GCM AAD as a
- * uint32_t. If the flags field ever grows past 32 bits, the AAD width has to move
- * with it -- otherwise both sides silently truncate the top bits and every packed
- * binary still decrypts. Trip this fence before the drift can ship. */
-typedef char _lethe_assert_flags_fits_aad
-    [(sizeof(((PackInfo *)0)->flags) == sizeof(uint32_t)) ? 1 : -1];
-
 /*
  * Import blob (metadata buffer + imports_off, imports_size bytes):
  *   u32 enc_pool_size
@@ -102,6 +101,7 @@ typedef char _lethe_assert_flags_fits_aad
  *       u32 iat_rva                  write the resolved address here
  *       u16 hint_or_ordinal          LETHE_IMPORT_BY_HASH = by-hash; else ordinal
  *       u32 func_name_hash           FNV-1a of function name (case-sensitive)
+ *       u32 preload_iat_rva          outer DLL IAT slot; zero for EXEs
  *   u32 terminator (0)
  *
  * Reloc blob (metadata buffer + relocs_off, relocs_size bytes):
