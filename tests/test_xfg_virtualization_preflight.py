@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _SHUFFLE_SEED = "8f" * 32
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
 _DLL_GATE = "LETHE_ENABLE_EXPERIMENTAL_DLL"
+_STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 
 
 def _visual_studio_available() -> bool:
@@ -293,38 +294,58 @@ def xfg_virtualization_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
     if os.name != "nt" or not shutil.which("cmake") or not _visual_studio_available():
         pytest.skip("CMake + the Visual Studio x64 toolchain are required")
     work = tmp_path_factory.mktemp("real-msvc-xfg-stub")
-    build = work / "build"
-    configured = subprocess.run(
-        [
-            "cmake",
-            "-S",
-            str(ROOT / "stub"),
-            "-B",
-            str(build),
-            "-G",
-            "Visual Studio 17 2022",
-            "-A",
-            "x64",
-            f"-DDVM_SHUFFLE_SEED={_SHUFFLE_SEED}",
-            "-DDVM_ROLLING=OFF",
-            "-DDVM_ROLL_POISON=OFF",
-            "-DBUILD_TESTING=OFF",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert configured.returncode == 0, configured.stdout + configured.stderr
-    compiled = subprocess.run(
-        ["cmake", "--build", str(build), "--config", "Release"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
-    stub = build / "Release/lethe_stub_x64.dll"
+    configured_stub = os.environ.get(_STUB_PATH_ENV)
+    if configured_stub:
+        source_stub = Path(configured_stub).resolve()
+        assert source_stub.is_file(), (
+            f"{_STUB_PATH_ENV} does not name a file: {source_stub}"
+        )
+        build = source_stub.parent.parent
+        cache = (build / "CMakeCache.txt").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        assert "DVM_ROLLING:BOOL=ON" in cache
+        assert "DVM_ROLL_POISON:BOOL=OFF" in cache
+        generated = runpy.run_path(str(build / "daedalus_opcodes_shuffled.py"))
+        stub = work / source_stub.name
+        shutil.copyfile(source_stub, stub)
+        shuffle_seed = generated["BUILD_SEED"]
+        rolling = True
+    else:
+        build = work / "build"
+        configured = subprocess.run(
+            [
+                "cmake",
+                "-S",
+                str(ROOT / "stub"),
+                "-B",
+                str(build),
+                "-G",
+                "Visual Studio 17 2022",
+                "-A",
+                "x64",
+                f"-DDVM_SHUFFLE_SEED={_SHUFFLE_SEED}",
+                "-DDVM_ROLLING=ON",
+                "-DDVM_ROLL_POISON=OFF",
+                "-DBUILD_TESTING=OFF",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert configured.returncode == 0, configured.stdout + configured.stderr
+        compiled = subprocess.run(
+            ["cmake", "--build", str(build), "--config", "Release"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        stub = build / "Release/lethe_stub_x64.dll"
+        generated = runpy.run_path(str(build / "daedalus_opcodes_shuffled.py"))
+        shuffle_seed = _SHUFFLE_SEED
+        rolling = True
     stub_bytes = stub.read_bytes()
-    generated = runpy.run_path(str(build / "daedalus_opcodes_shuffled.py"))
     Path(str(stub) + ".manifest.json").write_text(
         json.dumps(
             {
@@ -332,11 +353,12 @@ def xfg_virtualization_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
                 "artifact": stub.name,
                 "size_bytes": len(stub_bytes),
                 "sha256": hashlib.sha256(stub_bytes).hexdigest(),
-                "dvm_shuffle_seed": _SHUFFLE_SEED,
+                "dvm_shuffle_seed": shuffle_seed,
                 "dvm_handler_variant_sha256": generated[
                     "HANDLER_VARIANT_SHA256"
                 ],
-                "dvm_rolling": False,
+                "dvm_rolling": rolling,
+                "dvm_roll_poison": False,
                 "dvm_paged_runtime": True,
             },
             sort_keys=True,

@@ -239,7 +239,7 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, and real EXE/DLL direct-only XFG selected functions across three integer signature shapes pass natively, but wider ABI signatures and clean-VM compatibility evidence remain incomplete.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and three real DLL XFG integer signature shapes pass natively, but wider ABI signatures and clean-VM compatibility evidence remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "Real MSVC /guard:cf /guard:xfg EXE and DLL indirect calls retain each source GFID across three integer signature shapes, reach direct-only virtualized thunks with native parity, emit no thunk GFIDs, and reject forged generated-GFID paths before output."
+          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and three DLL integer signature shapes, reach direct-only virtualized thunks with native parity, emit no thunk GFIDs, and reject forged generated-GFID paths before output."
         }
       ]
     },
@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit scalar function subset is liftable; DIV/IDIV fault delivery, native calls, SIMD/FP, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit scalar function subset is liftable; bounded 32/64-bit SHLD/SHRD are covered, while DIV/IDIV fault delivery, native calls, SIMD/FP, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -275,6 +275,11 @@
           "type": "pytest",
           "path": "tests/test_bytecode_pages.py",
           "claim": "Authenticated bytecode page construction and tamper rejection are covered."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_lifter_double_shift.py",
+          "claim": "Bounded 32/64-bit SHLD/SHRD register and memory destinations, immediate and CL counts, zero-count behavior, writeback, and defined flags match the differential oracle."
         }
       ]
     },

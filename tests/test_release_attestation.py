@@ -118,11 +118,10 @@ def _candidate(tmp_path: Path) -> tuple[Path, Path, dict]:
             stdout=json.dumps({"tests": [{"name": str(i)} for i in range(4)]}))
     command("ctest", "ctest.json", bound=True)
     command("candidate-bound-native-runtime-hardening", "runtime-hardening.json",
-            bound=True, stdout="7 passed in 1.00s\n",
+            bound=True, stdout="11 passed in 1.00s\n",
             argv=["tool://python.exe", "-m", "pytest", "-q", "-p",
                   "no:cacheprovider",
-                  "repo://tests/test_native_runtime_hardening_stress.py",
-                  "repo://tests/test_native_virtualization_runtime.py"])
+                  *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS])
     command("roundtrip-fixture-build", "roundtrip-fixture-build.json", bound=True)
     command("exe-dll-roundtrip", "roundtrip.json", bound=True,
             stdout="11/11 passed -- PASS\n")

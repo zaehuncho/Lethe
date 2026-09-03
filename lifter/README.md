@@ -73,14 +73,20 @@ else + a **differential oracle** that proves every lift correct.
   `AX`/`DX:AX`/`EDX:EAX`/`RDX:RAX` products, narrow parent preservation,
   32-bit zero-extension, and defined `CF`/`OF` results are differential-checked
   against Unicorn. The packed native corpus exercises both 64-bit forms.
+- **Cut 11** — 32/64-bit `shld` and `shrd` with register or ordinary memory
+  destinations, register sources, and immediate/`CL` counts. Architectural
+  count masking, zero-count flag preservation, 32-bit parent zero-extension,
+  effective-address evaluation order, and every defined `CF/PF/ZF/SF/OF`
+  result are differential-checked. The native Win64 entry-thunk test executes
+  both operations through an actual generated selected-function thunk.
 
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, RIP-relative/segment memory, 8/16-bit
-shift/rotate or two-/three-operand `imul`, high-8 `AH/BH/CH/DH`, SIMD, string ops, and
-indirect/external branches.
+shift/rotate, 16-bit `shld`/`shrd`, or two-/three-operand `imul`, high-8
+`AH/BH/CH/DH`, SIMD, string ops, and indirect/external branches.
 
 ## Extending it (the fan-out contract)
 To add an instruction:

@@ -286,13 +286,11 @@ def _replay_rebuilt_candidate(
     }
     runtime = run(
         [host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         *(source / "tests" / name
-           for name in promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS)],
+         *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS],
         name="candidate-bound-native-runtime-hardening",
         portable_argv=["tool://python", "-m", "pytest", "-q", "-p",
                        "no:cacheprovider",
-                       *(f"repo://tests/{name}"
-                         for name in promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS)],
+                       *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS],
         env_overrides=test_environment,
     )
     try:

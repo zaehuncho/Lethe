@@ -56,10 +56,13 @@ compatible with `DEBUG_PROCESS` control. A rolling-capable stub is therefore not
 a reason to reject paged selected-function materialization, which continues to
 pass `rolling=False` and `paged=True`.
 The candidate-bound runtime command is mandatory during promotion and release
-replay. It runs `test_native_runtime_hardening_stress.py` together with
-`test_native_virtualization_runtime.py` against the exact rebuilt artifact,
-requires all seven native cases without skips, and proves the selected leaf emits
-a paged-v1 program whose eager and memory-guard packed outputs match the original.
+replay. It runs `test_native_runtime_hardening_stress.py`,
+`test_native_virtualization_runtime.py`, and
+`test_xfg_virtualization_preflight.py` against the exact rebuilt artifact,
+requires all eleven cases without skips, and proves the selected leaf emits a
+paged-v1 program whose eager and memory-guard packed outputs match the original.
+The same rolling-capable candidate DLL must also preserve real MSVC XFG indirect
+call parity for the EXE fixture and all three DLL signature shapes.
 The hardening side also runs a bounded one-minute, minimum-64-launch forced-ASLR
 memory-guard soak and proves that a debugged host rejects an anti-debug protected
 DLL without terminating the host process.

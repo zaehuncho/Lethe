@@ -16,8 +16,8 @@ reference interpreter runs the lifted bytecode; register files + flags must matc
 
 The current scalar surface includes 8/16/32/64-bit low GPR reads and writes,
 common arithmetic/logical operations, strict scalar memory sources, address
-arithmetic, shifts/rotates at 32/64 bits, one-/two-/three-operand IMUL, one-
-operand MUL, MOVZX/MOVSX/
+arithmetic, shifts/rotates and SHLD/SHRD at 32/64 bits, one-/two-/three-operand
+IMUL, one-operand MUL, MOVZX/MOVSX/
 MOVSXD, SETcc/CMOVcc, register XCHG, BSWAP, ADC, and SBB. High-8 aliases,
 scalar memory destinations, immediate stores, parity conditions, and balanced
 PUSH/POP/LEAVE stack frames are covered. Direct non-recursive calls to proven
@@ -627,16 +627,110 @@ class _Lifter:
         self.push_imm(0); self.wr_local(OF)        # OF defined only for cnt==1
         self.a.label(skip)
 
-    def _shift_count(self, instr):
+    def _shift_count(self, instr, operand_index: int = 1):
         """Classify a shift/rotate count operand: return ('imm', masked_cnt) or
         ('cl', None), or bail. `width` masking is applied by the caller."""
-        k1 = instr.op_kind(1)
-        if k1 == OpKind.REGISTER and instr.op_register(1) == Register.CL:
+        k1 = instr.op_kind(operand_index)
+        if (k1 == OpKind.REGISTER
+                and instr.op_register(operand_index) == Register.CL):
             return "cl", None
         if k1 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
                   OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
-            return "imm", instr.immediate(1)
+            return "imm", instr.immediate(operand_index)
         raise LiftUnsupported("shift/rotate count must be an immediate or CL")
+
+    def _double_shift(self, instr, *, left: bool) -> None:
+        """Lift 32/64-bit SHLD or SHRD, including their defined flags.
+
+        The source and destination are captured before any writeback so aliases,
+        CL counts, and memory effective-address registers retain x64 evaluation
+        order. Counts are masked architecturally. A zero count still performs a
+        32-bit register write (therefore zero-extending its parent), but preserves
+        all flags. OF is written only for count one; it is undefined otherwise.
+        """
+        if instr.op_count != 3:
+            raise LiftUnsupported(
+                "double shift requires destination, source, and count"
+            )
+        dst, width = self._read_rmw_destination(instr)
+        if width not in (32, 64):
+            raise LiftUnsupported("SHLD/SHRD support 32/64-bit destinations only")
+        self.push_operand(instr, 1, width); self.wr_local(T0)
+
+        count_kind, raw_count = self._shift_count(instr, 2)
+        immediate = count_kind == "imm"
+        count = (raw_count & (width - 1)) if immediate else None
+        if not immediate:
+            self._read_cl_count(width)
+
+        def push_count() -> None:
+            self.push_imm(count) if immediate else self.rd_local(SB)
+
+        def emit_nonzero_result() -> None:
+            if left:
+                self.rd_local(SA); push_count(); self.a("shl")
+                self.rd_local(T0); self.push_imm(width); push_count()
+                self.a("sub"); self.a("shr"); self.a("or")
+            else:
+                self.rd_local(SA); push_count(); self.a("shr")
+                self.rd_local(T0); self.push_imm(width); push_count()
+                self.a("sub"); self.a("shl"); self.a("or")
+            self._mask_sr(width); self.wr_local(SR)
+
+        if immediate:
+            if count == 0:
+                self.rd_local(SA); self.wr_local(SR)
+            else:
+                emit_nonzero_result()
+        else:
+            zero = self._new_label()
+            ready = self._new_label()
+            self.rd_local(SB); self.a(f"jz {zero}")
+            emit_nonzero_result()
+            self.a(f"jmp {ready}")
+            self.a.label(zero)
+            self.rd_local(SA); self.wr_local(SR)
+            self.a.label(ready)
+
+        self._write_rmw_destination(dst, width)
+
+        def emit_defined_flags() -> None:
+            self._zf_sf_from_sr(_width_signbit(width))
+            self.rd_local(SA)
+            if left:
+                self.push_imm(width); push_count(); self.a("sub")
+            else:
+                push_count(); self.push_imm(1); self.a("sub")
+            self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+
+            def emit_of() -> None:
+                if left:
+                    self.rd_local(SR); self.push_imm(width - 1); self.a("shr")
+                    self.push_imm(1); self.a("and"); self.rd_local(CF); self.a("xor")
+                else:
+                    self.rd_local(SA); self.push_imm(width - 1); self.a("shr")
+                    self.rd_local(SR); self.push_imm(width - 1); self.a("shr")
+                    self.a("xor"); self.push_imm(1); self.a("and")
+                self.wr_local(OF)
+
+            if immediate:
+                if count == 1:
+                    emit_of()
+            else:
+                not_one = self._new_label()
+                self.rd_local(SB); self.push_imm(1); self.a("cmp_eq")
+                self.a(f"jz {not_one}")
+                emit_of()
+                self.a.label(not_one)
+
+        if immediate:
+            if count != 0:
+                emit_defined_flags()
+        else:
+            unchanged = self._new_label()
+            self.rd_local(SB); self.a(f"jz {unchanged}")
+            emit_defined_flags()
+            self.a.label(unchanged)
 
     def _sar(self, instr) -> None:
         # sar reg, imm|cl -- arithmetic shift right (no VM sar; synthesized).
@@ -1124,6 +1218,10 @@ class _Lifter:
                 self._shift(instr, "shl")
             elif m == Mnemonic.SHR:
                 self._shift(instr, "shr")
+            elif m == Mnemonic.SHLD:
+                self._double_shift(instr, left=True)
+            elif m == Mnemonic.SHRD:
+                self._double_shift(instr, left=False)
             elif m == Mnemonic.SAR:
                 self._sar(instr)
             elif m == Mnemonic.ROL:

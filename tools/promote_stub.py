@@ -38,7 +38,6 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SEED_RE = re.compile(r"[0-9a-f]+\Z")
 ROUNDTRIP_RE = re.compile(r"(?m)^\s*(\d+)/(\d+) passed -- PASS\s*$")
-PYTEST_PASSED_RE = re.compile(r"(?m)(\d+) passed(?:,| in )")
 SUPPORTED_PYTHON = (3, 12)
 SUPPORTED_UV = "0.11.29"
 SUPPORTED_GENERATOR = "Visual Studio 17 2022"
@@ -47,8 +46,33 @@ REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
 REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_runtime_hardening_stress.py",
     "test_native_virtualization_runtime.py",
+    "test_xfg_virtualization_preflight.py",
 )
-REQUIRED_NATIVE_RUNTIME_PASS_COUNT = 7
+REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
+    "tests/test_native_runtime_hardening_stress.py::"
+    "test_native_exe_hardening_matrix_repeated_and_fail_closed",
+    "tests/test_native_runtime_hardening_stress.py::"
+    "test_antidebug_detects_positive_debug_process_launch",
+    "tests/test_native_runtime_hardening_stress.py::"
+    "test_dll_host_antidebug_rejects_load_without_terminating_host",
+    "tests/test_native_runtime_hardening_stress.py::"
+    "test_memory_guard_forced_aslr_repeated_process_long_soak",
+    "tests/test_native_runtime_hardening_stress.py::"
+    "test_process_hardening_excludes_current_directory_from_first_import",
+    "tests/test_native_virtualization_runtime.py::"
+    "test_packed_executable_calls_virtualized_leaf[eager]",
+    "tests/test_native_virtualization_runtime.py::"
+    "test_packed_executable_calls_virtualized_leaf[memguard]",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_direct_only_plan_preserves_source_gfid_identity",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_forged_generated_gfid_blocks_before_output",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_selected_function_pack_preserves_indirect_call_parity",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity",
+)
+REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
 CANDIDATE_POLICY_ID = "lethe-native-candidate-v1"
 CANDIDATE_ALLOWED_BLOCKERS = {
     "mitigation.load_config_cfg_xfg": "partial",
@@ -581,9 +605,11 @@ def validate_runtime_hardening_record(
     if record.exit_code != 0:
         raise PromotionError(
             f"candidate-bound native runtime hardening failed with exit {record.exit_code}")
-    if re.search(r"\b\d+ skipped\b", record.stdout):
-        raise PromotionError("candidate-bound native runtime hardening skipped tests")
-    match = PYTEST_PASSED_RE.search(record.stdout)
+    summary = record.stdout.rstrip().splitlines()
+    match = (
+        re.fullmatch(r"(\d+) passed in [^\r\n]+", summary[-1].strip())
+        if summary else None
+    )
     if match is None or int(match.group(1)) != expected_tests:
         raise PromotionError(
             "candidate-bound native runtime hardening has no exact pass summary")
@@ -1016,7 +1042,7 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         raise PromotionError("runtime-hardening evidence has unexpected fields")
     expected_runtime_argv = [
         "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        *(f"repo://tests/{name}" for name in REQUIRED_NATIVE_RUNTIME_TESTS),
+        *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
     ]
     if runtime_payload["argv"][1:] != expected_runtime_argv:
         raise PromotionError("runtime-hardening evidence names an unexpected command")
@@ -1156,7 +1182,7 @@ def execute(args: argparse.Namespace) -> Path | None:
     runtime_hardening = run_recorded(
         [
             host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            *(ROOT / "tests" / name for name in REQUIRED_NATIVE_RUNTIME_TESTS),
+            *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
         ],
         name="candidate-bound-native-runtime-hardening",
         path_name="runtime-hardening.json",

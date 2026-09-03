@@ -156,8 +156,9 @@ def test_generated_thunk_matches_native_leaf(
     # validates that the common bridge models the pre-shim caller RSP, not its
     # own internal stack frame.
     body = _asm(
-        "mov rax, rcx; xor rax, rdx; imul r8, r8, 3; "
-        "add rax, r8; add rax, r9; mov r10, [rsp+0x28]; add rax, r10"
+        "mov rax, rcx; shld rax, rdx, 13; "
+        "mov r10, r8; shrd r10, r9, 7; xor rax, r10; "
+        "mov r11, [rsp+0x28]; add rax, r11"
     )
     program = daedalus_asm.assemble(
         x64_lifter.lift_function(body, base=0x1000)
@@ -252,7 +253,9 @@ int verify_virtual_nonvolatiles(void);
 static uint64_t native_leaf(uint64_t a, uint64_t b, uint64_t c,
                             uint64_t d, uint64_t e)
 {{
-    return (a ^ b) + c * 3 + d + e;
+    const uint64_t left = (a << 13) | (b >> 51);
+    const uint64_t right = (c >> 7) | (d << 57);
+    return (left ^ right) + e;
 }}
 
 static int verify_thunk_unwind(PRUNTIME_FUNCTION runtime, DWORD64 image_base)
@@ -411,7 +414,8 @@ verify_virtual_nonvolatiles PROC FRAME
     mov r9, 4
     mov QWORD PTR [rsp + 32], 5
     call virtual_leaf
-    cmp rax, 21
+    mov r10, 0800000000002005h
+    cmp rax, r10
     jne verify_nonvolatile_bad
     cmp rbx, 1111h
     jne verify_nonvolatile_bad

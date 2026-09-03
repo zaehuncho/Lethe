@@ -70,10 +70,11 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-opt-in native runtime-hardening file, complete EXE/DLL round trip, and native
-production corpus against one immutable stub SHA-256 before evaluating the
-`all` production matrix. The hardening run inherits the normal process
-environment, overrides only `LETHE_RUN_NATIVE_RUNTIME_STRESS=1` and
+frozen eleven-node native hardening, selected-function, and XFG replay, complete
+EXE/DLL round trip, and native production corpus against one immutable stub
+SHA-256 before evaluating the `all` production matrix. The native replay
+inherits the normal process environment, overrides
+`LETHE_RUN_NATIVE_RUNTIME_STRESS=1`, `LETHE_RUN_NATIVE_VM_E2E=1`, and
 `LETHE_NATIVE_RUNTIME_STUB_PATH=<fresh-stub>`, and never serializes the inherited
 environment into evidence. A green matrix is accepted.
 A red matrix is accepted for candidate staging only when every blocker has the
@@ -222,9 +223,10 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name both the hardening stress
-file and the selected-function virtualization E2E file. It must report exactly
-seven passes with zero skips against the exact candidate hash; the E2E pair must
+The candidate-bound native runtime record must name the frozen list of eleven
+node IDs spanning hardening stress, selected-function virtualization E2E, and
+XFG preflight. Its terminal pytest summary must report exactly eleven passes
+with no other outcome against the exact candidate hash; the E2E pair must
 execute paged-v1 output in eager and memory-guard modes. Release replay repeats
 that same command against the byte-identical rebuilt stub.
 The candidate promoter, compatibility matrix, and dependency-lock hashes are read
