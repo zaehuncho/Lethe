@@ -18,13 +18,16 @@ typedef unsigned int (*sample_fn)(void);
 
 typedef struct tls_worker_ctx {
     sample_fn fn;
+    sample_fn alignment_fn;
     unsigned int value;
+    unsigned int aligned;
 } tls_worker_ctx;
 
 static DWORD WINAPI run_tls_fixture(LPVOID param)
 {
     tls_worker_ctx *ctx = (tls_worker_ctx *)param;
     ctx->value = ctx->fn();
+    ctx->aligned = ctx->alignment_fn();
     return 0;
 }
 
@@ -48,7 +51,11 @@ int main(int argc, char **argv)
     sample_fn fn = (sample_fn)(void *)GetProcAddress(h, "sample_dll_value");
     sample_fn tls_fn =
         (sample_fn)(void *)GetProcAddress(h, "sample_dll_tls_value");
-    if (!fn || !tls_fn) {
+    sample_fn tls_lifecycle_fn =
+        (sample_fn)(void *)GetProcAddress(h, "sample_dll_tls_lifecycle_ok");
+    sample_fn tls_alignment_fn =
+        (sample_fn)(void *)GetProcAddress(h, "sample_dll_tls_alignment_ok");
+    if (!fn || !tls_fn || !tls_lifecycle_fn || !tls_alignment_fn) {
         printf("host: FAIL GetProcAddress(sample export) err=%lu\n",
                (unsigned long)GetLastError());
         FreeLibrary(h);
@@ -57,7 +64,7 @@ int main(int argc, char **argv)
 
     unsigned int v = fn();
     unsigned int main_tls = tls_fn();
-    tls_worker_ctx tls_ctx = { tls_fn, 0u };
+    tls_worker_ctx tls_ctx = { tls_fn, tls_alignment_fn, 0u, 0u };
     HANDLE worker = CreateThread(NULL, 0, run_tls_fixture, &tls_ctx, 0, NULL);
     int rc;
     if (!worker) {
@@ -76,12 +83,17 @@ int main(int argc, char **argv)
     } else if (v != 0xC0FFEE42u) {
         printf("host: FAIL unexpected export value 0x%08X (want 0xC0FFEE42)\n", v);
         rc = 6;
-    } else if (main_tls != 105u || tls_ctx.value != 105u) {
+    } else if (main_tls != 105u || tls_ctx.value != 105u ||
+               tls_alignment_fn() != 1u || tls_ctx.aligned != 1u) {
         printf("host: FAIL static TLS main=%u worker=%u (want 105/105)\n",
                main_tls, tls_ctx.value);
         rc = 7;
+    } else if (tls_lifecycle_fn() != 1u) {
+        printf("host: FAIL TLS callback lifecycle was incomplete\n");
+        rc = 7;
     } else {
-        printf("host: PASS sample_dll_value=0x%08X, DllMain ran, TLS main=%u worker=%u\n",
+        printf("host: PASS sample_dll_value=0x%08X, DllMain ran, "
+               "TLS main=%u worker=%u callbacks=PASS\n",
                v, main_tls, tls_ctx.value);
         rc = 0;
     }

@@ -581,7 +581,14 @@ typedef struct mz_dummy_time_t_tag
 
 #define MZ_ASSERT(x) assert(x)
 
-#ifdef MINIZ_NO_MALLOC
+#if defined(LETHE_FREESTANDING_ALLOC)
+void *__cdecl lethe_malloc(size_t size);
+void __cdecl lethe_free(void *address);
+void *__cdecl lethe_realloc(void *address, size_t size);
+#define MZ_MALLOC(x) lethe_malloc(x)
+#define MZ_FREE(x) lethe_free(x)
+#define MZ_REALLOC(p, x) lethe_realloc(p, x)
+#elif defined(MINIZ_NO_MALLOC)
 #define MZ_MALLOC(x) NULL
 #define MZ_FREE(x) (void)x, ((void)0)
 #define MZ_REALLOC(p, x) NULL

@@ -9,8 +9,9 @@ extern "C" {
 
 int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep);
 
-int  pe_loader_tls_thread_init(void);
-void pe_loader_tls_thread_free(void);
+void pe_loader_tls_anchor_dispatch(void *image_base, DWORD reason,
+                                   void *reserved);
+void pe_loader_tls_dll_detach(DWORD reason, void *reserved);
 
 #ifdef __cplusplus
 }

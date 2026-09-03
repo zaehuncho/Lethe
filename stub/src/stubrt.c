@@ -2,12 +2,12 @@
  * Lethe stub -- freestanding C runtime shims.
  *
  * The stub links with /NODEFAULTLIB (no CRT), but MSVC and the bundled miniz
- * still emit references to a handful of standard functions (mem*, malloc/free/
- * realloc, _fltused). We satisfy them here with tiny Win32-backed definitions:
+ * still emit references to a handful of standard functions (mem*, allocation,
+ * _fltused). We satisfy them here with tiny Win32-backed definitions:
  *   - mem* via the __movsb/__stosb intrinsics (no libcall recursion) + byte loops
- *   - malloc/free/realloc backed by the process heap (HeapAlloc)
- * These are the only "libc" the stub needs; miniz's decompressor uses malloc for
- * its inflate state and mem* for buffer moves.
+ *   - named miniz allocation hooks backed by the process heap
+ * These are the only "libc" services the stub needs; miniz's decompressor uses
+ * the hooks for its inflate state and mem* for buffer moves.
  */
 #include <windows.h>
 #include <stddef.h>
@@ -18,10 +18,6 @@
 
 /* Tell MSVC these are real function definitions, not intrinsic overrides. */
 #pragma function(memset, memcpy, memmove, memcmp)
-
-/* Suppress C4273: UCRT headers declare malloc/free/realloc as dllimport but
- * we provide our own definitions (no CRT is linked). */
-#pragma warning(disable: 4273)
 
 /* The compiler may lower struct copies / initializers to memcpy/memset calls,
  * so these must exist as real symbols. MSVC uses rep movs/stos intrinsics;
@@ -77,17 +73,17 @@ int __cdecl memcmp(const void *a, const void *b, size_t n)
     return 0;
 }
 
-void *__cdecl malloc(size_t n)
+void *__cdecl lethe_malloc(size_t n)
 {
     return HeapAlloc(GetProcessHeap(), 0, n ? n : 1);
 }
 
-void __cdecl free(void *p)
+void __cdecl lethe_free(void *p)
 {
     if (p) HeapFree(GetProcessHeap(), 0, p);
 }
 
-void *__cdecl realloc(void *p, size_t n)
+void *__cdecl lethe_realloc(void *p, size_t n)
 {
     if (!p) return HeapAlloc(GetProcessHeap(), 0, n ? n : 1);
     if (!n) { HeapFree(GetProcessHeap(), 0, p); return NULL; }
