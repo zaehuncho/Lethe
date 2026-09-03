@@ -9,8 +9,7 @@
     data. Lethe produces protected first-party binaries and is never shipped
     to customers, so freezing it is fine.
 
-    Mirrors the project's proven Nuitka recipe (docs/IP_PROTECTION_PLAN.md
-    ~lines 315-318: the OrionSidecar standalone build) -- same
+    Uses the project's Nuitka standalone build shape -- the same
     --standalone / --assume-yes-for-downloads / --windows-console-mode=disable
     spine, plus --onefile and the PySide6 plugin.
 
@@ -36,8 +35,7 @@
     Why the explicit --include-package flags: app.py imports the packer core
     lazily (on the worker thread), and the core imports LIEF / cryptography
     inside submodules. Nuitka's static import analysis can miss those deferred
-    imports, so we force-include the whole packages -- exactly the lever the
-    generic Nuitka command missed for the sidecar (IP_PROTECTION_PLAN.md:310-314).
+    imports, so we force-include the whole packages.
 
     ------------------------------------------------------------------------
     STUB-PATH RESOLUTION REQUIREMENT (the assembler MUST honor this):
@@ -84,18 +82,20 @@
     until the stub is present -- for smoke-testing the freeze only).
 
 .NOTES
-    Toolchain (proven for this repo, IP_PROTECTION_PLAN.md:301-322):
-      * Python  : pin to 3.13 for release freezes (the sidecar build ran on
-                  3.13; Nuitka flags 3.14 as experimental). 3.11/3.12 also work.
-      * Nuitka  : >= 4.1.3 (the version that built OrionSidecar).
+    Toolchain (validate this exact combination before each release):
+      * Python  : 3.12, matching pyproject.toml and uv.lock.
+      * Nuitka  : >= 4.1.3.
       * MSVC    : Visual Studio 2022 C++ toolset (14.x); Nuitka auto-detects it
                   and, with --assume-yes-for-downloads, fetches ccache /
                   dependency-walker without prompting.
       * PySide6 : LGPL, the same Qt stack the app uses; --enable-plugin=pyside6
                   bundles the required Qt plugins.
 
-    Install the build deps into the build interpreter first:
-        python -m pip install nuitka PySide6 lief cryptography
+    Install the locked build dependencies from the repository root first:
+        uv sync --frozen --group gui-build
+
+    Then use the virtual-environment interpreter:
+        .\gui\build_gui.ps1 -PythonExe .\.venv\Scripts\python.exe
 
     First-time onefile Qt builds are large and can take several minutes.
 #>

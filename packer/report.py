@@ -10,8 +10,10 @@ two front-ends never drift:
 * :func:`validate_packed` -- a *structural* round-trip check that never executes
   the output: it confirms the file is a valid PE, locates the embedded Lethe
   container by magic, parses the 192-byte :class:`~packer.container.PackInfo`, and
-  sanity-checks it. Catches a corrupt/short/mis-keyed pack without the risk (or
-  the AV noise) of actually running a freshly packed binary.
+  sanity-checks it. Catches a corrupt, short, or unpopulated container without
+  the risk (or the AV noise) of actually running a freshly packed binary. It
+  does not authenticate or decrypt payload bytes; ``packer.keyed_validation``
+  owns that separate builder-only gate.
 """
 from __future__ import annotations
 
@@ -29,6 +31,8 @@ _IMAGE_FILE_DLL = 0x2000
 _SCN_MEM_EXECUTE = 0x20000000
 _SCN_MEM_READ = 0x40000000
 _SCN_MEM_WRITE = 0x80000000
+_PE32_PLUS = 0x20B
+_AMD64 = 0x8664
 
 # A sane upper bound on section count (the PE format allows many more, but a
 # Lethe-packed output has a handful; an absurd count means we mis-parsed).
@@ -64,6 +68,90 @@ class SectionInfo:
         return (("R" if self.readable else "-")
                 + ("W" if self.writable else "-")
                 + ("X" if self.executable else "-"))
+
+
+@dataclass(frozen=True)
+class _RawSection:
+    """Section geometry used to tie a PackInfo candidate to mapped PE bytes."""
+
+    rva: int
+    virtual_size: int
+    raw_size: int
+    raw_ptr: int
+    characteristics: int
+
+    def contains_file_range(self, offset: int, size: int) -> bool:
+        return (self.raw_size > 0 and self.raw_ptr <= offset
+                and offset + size <= self.raw_ptr + self.raw_size)
+
+    def contains_rva_range(self, rva: int, size: int, *, raw: bool) -> bool:
+        span = self.raw_size if raw else max(self.virtual_size, self.raw_size)
+        return span > 0 and self.rva <= rva and rva + size <= self.rva + span
+
+
+@dataclass(frozen=True)
+class _PELayout:
+    is_dll: bool
+    image_size: int
+    export_rva: int
+    export_size: int
+    sections: List[_RawSection]
+
+    def section_for_file_range(self, offset: int, size: int) -> Optional[_RawSection]:
+        return next((s for s in self.sections
+                     if s.contains_file_range(offset, size)), None)
+
+    def section_for_rva_range(self, rva: int, size: int, *,
+                              raw: bool = False) -> Optional[_RawSection]:
+        return next((s for s in self.sections
+                     if s.contains_rva_range(rva, size, raw=raw)), None)
+
+
+def _parse_pe_layout(data: bytes) -> _PELayout:
+    """Strictly parse the PE fields needed by post-pack validation."""
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ValueError("output is not a PE (no MZ header)")
+    (e_lfanew,) = struct.unpack_from("<I", data, 0x3C)
+    if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        raise ValueError("output is not a PE (no PE signature)")
+
+    coff = e_lfanew + 4
+    machine, num_sections = struct.unpack_from("<HH", data, coff)
+    opt_size, characteristics = struct.unpack_from("<HH", data, coff + 16)
+    if machine != _AMD64:
+        raise ValueError("output is not an AMD64 PE")
+    if not (0 < num_sections <= _MAX_SECTIONS):
+        raise ValueError(f"implausible section count: {num_sections}")
+
+    optional = coff + 20
+    optional_end = optional + opt_size
+    if opt_size < 0x78 or optional_end > len(data):
+        raise ValueError("output has a truncated PE32+ optional header")
+    if struct.unpack_from("<H", data, optional)[0] != _PE32_PLUS:
+        raise ValueError("output is not PE32+ (x64)")
+    image_size = struct.unpack_from("<I", data, optional + 0x38)[0]
+    export_rva, export_size = struct.unpack_from("<II", data, optional + 0x70)
+    if image_size == 0:
+        raise ValueError("output has a zero SizeOfImage")
+
+    section_table = optional_end
+    if section_table + num_sections * 40 > len(data):
+        raise ValueError("section table runs past end of file")
+    sections: List[_RawSection] = []
+    for index in range(num_sections):
+        off = section_table + index * 40
+        virtual_size, rva, raw_size, raw_ptr = struct.unpack_from(
+            "<IIII", data, off + 8)
+        section_chars = struct.unpack_from("<I", data, off + 36)[0]
+        if raw_size and (not raw_ptr or raw_ptr + raw_size > len(data)):
+            raise ValueError(f"section {index} raw range runs past end of file")
+        if rva + max(virtual_size, raw_size) > image_size:
+            raise ValueError(f"section {index} mapped range exceeds SizeOfImage")
+        sections.append(_RawSection(
+            rva, virtual_size, raw_size, raw_ptr, section_chars))
+    return _PELayout(
+        bool(characteristics & _IMAGE_FILE_DLL), image_size,
+        export_rva, export_size, sections)
 
 
 def _parse_sections(data: bytes) -> List[SectionInfo]:
@@ -133,6 +221,102 @@ class ValidationResult:
         return f"invalid: {self.reason}"
 
 
+def _candidate_is_live(info: container.PackInfo, offset: int,
+                       layout: _PELayout) -> bool:
+    """Return whether a magic-bearing PackInfo is the live mapped container.
+
+    The assembler puts the live structure in a raw-backed writable stub section;
+    intentional decoys live in the read-only payload. The range checks tie the
+    candidate to the emitted PE instead of accepting arbitrary parseable bytes.
+    """
+    owner = layout.section_for_file_range(offset, container.PACKINFO_SIZE)
+    if owner is None or not (owner.characteristics & _SCN_MEM_WRITE):
+        return False
+    packinfo_rva = owner.rva + (offset - owner.raw_ptr)
+
+    allowed_flags = (
+        container.FLAG_HAS_TLS | container.FLAG_HAS_EXCEPTIONS
+        | container.FLAG_ANTIDEBUG | container.FLAG_MEMGUARD
+        | container.FLAG_PAGED_DVM | container.FLAG_LOAD_CONFIG
+        | container.FLAG_DLL_PRELOAD_IAT | container.FLAG_PROCESS_HARDENING
+    )
+    if info.flags & ~allowed_flags:
+        return False
+    if info.is_dll not in (0, 1) or bool(info.is_dll) != layout.is_dll:
+        return False
+    if bool(info.flags & container.FLAG_DLL_PRELOAD_IAT) != layout.is_dll:
+        return False
+    if layout.is_dll:
+        if (info.dll_export_rva, info.dll_export_size) != (
+                layout.export_rva, layout.export_size):
+            return False
+        if info.dll_export_rva == 0 or info.dll_export_size == 0:
+            if (info.dll_export_rva != 0 or info.dll_export_size != 0 or
+                    any(info.dll_export_sha256_128)):
+                return False
+        else:
+            if (info.dll_export_size < 40 or
+                    info.dll_export_rva + info.dll_export_size >
+                    info.original_size_of_image or
+                    not any(info.dll_export_sha256_128)):
+                return False
+            export_owner = layout.section_for_rva_range(
+                info.dll_export_rva, info.dll_export_size, raw=True)
+            if (export_owner is None or
+                    not (export_owner.characteristics & _SCN_MEM_READ)):
+                return False
+    elif (info.dll_export_rva != 0 or info.dll_export_size != 0 or
+          any(info.dll_export_sha256_128)):
+        return False
+    if not (1 <= info.section_count <= _MAX_SECTIONS):
+        return False
+    if not (0 < info.original_size_of_image <= layout.image_size):
+        return False
+    if info.oep_rva and info.oep_rva >= info.original_size_of_image:
+        return False
+
+    if packinfo_rva < info.original_size_of_image:
+        return False
+    if info.stub_text_size == 0 or info.stub_text_rva < info.original_size_of_image:
+        return False
+    text_owner = layout.section_for_rva_range(
+        info.stub_text_rva, info.stub_text_size)
+    if text_owner is None or not (text_owner.characteristics & _SCN_MEM_EXECUTE):
+        return False
+
+    if info.meta_stored_size == 0 or info.meta_uncompressed_size == 0:
+        return False
+    if info.meta_rva < info.original_size_of_image:
+        return False
+    meta_owner = layout.section_for_rva_range(
+        info.meta_rva, info.meta_stored_size, raw=True)
+    if meta_owner is None or not (meta_owner.characteristics & _SCN_MEM_READ):
+        return False
+
+    meta_size = info.meta_uncompressed_size
+    ranges = (
+        (info.sections_off, info.section_count * container.SECTIONDESC_SIZE),
+        (info.imports_off, info.imports_size),
+        (info.relocs_off, info.relocs_size),
+    )
+    if any(off + size > meta_size for off, size in ranges):
+        return False
+    if (info.flags & container.FLAG_HAS_TLS) and info.tls_off + 24 > meta_size:
+        return False
+    if info.flags & container.FLAG_HAS_EXCEPTIONS:
+        if not info.pdata_rva or not info.pdata_count:
+            return False
+        if info.pdata_rva + info.pdata_count * 12 > info.original_size_of_image:
+            return False
+
+    # An untouched stub and low-effort injected decoys use zero-filled crypto
+    # fields. Real builds fill every one from CSPRNG/AES-GCM operations.
+    if (not any(info.meta_nonce) or not any(info.meta_tag)
+            or not any(info.aes_key_enc) or not any(info.kdf_salt)):
+        return False
+    return True
+
+
 def validate_packed(path: str) -> ValidationResult:
     """Structural round-trip check of a packed output -- never executes it.
 
@@ -148,43 +332,52 @@ def validate_packed(path: str) -> ValidationResult:
     except OSError as exc:
         return ValidationResult(False, f"cannot read output: {exc}")
 
-    if len(data) < 64 or data[:2] != b"MZ":
-        return ValidationResult(False, "output is not a PE (no MZ header)")
     try:
-        (e_lfanew,) = struct.unpack_from("<I", data, 0x3C)
-        if data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
-            return ValidationResult(False, "output is not a PE (no PE signature)")
-    except struct.error:
-        return ValidationResult(False, "output is not a PE (truncated header)")
+        layout = _parse_pe_layout(data)
+    except (ValueError, struct.error) as exc:
+        return ValidationResult(False, str(exc))
 
-    offset = data.find(container.MAGIC)
-    if offset < 0:
+    offsets: List[int] = []
+    cursor = 0
+    while True:
+        offset = data.find(container.MAGIC, cursor)
+        if offset < 0:
+            break
+        offsets.append(offset)
+        cursor = offset + 1
+    if not offsets:
         return ValidationResult(
             False, "no Lethe container found (PackInfo magic absent) -- "
                    "the stub may not be embedded or the pack was aborted")
-    if offset + container.PACKINFO_SIZE > len(data):
-        return ValidationResult(
-            False, "Lethe container magic found but the PackInfo is truncated")
 
-    try:
-        info = container.PackInfo.from_bytes(
-            data[offset:offset + container.PACKINFO_SIZE])
-    except Exception as exc:  # noqa: BLE001 -- report any parse/version failure
-        return ValidationResult(False, f"PackInfo failed to parse: {exc}",
-                                magic_offset=offset)
+    candidates = []
+    for offset in offsets:
+        if offset + container.PACKINFO_SIZE > len(data):
+            continue
+        try:
+            info = container.PackInfo.from_bytes(
+                data[offset:offset + container.PACKINFO_SIZE])
+        except Exception:
+            continue
+        if _candidate_is_live(info, offset, layout):
+            candidates.append((offset, info))
 
-    warnings: List[str] = []
-    if not (1 <= info.section_count <= _MAX_SECTIONS):
+    if not candidates:
         return ValidationResult(
             False,
-            f"container has {info.section_count} section(s) -- not a packed "
-            f"output (an unpopulated stub reads 0)",
-            section_count=info.section_count,
-            format_version=container.FORMAT_VERSION,
-            flags=info.flags, magic_offset=offset)
+            f"found {len(offsets)} PackInfo magic candidate(s), but none is a "
+            "structurally valid live container (decoy-only or corrupt output)")
+    if len(candidates) != 1:
+        return ValidationResult(
+            False,
+            f"ambiguous output: found {len(candidates)} structurally valid "
+            "PackInfo candidates; refusing to guess")
 
-    if data.count(container.MAGIC) > 1:
-        warnings.append(f"magic appears {data.count(container.MAGIC)}x")
+    offset, info = candidates[0]
+    warnings: List[str] = []
+    ignored = len(offsets) - 1
+    if ignored:
+        warnings.append(f"ignored {ignored} decoy PackInfo candidate(s)")
 
     return ValidationResult(
         True, "", section_count=info.section_count,
