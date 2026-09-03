@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "artifact": "lethe_stub_x64.dll",
+  "sha256": "b02588ba5bc0a6e8e779ccf9ff3058abb8c0fcf7f3b5fc0c0576622eda6d2313",
+  "size_bytes": 68096,
+  "source_commit": null,
+  "source_dirty": null,
+  "configuration": null,
+  "cmake_generator": null,
+  "cmake_version": null,
+  "python_version": null,
+  "dvm_shuffle_seed": null,
+  "dvm_rolling": null,
+  "memguard_kalypso": null,
+  "provenance_status": "legacy-unverified"
+}

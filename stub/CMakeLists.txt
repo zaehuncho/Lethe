@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(lethe_stub C ASM_MASM)
 
+include(CTest)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(lethe_stub_x64 SHARED
     src/stub_main.c
     src/pe_loader.c
+    src/load_config_binding.c
     src/crypto.c
+    src/bytecode_pages.c
+    src/metadata_aad.c
     src/key_scatter.c
     src/tls_anchor.c
     src/stubrt.c
@@ -16,16 +21,26 @@ add_library(lethe_stub_x64 SHARED
     src/memguard.c
     src/daedalus_vm.c
     src/daedalus_trampoline.asm
+    src/daedalus_x64_thunk.asm
     src/miniz.c
     src/chkstk.asm
-    # Decoy imports (user32/advapi32/ole32/shell32/gdi32/shlwapi): never called,
-    # pulls those DLLs into the IAT so the packed binary's import graph looks
-    # like a normal Windows app instead of a bare packer stub. See file header.
-    src/stub_junk_imports.c
 )
 
 target_include_directories(lethe_stub_x64 PRIVATE src)
-target_link_libraries(lethe_stub_x64 PRIVATE kernel32)
+target_link_libraries(lethe_stub_x64 PRIVATE kernel32 bcrypt)
+target_compile_definitions(lethe_stub_x64 PRIVATE DVM_PAGED_RUNTIME)
+
+if(BUILD_TESTING)
+    add_executable(LetheMetadataAADTest
+        tests/metadata_aad_test.c
+        src/metadata_aad.c
+    )
+    target_include_directories(LetheMetadataAADTest PRIVATE src)
+    if(MSVC)
+        target_compile_options(LetheMetadataAADTest PRIVATE /W4 /WX /O2)
+    endif()
+    add_test(NAME LetheMetadataAADVector COMMAND LetheMetadataAADTest)
+endif()
 
 # Freestanding: no CRT, no default libs, no DLL entry point.
 target_link_options(lethe_stub_x64 PRIVATE
@@ -34,13 +49,14 @@ target_link_options(lethe_stub_x64 PRIVATE
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
+    /EXPORT:daedalus_x64_enter_common
 )
 
 # Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer),
 # lower warning level (we don't own this code).
 set_source_files_properties(src/miniz.c PROPERTIES
     COMPILE_OPTIONS "/W3;/WX-"
-    COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+    COMPILE_DEFINITIONS "LETHE_FREESTANDING_ALLOC;MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
 )
 
 # Key-binding integrity: the builder hashes .text to derive the AES key.
@@ -109,6 +125,8 @@ if(MEMGUARD_KALYPSO)
 endif()
 
 option(DVM_SHUFFLE_OPCODES "Enable per-build opcode shuffling for Daedalus VM" ON)
+set(DVM_SHUFFLE_SEED "" CACHE STRING
+    "Optional hex seed for a reproducible opcode permutation (empty = random)")
 
 # Guard against a silent security DOWNGRADE: the rolling ('VR') containers are
 # emitted by generate_programs, which runs only inside the shuffle block below.
@@ -131,13 +149,18 @@ if(DVM_SHUFFLE_OPCODES)
     set(_dvm_asm         "${_dvm_daedalus_dir}/daedalus_asm.py")
     set(_dvm_programs_dir "${_dvm_daedalus_dir}/programs")
     set(_dvm_shuffled_h  "${CMAKE_CURRENT_BINARY_DIR}/daedalus_opcodes_shuffled.h")
-    set(_dvm_shuffled_py "${_dvm_daedalus_dir}/daedalus_opcodes_shuffled.py")
+    set(_dvm_shuffled_py "${CMAKE_CURRENT_BINARY_DIR}/daedalus_opcodes_shuffled.py")
     set(_dvm_programs_h  "${CMAKE_CURRENT_BINARY_DIR}/daedalus_programs_shuffled.h")
+    set(_dvm_seed_args "")
+    if(DVM_SHUFFLE_SEED)
+        list(APPEND _dvm_seed_args --seed "${DVM_SHUFFLE_SEED}")
+    endif()
 
     # Step 1: mint a fresh per-build opcode permutation.
     add_custom_command(
         OUTPUT "${_dvm_shuffled_h}" "${_dvm_shuffled_py}"
         COMMAND ${Python3_EXECUTABLE} "${_dvm_shuffler}" generate
+                ${_dvm_seed_args}
                 --c-header "${_dvm_shuffled_h}"
                 --py-dict "${_dvm_shuffled_py}"
         COMMENT "Shuffling Daedalus VM opcodes (per-build randomization)"
@@ -195,12 +218,6 @@ if(LETHE_ENABLE_DIAG)
     target_compile_definitions(lethe_stub_x64 PRIVATE LETHE_DIAG)
 endif()
 
-# Prebuilt output: copy the DLL to stub/prebuilt/ after build.
-set(PREBUILT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/prebuilt")
-add_custom_command(TARGET lethe_stub_x64 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${PREBUILT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:lethe_stub_x64>"
-        "${PREBUILT_DIR}/lethe_stub_x64.dll"
-    COMMENT "Copying stub to prebuilt/"
-)
+# Ordinary builds stay hermetic. Release promotion is owned by build_stub.ps1,
+# which verifies Git/CMake provenance and stages the DLL with its manifest. CMake
+# intentionally has no direct path that can update the tracked prebuilt alone.
