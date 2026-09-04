@@ -10,7 +10,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -24,6 +26,7 @@ from .pe_content_id import (
     snapshot_file,
     validate_signing_delta_snapshots,
 )
+from .strict_json import MAX_JSON_DEPTH, MAX_JSON_NODES, load_json_object_bytes
 
 
 TRUST_SCHEMA = 2
@@ -60,6 +63,8 @@ class VerifiedReceipt:
     prepared_subject: FileSnapshot
     signed_subject: FileSnapshot
     backings: tuple[VerifiedBacking, ...]
+    signature: bytes = b""
+    signature_payload: bytes = b""
 
 ROLES = frozenset({"scanner", "clean-vm", "application"})
 SUBJECT_KINDS = frozenset({"exe", "dll"})
@@ -161,6 +166,40 @@ class ExternalEvidenceV2Error(ValueError):
     """A v2 trust document, challenge, receipt, or backing is invalid."""
 
 
+def _private_value(value: Any, *, what: str, policy: bool = False) -> Any:
+    """Detach caller-owned containers without invoking custom copy methods."""
+    nodes = 0
+
+    def clone(item: Any, depth: int) -> Any:
+        nonlocal nodes
+        nodes += 1
+        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+            raise ExternalEvidenceV2Error(f"{what} exceeds the structure limit")
+        kind = type(item)
+        if kind is dict:
+            result = {}
+            # Capture each container once; every descendant is privately copied.
+            for key, child in tuple(item.items()):
+                if type(key) is not str:
+                    raise ExternalEvidenceV2Error(f"{what} object key is not text")
+                nodes += 1
+                result[key] = clone(child, depth + 1)
+            return result
+        if kind is list:
+            return [clone(child, depth + 1) for child in tuple(item)]
+        if kind in (str, int, bool, type(None)):
+            return item
+        if kind is float and math.isfinite(item):
+            return item
+        if policy and kind is bytes:
+            return item
+        if policy and kind is frozenset:
+            return frozenset(clone(child, depth + 1) for child in item)
+        raise ExternalEvidenceV2Error(f"{what} contains an unsupported value")
+
+    return clone(value, 1)
+
+
 def canonical_json_bytes(payload: Any) -> bytes:
     try:
         return json.dumps(
@@ -224,12 +263,9 @@ def _reject_linklike_ancestors(path: Path, what: str) -> None:
 def _read_json_object(path: Path, what: str) -> dict[str, Any]:
     try:
         snapshot = snapshot_file(path, what=what, reject_hardlinks=True)
-        payload = json.loads(snapshot.data.decode("utf-8-sig"))
-    except (ValueError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return load_json_object_bytes(snapshot.data, what=what)
+    except (ValueError, OSError) as exc:
         raise ExternalEvidenceV2Error(f"cannot read {what}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ExternalEvidenceV2Error(f"{what} root must be an object")
-    return payload
 
 
 def _nonzero_hex(value: Any, pattern: re.Pattern[str], what: str) -> str:
@@ -270,7 +306,9 @@ def _string(value: Any, what: str, *, maximum: int = 256) -> str:
 
 def validate_evidence_trust_store_v2(payload: Any) -> dict[str, Any]:
     """Validate an in-memory v2 trust document and return active providers."""
+    payload = _private_value(payload, what="v2 trust store")
     if (not isinstance(payload, dict) or set(payload) != TRUST_FIELDS
+            or type(payload.get("schema")) is not int
             or payload.get("schema") != TRUST_SCHEMA
             or payload.get("algorithm") != "ed25519"
             or not isinstance(payload.get("providers"), list)
@@ -401,7 +439,18 @@ def validate_challenge(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Validate a current challenge and all candidate, subject, and key bindings."""
+    return _validate_challenge_private(
+        _private_value(challenge, what="challenge"),
+        trust_policy=_private_value(trust_policy, what="v2 trust policy", policy=True),
+        now=_normalized_now(now),
+    )
+
+
+def _validate_challenge_private(
+    challenge: Any, *, trust_policy: dict[str, Any], now: datetime,
+) -> dict[str, Any]:
     if (not isinstance(challenge, dict) or set(challenge) != CHALLENGE_FIELDS
+            or type(challenge.get("schema")) is not int
             or challenge.get("schema") != CHALLENGE_SCHEMA
             or challenge.get("kind") != CHALLENGE_KIND):
         raise ExternalEvidenceV2Error("external-evidence challenge is malformed")
@@ -607,15 +656,19 @@ def _validate_observation(
         raise ExternalEvidenceV2Error("application observation is not a pass")
 
 
-def _regular_backing(root: Path, relative: Any, what: str) -> Path:
+def _normalized_backing_path(relative: Any, what: str) -> PurePosixPath:
     if (not isinstance(relative, str) or not relative or "\\" in relative
-            or ":" in relative):
+            or ":" in relative or "\x00" in relative):
         raise ExternalEvidenceV2Error(f"{what} path is invalid")
     relative_path = PurePosixPath(relative)
     if (relative_path.is_absolute() or relative_path.as_posix() != relative
             or any(part in {"", ".", ".."} for part in relative_path.parts)):
         raise ExternalEvidenceV2Error(f"{what} path is not a normalized relative path")
+    return relative_path
 
+
+def _regular_backing(root: Path, relative: Any, what: str) -> Path:
+    relative_path = _normalized_backing_path(relative, what)
     raw_root = root.absolute()
     _reject_linklike_ancestors(raw_root, "backing root")
     try:
@@ -650,13 +703,127 @@ def verify_detached_receipt(
     now: datetime | None = None,
 ) -> VerifiedReceipt:
     """Verify one provider receipt and every referenced local backing byte."""
+    private_envelope, private_challenge, private_policy = _private_verification_inputs(
+        envelope, challenge, trust_policy)
+
+    def subjects() -> tuple[FileSnapshot, FileSnapshot]:
+        return (
+            snapshot_file(prepared_unsigned_subject_path,
+                          what="prepared unsigned subject", reject_hardlinks=True),
+            snapshot_file(signed_subject_path,
+                          what="signed subject", reject_hardlinks=True),
+        )
+
+    def backing(relative: str, what: str) -> FileSnapshot:
+        path = _regular_backing(backing_root, relative, what)
+        return snapshot_file(path, what=what, reject_hardlinks=True)
+
+    return _verify_detached_receipt_private(
+        private_envelope, challenge=private_challenge, trust_policy=private_policy,
+        get_subjects=subjects, get_backing=backing, now=_normalized_now(now),
+    )
+
+
+def _private_verification_inputs(
+    envelope: Any, challenge: Any, trust_policy: Any,
+) -> tuple[Any, Any, Any]:
+    return (
+        _private_value(envelope, what="receipt envelope"),
+        _private_value(challenge, what="challenge"),
+        _private_value(trust_policy, what="v2 trust policy", policy=True),
+    )
+
+
+def _validated_snapshot(snapshot: FileSnapshot, what: str) -> FileSnapshot:
+    """Validate snapshot metadata against its own bytes, without path access."""
+    if type(snapshot) is not FileSnapshot:
+        raise ExternalEvidenceV2Error(f"{what} snapshot is malformed")
+    private = FileSnapshot(
+        path=snapshot.path, data=snapshot.data, sha256=snapshot.sha256,
+        size=snapshot.size, device=snapshot.device, inode=snapshot.inode,
+        link_count=snapshot.link_count, mtime_ns=snapshot.mtime_ns,
+        ctime_ns=snapshot.ctime_ns,
+    )
+    if (not isinstance(private.path, Path) or type(private.data) is not bytes
+            or type(private.sha256) is not str
+            or any(type(value) is not int for value in (
+                private.size, private.device, private.inode, private.link_count,
+                private.mtime_ns, private.ctime_ns))
+            or private.size < 0 or private.device < 0 or private.inode < 0
+            or private.link_count < 1):
+        raise ExternalEvidenceV2Error(f"{what} snapshot is malformed")
+    if private.link_count != 1:
+        raise ExternalEvidenceV2Error(f"{what} snapshot is hard-linked")
+    if (private.size != len(private.data)
+            or private.sha256 != hashlib.sha256(private.data).hexdigest()):
+        raise ExternalEvidenceV2Error(f"{what} snapshot metadata does not match bytes")
+    return private
+
+
+def verify_detached_receipt_snapshots(
+    envelope: Any,
+    *,
+    challenge: dict[str, Any],
+    trust_policy: dict[str, Any],
+    prepared_snapshot: FileSnapshot,
+    signed_snapshot: FileSnapshot,
+    backing_snapshots: dict[str, FileSnapshot],
+    now: datetime | None = None,
+) -> VerifiedReceipt:
+    """Verify already-captured bytes without reading or resolving any path.
+
+    The backing map must exactly cover receipt paths, using their normalized
+    relative spelling. Snapshot metadata and hardlink/reuse checks still apply;
+    the caller captures snapshots through ``snapshot_file`` to establish their
+    original filesystem provenance. This function never reopens those sources.
+    """
+    private_envelope, private_challenge, private_policy = _private_verification_inputs(
+        envelope, challenge, trust_policy)
+    prepared = _validated_snapshot(prepared_snapshot, "prepared unsigned subject")
+    signed = _validated_snapshot(signed_snapshot, "signed subject")
+    if type(backing_snapshots) is not dict:
+        raise ExternalEvidenceV2Error("receipt backing snapshots must be a map")
+    private_backings: dict[str, FileSnapshot] = {}
+    for relative, snapshot in tuple(backing_snapshots.items()):
+        if type(relative) is not str:
+            raise ExternalEvidenceV2Error("receipt backing snapshot path is invalid")
+        _normalized_backing_path(relative, "receipt backing snapshot")
+        private_backings[relative] = _validated_snapshot(snapshot, "receipt backing")
+
+    def backing(relative: str, what: str) -> FileSnapshot:
+        if relative not in private_backings:
+            raise ExternalEvidenceV2Error(f"{what} snapshot is missing")
+        return private_backings[relative]
+
+    result = _verify_detached_receipt_private(
+        private_envelope, challenge=private_challenge, trust_policy=private_policy,
+        get_subjects=lambda: (prepared, signed), get_backing=backing,
+        now=_normalized_now(now),
+    )
+    if set(private_backings) != {item.relative_path for item in result.backings}:
+        raise ExternalEvidenceV2Error("receipt backing snapshots contain extra paths")
+    return result
+
+
+def _verify_detached_receipt_private(
+    envelope: Any,
+    *,
+    challenge: dict[str, Any],
+    trust_policy: dict[str, Any],
+    get_subjects: Callable[[], tuple[FileSnapshot, FileSnapshot]],
+    get_backing: Callable[[str, str], FileSnapshot],
+    now: datetime,
+) -> VerifiedReceipt:
+    """Shared verification logic; adapters each supply a source snapshot once."""
     if (not isinstance(envelope, dict) or set(envelope) != ENVELOPE_FIELDS
+            or type(envelope.get("schema")) is not int
             or envelope.get("schema") != RECEIPT_SCHEMA
             or envelope.get("kind") != RECEIPT_KIND
             or not isinstance(envelope.get("receipt"), dict)):
         raise ExternalEvidenceV2Error("detached receipt envelope is malformed")
     receipt = envelope["receipt"]
-    if set(receipt) != RECEIPT_FIELDS or receipt.get("schema") != RECEIPT_SCHEMA:
+    if (set(receipt) != RECEIPT_FIELDS or type(receipt.get("schema")) is not int
+            or receipt.get("schema") != RECEIPT_SCHEMA):
         raise ExternalEvidenceV2Error("detached receipt is malformed")
     role = receipt.get("role")
     if not isinstance(role, str) or role not in ROLES:
@@ -671,13 +838,15 @@ def verify_detached_receipt(
         trust_policy, key_id, role=role, scope=scope_id)
     signature = _decode_b64(
         envelope.get("signature_base64"), length=64, what="receipt signature")
+    canonical_receipt = canonical_json_bytes(receipt)
+    signature_payload = RECEIPT_SIGNATURE_DOMAIN + canonical_receipt
     try:
         Ed25519PublicKey.from_public_bytes(provider["public_key"]).verify(
-            signature, detached_receipt_signature_payload(receipt))
+            signature, signature_payload)
     except (InvalidSignature, ValueError) as exc:
         raise ExternalEvidenceV2Error("detached receipt signature is invalid") from exc
 
-    challenge_state = validate_challenge(
+    challenge_state = _validate_challenge_private(
         challenge, trust_policy=trust_policy, now=now)
     if (receipt.get("challenge_id") != challenge["challenge_id"]
             or receipt.get("challenge_nonce_base64") != challenge["nonce_base64"]):
@@ -690,7 +859,7 @@ def verify_detached_receipt(
     observed = _timestamp(receipt.get("observed_at_utc"), "receipt observation time")
     current = _normalized_now(now)
     if (observed < challenge_state["created_at"]
-            or observed > challenge_state["expires_at"]
+            or observed >= challenge_state["expires_at"]
             or observed > current + MAX_CLOCK_SKEW):
         raise ExternalEvidenceV2Error("receipt observation time is outside the challenge")
 
@@ -716,16 +885,9 @@ def verify_detached_receipt(
         raise ExternalEvidenceV2Error("receipt signed subject size is invalid")
 
     try:
-        prepared_snapshot = snapshot_file(
-            prepared_unsigned_subject_path,
-            what="prepared unsigned subject",
-            reject_hardlinks=True,
-        )
-        signed_snapshot = snapshot_file(
-            signed_subject_path,
-            what="signed subject",
-            reject_hardlinks=True,
-        )
+        prepared_snapshot, signed_snapshot = get_subjects()
+        prepared_snapshot = _validated_snapshot(prepared_snapshot, "prepared unsigned subject")
+        signed_snapshot = _validated_snapshot(signed_snapshot, "signed subject")
         signing_delta = validate_signing_delta_snapshots(
             prepared_snapshot,
             signed_snapshot,
@@ -757,15 +919,14 @@ def verify_detached_receipt(
             backing.get("sha256"), SHA256_RE, f"receipt backing[{index}] hash")
         if type(backing.get("size_bytes")) is not int or backing["size_bytes"] <= 0:
             raise ExternalEvidenceV2Error(f"receipt backing[{index}] size is invalid")
-        path = _regular_backing(backing_root, relative, f"receipt backing[{index}]")
+        _normalized_backing_path(relative, f"receipt backing[{index}]")
         normalized_path = relative.casefold()
         if backing_id in backing_index or normalized_path in seen_paths:
             raise ExternalEvidenceV2Error("receipt backing identity is duplicated")
         try:
-            backing_snapshot = snapshot_file(
-                path,
-                what=f"receipt backing[{index}]",
-                reject_hardlinks=True,
+            backing_snapshot = _validated_snapshot(
+                get_backing(relative, f"receipt backing[{index}]"),
+                f"receipt backing[{index}]",
             )
         except ValueError as exc:
             raise ExternalEvidenceV2Error(
@@ -797,7 +958,6 @@ def verify_detached_receipt(
                 != requirement["definition_sha256"]):
         raise ExternalEvidenceV2Error(
             "application workflow definition does not match challenge")
-    canonical_receipt = canonical_json_bytes(receipt)
     return VerifiedReceipt(
         role=role,
         provider_key_id=key_id,
@@ -809,6 +969,8 @@ def verify_detached_receipt(
         prepared_subject=prepared_snapshot,
         signed_subject=signed_snapshot,
         backings=tuple(verified_backings),
+        signature=signature,
+        signature_payload=signature_payload,
     )
 
 
@@ -833,4 +995,5 @@ __all__ = [
     "validate_challenge",
     "validate_evidence_trust_store_v2",
     "verify_detached_receipt",
+    "verify_detached_receipt_snapshots",
 ]

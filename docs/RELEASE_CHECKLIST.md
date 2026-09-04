@@ -199,6 +199,18 @@ reports, protection profiles, per-engine raw scanner output and receipts,
 per-cell clean-VM result logs, and structured application workflow results and
 logs. Missing, linked, escaped, forged, or changed backing files fail release.
 
+`packer.external_evidence_phase_b` is the evidence-only v2 preparation boundary.
+It snapshots already-built candidate and EXE/DLL material once, requires an
+explicit bytes-only candidate verifier, creates a CSPRNG challenge, ingests
+strict duplicate-free detached receipts, and retains their exact canonical
+payload, signature, subjects, and backings. Finalization reverifies complete
+subject/role/scope coverage under current trust and requires an explicit
+bytes-only Authenticode verifier whose hashes and signer/TSA pins match the
+retained signed subjects. It never executes or recollects an artifact and never
+reopens an accepted source path. Its publisher writes only retained bytes and
+sets `release_authorized=false`; this foundation is not yet wired into
+`tools/release_stub.py` and does not satisfy any external production-matrix row.
+
 ```powershell
 uv run python tools/release_stub.py `
   --candidate-dir <candidate-directory> `

@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import os
 import struct
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from packer import external_evidence_phase_b as phase_b
 from packer import external_evidence_v2 as evidence
 from packer.pe_content_id import pe_content_id
 
@@ -836,3 +838,574 @@ def test_receipt_rejects_nested_subject_link_ancestor(
             envelope, challenge=challenge, trust_policy=policy,
             prepared_unsigned_subject_path=_prepared(subject),
             signed_subject_path=nested_subject, backing_root=root, now=NOW)
+
+
+def _captured_receipt(evidence_context, root: Path, role="scanner", key_name="scanner-a"):
+    subject, _, policy, challenge, keys, ids = evidence_context
+    root.mkdir()
+    envelope = _receipt(
+        role, challenge=challenge, key=keys[key_name], key_id=ids[key_name],
+        subject_path=subject, backing_root=root)
+    snapshots = {
+        "prepared_snapshot": evidence.snapshot_file(_prepared(subject), what="fixture"),
+        "signed_snapshot": evidence.snapshot_file(subject, what="fixture"),
+        "backing_snapshots": {
+            backing["path"]: evidence.snapshot_file(root / backing["path"], what="fixture")
+            for backing in envelope["receipt"]["backings"]
+        },
+    }
+    return envelope, challenge, policy, snapshots
+
+
+def test_validate_challenge_returns_private_containers(evidence_context):
+    _, _, policy, challenge, _, _ = evidence_context
+    original = copy.deepcopy(challenge)
+    state = evidence.validate_challenge(challenge, trust_policy=policy, now=NOW)
+    state["challenge"]["candidate"]["source_commit"] = "7" * 40
+    state["subjects"]["representative-exe"]["subject_kind"] = "dll"
+    state["requirements"]["scanner"]["defender"]["tool_version"] = "changed"
+    assert challenge == original
+    challenge["subjects"][1]["subject_id"] = "changed"
+    assert state["subjects"]["representative-dll"]["subject_id"] == "representative-dll"
+
+
+@pytest.mark.parametrize("target", ["trust", "challenge", "envelope", "receipt"])
+def test_schema_versions_require_exact_integer(evidence_context, tmp_path, target):
+    subject, document, policy, challenge, keys, ids = evidence_context
+    if target == "trust":
+        document["schema"] = 2.0
+        with pytest.raises(evidence.ExternalEvidenceV2Error, match="malformed"):
+            evidence.validate_evidence_trust_store_v2(document)
+        return
+    if target == "challenge":
+        challenge["schema"] = 2.0
+        challenge["challenge_id"] = evidence.compute_challenge_id(challenge)
+        with pytest.raises(evidence.ExternalEvidenceV2Error, match="malformed"):
+            evidence.validate_challenge(challenge, trust_policy=policy, now=NOW)
+        return
+    root = tmp_path / "backings"
+    root.mkdir()
+    envelope = _receipt(
+        "scanner", challenge=challenge, key=keys["scanner-a"],
+        key_id=ids["scanner-a"], subject_path=subject, backing_root=root)
+    (envelope if target == "envelope" else envelope["receipt"])["schema"] = 2.0
+    _resign(envelope, keys["scanner-a"])
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match="malformed"):
+        evidence.verify_detached_receipt(
+            envelope, challenge=challenge, trust_policy=policy,
+            prepared_unsigned_subject_path=_prepared(subject), signed_subject_path=subject,
+            backing_root=root, now=NOW)
+
+
+def test_trust_file_uses_duplicate_rejecting_json_loader(evidence_context, tmp_path):
+    _, document, _, _, _, _ = evidence_context
+    encoded = evidence.canonical_json_bytes(document)
+    path = tmp_path / "trust.json"
+    path.write_bytes(encoded.replace(b'"schema":2', b'"schema":2,"schema":2'))
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match="duplicate"):
+        evidence.load_evidence_trust_store_v2(path)
+
+
+def test_verifier_detaches_inputs_and_serializes_signed_receipt_once(
+    evidence_context, tmp_path, monkeypatch,
+):
+    subject, _, policy, challenge, keys, ids = evidence_context
+    root = tmp_path / "backings"
+    root.mkdir()
+    envelope = _receipt(
+        "scanner", challenge=challenge, key=keys["scanner-a"],
+        key_id=ids["scanner-a"], subject_path=subject, backing_root=root)
+    expected = evidence.canonical_json_bytes(envelope["receipt"])
+    expected_signature = base64.b64decode(envelope["signature_base64"])
+    original_canonical = evidence.canonical_json_bytes
+    receipt_calls = []
+
+    def canonical_with_caller_update(payload):
+        result = original_canonical(payload)
+        if "role" in payload:
+            receipt_calls.append(result)
+            envelope["receipt"]["observation"]["definitions_version"] = "next"
+            envelope["signature_base64"] = "changed"
+            challenge["candidate"]["source_commit"] = "7" * 40
+            challenge["requirements"]["scanners"][0]["tool_version"] = "next"
+            policy["providers"].clear()
+        return result
+
+    monkeypatch.setattr(evidence, "canonical_json_bytes", canonical_with_caller_update)
+    verified = evidence.verify_detached_receipt(
+        envelope, challenge=challenge, trust_policy=policy,
+        prepared_unsigned_subject_path=_prepared(subject), signed_subject_path=subject,
+        backing_root=root, now=NOW)
+    assert receipt_calls == [expected]
+    assert verified.canonical_receipt is receipt_calls[0]
+    assert verified.signature == expected_signature
+    assert verified.signature_payload == evidence.RECEIPT_SIGNATURE_DOMAIN + expected
+    keys["scanner-a"].public_key().verify(verified.signature, verified.signature_payload)
+
+
+@pytest.mark.parametrize("role,key_name", [
+    ("scanner", "scanner-a"), ("clean-vm", "vm"), ("application", "application"),
+])
+def test_pure_snapshot_verifier_matches_path_verifier_without_any_io(
+    evidence_context, tmp_path, monkeypatch, role, key_name,
+):
+    root = tmp_path / "backings"
+    envelope, challenge, policy, snapshots = _captured_receipt(
+        evidence_context, root, role, key_name)
+    subject = evidence_context[0]
+    path_result = evidence.verify_detached_receipt(
+        envelope, challenge=challenge, trust_policy=policy,
+        prepared_unsigned_subject_path=_prepared(subject), signed_subject_path=subject,
+        backing_root=root, now=NOW)
+
+    def unexpected_io(*args, **kwargs):
+        raise AssertionError("snapshot-only verification attempted filesystem access")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(evidence, "snapshot_file", unexpected_io)
+        for name in ("open", "stat", "lstat", "resolve", "is_file", "is_dir"):
+            guard.setattr(Path, name, unexpected_io)
+        result = evidence.verify_detached_receipt_snapshots(
+            envelope, challenge=challenge, trust_policy=policy, now=NOW, **snapshots)
+    assert result == path_result
+
+
+def test_pure_snapshot_verifier_retains_capture_after_source_updates(
+    evidence_context, tmp_path,
+):
+    envelope, challenge, policy, snapshots = _captured_receipt(
+        evidence_context, tmp_path / "backings")
+    for snapshot in (
+        snapshots["prepared_snapshot"], snapshots["signed_snapshot"],
+        *snapshots["backing_snapshots"].values(),
+    ):
+        snapshot.path.write_bytes(b"later source version")
+    result = evidence.verify_detached_receipt_snapshots(
+        envelope, challenge=challenge, trust_policy=policy, now=NOW, **snapshots)
+    assert result.prepared_subject == snapshots["prepared_snapshot"]
+    assert result.backings[0].snapshot.data == b"clean"
+
+
+@pytest.mark.parametrize("which", ["prepared_snapshot", "signed_snapshot", "backing"])
+@pytest.mark.parametrize("field,value", [
+    ("sha256", "1" * 64), ("size", 1), ("link_count", 2), ("size", True),
+])
+def test_pure_snapshot_verifier_rejects_inconsistent_metadata(
+    evidence_context, tmp_path, which, field, value,
+):
+    envelope, challenge, policy, snapshots = _captured_receipt(
+        evidence_context, tmp_path / "backings")
+    if which == "backing":
+        key = next(iter(snapshots["backing_snapshots"]))
+        snapshots["backing_snapshots"][key] = replace(
+            snapshots["backing_snapshots"][key], **{field: value})
+    else:
+        snapshots[which] = replace(snapshots[which], **{field: value})
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match="snapshot"):
+        evidence.verify_detached_receipt_snapshots(
+            envelope, challenge=challenge, trust_policy=policy, now=NOW, **snapshots)
+
+
+@pytest.mark.parametrize("change,message", [
+    ("missing", "missing"), ("extra", "extra"), ("relative", "normalized relative"),
+])
+def test_pure_snapshot_verifier_requires_exact_normalized_backing_map(
+    evidence_context, tmp_path, change, message,
+):
+    envelope, challenge, policy, snapshots = _captured_receipt(
+        evidence_context, tmp_path / "backings")
+    backing_map = snapshots["backing_snapshots"]
+    key = next(iter(backing_map))
+    if change == "missing":
+        backing_map.pop(key)
+    else:
+        backing_map["../other.txt" if change == "relative" else "other.txt"] = backing_map[key]
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match=message):
+        evidence.verify_detached_receipt_snapshots(
+            envelope, challenge=challenge, trust_policy=policy, now=NOW, **snapshots)
+
+
+def test_pure_snapshot_verifier_rejects_backing_filesystem_identity_reuse(
+    evidence_context, tmp_path,
+):
+    envelope, challenge, policy, snapshots = _captured_receipt(
+        evidence_context, tmp_path / "backings", "application", "application")
+    backing_map = snapshots["backing_snapshots"]
+    first, second, *_ = backing_map
+    backing_map[second] = replace(
+        backing_map[second], device=backing_map[first].device, inode=backing_map[first].inode)
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match="filesystem identity is duplicated"):
+        evidence.verify_detached_receipt_snapshots(
+            envelope, challenge=challenge, trust_policy=policy, now=NOW, **snapshots)
+
+
+@pytest.mark.parametrize("mode", ["path", "snapshots"])
+@pytest.mark.parametrize("at_expiry", [False, True])
+def test_receipt_observation_uses_exclusive_expiry_boundary(
+    evidence_context, tmp_path, mode, at_expiry,
+):
+    root = tmp_path / "backings"
+    envelope, challenge, policy, snapshots = _captured_receipt(evidence_context, root)
+    expiry = datetime.fromisoformat(challenge["expires_at_utc"].replace("Z", "+00:00"))
+    envelope["receipt"]["observed_at_utc"] = _timestamp(
+        expiry if at_expiry else expiry - timedelta(microseconds=1))
+    _resign(envelope, evidence_context[4]["scanner-a"])
+    if mode == "path":
+        function = evidence.verify_detached_receipt
+        kwargs = {
+            "prepared_unsigned_subject_path": _prepared(evidence_context[0]),
+            "signed_subject_path": evidence_context[0], "backing_root": root,
+        }
+    else:
+        function = evidence.verify_detached_receipt_snapshots
+        kwargs = snapshots
+    if at_expiry:
+        with pytest.raises(evidence.ExternalEvidenceV2Error, match="outside the challenge"):
+            function(envelope, challenge=challenge, trust_policy=policy,
+                     now=expiry - timedelta(minutes=1), **kwargs)
+    else:
+        assert function(envelope, challenge=challenge, trust_policy=policy,
+                        now=expiry - timedelta(minutes=1), **kwargs).role == "scanner"
+
+
+def test_challenge_expiry_is_exclusive(evidence_context):
+    _, _, policy, challenge, _, _ = evidence_context
+    expiry = datetime.fromisoformat(challenge["expires_at_utc"].replace("Z", "+00:00"))
+    with pytest.raises(evidence.ExternalEvidenceV2Error, match="expired"):
+        evidence.validate_challenge(challenge, trust_policy=policy, now=expiry)
+
+
+def _test_candidate_verifier(
+    stub: bytes, manifest: bytes, production_native: bytes, source_commit: str,
+) -> phase_b.CandidateVerificationResult:
+    return phase_b.CandidateVerificationResult(
+        source_commit,
+        _hash(stub),
+        _hash(manifest),
+        _hash(production_native),
+        "test-only-candidate-verifier",
+        "1.0",
+        True,
+    )
+
+
+def _phase_b_context(tmp_path: Path, candidate_verifier=_test_candidate_verifier):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    trust, keys, ids = _trust()
+    trust_bytes = evidence.canonical_json_bytes(trust)
+    candidate_files = {
+        "stub": tmp_path / "candidate-stub.dll",
+        "manifest": tmp_path / "candidate-manifest.json",
+        "production_native": tmp_path / "production-native.dll",
+    }
+    candidate_files["stub"].write_bytes(b"candidate-stub")
+    candidate_files["manifest"].write_bytes(evidence.canonical_json_bytes({
+        "source_commit": "1" * 40,
+    }))
+    candidate_files["production_native"].write_bytes(b"production-native")
+
+    exe_unsigned = tmp_path / "representative-exe.unsigned.exe"
+    exe_unsigned.write_bytes(_minimal_pe())
+    requirement_fixture = _challenge(exe_unsigned, ids)
+    dll_unsigned = exe_unsigned.with_suffix(".dll")
+    subject_paths = {
+        "representative-exe": {
+            "kind": "exe", "unsigned": exe_unsigned,
+            "signed": tmp_path / "representative-exe.signed.exe",
+        },
+        "representative-dll": {
+            "kind": "dll", "unsigned": dll_unsigned,
+            "signed": tmp_path / "representative-dll.signed.dll",
+        },
+    }
+    inputs = []
+    source_paths = list(candidate_files.values())
+    for subject_id, paths in subject_paths.items():
+        paths["signed"].write_bytes(_signed_pe(paths["unsigned"].read_bytes()))
+        metadata = {}
+        for field in ("input", "pack_report", "protection_profile"):
+            path = tmp_path / f"{subject_id}.{field}.bin"
+            path.write_bytes(f"{subject_id}:{field}".encode())
+            metadata[field] = path
+        inputs.append(phase_b.SubjectInput(
+            subject_id, paths["kind"], paths["unsigned"], metadata["input"],
+            metadata["pack_report"], metadata["protection_profile"],
+        ))
+        source_paths.extend((paths["unsigned"], paths["signed"], *metadata.values()))
+    prepared = phase_b.prepare_evidence(
+        phase_b.CandidateInput(
+            "1" * 40, candidate_files["stub"], candidate_files["manifest"],
+            candidate_files["production_native"],
+        ),
+        inputs,
+        requirement_fixture["requirements"],
+        trust_bytes,
+        candidate_verifier=candidate_verifier,
+        now=NOW,
+    )
+    return prepared, trust, trust_bytes, keys, ids, subject_paths, source_paths
+
+
+def _phase_b_receipt(
+    prepared: phase_b.PreparedEvidence,
+    *,
+    subject_id: str,
+    subject_kind: str,
+    signed_subject_path: Path,
+    role: str,
+    scope_id: str,
+    key_name: str,
+    keys: dict[str, Ed25519PrivateKey],
+    ids: dict[str, str],
+    root: Path,
+) -> tuple[dict, Path]:
+    challenge = evidence.load_json_object_bytes(prepared.challenge_bytes)
+    envelope = _receipt(
+        role,
+        challenge=challenge,
+        key=keys[key_name],
+        key_id=ids[key_name],
+        subject_path=signed_subject_path,
+        backing_root=root,
+    )
+    envelope["receipt"]["subject"] = {
+        "subject_id": subject_id,
+        "subject_kind": subject_kind,
+        "signed_subject_sha256": _hash(signed_subject_path.read_bytes()),
+        "signed_subject_size_bytes": signed_subject_path.stat().st_size,
+        "signing_stable_pe_id": pe_content_id(signed_subject_path),
+    }
+    if role == "scanner" and scope_id == "independent":
+        envelope["receipt"]["scope"] = {"scanner_id": scope_id}
+        envelope["receipt"]["observation"].update({
+            "tool_name": "Independent",
+            "tool_version": "2.0",
+            "definitions_version": "2026.09.03",
+        })
+    _resign(envelope, keys[key_name])
+    return envelope, root
+
+
+def _phase_b_receipts(context, tmp_path: Path):
+    prepared, _, _, keys, ids, subject_paths, _ = context
+    scopes = (
+        ("scanner", "defender", "scanner-a"),
+        ("scanner", "independent", "scanner-b"),
+        ("clean-vm", "win11-hvci", "vm"),
+        ("application", "startup", "application"),
+    )
+    result = []
+    for subject_id, paths in subject_paths.items():
+        for role, scope_id, key_name in scopes:
+            root = tmp_path / f"{subject_id}-{role}-{scope_id}"
+            root.mkdir()
+            envelope, root = _phase_b_receipt(
+                prepared,
+                subject_id=subject_id,
+                subject_kind=paths["kind"],
+                signed_subject_path=paths["signed"],
+                role=role,
+                scope_id=scope_id,
+                key_name=key_name,
+                keys=keys,
+                ids=ids,
+                root=root,
+            )
+            result.append(phase_b.ingest_receipt(
+                prepared,
+                evidence.canonical_json_bytes(envelope),
+                signed_subject_path=paths["signed"],
+                backing_root=root,
+                now=NOW,
+            ))
+    return result
+
+
+def _test_authenticode(data: bytes, current: datetime) -> phase_b.AuthenticodeResult:
+    return phase_b.AuthenticodeResult(
+        _hash(data), len(data), "1" * 40, "2" * 40, current,
+        "test-only-bytes-verifier", "1.0", True,
+    )
+
+
+def test_phase_b_finalizes_complete_retained_evidence_without_reopening_sources(tmp_path):
+    context = _phase_b_context(tmp_path)
+    prepared, _, trust_bytes, _, _, _, source_paths = context
+    receipts = _phase_b_receipts(context, tmp_path)
+
+    for path in source_paths:
+        if path.exists():
+            path.write_bytes(b"changed after capture")
+
+    finalized = phase_b.finalize_evidence(
+        prepared,
+        receipts,
+        current_trust_document=trust_bytes,
+        authenticode_verifier=_test_authenticode,
+        now=NOW,
+    )
+    manifest = evidence.load_json_object_bytes(finalized.manifest_bytes)
+    assert finalized.release_authorized is False
+    assert manifest["release_authorized"] is False
+    assert len(manifest["authenticode"]) == 2
+    assert manifest["candidate_verification"] == phase_b._candidate_verification_record(
+        prepared.candidate_verification, prepared.candidate)
+    records = {record["purpose"]: record for record in manifest["files"]}
+    context_input = {
+        "challenge_sha256": records["challenge"]["sha256"],
+        "trust_sha256": records["initial-trust"]["sha256"],
+        "candidate_verification": manifest["candidate_verification"],
+        "material": [{
+            "purpose": purpose,
+            "sha256": records[purpose]["sha256"],
+            "size": records[purpose]["size_bytes"],
+        } for purpose, _ in phase_b._material(prepared)],
+    }
+    assert _hash(
+        phase_b._CONTEXT_DOMAIN + evidence.canonical_json_bytes(context_input)
+    ) == finalized.context_id
+    retained_data = {item.data for item in finalized.files}
+    assert all(receipt.canonical_receipt in retained_data for receipt in receipts)
+    assert all(receipt.signature in retained_data for receipt in receipts)
+    assert b"changed after capture" not in retained_data
+
+    published = phase_b.publish_evidence(finalized, tmp_path / "published")
+    assert published.read_bytes() == finalized.manifest_bytes
+    for item in finalized.files:
+        assert (published.parent / item.relative_path).read_bytes() == item.data
+
+
+def test_phase_b_uses_fresh_nonce_and_private_caller_state(tmp_path):
+    first_context = _phase_b_context(tmp_path / "first")
+    second_context = _phase_b_context(tmp_path / "second")
+    first = evidence.load_json_object_bytes(first_context[0].challenge_bytes)
+    second = evidence.load_json_object_bytes(second_context[0].challenge_bytes)
+    assert first["nonce_base64"] != second["nonce_base64"]
+    assert len(base64.b64decode(first["nonce_base64"], validate=True)) == 32
+    assert first_context[0].context_id != second_context[0].context_id
+
+
+def test_phase_b_requires_exact_candidate_bundle_verification(tmp_path):
+    with pytest.raises(phase_b.PhaseBError, match="candidate verifier is required"):
+        _phase_b_context(tmp_path / "missing", candidate_verifier=None)
+
+    def mismatched(stub, manifest, production_native, source_commit):
+        result = _test_candidate_verifier(
+            stub, manifest, production_native, source_commit)
+        return replace(result, stub_sha256="0" * 64)
+
+    with pytest.raises(phase_b.PhaseBError, match="invalid or mismatched"):
+        _phase_b_context(tmp_path / "mismatched", candidate_verifier=mismatched)
+
+
+def test_phase_b_rejects_missing_authenticode_or_incomplete_receipt_coverage(tmp_path):
+    context = _phase_b_context(tmp_path)
+    prepared, _, trust_bytes, _, _, _, _ = context
+    receipts = _phase_b_receipts(context, tmp_path)
+    with pytest.raises(phase_b.PhaseBError, match="Authenticode verifier"):
+        phase_b.finalize_evidence(
+            prepared, receipts, current_trust_document=trust_bytes, now=NOW)
+    with pytest.raises(phase_b.PhaseBError, match="coverage is incomplete"):
+        phase_b.finalize_evidence(
+            prepared, receipts[:-1], current_trust_document=trust_bytes,
+            authenticode_verifier=_test_authenticode, now=NOW)
+
+
+def test_phase_b_rejects_current_provider_revocation_and_authenticode_pin_mismatch(tmp_path):
+    context = _phase_b_context(tmp_path)
+    prepared, trust, _, _, ids, _, _ = context
+    receipts = _phase_b_receipts(context, tmp_path)
+    revoked = copy.deepcopy(trust)
+    next(provider for provider in revoked["providers"]
+         if provider["id"] == ids["scanner-a"])["revoked"] = True
+    with pytest.raises(phase_b.PhaseBError, match="revoked|active"):
+        phase_b.finalize_evidence(
+            prepared,
+            receipts,
+            current_trust_document=evidence.canonical_json_bytes(revoked),
+            authenticode_verifier=_test_authenticode,
+            now=NOW,
+        )
+
+    def wrong_pin(data: bytes, current: datetime) -> phase_b.AuthenticodeResult:
+        result = _test_authenticode(data, current)
+        return replace(result, signer_thumbprint="3" * 40)
+
+    with pytest.raises(phase_b.PhaseBError, match="outside current pins"):
+        phase_b.finalize_evidence(
+            prepared,
+            receipts,
+            current_trust_document=evidence.canonical_json_bytes(trust),
+            authenticode_verifier=wrong_pin,
+            now=NOW,
+        )
+
+
+def test_phase_b_rejects_conflicting_signed_bytes_for_one_subject(tmp_path):
+    context = _phase_b_context(tmp_path)
+    prepared, _, trust_bytes, keys, ids, subject_paths, _ = context
+    receipts = _phase_b_receipts(context, tmp_path)
+    alternate = tmp_path / "alternate.exe"
+    unsigned = subject_paths["representative-exe"]["unsigned"].read_bytes()
+    alternate_signed = bytearray(_signed_pe(unsigned))
+    alternate_signed[0x408] ^= 1
+    alternate.write_bytes(alternate_signed)
+    root = tmp_path / "alternate-receipt"
+    root.mkdir()
+    envelope, _ = _phase_b_receipt(
+        prepared,
+        subject_id="representative-exe",
+        subject_kind="exe",
+        signed_subject_path=alternate,
+        role="scanner",
+        scope_id="defender",
+        key_name="scanner-a",
+        keys=keys,
+        ids=ids,
+        root=root,
+    )
+    alternate_receipt = phase_b.ingest_receipt(
+        prepared,
+        evidence.canonical_json_bytes(envelope),
+        signed_subject_path=alternate,
+        backing_root=root,
+        now=NOW,
+    )
+    replaced = [alternate_receipt if (
+        item.subject_id == "representative-exe"
+        and item.role == "scanner"
+        and item.scope_id == "defender"
+    ) else item for item in receipts]
+    with pytest.raises(phase_b.PhaseBError, match="conflicting signed subject bytes"):
+        phase_b.finalize_evidence(
+            prepared,
+            replaced,
+            current_trust_document=trust_bytes,
+            authenticode_verifier=_test_authenticode,
+            now=NOW,
+        )
+
+
+def test_phase_b_publish_rejects_tampered_manifest_and_files(tmp_path):
+    context = _phase_b_context(tmp_path)
+    prepared, _, trust_bytes, _, _, _, _ = context
+    receipts = _phase_b_receipts(context, tmp_path)
+    finalized = phase_b.finalize_evidence(
+        prepared,
+        receipts,
+        current_trust_document=trust_bytes,
+        authenticode_verifier=_test_authenticode,
+        now=NOW,
+    )
+    with pytest.raises(phase_b.PhaseBError, match="manifest identity"):
+        phase_b.publish_evidence(
+            replace(finalized, manifest_bytes=finalized.manifest_bytes + b" "),
+            tmp_path / "bad-manifest",
+        )
+    tampered = replace(
+        finalized.files[0], data=finalized.files[0].data + b"tamper")
+    with pytest.raises(phase_b.PhaseBError, match="file name, bytes, or purpose"):
+        phase_b.publish_evidence(
+            replace(finalized, files=(tampered, *finalized.files[1:])),
+            tmp_path / "bad-files",
+        )
