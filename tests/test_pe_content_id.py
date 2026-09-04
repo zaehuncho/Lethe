@@ -6,8 +6,12 @@ import builtins
 import hashlib
 import importlib
 import os
+import stat
 import struct
+import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -222,3 +226,140 @@ def test_snapshot_blocks_or_rejects_same_size_mutation_after_final_read(
         assert attempted
         assert blocked
         assert snapshot.data == b"original"
+
+
+class _IntegerSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize("limit", [
+    True, False, 0, -1, 1.0, "1", b"1", [], object(), _IntegerSubclass(1),
+    sys.maxsize, sys.maxsize + 1, 10 ** 200,
+])
+def test_snapshot_rejects_invalid_limit_before_path_conversion_or_io(limit, monkeypatch):
+    class UnusedPath:
+        def __fspath__(self):
+            raise AssertionError("path conversion preceded limit validation")
+
+    def unexpected_io(*args, **kwargs):
+        raise AssertionError("I/O preceded limit validation")
+
+    monkeypatch.setattr(PE_CONTENT_ID_MODULE, "_reject_linklike_ancestors", unexpected_io)
+    monkeypatch.setattr(PE_CONTENT_ID_MODULE, "_open_snapshot_stream", unexpected_io)
+    with pytest.raises(ValueError, match="max_bytes must be an integer"):
+        snapshot_file(UnusedPath(), max_bytes=limit)
+
+
+@contextmanager
+def _synthetic_snapshot_reader(monkeypatch, *, before_size, data, after_size=None, read_error=None):
+    """Instrument a small held-handle fixture without allocating a large file."""
+    state = SimpleNamespace(read_calls=[], fstat_calls=0, closed=False)
+
+    def info(size):
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=1, st_size=size,
+                               st_dev=1, st_ino=2, st_mtime_ns=3, st_ctime_ns=4)
+
+    after_size = before_size if after_size is None else after_size
+
+    class Reader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            state.closed = True
+
+        def fileno(self):
+            return 101
+
+        def read(self, *args):
+            state.read_calls.append(args)
+            if read_error is not None:
+                raise read_error
+            return data
+
+    def held_fstat(descriptor):
+        assert descriptor == 101
+        state.fstat_calls += 1
+        return info(before_size if state.fstat_calls == 1 else after_size)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PE_CONTENT_ID_MODULE, "_reject_linklike_ancestors", lambda *args: None)
+        patch.setattr(PE_CONTENT_ID_MODULE, "_open_snapshot_stream", lambda *args: Reader())
+        patch.setattr(PE_CONTENT_ID_MODULE.os, "fstat", held_fstat)
+        patch.setattr(PE_CONTENT_ID_MODULE.os, "stat", lambda *args, **kwargs: info(after_size))
+        yield state
+
+
+@pytest.mark.parametrize("data,limit", [(b"", 1), (b"ab", 3), (b"abc", 3)])
+def test_snapshot_bounded_read_accepts_empty_under_and_exact_boundary(tmp_path, data, limit):
+    path = tmp_path / "small.bin"
+    path.write_bytes(data)
+    result = snapshot_file(path, max_bytes=limit)
+    assert result.data == data
+    assert result.size == len(data)
+    assert result.sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_snapshot_rejects_held_handle_oversize_without_read(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=4, data=b"unused") as state:
+        with pytest.raises(ValueError, match="exceeds max_bytes"):
+            snapshot_file("synthetic.bin", max_bytes=3)
+    assert state.read_calls == []
+    assert state.fstat_calls == 1
+    assert state.closed
+
+
+def test_snapshot_bounded_read_uses_one_extra_byte(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=3, data=b"abc") as state:
+        result = snapshot_file("synthetic.bin", max_bytes=5)
+    assert state.read_calls == [(6,)]
+    assert result.data == b"abc"
+    assert state.closed
+
+
+def test_snapshot_detects_growth_from_bounded_read_before_snapshot_construction(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=2, data=b"abcd") as state:
+        with pytest.raises(ValueError, match="exceeds max_bytes.*while reading"):
+            snapshot_file("synthetic.bin", max_bytes=3)
+    assert state.read_calls == [(4,)]
+    assert state.fstat_calls == 1
+    assert state.closed
+
+
+def test_snapshot_detects_growth_in_final_held_handle_size(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=3, data=b"abc", after_size=4) as state:
+        with pytest.raises(ValueError, match="grew beyond max_bytes"):
+            snapshot_file("synthetic.bin", max_bytes=3)
+    assert state.read_calls == [(4,)]
+    assert state.fstat_calls == 2
+    assert state.closed
+
+
+def test_snapshot_preserves_fingerprint_rejection_within_byte_limit(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=2, data=b"abc", after_size=3):
+        with pytest.raises(ValueError, match="changed while being snapshotted"):
+            snapshot_file("synthetic.bin", max_bytes=5)
+
+
+def test_snapshot_largest_representable_limit_uses_sentinel_without_giant_allocation(monkeypatch):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=3, data=b"abc") as state:
+        assert snapshot_file("synthetic.bin", max_bytes=sys.maxsize - 1).data == b"abc"
+    assert state.read_calls == [(sys.maxsize,)]
+
+
+@pytest.mark.parametrize("error", [OverflowError("synthetic read-size error"), MemoryError("synthetic allocation error")])
+def test_snapshot_bounded_reader_resource_failure_is_a_validation_error(monkeypatch, error):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=3, data=b"", read_error=error) as state:
+        with pytest.raises(ValueError, match="bounded read could not use max_bytes") as raised:
+            snapshot_file("synthetic.bin", max_bytes=3)
+    assert raised.value.__cause__ is error
+    assert state.read_calls == [(4,)]
+    assert state.closed
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"max_bytes": None}])
+def test_snapshot_default_keeps_original_unsized_read(monkeypatch, kwargs):
+    with _synthetic_snapshot_reader(monkeypatch, before_size=3, data=b"abc") as state:
+        assert snapshot_file("synthetic.bin", **kwargs).data == b"abc"
+    assert state.read_calls == [()]
+    assert state.fstat_calls == 2

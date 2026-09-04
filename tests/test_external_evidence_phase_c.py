@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import json
 import os
 from collections import Counter
@@ -18,6 +19,8 @@ from packer import external_evidence_v2 as evidence
 from test_external_evidence_v2 import (
     NOW, _phase_b_context, _phase_b_receipts, _test_authenticode, _test_candidate_verifier,
 )
+
+SNAPSHOT_MODULE = importlib.import_module('packer.pe_content_id')
 
 
 def _read(path):
@@ -115,11 +118,15 @@ def test_publish_and_reload_never_reopen_original_sources(prepared_case, tmp_pat
         s.data for _, s in phase_b._material(prepared)]
 
 
-def test_digest_deduplication_reads_shared_content_once(prepared_case, tmp_path, monkeypatch):
+@pytest.mark.parametrize('content', ['shared-metadata', 'empty', 'trust-json'])
+def test_digest_deduplication_reads_shared_content_once(prepared_case, tmp_path, monkeypatch, content):
     _, original, _, _ = prepared_case
     # Prepare again from sources with deliberately shared bytes, rather than
     # assuming the representative fixture happens to contain a duplicate.
-    original.subjects[1].input.path.write_bytes(original.subjects[0].input.data)
+    shared = {'shared-metadata': original.subjects[0].input.data,
+              'empty': b'', 'trust-json': original.trust_bytes}[content]
+    for subject in original.subjects:
+        subject.input.path.write_bytes(shared)
     candidate = original.candidate
     prepared = phase_b.prepare_evidence(
         phase_b.CandidateInput(candidate.source_commit, candidate.stub.path,
@@ -135,14 +142,138 @@ def test_digest_deduplication_reads_shared_content_once(prepared_case, tmp_path,
     assert len({r['path'] for r in records}) < len(records)
     actual = phase_c.snapshot_file
     calls = Counter()
+    budgets = {r['path']: max(1, r['size_bytes']) for r in records}
+    budgets['prepared.json'] = 1048576
 
     def count(path, **kwargs):
-        calls[Path(path).name] += 1
+        name = Path(path).name
+        calls[name] += 1
+        assert kwargs['max_bytes'] == budgets[name]
         return actual(path, **kwargs)
 
     monkeypatch.setattr(phase_c, 'snapshot_file', count)
-    _reload(prepared, folder)
+    loaded = _reload(prepared, folder)
+    assert all(subject.input.data == shared for subject in loaded.subjects)
     assert all(count == 1 for count in calls.values())
+
+
+def test_valid_descriptor_recomputes_phase_b_commitment(prepared_case):
+    _, prepared, _, descriptor = prepared_case
+    document = phase_c._decode_descriptor(descriptor.read_bytes())
+    assert phase_c._descriptor_context_id(document) == phase_b._context_id(prepared)
+
+
+def test_oversized_descriptor_is_rejected_without_reading_its_stream(prepared_case, monkeypatch):
+    _, prepared, folder, descriptor = prepared_case
+    descriptor.write_bytes(b' ' * (1048576 + 1))
+    actual = SNAPSHOT_MODULE._open_snapshot_stream
+    opened, reads, bounds = [], [], []
+    capture = phase_c.snapshot_file
+
+    class Reader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, *args):
+            reads.append(args)
+            raise AssertionError('oversized descriptor must be rejected before a stream read')
+
+    def open_stream(path, what):
+        opened.append(Path(path))
+        return Reader(actual(path, what))
+
+    def snapshot(path, **kwargs):
+        bounds.append(kwargs['max_bytes'])
+        return capture(path, **kwargs)
+
+    monkeypatch.setattr(SNAPSHOT_MODULE, '_open_snapshot_stream', open_stream)
+    monkeypatch.setattr(phase_c, 'snapshot_file', snapshot)
+    with pytest.raises(phase_c.PreparedBundleError, match='exceeds max_bytes'):
+        _reload(prepared, folder)
+    assert opened == [descriptor]
+    assert reads == []
+    assert bounds == [1048576]
+
+
+@pytest.mark.parametrize('change', ['size', 'hash'])
+def test_material_metadata_must_match_pin_before_any_artifact_snapshot(prepared_case, monkeypatch, change):
+    _, prepared, folder, descriptor = prepared_case
+    document = _read(descriptor)
+    record = document['files'][-1]
+    if change == 'size':
+        record['size_bytes'] = 1 << 40  # Metadata only; no large file or allocation.
+    else:
+        record['sha256'] = 'a' * 64
+        record['path'] = record['sha256'] + '.bin'
+    _write(descriptor, document)
+    actual = phase_c.snapshot_file
+    captured = []
+
+    def capture(path, **kwargs):
+        captured.append(Path(path).name)
+        assert Path(path).name == 'prepared.json', 'artifact read preceded metadata-pin check'
+        return actual(path, **kwargs)
+
+    monkeypatch.setattr(phase_c, 'snapshot_file', capture)
+    with pytest.raises(phase_c.PreparedBundleError, match='metadata does not match the expected external pin'):
+        _reload(prepared, folder)
+    assert captured == ['prepared.json']
+
+
+@pytest.mark.parametrize('field', ['source_commit', 'candidate_stub_sha256',
+                                    'candidate_manifest_sha256', 'production_native_sha256'])
+def test_candidate_metadata_bindings_are_checked_before_artifact_snapshot(prepared_case, monkeypatch, field):
+    _, prepared, folder, descriptor = prepared_case
+    document = _read(descriptor)
+    if field == 'source_commit':
+        document['candidate']['source_commit'] = 'a' * 40
+    else:
+        document['candidate_verification'][field] = 'a' * 64
+    _write(descriptor, document)
+    actual = phase_c.snapshot_file
+    captured = []
+
+    def capture(path, **kwargs):
+        captured.append(Path(path).name)
+        assert Path(path).name == 'prepared.json'
+        return actual(path, **kwargs)
+
+    monkeypatch.setattr(phase_c, 'snapshot_file', capture)
+    with pytest.raises(phase_c.PreparedBundleError, match='candidate verification and material bindings'):
+        _reload(prepared, folder)
+    assert captured == ['prepared.json']
+
+
+@pytest.mark.parametrize('purpose_index', [0, 1])
+@pytest.mark.parametrize('size', [0, -1, 1 << 40])
+def test_challenge_trust_sizes_have_independent_pre_read_json_bounds(prepared_case, monkeypatch, purpose_index, size):
+    _, prepared, folder, descriptor = prepared_case
+    document = _read(descriptor)
+    # These sizes are not included in Phase B's metadata-context formula.
+    document['files'][purpose_index]['size_bytes'] = size
+    _write(descriptor, document)
+    actual = phase_c.snapshot_file
+    captured = []
+
+    def capture(path, **kwargs):
+        captured.append(Path(path).name)
+        assert Path(path).name == 'prepared.json'
+        return actual(path, **kwargs)
+
+    monkeypatch.setattr(phase_c, 'snapshot_file', capture)
+    with pytest.raises(phase_c.PreparedBundleError):
+        _reload(prepared, folder)
+    assert captured == ['prepared.json']
 
 
 @pytest.mark.parametrize('which', ['root', 'ancestor', 'artifact'])

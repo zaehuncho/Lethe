@@ -24,6 +24,7 @@ from .strict_json import load_json_object_bytes
 
 _KIND = "lethe-prepared-evidence-bundle"
 _DESCRIPTOR = "prepared.json"
+_JSON_MAX_BYTES = 1048576
 _FIELDS = frozenset({
     "schema", "kind", "release_authorized", "context_id",
     "candidate_verification", "candidate", "subjects", "files",
@@ -103,6 +104,12 @@ def _validate_descriptor(document: dict[str, Any]) -> None:
         if (type(record["path"]) is not str or record["path"] != record["sha256"] + ".bin"
                 or type(record["size_bytes"]) is not int or record["size_bytes"] < 0):
             raise PreparedBundleError("prepared file path or size is invalid")
+        # Challenge/trust hashes, but not their sizes, are committed by Phase B.
+        # Material-file sizes below are included in that context commitment.
+        # Preserve the JSON parser's existing bound independently of the pin.
+        if (expected_purpose in _INITIAL_PURPOSES[:2]
+                and not 1 <= record["size_bytes"] <= _JSON_MAX_BYTES):
+            raise PreparedBundleError("prepared challenge or trust size exceeds the JSON boundary")
         identity = (record["sha256"], record["size_bytes"])
         if record["path"] in shared and shared[record["path"]] != identity:
             raise PreparedBundleError("shared prepared artifact metadata conflicts")
@@ -110,11 +117,35 @@ def _validate_descriptor(document: dict[str, Any]) -> None:
 
 
 def _decode_descriptor(data: bytes) -> dict[str, Any]:
-    document = load_json_object_bytes(data, what="prepared descriptor", max_bytes=1048576)
+    document = load_json_object_bytes(data, what="prepared descriptor", max_bytes=_JSON_MAX_BYTES)
     _validate_descriptor(document)
     if evidence.canonical_json_bytes(document) != data:
         raise PreparedBundleError("prepared descriptor must use canonical JSON")
     return document
+
+
+def _descriptor_context_id(document: dict[str, Any]) -> str:
+    """Mirror Phase B's exact commitment from validated metadata, before I/O.
+
+    This precheck pins material read sizes; full retained-byte validation by
+    Phase B remains necessary after capture. Challenge/trust size bounds are
+    separate JSON invariants, not fields included in the context commitment.
+    """
+    records = document["files"]
+    verification = document["candidate_verification"]
+    if (document["candidate"]["source_commit"] != verification["source_commit"]
+            or verification["candidate_stub_sha256"] != records[2]["sha256"]
+            or verification["candidate_manifest_sha256"] != records[3]["sha256"]
+            or verification["production_native_sha256"] != records[4]["sha256"]):
+        raise PreparedBundleError("prepared candidate verification and material bindings do not match")
+    content = {
+        "challenge_sha256": records[0]["sha256"],
+        "trust_sha256": records[1]["sha256"],
+        "candidate_verification": verification,
+        "material": [{"purpose": record["purpose"], "sha256": record["sha256"],
+                      "size": record["size_bytes"]} for record in records[2:]],
+    }
+    return _digest(phase_b._CONTEXT_DOMAIN + evidence.canonical_json_bytes(content))
 
 
 def _reject_reparse(path: Path, info: os.stat_result) -> None:
@@ -229,7 +260,10 @@ def load_prepared_bundle(
 ) -> phase_b.PreparedEvidence:
     """Reload only a bundle matching the caller's independently retained pin.
 
-    Each unique artifact and descriptor is captured once. Root identity and
+    The descriptor uses a bounded capture; validated metadata must reproduce
+    the external pin before material sizes become read budgets. Challenge and
+    trust JSON retain their independent parser-size bound. Each unique artifact
+    and descriptor is captured once. Root identity and
     exact flat membership are checked before and after loading. This is a
     fail-closed consistency check, not a held-directory guarantee against a
     concurrently hostile storage parent; callers keep that parent stable.
@@ -242,10 +276,14 @@ def load_prepared_bundle(
             raise PreparedBundleError("bundle_dir must be a Path")
         root = bundle_dir.absolute()
         before = _inventory(root)
-        descriptor_snapshot = snapshot_file(root / _DESCRIPTOR, what="prepared descriptor", reject_hardlinks=True)
+        descriptor_snapshot = snapshot_file(
+            root / _DESCRIPTOR, what="prepared descriptor", reject_hardlinks=True,
+            max_bytes=_JSON_MAX_BYTES)
         descriptor = _decode_descriptor(descriptor_snapshot.data)
         if descriptor["context_id"] != expected_context_id:
             raise PreparedBundleError("prepared context does not match the expected external pin")
+        if _descriptor_context_id(descriptor) != expected_context_id:
+            raise PreparedBundleError("prepared descriptor metadata does not match the expected external pin")
         expected_names = frozenset({_DESCRIPTOR, *(record["path"] for record in descriptor["files"])})
         if before[1] != expected_names:
             raise PreparedBundleError("bundle directory has extra, missing, or aliased entries")
@@ -254,7 +292,11 @@ def load_prepared_bundle(
         for record in descriptor["files"]:
             filename = record["path"]
             if filename not in snapshots:
-                snapshots[filename] = snapshot_file(root / filename, what="prepared artifact", reject_hardlinks=True)
+                # snapshot_file requires a positive bound; an empty opaque
+                # artifact still has an exact zero-size/hash check below.
+                snapshots[filename] = snapshot_file(
+                    root / filename, what="prepared artifact", reject_hardlinks=True,
+                    max_bytes=max(1, record["size_bytes"]))
             snapshot = snapshots[filename]
             if snapshot.sha256 != record["sha256"] or snapshot.size != record["size_bytes"]:
                 raise PreparedBundleError("prepared artifact bytes do not match declared digest or size")

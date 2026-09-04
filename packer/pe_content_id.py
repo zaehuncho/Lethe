@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -205,8 +206,19 @@ def snapshot_file(
     *,
     what: str = "input file",
     reject_hardlinks: bool = False,
+    max_bytes: int | None = None,
 ) -> FileSnapshot:
-    """Copy one regular file through a held handle and detect concurrent mutation."""
+    """Copy one regular file through a held handle and detect concurrent mutation.
+
+    An optional positive ``max_bytes`` bounds the read, including one extra
+    byte to detect growth. The limit must be smaller than ``sys.maxsize`` so
+    that sentinel read size is representable by Python; this is not a PE size
+    policy. ``None`` preserves the original unbounded read behavior.
+    """
+    if max_bytes is not None and (
+        type(max_bytes) is not int or not 1 <= max_bytes < sys.maxsize
+    ):
+        raise ValueError("max_bytes must be an integer from 1 through sys.maxsize - 1")
     raw_path = Path(path).absolute()
     _reject_linklike_ancestors(raw_path, what)
     try:
@@ -216,8 +228,20 @@ def snapshot_file(
                 raise ValueError(f"{what} is not a regular file")
             if reject_hardlinks and before.st_nlink > 1:
                 raise ValueError(f"{what} must not be hard-linked")
-            data = stream.read()
+            if max_bytes is None:
+                data = stream.read()
+            else:
+                if before.st_size > max_bytes:
+                    raise ValueError(f"{what} exceeds max_bytes ({max_bytes})")
+                try:
+                    data = stream.read(max_bytes + 1)
+                except (OverflowError, MemoryError) as exc:
+                    raise ValueError(f"{what} bounded read could not use max_bytes ({max_bytes})") from exc
+                if len(data) > max_bytes:
+                    raise ValueError(f"{what} exceeds max_bytes ({max_bytes}) while reading")
             after = os.fstat(stream.fileno())
+            if max_bytes is not None and after.st_size > max_bytes:
+                raise ValueError(f"{what} grew beyond max_bytes ({max_bytes}) while reading")
             path_after = os.stat(raw_path, follow_symlinks=False)
             if (_stable_fingerprint(before) != _stable_fingerprint(after)
                     or _stable_fingerprint(after) != _stable_fingerprint(path_after)

@@ -80,6 +80,24 @@ junctions, reparse points, hard-linked files, subdirectories, and nonregular
 entries are rejected; ancestor directories are checked too. The restored
 context is revalidated by Phase B before it is returned.
 
+Descriptor capture itself is capped at 1 MiB before its contents are read.
+After strict descriptor validation, the loader recomputes the existing Phase B
+context commitment from the challenge/trust hashes, candidate-verification
+record, and ordered material purpose/hash/size records. That commitment must
+match the independently retained pin before any artifact capture. Candidate
+source/hash bindings are checked separately against the candidate file records.
+
+Each material capture is bounded by its pinned size, not an arbitrary PE size
+ceiling. Challenge/trust sizes are not fields in the Phase B commitment, so
+they retain a separate 1..1 MiB JSON bound. Shared contents are still captured
+once; an empty opaque material file uses a one-byte budget and must still pass
+the exact zero-size/hash check. `snapshot_file(max_bytes=...)` checks the held
+handle's size before reading and reads at most the budget plus one sentinel
+byte to detect growth. Its optional limit must be an exact positive integer
+smaller than `sys.maxsize` so the sentinel read size is representable. Existing
+callers that omit the limit keep their previous behavior. These pre-read checks
+do not replace the full post-capture challenge/trust/material validation.
+
 Publication validates retained bytes without reopening original sources. It
 creates a new directory exclusively, writes each file with exclusive creation,
 flushes and fsyncs it, and writes `prepared.json` last. An existing directory,
