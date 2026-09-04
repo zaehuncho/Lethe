@@ -284,6 +284,27 @@ def test_dll_antidebug_detection_returns_failure_without_killing_host() -> None:
     )
 
 
+def test_clock_crosscheck_requires_repeated_divergence() -> None:
+    antidebug = _read(SRC / "antidebug.c")
+    region = antidebug[
+        antidebug.index("static int check_timing_crosscheck(void)"):
+        antidebug.index("extern volatile PackInfo g_packinfo")
+    ]
+
+    assert "#define XCHK_RUNS            5" in antidebug
+    assert "#define RDTSC_WINDOWS        3" in antidebug
+    assert "for (run = 0; run < XCHK_RUNS; ++run)" in region
+    assert "_umul128(tsc_a, qpc_b, &cross1.high)" in region
+    assert "_umul128(tsc_b, qpc_a, &cross2.high)" in region
+    assert "smaller.high * XCHK_TOLERANCE + scale_carry" in region
+    assert "return 1;" in region
+    tripwire = antidebug[
+        antidebug.index("int antidbg_tripwire_rdtsc(void)"):
+        antidebug.index("int antidbg_tripwire_debug_port(void)")
+    ]
+    assert "if (check_rdtsc_timing())" in tripwire
+
+
 def test_antidump_writes_restore_and_verify_page_protections() -> None:
     antidump = _read(SRC / "antidump.c")
     loader = _read(SRC / "pe_loader.c")

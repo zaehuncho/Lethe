@@ -102,6 +102,7 @@
  *      cycles). TIGHTENED from the former 0x100000 (1,048,576) threshold,
  *      which a lightweight stepping debugger could slip under. */
 #define RDTSC_ITERATIONS     8
+#define RDTSC_WINDOWS        3
 #define RDTSC_THRESHOLD      200000ull
 
 /* (11) RDTSC gate around a real API call (GetTickCount64 -- reads
@@ -131,6 +132,7 @@
  *      workloads differ 8x. Flag only a >4x divergence. */
 #define XCHK_ITERS_A         40000
 #define XCHK_ITERS_B         320000
+#define XCHK_RUNS            5
 #define XCHK_TOLERANCE       4ull
 
 /* Read PEB->BeingDebugged. Returns 1 if a debugger flag is set, else 0. */
@@ -408,7 +410,7 @@ static int check_parent_process(void)
  * (10) Trivial-op RDTSC gate. Keep the smallest delta across N iterations; flag
  *      only if that minimum exceeds RDTSC_THRESHOLD.
  */
-static int check_rdtsc_timing(void)
+static int rdtsc_window_is_slow(void)
 {
     uint64_t best = ~0ull;
     int i;
@@ -433,6 +435,16 @@ static int check_rdtsc_timing(void)
     }
 
     return best > RDTSC_THRESHOLD ? 1 : 0;
+}
+
+static int check_rdtsc_timing(void)
+{
+    int window;
+    for (window = 0; window < RDTSC_WINDOWS; ++window) {
+        if (!rdtsc_window_is_slow())
+            return 0;
+    }
+    return 1;
 }
 
 /*
@@ -502,54 +514,76 @@ static int check_qpc_timing(void)
 
 /*
  * (13) RDTSC vs QPC crosscheck. See the XCHK_* comment above for the theory.
- *      Robust to preemption: a stall inflates a measurement's tsc AND qpc
- *      together, preserving the ratio identity.
+ *      The QPC and TSC brackets cannot be sampled atomically: a preemption in
+ *      either narrow outer-bracket gap can inflate only QPC and make one honest
+ *      sample look divergent. Require every repeated sample to diverge; any
+ *      consistent sample makes this heuristic inconclusive rather than turning
+ *      ordinary scheduler jitter into a loader rejection.
  */
 static int check_timing_crosscheck(void)
 {
-    LARGE_INTEGER f, a0, a1, b0, b1;
-    uint64_t ta0, ta1, tb0, tb1;
-    uint64_t tsc_a, tsc_b, qpc_a, qpc_b, cross1, cross2, lo, hi;
-    volatile uint64_t sink = 0;
-    int i;
+    typedef struct TimingProduct {
+        uint64_t low;
+        uint64_t high;
+    } TimingProduct;
+    LARGE_INTEGER f;
+    int run;
 
     if (!QueryPerformanceFrequency(&f) || f.QuadPart == 0)
         return 0;
 
-    /* Measurement A: small workload. */
-    QueryPerformanceCounter(&a0);
-    _mm_lfence(); ta0 = __rdtsc(); _mm_lfence();
-    for (i = 0; i < XCHK_ITERS_A; ++i)
-        sink += (uint64_t)i;
-    _mm_lfence(); ta1 = __rdtsc(); _mm_lfence();
-    QueryPerformanceCounter(&a1);
+    for (run = 0; run < XCHK_RUNS; ++run) {
+        LARGE_INTEGER a0, a1, b0, b1;
+        uint64_t ta0, ta1, tb0, tb1;
+        uint64_t tsc_a, tsc_b, qpc_a, qpc_b;
+        TimingProduct cross1, cross2, smaller, larger, scaled;
+        uint64_t scale_carry;
+        volatile uint64_t sink = 0;
+        int i;
 
-    /* Measurement B: 8x workload, identical bracketing. */
-    QueryPerformanceCounter(&b0);
-    _mm_lfence(); tb0 = __rdtsc(); _mm_lfence();
-    for (i = 0; i < XCHK_ITERS_B; ++i)
-        sink += (uint64_t)i;
-    _mm_lfence(); tb1 = __rdtsc(); _mm_lfence();
-    QueryPerformanceCounter(&b1);
+        QueryPerformanceCounter(&a0);
+        _mm_lfence(); ta0 = __rdtsc(); _mm_lfence();
+        for (i = 0; i < XCHK_ITERS_A; ++i)
+            sink += (uint64_t)i;
+        _mm_lfence(); ta1 = __rdtsc(); _mm_lfence();
+        QueryPerformanceCounter(&a1);
 
-    tsc_a = ta1 - ta0;
-    tsc_b = tb1 - tb0;
-    qpc_a = (uint64_t)(a1.QuadPart - a0.QuadPart);
-    qpc_b = (uint64_t)(b1.QuadPart - b0.QuadPart);
+        QueryPerformanceCounter(&b0);
+        _mm_lfence(); tb0 = __rdtsc(); _mm_lfence();
+        for (i = 0; i < XCHK_ITERS_B; ++i)
+            sink += (uint64_t)i;
+        _mm_lfence(); tb1 = __rdtsc(); _mm_lfence();
+        QueryPerformanceCounter(&b1);
 
-    /* If any interval registered zero, the granularity is too coarse to judge
-       (or a clock stalled); treat as inconclusive rather than false-positive. */
-    if (tsc_a == 0 || tsc_b == 0 || qpc_a == 0 || qpc_b == 0)
-        return 0;
+        tsc_a = ta1 - ta0;
+        tsc_b = tb1 - tb0;
+        qpc_a = (uint64_t)(a1.QuadPart - a0.QuadPart);
+        qpc_b = (uint64_t)(b1.QuadPart - b0.QuadPart);
+        if (tsc_a == 0 || tsc_b == 0 || qpc_a == 0 || qpc_b == 0)
+            return 0;
 
-    /* Honest hardware: tsc_a*qpc_b == tsc_b*qpc_a. Flag a >4x divergence. */
-    cross1 = tsc_a * qpc_b;
-    cross2 = tsc_b * qpc_a;
-    lo = cross1 < cross2 ? cross1 : cross2;
-    hi = cross1 < cross2 ? cross2 : cross1;
-    if (hi > lo * XCHK_TOLERANCE)
-        return 1;
-    return 0;
+        cross1.low = _umul128(tsc_a, qpc_b, &cross1.high);
+        cross2.low = _umul128(tsc_b, qpc_a, &cross2.high);
+        if (cross1.high < cross2.high ||
+            (cross1.high == cross2.high && cross1.low < cross2.low)) {
+            smaller = cross1;
+            larger = cross2;
+        } else {
+            smaller = cross2;
+            larger = cross1;
+        }
+        if (smaller.high == 0 && smaller.low == 0)
+            return 0;
+        scaled.low = _umul128(
+            smaller.low, XCHK_TOLERANCE, &scale_carry);
+        if (smaller.high > (~0ull - scale_carry) / XCHK_TOLERANCE)
+            return 0;
+        scaled.high = smaller.high * XCHK_TOLERANCE + scale_carry;
+        if (larger.high < scaled.high ||
+            (larger.high == scaled.high && larger.low <= scaled.low))
+            return 0;
+    }
+    return 1;
 }
 
 /*
@@ -614,23 +648,7 @@ __declspec(noinline) int antidbg_tripwire_ntgf(void)
 /* Tripwire 3: RDTSC timing gate (placed before OEP transfer in stub_main). */
 __declspec(noinline) int antidbg_tripwire_rdtsc(void)
 {
-    uint64_t best = ~0ull;
-    int i;
-    for (i = 0; i < RDTSC_ITERATIONS; ++i) {
-        uint64_t t0, t1, delta;
-        volatile int trivial = i;
-        _mm_lfence();
-        t0 = __rdtsc();
-        _mm_lfence();
-        trivial = trivial + 1;
-        _mm_lfence();
-        t1 = __rdtsc();
-        _mm_lfence();
-        delta = t1 - t0;
-        if (delta < best)
-            best = delta;
-    }
-    if (best > RDTSC_THRESHOLD) {
+    if (check_rdtsc_timing()) {
         wipe_master_key();
         return 1;
     }

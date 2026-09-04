@@ -367,7 +367,7 @@
         {
           "type": "pytest",
           "path": "tests/test_stub_safety_contracts.py",
-          "claim": "DLL anti-debug paths return failure to the host without ExitProcess and use reliable debug-port checks."
+          "claim": "DLL anti-debug paths return failure to the host without ExitProcess, use reliable debug-port checks, and require repeated timing-window consensus with overflow-safe clock cross-products."
         },
         {
           "type": "promotion",
