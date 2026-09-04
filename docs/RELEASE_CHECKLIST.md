@@ -211,6 +211,11 @@ reopens an accepted source path. Its publisher writes only retained bytes and
 sets `release_authorized=false`; this foundation is not yet wired into
 `tools/release_stub.py` and does not satisfy any external production-matrix row.
 
+Phase C adds [durable prepared bundles](EXTERNAL_EVIDENCE_PHASE_C.md) for
+multi-process evidence workflows. Reload requires an independently retained
+context pin and revalidates exact retained material; persistence does not
+renew challenge expiry or grant release authority.
+
 ```powershell
 uv run python tools/release_stub.py `
   --candidate-dir <candidate-directory> `
