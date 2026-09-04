@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+from .pe_content_id import pe_content_id as _pe_content_id
+
 # IMAGE_FILE_DLL bit in the COFF file-header Characteristics field.
 _IMAGE_FILE_DLL = 0x2000
 
@@ -179,65 +181,6 @@ def _extract_error(raw: bytes) -> str:
         return str(json.loads(raw).get("error", "no error field"))
     except (ValueError, TypeError, AttributeError):
         return "unparseable error body"
-
-
-def _pe_content_id(path: str) -> str:
-    """Return a signing-stable SHA-256 identifier for an x64 PE.
-
-    The digest follows the Authenticode exclusion model: the mutable PE checksum,
-    the certificate-table directory entry, and the certificate bytes themselves
-    are omitted. Consequently the same packed image has the same ID before and
-    after signing, while changes to executable content still change the ID.
-    """
-    with open(path, "rb") as f:
-        data = f.read()
-
-    if len(data) < 0x40 or data[:2] != b"MZ":
-        raise ValueError(f"{path!r} is not a valid PE (missing DOS header)")
-    (e_lfanew,) = struct.unpack_from("<I", data, 0x3C)
-    file_header = e_lfanew + 4
-    optional_header = file_header + 20
-    if (e_lfanew + 24 > len(data)
-            or data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00"):
-        raise ValueError(f"{path!r} is not a valid PE (missing PE signature)")
-
-    (optional_size,) = struct.unpack_from("<H", data, file_header + 16)
-    optional_end = optional_header + optional_size
-    if optional_end > len(data) or optional_size < 0x98:
-        raise ValueError(f"{path!r} has a truncated PE32+ optional header")
-    if struct.unpack_from("<H", data, file_header)[0] != 0x8664:
-        raise ValueError(f"{path!r} is not an AMD64 PE image")
-    if struct.unpack_from("<H", data, optional_header)[0] != 0x20B:
-        raise ValueError(f"{path!r} is not an x64 PE32+ image")
-
-    checksum_off = optional_header + 0x40
-    number_of_dirs = struct.unpack_from("<I", data, optional_header + 0x6C)[0]
-    if number_of_dirs <= 4:
-        raise ValueError(f"{path!r} has no certificate-table directory entry")
-    security_dir_off = optional_header + 0x70 + (4 * 8)
-    if security_dir_off + 8 > optional_end:
-        raise ValueError(f"{path!r} has a truncated certificate-table directory")
-
-    cert_off, cert_size = struct.unpack_from("<II", data, security_dir_off)
-    after_security_dir = security_dir_off + 8
-    if bool(cert_off) != bool(cert_size):
-        raise ValueError(f"{path!r} has an invalid certificate-table range")
-    if cert_off:
-        cert_end = cert_off + cert_size
-        if cert_off < after_security_dir or cert_end > len(data):
-            raise ValueError(f"{path!r} has an out-of-range certificate table")
-    else:
-        cert_end = 0
-
-    digest = hashlib.sha256()
-    digest.update(data[:checksum_off])
-    digest.update(data[checksum_off + 4:security_dir_off])
-    if cert_off:
-        digest.update(data[after_security_dir:cert_off])
-        digest.update(data[cert_end:])
-    else:
-        digest.update(data[after_security_dir:])
-    return digest.hexdigest()
 
 
 def _validate_build_id(build_id: str) -> str:
