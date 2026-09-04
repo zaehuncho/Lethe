@@ -55,7 +55,7 @@ def _parsed(functions, *, start=None, end=None, path="fixture.exe"):
 
 def test_exact_runtime_candidates_report_lift_rejection_and_handler_flags():
     good = _asm("mov eax, 7; ret", 0x1000)
-    unsupported = _asm("movaps xmm0, xmm1; nop; nop; ret", 0x1100)
+    unsupported = _asm("addsd xmm0, xmm1; nop; nop; ret", 0x1100)
     handler = _asm("mov eax, 9; ret", 0x1200)
     parsed = _parsed([
         (0x1000, good, 0),
@@ -78,8 +78,8 @@ def test_exact_runtime_candidates_report_lift_rejection_and_handler_flags():
     assert rejected.liftable is False
     assert "mnemonic" in rejected.rejection_reason
     assert rejected.first_unsupported_instruction.rva == 0x1100
-    assert "movaps" in rejected.first_unsupported_instruction.text
-    assert "movaps" in rejected.rejection_reason
+    assert "addsd" in rejected.first_unsupported_instruction.text
+    assert "addsd" in rejected.rejection_reason
     assert report.candidates[2].unwind_flag_names == ("EHANDLER",)
     assert "EHANDLER" in report.candidates[2].rejection_reason
     assert all(item.indirect_target_closure_proven is False for item in report.candidates)

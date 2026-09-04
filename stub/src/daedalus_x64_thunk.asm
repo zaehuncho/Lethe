@@ -11,10 +11,12 @@
 ; return-to-shim (8) + shadow (32) + saved RFLAGS (8). The bridge captures all
 ; GPRs before using a scratch register and stores that original RSP in the VM
 ; context, so [rsp+40] stack arguments and RSP-relative loads retain x64 entry
-; semantics. The API commits its context only after a successful HALT.
+; semantics. Legacy XMM0-XMM15 state is captured before the C runtime can use it.
+; The API commits its context only after a successful HALT.
 ;
-; On success, volatile GPRs come from the VM, RAX is the function return, and
-; Win64 nonvolatiles are restored from private copies. Physical return RFLAGS
+; On success, volatile GPRs and XMM0-XMM5 come from the VM, RAX/XMM0 carry the
+; scalar return, and Win64 nonvolatiles including XMM6-XMM15 are restored from
+; private copies. Physical return RFLAGS
 ; are ABI-volatile; the VM frame retains them only for lifted semantics. On failure,
 ; the context is still the original capture, GPRs are restored for a controlled
 ; bridge exit, and status=1 is written into the shim's first shadow slot. The shim owns the final
@@ -29,7 +31,7 @@ PUBLIC daedalus_x64_enter_common
 DVM_DESCRIPTOR_VERSION_PLAIN EQU 3
 DVM_DESCRIPTOR_VERSION_PAGED EQU 4
 
-FRAME_SIZE          EQU 248
+FRAME_SIZE          EQU 664
 CTX                 EQU 40
 CTX_RAX             EQU CTX + 0
 CTX_RCX             EQU CTX + 8
@@ -49,14 +51,42 @@ CTX_R14             EQU CTX + 112
 CTX_R15             EQU CTX + 120
 CTX_RFLAGS          EQU CTX + 128
 
-SAVE_RBX            EQU 176
-SAVE_RBP            EQU 184
-SAVE_RSI            EQU 192
-SAVE_RDI            EQU 200
-SAVE_R12            EQU 208
-SAVE_R13            EQU 216
-SAVE_R14            EQU 224
-SAVE_R15            EQU 232
+CTX_XMM0            EQU CTX + 136
+CTX_XMM1            EQU CTX + 152
+CTX_XMM2            EQU CTX + 168
+CTX_XMM3            EQU CTX + 184
+CTX_XMM4            EQU CTX + 200
+CTX_XMM5            EQU CTX + 216
+CTX_XMM6            EQU CTX + 232
+CTX_XMM7            EQU CTX + 248
+CTX_XMM8            EQU CTX + 264
+CTX_XMM9            EQU CTX + 280
+CTX_XMM10           EQU CTX + 296
+CTX_XMM11           EQU CTX + 312
+CTX_XMM12           EQU CTX + 328
+CTX_XMM13           EQU CTX + 344
+CTX_XMM14           EQU CTX + 360
+CTX_XMM15           EQU CTX + 376
+
+SAVE_RBX            EQU 432
+SAVE_RBP            EQU 440
+SAVE_RSI            EQU 448
+SAVE_RDI            EQU 456
+SAVE_R12            EQU 464
+SAVE_R13            EQU 472
+SAVE_R14            EQU 480
+SAVE_R15            EQU 488
+
+SAVE_XMM6           EQU 496
+SAVE_XMM7           EQU 512
+SAVE_XMM8           EQU 528
+SAVE_XMM9           EQU 544
+SAVE_XMM10          EQU 560
+SAVE_XMM11          EQU 576
+SAVE_XMM12          EQU 592
+SAVE_XMM13          EQU 608
+SAVE_XMM14          EQU 624
+SAVE_XMM15          EQU 640
 
 COMMON_RETURN       EQU FRAME_SIZE
 SHIM_STATUS         EQU FRAME_SIZE + 8
@@ -92,6 +122,23 @@ daedalus_x64_enter_common PROC FRAME
     mov     rax, [rsp + SHIM_SAVED_RFLAGS]
     mov     [rsp + CTX_RFLAGS], rax
 
+    movdqu  XMMWORD PTR [rsp + CTX_XMM0], xmm0
+    movdqu  XMMWORD PTR [rsp + CTX_XMM1], xmm1
+    movdqu  XMMWORD PTR [rsp + CTX_XMM2], xmm2
+    movdqu  XMMWORD PTR [rsp + CTX_XMM3], xmm3
+    movdqu  XMMWORD PTR [rsp + CTX_XMM4], xmm4
+    movdqu  XMMWORD PTR [rsp + CTX_XMM5], xmm5
+    movdqu  XMMWORD PTR [rsp + CTX_XMM6], xmm6
+    movdqu  XMMWORD PTR [rsp + CTX_XMM7], xmm7
+    movdqu  XMMWORD PTR [rsp + CTX_XMM8], xmm8
+    movdqu  XMMWORD PTR [rsp + CTX_XMM9], xmm9
+    movdqu  XMMWORD PTR [rsp + CTX_XMM10], xmm10
+    movdqu  XMMWORD PTR [rsp + CTX_XMM11], xmm11
+    movdqu  XMMWORD PTR [rsp + CTX_XMM12], xmm12
+    movdqu  XMMWORD PTR [rsp + CTX_XMM13], xmm13
+    movdqu  XMMWORD PTR [rsp + CTX_XMM14], xmm14
+    movdqu  XMMWORD PTR [rsp + CTX_XMM15], xmm15
+
     ; Private copies guarantee the bridge preserves Win64 nonvolatiles even if
     ; lifted bytecode writes their VM slots.
     mov     [rsp + SAVE_RBX], rbx
@@ -102,6 +149,16 @@ daedalus_x64_enter_common PROC FRAME
     mov     [rsp + SAVE_R13], r13
     mov     [rsp + SAVE_R14], r14
     mov     [rsp + SAVE_R15], r15
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM6], xmm6
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM7], xmm7
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM8], xmm8
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM9], xmm9
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM10], xmm10
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM11], xmm11
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM12], xmm12
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM13], xmm13
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM14], xmm14
+    movdqu  XMMWORD PTR [rsp + SAVE_XMM15], xmm15
 
     ; The exact return address is the two-byte short jump. Its following qword
     ; is the generated function's descriptor pointer.
@@ -160,6 +217,13 @@ dvm_restore_context:
     mov     r9,  [rsp + CTX_R9]
     mov     r10, [rsp + CTX_R10]
 
+    movdqu  xmm0, XMMWORD PTR [rsp + CTX_XMM0]
+    movdqu  xmm1, XMMWORD PTR [rsp + CTX_XMM1]
+    movdqu  xmm2, XMMWORD PTR [rsp + CTX_XMM2]
+    movdqu  xmm3, XMMWORD PTR [rsp + CTX_XMM3]
+    movdqu  xmm4, XMMWORD PTR [rsp + CTX_XMM4]
+    movdqu  xmm5, XMMWORD PTR [rsp + CTX_XMM5]
+
     mov     rbx, [rsp + SAVE_RBX]
     mov     rbp, [rsp + SAVE_RBP]
     mov     rsi, [rsp + SAVE_RSI]
@@ -168,6 +232,16 @@ dvm_restore_context:
     mov     r13, [rsp + SAVE_R13]
     mov     r14, [rsp + SAVE_R14]
     mov     r15, [rsp + SAVE_R15]
+    movdqu  xmm6, XMMWORD PTR [rsp + SAVE_XMM6]
+    movdqu  xmm7, XMMWORD PTR [rsp + SAVE_XMM7]
+    movdqu  xmm8, XMMWORD PTR [rsp + SAVE_XMM8]
+    movdqu  xmm9, XMMWORD PTR [rsp + SAVE_XMM9]
+    movdqu  xmm10, XMMWORD PTR [rsp + SAVE_XMM10]
+    movdqu  xmm11, XMMWORD PTR [rsp + SAVE_XMM11]
+    movdqu  xmm12, XMMWORD PTR [rsp + SAVE_XMM12]
+    movdqu  xmm13, XMMWORD PTR [rsp + SAVE_XMM13]
+    movdqu  xmm14, XMMWORD PTR [rsp + SAVE_XMM14]
+    movdqu  xmm15, XMMWORD PTR [rsp + SAVE_XMM15]
 
     mov     r11, [rsp + CTX_R11]
     add     rsp, FRAME_SIZE

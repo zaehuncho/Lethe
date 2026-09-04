@@ -849,7 +849,9 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["cfg_target_declared"] is False
         assert function.capabilities["xfg_function_hash_emitted"] is False
         assert function.capabilities["stack_arguments_supported"] is True
-        assert function.capabilities["xmm_state_supported"] is False
+        assert function.capabilities["xmm_register_state_captured"] is True
+        assert function.capabilities["xmm_register_moves_and_xor_supported"] is True
+        assert function.capabilities["simd_fp_arithmetic_supported"] is False
         thunk_rva = function.generated_executable_ranges[0].rva
         thunk_rvas.add(thunk_rva)
         entry = pe_analyze._slice_at_rva(

@@ -26,7 +26,9 @@ _RUN_GATE = "LETHE_RUN_NATIVE_VM_E2E"
 _STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
 _SHUFFLE_SEED = "3141592653589793238462643383279502884197169399375105820974944592"
-_LEAF_BYTES = bytes.fromhex("b82a000000c3")
+_LEAF_BYTES = bytes.fromhex(
+    "b844332211660f6ec0ba6e332211660f6eca660fefc1660f7ec0c3"
+)
 
 
 def _visual_studio_available() -> bool:
@@ -76,11 +78,7 @@ def _build_fixture(work: Path) -> Path:
         """
 #include <windows.h>
 
-__declspec(dllexport) __declspec(noinline)
-int __cdecl vm_leaf(void)
-{
-    return 42;
-}
+int __cdecl vm_leaf(void);
 
 __declspec(noreturn) void fixture_entry(void)
 {
@@ -97,15 +95,34 @@ __declspec(noreturn) void fixture_entry(void)
 """.lstrip(),
         encoding="ascii",
     )
+    (source / "fixture.asm").write_text(
+        r"""
+OPTION CASEMAP:NONE
+.code
+PUBLIC vm_leaf
+vm_leaf PROC
+    mov eax, 11223344h
+    movd xmm0, eax
+    mov edx, 1122336eh
+    movd xmm1, edx
+    pxor xmm0, xmm1
+    movd eax, xmm0
+    ret
+vm_leaf ENDP
+END
+""".lstrip(),
+        encoding="ascii",
+    )
     (source / "CMakeLists.txt").write_text(
         """
 cmake_minimum_required(VERSION 3.20)
-project(lethe_native_vm_fixture C)
-add_executable(vm_fixture fixture.c)
-target_compile_options(vm_fixture PRIVATE /W4 /WX /O2 /GS- /guard:cf-)
+project(lethe_native_vm_fixture C ASM_MASM)
+add_executable(vm_fixture fixture.c fixture.asm)
+target_compile_options(vm_fixture PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2;/GS-;/guard:cf->)
 target_link_options(vm_fixture PRIVATE
     /INCREMENTAL:NO /FIXED /DYNAMICBASE:NO /NXCOMPAT /HIGHENTROPYVA:NO /CETCOMPAT:NO
-    /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE)
+    /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_leaf)
 target_link_libraries(vm_fixture PRIVATE kernel32.lib)
 """.lstrip(),
         encoding="ascii",
@@ -234,7 +251,7 @@ def test_packed_executable_calls_virtualized_leaf(
         source_image = assemble._StubImage(source.read_bytes())
         leaf_rva = source_image.find_export_rva("vm_leaf")
         assert leaf_rva is not None
-        leaf_window = source_image.read_at_rva(leaf_rva, 16)
+        leaf_window = source_image.read_at_rva(leaf_rva, 64)
         ret_offset = leaf_window.find(b"\xC3")
         assert ret_offset >= 0
         leaf_size = ret_offset + 1

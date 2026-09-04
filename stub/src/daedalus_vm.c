@@ -938,6 +938,11 @@ static void dvm_x64_import(DaedalusVM *vm,
 
     for (i = 0; i < DVM_X64_GPR_COUNT; i++)
         dvm_x64_local_write(vm, i * 8u, context->gpr[i]);
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {
+        const uint32_t off = DVM_X64_LOCAL_XMM_BASE + i * DVM_X64_XMM_STRIDE;
+        dvm_x64_local_write(vm, off, context->xmm[i][0]);
+        dvm_x64_local_write(vm, off + 8u, context->xmm[i][1]);
+    }
     dvm_x64_local_write(vm, DVM_X64_LOCAL_CF,
                         (flags & DVM_X64_RFLAGS_CF) ? 1u : 0u);
     dvm_x64_local_write(vm, DVM_X64_LOCAL_PF,
@@ -960,6 +965,11 @@ static void dvm_x64_export(const DaedalusVM *vm,
 
     for (i = 0; i < DVM_X64_GPR_COUNT; i++)
         context->gpr[i] = dvm_x64_local_read(vm, i * 8u);
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {
+        const uint32_t off = DVM_X64_LOCAL_XMM_BASE + i * DVM_X64_XMM_STRIDE;
+        context->xmm[i][0] = dvm_x64_local_read(vm, off);
+        context->xmm[i][1] = dvm_x64_local_read(vm, off + 8u);
+    }
     if (dvm_x64_local_read(vm, DVM_X64_LOCAL_CF) & 1u)
         flags |= DVM_X64_RFLAGS_CF;
     if (dvm_x64_local_read(vm, DVM_X64_LOCAL_PF) & 1u)

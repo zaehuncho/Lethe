@@ -22,15 +22,25 @@ MOVSXD, SETcc/CMOVcc, register XCHG, BSWAP, ADC, and SBB. High-8 aliases,
 scalar memory destinations, immediate stores, parity conditions, and balanced
 PUSH/POP/LEAVE stack frames are covered. Direct non-recursive calls to proven
 instruction boundaries inside the same selected extent preserve architectural
-stack effects and use shadow-validated VM returns. Atomic XCHG/LOCK forms,
-SIMD, external/indirect/recursive calls, and unmodeled widths remain explicit
-whole-function bailouts.
+stack effects and use shadow-validated VM returns. Legacy register-only XMM
+moves and bitwise XOR operate on a captured 16-register, two-lane state.
+Floating-point arithmetic, XMM memory operands, VEX/EVEX encodings, atomic
+XCHG/LOCK forms, external/indirect/recursive calls, and unmodeled widths remain
+explicit whole-function bailouts.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from iced_x86 import Decoder, FlowControl, MemorySizeExt, Mnemonic, OpKind, Register
+from iced_x86 import (
+    Decoder,
+    EncodingKind,
+    FlowControl,
+    MemorySizeExt,
+    Mnemonic,
+    OpKind,
+    Register,
+)
 
 # --- VM local layout (byte offsets into RefVM.locals) ----------------------
 # 16 GPRs at 0..127, flags at 128.., scratch at 160..
@@ -60,6 +70,13 @@ REG16_OFF = {r: i * 8 for i, r in enumerate(_R16)}
 REG8_OFF = {r: i * 8 for i, r in enumerate(_R8)}
 GPR_NAMES = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+_XMM = [
+    Register.XMM0, Register.XMM1, Register.XMM2, Register.XMM3,
+    Register.XMM4, Register.XMM5, Register.XMM6, Register.XMM7,
+    Register.XMM8, Register.XMM9, Register.XMM10, Register.XMM11,
+    Register.XMM12, Register.XMM13, Register.XMM14, Register.XMM15,
+]
+XMM_NAMES = [f"xmm{i}" for i in range(16)]
 
 CF, ZF, SF, OF = 128, 136, 144, 152          # legacy flag locals
 SA, SB, SR = 160, 168, 176                   # scratch: operand a, b, result
@@ -70,7 +87,21 @@ CALL_DEPTH = 240                              # active internal CALL frames
 CALL_RET_BASE = 248                           # 32 x architectural return RIP
 CALL_STACK_CAPACITY = 32
 IMAGE_BASE = CALL_RET_BASE + CALL_STACK_CAPACITY * 8
-LOCALS_NEEDED = IMAGE_BASE + 8
+XMM_BASE = IMAGE_BASE + 8
+XMM_LANE_SIZE = 16
+XMM_OFF = {register: XMM_BASE + i * XMM_LANE_SIZE for i, register in enumerate(_XMM)}
+LOCALS_NEEDED = XMM_BASE + len(_XMM) * XMM_LANE_SIZE
+_XMM_MOVES = {
+    Mnemonic.MOVAPS: "movaps",
+    Mnemonic.MOVUPS: "movups",
+    Mnemonic.MOVDQA: "movdqa",
+    Mnemonic.MOVDQU: "movdqu",
+}
+_XMM_XORS = {
+    Mnemonic.PXOR: "pxor",
+    Mnemonic.XORPS: "xorps",
+    Mnemonic.XORPD: "xorpd",
+}
 
 MASK64 = (1 << 64) - 1
 SIGN64 = 63
@@ -249,6 +280,72 @@ class _Lifter:
         reg = instr.op_register(i)
         off, width = self._reg_info(reg)      # bails on unsupported sub-register
         return reg, width
+
+    def _require_legacy_registers(self, instr, mnemonic: str):
+        if instr.encoding != EncodingKind.LEGACY:
+            raise LiftUnsupported(f"{mnemonic} VEX/EVEX encoding is not supported")
+        if instr.op_count != 2 or any(
+                instr.op_kind(index) != OpKind.REGISTER for index in (0, 1)):
+            raise LiftUnsupported(f"{mnemonic} requires register-only operands")
+        return instr.op_register(0), instr.op_register(1)
+
+    def _xmm_offset(self, register) -> int:
+        try:
+            return XMM_OFF[register]
+        except KeyError as exc:
+            raise LiftUnsupported(f"expected an XMM0-XMM15 register, got {register!r}") from exc
+
+    def _read_xmm(self, register) -> None:
+        offset = self._xmm_offset(register)
+        self.rd_local(offset); self.wr_local(T0)
+        self.rd_local(offset + 8); self.wr_local(T1)
+
+    def _write_xmm_from_temps(self, register) -> None:
+        offset = self._xmm_offset(register)
+        self.rd_local(T0); self.wr_local(offset)
+        self.rd_local(T1); self.wr_local(offset + 8)
+
+    def _xmm_move(self, instr, mnemonic: str) -> None:
+        destination, source = self._require_legacy_registers(instr, mnemonic)
+        self._xmm_offset(destination)
+        self._xmm_offset(source)
+        self._read_xmm(source)
+        self._write_xmm_from_temps(destination)
+
+    def _xmm_logical(self, instr, mnemonic: str) -> None:
+        destination, source = self._require_legacy_registers(instr, mnemonic)
+        destination_offset = self._xmm_offset(destination)
+        source_offset = self._xmm_offset(source)
+        self.rd_local(destination_offset); self.rd_local(source_offset); self.a("xor")
+        self.wr_local(T0)
+        self.rd_local(destination_offset + 8); self.rd_local(source_offset + 8)
+        self.a("xor"); self.wr_local(T1)
+        self._write_xmm_from_temps(destination)
+
+    def _movd_movq(self, instr, *, width: int) -> None:
+        mnemonic = "movd" if width == 32 else "movq"
+        destination, source = self._require_legacy_registers(instr, mnemonic)
+        destination_is_xmm = destination in XMM_OFF
+        source_is_xmm = source in XMM_OFF
+        if destination_is_xmm:
+            if source_is_xmm:
+                if width != 64:
+                    raise LiftUnsupported("movd does not support an XMM register source")
+                self.rd_local(self._xmm_offset(source)); self.wr_local(T0)
+            else:
+                _source_offset, source_width = self._reg_info(source)
+                if source_width != width:
+                    raise LiftUnsupported(f"{mnemonic} GPR source width mismatch")
+                self.rd_reg(source); self.wr_local(T0)
+            self.push_imm(0); self.wr_local(T1)
+            self._write_xmm_from_temps(destination)
+            return
+        if not source_is_xmm:
+            raise LiftUnsupported(f"{mnemonic} requires one XMM register operand")
+        _destination_offset, destination_width = self._reg_info(destination)
+        if destination_width != width:
+            raise LiftUnsupported(f"{mnemonic} GPR destination width mismatch")
+        self.rd_local(self._xmm_offset(source)); self.wr_reg(destination)
 
     def _read_rmw_destination(self, instr):
         """Read operand zero into SA and preserve its destination geometry.
@@ -1182,6 +1279,14 @@ class _Lifter:
                 self._extend_move(instr, signed=True)
             elif m == Mnemonic.MOVSXD:
                 self._extend_move(instr, signed=True, movsxd=True)
+            elif m == Mnemonic.MOVD:
+                self._movd_movq(instr, width=32)
+            elif m == Mnemonic.MOVQ:
+                self._movd_movq(instr, width=64)
+            elif m in _XMM_MOVES:
+                self._xmm_move(instr, _XMM_MOVES[m])
+            elif m in _XMM_XORS:
+                self._xmm_logical(instr, _XMM_XORS[m])
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:

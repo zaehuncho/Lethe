@@ -156,7 +156,8 @@ def test_generated_thunk_matches_native_leaf(
     # validates that the common bridge models the pre-shim caller RSP, not its
     # own internal stack frame.
     body = _asm(
-        "mov rax, rcx; shld rax, rdx, 13; "
+        "movq xmm0, rcx; movq xmm15, rdx; pxor xmm0, xmm15; movq rax, xmm0; "
+        "shld rax, rdx, 13; "
         "mov r10, r8; shrd r10, r9, 7; xor rax, r10; "
         "mov r11, [rsp+0x28]; add rax, r11"
     )
@@ -166,6 +167,21 @@ def test_generated_thunk_matches_native_leaf(
     if rolling:
         program = daedalus_rolling.pack_rolling_blob(
             program, bytes.fromhex("102132435465768798a9bacbdcedfe0f")
+        )
+    xmm_body = _asm("movq rax, xmm0; movq rdx, xmm1; xor rax, rdx")
+    xmm_program = daedalus_asm.assemble(
+        x64_lifter.lift_function(xmm_body, base=0x1000)
+    )
+    xmm_return_program = daedalus_asm.assemble(
+        x64_lifter.lift_function(_asm("movaps xmm0, xmm1"), base=0x1000)
+    )
+    if rolling:
+        xmm_program = daedalus_rolling.pack_rolling_blob(
+            xmm_program, bytes.fromhex("ffeeddccbbaa99887766554433221100")
+        )
+        xmm_return_program = daedalus_rolling.pack_rolling_blob(
+            xmm_return_program,
+            bytes.fromhex("00112233445566778899aabbccddeeff"),
         )
 
     harness = f"""
@@ -215,6 +231,10 @@ uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv)
 {{ (void)func; (void)argc; (void)argv; return 0; }}
 
 static const uint8_t virtual_program[] = {{ {_c_bytes(program)} }};
+static const uint8_t virtual_xmm_program[] = {{ {_c_bytes(xmm_program)} }};
+static const uint8_t virtual_xmm_return_program[] = {{
+    {_c_bytes(xmm_return_program)}
+}};
 static const uint8_t nonzero_program[] = {{ 0x00, 0x00, 0x02, 0x01, 0x00 }};
 
 const DaedalusX64Descriptor virtual_descriptor = {{
@@ -228,6 +248,18 @@ const DaedalusX64Descriptor failure_descriptor = {{
     (uint32_t)sizeof(nonzero_program),
     nonzero_program,
     nonzero_program
+}};
+const DaedalusX64Descriptor virtual_xmm_descriptor = {{
+    DVM_X64_DESCRIPTOR_VERSION,
+    (uint32_t)sizeof(virtual_xmm_program),
+    virtual_xmm_program,
+    virtual_xmm_program
+}};
+const DaedalusX64Descriptor virtual_xmm_return_descriptor = {{
+    DVM_X64_DESCRIPTOR_VERSION,
+    (uint32_t)sizeof(virtual_xmm_return_program),
+    virtual_xmm_return_program,
+    virtual_xmm_return_program
 }};
 const DaedalusX64Descriptor zero_base_descriptor = {{
     DVM_X64_DESCRIPTOR_VERSION,
@@ -243,6 +275,8 @@ typedef char DescriptorImageBaseOffsetGuard[
 
 uint64_t virtual_leaf(uint64_t a, uint64_t b, uint64_t c,
                       uint64_t d, uint64_t e);
+uint64_t virtual_xmm(double a, double b);
+double virtual_xmm_return(double a, double b);
 uint64_t virtual_failure(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e);
 uint64_t virtual_zero_base(uint64_t a, uint64_t b, uint64_t c,
@@ -253,9 +287,19 @@ int verify_virtual_nonvolatiles(void);
 static uint64_t native_leaf(uint64_t a, uint64_t b, uint64_t c,
                             uint64_t d, uint64_t e)
 {{
-    const uint64_t left = (a << 13) | (b >> 51);
+    const uint64_t mixed = a ^ b;
+    const uint64_t left = (mixed << 13) | (b >> 51);
     const uint64_t right = (c >> 7) | (d << 57);
     return (left ^ right) + e;
+}}
+
+static uint64_t native_xmm(double a, double b)
+{{
+    uint64_t left = 0;
+    uint64_t right = 0;
+    memcpy(&left, &a, sizeof(left));
+    memcpy(&right, &b, sizeof(right));
+    return left ^ right;
 }}
 
 static int verify_thunk_unwind(PRUNTIME_FUNCTION runtime, DWORD64 image_base)
@@ -351,6 +395,25 @@ int main(int argc, char **argv)
         if (actual != expected)
             return 10 + (int)i;
     }}
+    {{
+        static const double xmm_cases[][2] = {{
+            {{ 0.0, -0.0 }},
+            {{ 1.25, -9.5 }},
+            {{ 123456.75, 0.03125 }}
+        }};
+        for (i = 0; i < sizeof(xmm_cases) / sizeof(xmm_cases[0]); i++) {{
+            const uint64_t expected = native_xmm(xmm_cases[i][0], xmm_cases[i][1]);
+            const uint64_t actual = virtual_xmm(xmm_cases[i][0], xmm_cases[i][1]);
+            uint64_t returned_bits = 0;
+            const double returned = virtual_xmm_return(
+                xmm_cases[i][0], xmm_cases[i][1]);
+            memcpy(&returned_bits, &returned, sizeof(returned_bits));
+            if (actual != expected)
+                return 30 + (int)i;
+            if (returned_bits != native_xmm(0.0, xmm_cases[i][1]))
+                return 40 + (int)i;
+        }}
+    }}
     if (verify_virtual_nonvolatiles() != 0)
         return 20;
     return 0;
@@ -365,6 +428,18 @@ int main(int argc, char **argv)
         win64_thunk.render_entry_thunk("virtual_failure", "failure_descriptor"),
         encoding="utf-8",
     )
+    (tmp_path / "virtual_xmm.asm").write_text(
+        win64_thunk.render_entry_thunk(
+            "virtual_xmm", "virtual_xmm_descriptor"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "virtual_xmm_return.asm").write_text(
+        win64_thunk.render_entry_thunk(
+            "virtual_xmm_return", "virtual_xmm_return_descriptor"
+        ),
+        encoding="utf-8",
+    )
     (tmp_path / "virtual_zero_base.asm").write_text(
         win64_thunk.render_entry_thunk(
             "virtual_zero_base", "zero_base_descriptor"
@@ -377,6 +452,18 @@ OPTION CASEMAP:NONE
 EXTERN virtual_leaf:PROC
 EXTERN virtual_failure:PROC
 PUBLIC verify_virtual_nonvolatiles
+.const
+ALIGN 16
+xmm_sentinel6  DQ 0606060606060606h, 6000000000000006h
+xmm_sentinel7  DQ 0707070707070707h, 7000000000000007h
+xmm_sentinel8  DQ 0808080808080808h, 8000000000000008h
+xmm_sentinel9  DQ 0909090909090909h, 9000000000000009h
+xmm_sentinel10 DQ 1010101010101010h, 1000000000000010h
+xmm_sentinel11 DQ 1111111111111111h, 1100000000000011h
+xmm_sentinel12 DQ 1212121212121212h, 1200000000000012h
+xmm_sentinel13 DQ 1313131313131313h, 1300000000000013h
+xmm_sentinel14 DQ 1414141414141414h, 1400000000000014h
+xmm_sentinel15 DQ 1515151515151515h, 1500000000000015h
 .code
 
 verify_virtual_nonvolatiles PROC FRAME
@@ -396,8 +483,28 @@ verify_virtual_nonvolatiles PROC FRAME
     .pushreg r14
     push r15
     .pushreg r15
-    sub  rsp, 40
-    .allocstack 40
+    sub  rsp, 216
+    .allocstack 216
+    movdqu XMMWORD PTR [rsp + 48], xmm6
+    .savexmm128 xmm6, 48
+    movdqu XMMWORD PTR [rsp + 64], xmm7
+    .savexmm128 xmm7, 64
+    movdqu XMMWORD PTR [rsp + 80], xmm8
+    .savexmm128 xmm8, 80
+    movdqu XMMWORD PTR [rsp + 96], xmm9
+    .savexmm128 xmm9, 96
+    movdqu XMMWORD PTR [rsp + 112], xmm10
+    .savexmm128 xmm10, 112
+    movdqu XMMWORD PTR [rsp + 128], xmm11
+    .savexmm128 xmm11, 128
+    movdqu XMMWORD PTR [rsp + 144], xmm12
+    .savexmm128 xmm12, 144
+    movdqu XMMWORD PTR [rsp + 160], xmm13
+    .savexmm128 xmm13, 160
+    movdqu XMMWORD PTR [rsp + 176], xmm14
+    .savexmm128 xmm14, 176
+    movdqu XMMWORD PTR [rsp + 192], xmm15
+    .savexmm128 xmm15, 192
     .endprolog
 
     mov rbx, 1111h
@@ -408,14 +515,74 @@ verify_virtual_nonvolatiles PROC FRAME
     mov r13, 6666h
     mov r14, 7777h
     mov r15, 8888h
+    movdqu xmm6, XMMWORD PTR xmm_sentinel6
+    movdqu xmm7, XMMWORD PTR xmm_sentinel7
+    movdqu xmm8, XMMWORD PTR xmm_sentinel8
+    movdqu xmm9, XMMWORD PTR xmm_sentinel9
+    movdqu xmm10, XMMWORD PTR xmm_sentinel10
+    movdqu xmm11, XMMWORD PTR xmm_sentinel11
+    movdqu xmm12, XMMWORD PTR xmm_sentinel12
+    movdqu xmm13, XMMWORD PTR xmm_sentinel13
+    movdqu xmm14, XMMWORD PTR xmm_sentinel14
+    movdqu xmm15, XMMWORD PTR xmm_sentinel15
     mov rcx, 1
     mov rdx, 2
     mov r8, 3
     mov r9, 4
     mov QWORD PTR [rsp + 32], 5
     call virtual_leaf
-    mov r10, 0800000000002005h
+    mov r10, 0800000000006005h
     cmp rax, r10
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm6
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel6
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm7
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel7
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm8
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel8
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm9
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel9
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm10
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel10
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm11
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel11
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm12
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel12
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm13
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel13
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm14
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel14
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
+    jne verify_nonvolatile_bad
+    movdqu xmm0, xmm15
+    pcmpeqb xmm0, XMMWORD PTR xmm_sentinel15
+    pmovmskb eax, xmm0
+    cmp eax, 0FFFFh
     jne verify_nonvolatile_bad
     cmp rbx, 1111h
     jne verify_nonvolatile_bad
@@ -438,7 +605,17 @@ verify_virtual_nonvolatiles PROC FRAME
 verify_nonvolatile_bad:
     mov eax, 1
 verify_nonvolatile_done:
-    add rsp, 40
+    movdqu xmm6, XMMWORD PTR [rsp + 48]
+    movdqu xmm7, XMMWORD PTR [rsp + 64]
+    movdqu xmm8, XMMWORD PTR [rsp + 80]
+    movdqu xmm9, XMMWORD PTR [rsp + 96]
+    movdqu xmm10, XMMWORD PTR [rsp + 112]
+    movdqu xmm11, XMMWORD PTR [rsp + 128]
+    movdqu xmm12, XMMWORD PTR [rsp + 144]
+    movdqu xmm13, XMMWORD PTR [rsp + 160]
+    movdqu xmm14, XMMWORD PTR [rsp + 176]
+    movdqu xmm15, XMMWORD PTR [rsp + 192]
+    add rsp, 216
     pop r15
     pop r14
     pop r13
@@ -458,6 +635,8 @@ END
         "harness.c",
         "virtual_leaf.asm",
         "virtual_failure.asm",
+        "virtual_xmm.asm",
+        "virtual_xmm_return.asm",
         "virtual_zero_base.asm",
         "verifier.asm",
         f'"{(ROOT / "stub/src/daedalus_vm.c").as_posix()}"',

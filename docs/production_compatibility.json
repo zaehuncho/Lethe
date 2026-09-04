@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit scalar function subset is liftable; bounded 32/64-bit SHLD/SHRD are covered, while DIV/IDIV fault delivery, native calls, SIMD/FP, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit bounded function subset is liftable; legacy register-only XMM moves and bitwise XOR are covered, while XMM memory forms, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -280,6 +280,21 @@
           "type": "pytest",
           "path": "tests/test_lifter_double_shift.py",
           "claim": "Bounded 32/64-bit SHLD/SHRD register and memory destinations, immediate and CL counts, zero-count behavior, writeback, and defined flags match the differential oracle."
+        },
+        {
+          "type": "pytest",
+          "path": "tests/test_lifter_xmm.py",
+          "claim": "Legacy register-only MOVD/MOVQ, 128-bit MOVAPS/MOVUPS/MOVDQA/MOVDQU, and PXOR/XORPS/XORPD match Unicorn across all XMM lanes and preserve requested GPR/flag state; memory, VEX/EVEX, and SIMD/FP arithmetic forms fail closed."
+        },
+        {
+          "type": "native-pytest",
+          "path": "tests/test_lifter_win64_thunk.py",
+          "claim": "The Win64 bridge captures volatile XMM arguments, transports an XMM0 return, restores XMM6-XMM15, and executes the bounded XMM subset through plain and rolling entry-thunk paths."
+        },
+        {
+          "type": "native-pytest",
+          "path": "tests/test_native_virtualization_runtime.py",
+          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bytecode from the bounded XMM subset."
         }
       ]
     },

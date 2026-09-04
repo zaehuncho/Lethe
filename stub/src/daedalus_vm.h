@@ -73,7 +73,11 @@ extern "C" {
 #define DVM_X64_LOCAL_CALL_DEPTH 240
 #define DVM_X64_LOCAL_CALL_RET_BASE 248
 #define DVM_X64_LOCAL_IMAGE_BASE 504
-#define DVM_X64_LOCALS_REQUIRED 512
+#define DVM_X64_XMM_COUNT       16
+#define DVM_X64_XMM_LANES       2
+#define DVM_X64_LOCAL_XMM_BASE  512
+#define DVM_X64_XMM_STRIDE      16
+#define DVM_X64_LOCALS_REQUIRED 768
 
 #define DVM_X64_RFLAGS_CF (UINT64_C(1) << 0)
 #define DVM_X64_RFLAGS_PF (UINT64_C(1) << 2)
@@ -91,6 +95,7 @@ extern "C" {
 typedef struct DaedalusX64Context {
     uint64_t gpr[DVM_X64_GPR_COUNT];
     uint64_t rflags;
+    uint64_t xmm[DVM_X64_XMM_COUNT][DVM_X64_XMM_LANES];
 } DaedalusX64Context;
 
 /* Versions 3/4 include a separately relocated image base. Older descriptors
@@ -99,7 +104,7 @@ typedef struct DaedalusX64Context {
 #define DVM_X64_DESCRIPTOR_SIZE    24u
 #define DVM_X64_PAGED_DESCRIPTOR_VERSION 4u
 #define DVM_X64_PAGED_DESCRIPTOR_SIZE    40u
-#define DVM_X64_CONTEXT_SIZE       136u
+#define DVM_X64_CONTEXT_SIZE       392u
 
 typedef struct DaedalusX64Descriptor {
     uint32_t version;

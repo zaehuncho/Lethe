@@ -79,14 +79,22 @@ else + a **differential oracle** that proves every lift correct.
   effective-address evaluation order, and every defined `CF/PF/ZF/SF/OF`
   result are differential-checked. The native Win64 entry-thunk test executes
   both operations through an actual generated selected-function thunk.
+- **Cut 12** — legacy XMM0-XMM15 capture plus register-only `movd`, `movq`,
+  `movaps`, `movups`, `movdqa`, `movdqu`, `pxor`, `xorps`, and `xorpd`. Each
+  128-bit register occupies two 64-bit VM lanes. Directed and deterministic
+  fuzz cases compare the full XMM/GPR/flags state against Unicorn. Native-frame,
+  entry-thunk, plain, rolling, eager-pack, and memory-guard tests exercise
+  bytecode drawn from this bounded subset. XMM memory operands and VEX/EVEX
+  encodings remain fail-closed.
 
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, RIP-relative/segment memory, 8/16-bit
-shift/rotate, 16-bit `shld`/`shrd`, or two-/three-operand `imul`, high-8
-`AH/BH/CH/DH`, SIMD, string ops, and indirect/external branches.
+shift/rotate, 16-bit `shld`/`shrd`, high-8 `AH/BH/CH/DH`, XMM memory forms,
+SIMD/FP arithmetic, VEX/EVEX encodings, YMM/ZMM state, string ops, and
+indirect/external branches.
 
 ## Extending it (the fan-out contract)
 To add an instruction:
@@ -103,7 +111,8 @@ To add an instruction:
 The native VM exposes `daedalus_vm_exec_x64`, and `win64_thunk.py` emits a small
 descriptor-selecting entry shim backed by `daedalus_x64_enter_common`. The bridge
 captures the fixed 16-GPR + CF/PF/ZF/SF/OF frame, preserves the original entry RSP
-for stack arguments, restores Win64 nonvolatiles, and has MASM unwind metadata.
+for stack arguments, captures XMM0-XMM15 as two 64-bit lanes, restores the
+Win64 nonvolatile GPRs and XMM6-XMM15, and has MASM unwind metadata.
 The VM frame still exports CF/PF/ZF/SF/OF for lifted semantics, but physical Win64
 return flags are ABI-volatile and are not restored by the legal
 `add rsp,40; ret` epilogue. A nonzero VM HALT/status takes the generated

@@ -40,14 +40,23 @@ def _c_bytes(blob: bytes) -> str:
 
 def test_native_local_capacity_guard_matches_lifter_scratch_extent() -> None:
     header = (ROOT / "stub/src/daedalus_vm.h").read_text(encoding="utf-8")
-    assert lifter.LOCALS_NEEDED == 512
-    assert "#define DVM_X64_LOCALS_REQUIRED 512" in header
+    assert lifter.LOCALS_NEEDED == 768
+    assert "#define DVM_X64_LOCALS_REQUIRED 768" in header
     assert "#define DVM_X64_LOCAL_PF       232" in header
     assert "#define DVM_X64_LOCAL_IMAGE_BASE 504" in header
+    assert "#define DVM_X64_LOCAL_XMM_BASE  512" in header
 
 
 def _c_u64s(values: list[int]) -> str:
     return ", ".join(f"UINT64_C(0x{value:016X})" for value in values)
+
+
+def _c_xmms(values: list[int]) -> str:
+    return ", ".join(
+        "{ UINT64_C(0x%016X), UINT64_C(0x%016X) }"
+        % (value & ((1 << 64) - 1), value >> 64)
+        for value in values
+    )
 
 
 def _flag_mask(flags: dict[str, int]) -> int:
@@ -87,7 +96,8 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
         pytest.skip("CMake + the Visual Studio x64 toolchain are required")
 
     body = _asm(
-        "mov rax, rcx; imul rax, rdx; add rax, r8; xor r11d, r11d"
+        "movd xmm0, ecx; movd xmm15, edx; pxor xmm0, xmm15; "
+        "movd eax, xmm0; imul rax, r8; xor r11d, r11d"
     )
     blob = daedalus_asm.assemble(lifter.lift_function(body, base=oracle.BASE))
     rolling_blob = daedalus_rolling.pack_rolling_blob(
@@ -98,7 +108,13 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
         5, 0xB9, 0xBA, 0xBBBBBBBBBBBBBBBB,
         0xBC, 0xBD, 0xBE, 0xBF,
     ]
-    expected, flags, _ = oracle.run_unicorn(body, initial)
+    initial_xmm = [
+        ((index + 1) << 120) | (0x0102030405060708 * (index + 1))
+        for index in range(16)
+    ]
+    expected, flags, _, expected_xmm = oracle.run_unicorn_xmm(
+        body, initial, initial_xmm
+    )
 
     preserve_cf_body = _asm("inc rax")
     preserve_cf_blob = daedalus_asm.assemble(
@@ -147,9 +163,15 @@ static const uint8_t preserve_cf_program[] = {{ {_c_bytes(preserve_cf_blob)} }};
 
 int main(void)
 {{
-    const DaedalusX64Context initial = {{ {{ {_c_u64s(initial)} }}, UINT64_C(0x202) }};
+    const DaedalusX64Context initial = {{
+        {{ {_c_u64s(initial)} }}, UINT64_C(0x202),
+        {{ {_c_xmms(initial_xmm)} }}
+    }};
     DaedalusX64Context context = initial;
     const uint64_t expected[DVM_X64_GPR_COUNT] = {{ {_c_u64s(expected)} }};
+    const uint64_t expected_xmm[DVM_X64_XMM_COUNT][DVM_X64_XMM_LANES] = {{
+        {_c_xmms(expected_xmm)}
+    }};
     const uint8_t malformed[] = {{ 0x00, 0x00, 0xFF }};
     const uint8_t nonzero_halt[] = {{ 0x00, 0x00, 0x02, 0x01, 0x00 }};
     DaedalusX64Context snapshot;
@@ -162,6 +184,11 @@ int main(void)
     for (i = 0; i < DVM_X64_GPR_COUNT; i++) {{
         if (context.gpr[i] != expected[i])
             return 20 + (int)i;
+    }}
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {{
+        if (context.xmm[i][0] != expected_xmm[i][0]
+                || context.xmm[i][1] != expected_xmm[i][1])
+            return 70 + (int)i;
     }}
     if ((context.rflags & DVM_X64_RFLAGS_MASK)
             != UINT64_C(0x{_flag_mask(flags):X}))
@@ -178,6 +205,11 @@ int main(void)
     for (i = 0; i < DVM_X64_GPR_COUNT; i++) {{
         if (context.gpr[i] != expected[i])
             return 43 + (int)i;
+    }}
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {{
+        if (context.xmm[i][0] != expected_xmm[i][0]
+                || context.xmm[i][1] != expected_xmm[i][1])
+            return 90 + (int)i;
     }}
     if ((context.rflags & DVM_X64_RFLAGS_MASK)
             != UINT64_C(0x{_flag_mask(flags):X}))

@@ -1210,7 +1210,9 @@ def compile_virtualization_manifest(
             "unwind_materialized_and_registered": False,
             "whole_function_only": True,
             "xfg_function_hash_emitted": False,
-            "xmm_state_supported": False,
+            "xmm_register_state_captured": True,
+            "xmm_register_moves_and_xor_supported": True,
+            "simd_fp_arithmetic_supported": False,
             "return_address_shadow_validated": has_internal_calls,
         }
         if descriptor_version == DESCRIPTOR_VERSION_PAGED:
