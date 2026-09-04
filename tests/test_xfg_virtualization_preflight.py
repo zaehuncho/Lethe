@@ -62,6 +62,40 @@ def _xfg_callsite_hashes(
     return tuple(hashes)
 
 
+def _straight_line_leaf_size(
+    image: assemble._StubImage,
+    rva: int,
+    *,
+    limit: int = 96,
+) -> int:
+    """Return one decoded straight-line leaf extent ending at its first RET."""
+    from iced_x86 import Decoder, FlowControl
+
+    start_ip = image.image_base + rva
+    for instruction in Decoder(64, image.read_at_rva(rva, limit), ip=start_ip):
+        if instruction.flow_control == FlowControl.RETURN:
+            return instruction.next_ip - start_ip
+        assert instruction.flow_control == FlowControl.NEXT, (
+            f"selected fixture target at RVA 0x{rva:x} is not a straight-line leaf: "
+            f"{instruction}"
+        )
+    raise AssertionError(
+        f"selected fixture target at RVA 0x{rva:x} has no RET within {limit} bytes"
+    )
+
+
+def _exported_pointer_target_rva(
+    image: assemble._StubImage,
+    export_name: str,
+) -> tuple[int, int]:
+    slot_rva = image.find_export_rva(export_name)
+    assert slot_rva is not None
+    target_va = int.from_bytes(image.read_at_rva(slot_rva, 8), "little")
+    target_rva = target_va - image.image_base
+    assert image.section_containing(target_rva) is not None
+    return slot_rva, target_rva
+
+
 def _visual_studio_available() -> bool:
     if shutil.which("cl.exe"):
         return True
@@ -194,9 +228,45 @@ def real_msvc_xfg_dll_bundle(
     if os.name != "nt" or not shutil.which("cmake") or not _visual_studio_available():
         pytest.skip("CMake + the Visual Studio x64 toolchain are required")
     work = tmp_path_factory.mktemp("real-msvc-xfg-dll")
+    abi_header = work / "xfg_abi.h"
+    abi_header.write_text(
+        """
+#pragma once
+#include <emmintrin.h>
+
+typedef struct xfg_pair16 {
+    unsigned __int64 low;
+    unsigned __int64 high;
+} xfg_pair16;
+
+typedef union xfg_f32_word {
+    float value;
+    unsigned int bits;
+} xfg_f32_word;
+
+typedef union xfg_f64_word {
+    double value;
+    unsigned __int64 bits;
+} xfg_f64_word;
+
+typedef float (__cdecl *xfg_f32_bits_fn)(float, float, float);
+typedef double (__cdecl *xfg_f64_bits_fn)(
+    double, double, unsigned __int64);
+typedef float (__cdecl *xfg_mixed_bits_fn)(unsigned int, float, unsigned int, float);
+typedef __m128i (__vectorcall *xfg_v128x6_fn)(
+    __m128i, __m128i, __m128i, __m128i, __m128i, __m128i);
+typedef unsigned __int64 (__cdecl *xfg_pair_fold_fn)(
+    xfg_pair16, unsigned __int64);
+typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
+    unsigned __int64, unsigned __int64);
+""".lstrip(),
+        encoding="utf-8",
+    )
     dll_source = work / "xfg_dll.c"
     dll_source.write_text(
         """
+#include "xfg_abi.h"
+
 __declspec(dllexport) __declspec(noinline) int __cdecl xfg_i32(int value)
 {
     return value * 9 + 5;
@@ -247,6 +317,69 @@ __declspec(dllexport) __declspec(noinline) void __cdecl xfg_ptr_write(
     *destination = value ^ 0x0F1E2D3C4B5A6978ui64;
 }
 
+__declspec(dllexport) __declspec(noinline) float __cdecl xfg_f32_bits(
+    float first,
+    float second,
+    float third)
+{
+    __m128 result = _mm_xor_ps(_mm_set_ss(first), _mm_set_ss(second));
+    result = _mm_xor_ps(result, _mm_set_ss(third));
+    return _mm_cvtss_f32(result);
+}
+
+__declspec(dllexport) __declspec(noinline) double __cdecl xfg_f64_bits(
+    double first,
+    double second,
+    unsigned __int64 mask)
+{
+    __m128d result = _mm_xor_pd(_mm_set_sd(first), _mm_set_sd(second));
+    __m128i integer_mask = _mm_cvtsi64_si128((__int64)mask);
+    result = _mm_xor_pd(result, _mm_castsi128_pd(integer_mask));
+    return _mm_cvtsd_f64(result);
+}
+
+__declspec(dllexport) __declspec(noinline) float __cdecl xfg_mixed_bits(
+    unsigned int first,
+    float second,
+    unsigned int third,
+    float fourth)
+{
+    __m128 result = _mm_xor_ps(_mm_set_ss(second), _mm_set_ss(fourth));
+    __m128i integer_mask = _mm_cvtsi32_si128((int)(first ^ third));
+    result = _mm_xor_ps(result, _mm_castsi128_ps(integer_mask));
+    return _mm_cvtss_f32(result);
+}
+
+__declspec(noinline) __m128i __vectorcall xfg_v128x6(
+    __m128i first,
+    __m128i second,
+    __m128i third,
+    __m128i fourth,
+    __m128i fifth,
+    __m128i sixth)
+{
+    __m128i result = _mm_xor_si128(first, second);
+    result = _mm_xor_si128(result, third);
+    result = _mm_xor_si128(result, fourth);
+    result = _mm_xor_si128(result, fifth);
+    return _mm_xor_si128(result, sixth);
+}
+
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_pair_fold(
+    xfg_pair16 value,
+    unsigned __int64 salt)
+{
+    return value.low ^ value.high ^ salt;
+}
+
+__declspec(dllexport) __declspec(noinline) xfg_pair16 __cdecl xfg_pair_make(
+    unsigned __int64 low,
+    unsigned __int64 high)
+{
+    xfg_pair16 result = { low, high };
+    return result;
+}
+
 typedef int (__cdecl *xfg_i32_fn)(int);
 typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
 typedef int (__cdecl *xfg_i32x3_fn)(int, int, int);
@@ -268,12 +401,49 @@ __declspec(dllexport) xfg_noargs_fn volatile selected_xfg_noargs = xfg_noargs;
 __declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = xfg_u64x6;
 __declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = xfg_ptr_read;
 __declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = xfg_ptr_write;
+__declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = xfg_f32_bits;
+__declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = xfg_f64_bits;
+__declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_mixed_bits;
+__declspec(dllexport) xfg_v128x6_fn volatile selected_xfg_v128x6 = xfg_v128x6;
+__declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = xfg_pair_fold;
+__declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = xfg_pair_make;
 
 __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
 {
     const unsigned int input[2] = { 13u, 29u };
     unsigned __int64 written = 0;
+    xfg_f32_word f32_first;
+    xfg_f32_word f32_second;
+    xfg_f32_word f32_third;
+    xfg_f32_word f32_result;
+    xfg_f64_word f64_first;
+    xfg_f64_word f64_second;
+    xfg_f64_word f64_result;
+    xfg_pair16 pair_value;
+    xfg_pair16 pair_result;
+    __m128i vector_first = _mm_set_epi32(1, 2, 3, 4);
+    __m128i vector_second = _mm_set_epi32(5, 6, 7, 8);
+    __m128i vector_third = _mm_set_epi32(9, 10, 11, 12);
+    __m128i vector_fourth = _mm_set_epi32(13, 14, 15, 16);
+    __m128i vector_fifth = _mm_set_epi32(17, 18, 19, 20);
+    __m128i vector_sixth = _mm_set_epi32(21, 22, 23, 24);
+    __m128i vector_expected;
+    __m128i vector_result;
     int ok = selected_xfg_i32(41) == 374;
+
+    f32_first.bits = 0x3F800000u;
+    f32_second.bits = 0x80000000u;
+    f32_third.bits = 0x00800000u;
+    f64_first.bits = 0x3FF0000000000000ui64;
+    f64_second.bits = 0x8000000000000000ui64;
+    pair_value.low = 0x1122334455667788ui64;
+    pair_value.high = 0x8877665544332211ui64;
+    vector_expected = _mm_xor_si128(vector_first, vector_second);
+    vector_expected = _mm_xor_si128(vector_expected, vector_third);
+    vector_expected = _mm_xor_si128(vector_expected, vector_fourth);
+    vector_expected = _mm_xor_si128(vector_expected, vector_fifth);
+    vector_expected = _mm_xor_si128(vector_expected, vector_sixth);
+
     ok = ok && selected_xfg_u64(
         0x1122334455667788ui64,
         0x8877665544332211ui64)
@@ -289,6 +459,27 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     selected_xfg_ptr_write(&written, 0x8877665544332211ui64);
     ok = ok && written
         == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
+    f32_result.value = selected_xfg_f32_bits(
+        f32_first.value, f32_second.value, f32_third.value);
+    ok = ok && f32_result.bits == 0xBF000000u;
+    f64_result.value = selected_xfg_f64_bits(
+        f64_first.value, f64_second.value, 0x0018000000000000ui64);
+    ok = ok && f64_result.bits == 0xBFE8000000000000ui64;
+    f32_result.value = selected_xfg_mixed_bits(
+        0x13579BDFu, f32_first.value, 0x2468ACE0u, f32_second.value);
+    ok = ok && f32_result.bits == 0x88BF373Fu;
+    vector_result = selected_xfg_v128x6(
+        vector_first, vector_second, vector_third,
+        vector_fourth, vector_fifth, vector_sixth);
+    ok = ok && _mm_movemask_epi8(
+        _mm_cmpeq_epi8(vector_result, vector_expected)) == 0xFFFF;
+    ok = ok && selected_xfg_pair_fold(
+        pair_value, 0x0F1E2D3C4B5A6978ui64)
+        == (pair_value.low ^ pair_value.high ^ 0x0F1E2D3C4B5A6978ui64);
+    pair_result = selected_xfg_pair_make(
+        0x1020304050607080ui64, 0x8877665544332211ui64);
+    ok = ok && pair_result.low == 0x1020304050607080ui64;
+    ok = ok && pair_result.high == 0x8877665544332211ui64;
     return ok;
 }
 """.lstrip(),
@@ -298,6 +489,7 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     host_source.write_text(
         """
 #include <windows.h>
+#include "xfg_abi.h"
 
 typedef int (__cdecl *xfg_i32_fn)(int);
 typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
@@ -324,9 +516,33 @@ static int run_once(const char *path)
     xfg_u64x6_fn u64x6;
     xfg_ptr_read_fn ptr_read;
     xfg_ptr_write_fn ptr_write;
+    xfg_f32_bits_fn f32_bits;
+    xfg_f64_bits_fn f64_bits;
+    xfg_mixed_bits_fn mixed_bits;
+    xfg_v128x6_fn v128x6;
+    xfg_v128x6_fn volatile *v128x6_slot;
+    xfg_pair_fold_fn pair_fold;
+    xfg_pair_make_fn pair_make;
     xfg_run_all_fn run_all;
     const unsigned int input[2] = { 13u, 29u };
     unsigned __int64 written = 0;
+    xfg_f32_word f32_first;
+    xfg_f32_word f32_second;
+    xfg_f32_word f32_third;
+    xfg_f32_word f32_result;
+    xfg_f64_word f64_first;
+    xfg_f64_word f64_second;
+    xfg_f64_word f64_result;
+    xfg_pair16 pair_value;
+    xfg_pair16 pair_result;
+    __m128i vector_first = _mm_set_epi32(1, 2, 3, 4);
+    __m128i vector_second = _mm_set_epi32(5, 6, 7, 8);
+    __m128i vector_third = _mm_set_epi32(9, 10, 11, 12);
+    __m128i vector_fourth = _mm_set_epi32(13, 14, 15, 16);
+    __m128i vector_fifth = _mm_set_epi32(17, 18, 19, 20);
+    __m128i vector_sixth = _mm_set_epi32(21, 22, 23, 24);
+    __m128i vector_expected;
+    __m128i vector_result;
     int ok;
     if (module == NULL) {
         return 10;
@@ -338,13 +554,35 @@ static int run_once(const char *path)
     u64x6 = (xfg_u64x6_fn)GetProcAddress(module, "xfg_u64x6");
     ptr_read = (xfg_ptr_read_fn)GetProcAddress(module, "xfg_ptr_read");
     ptr_write = (xfg_ptr_write_fn)GetProcAddress(module, "xfg_ptr_write");
+    f32_bits = (xfg_f32_bits_fn)GetProcAddress(module, "xfg_f32_bits");
+    f64_bits = (xfg_f64_bits_fn)GetProcAddress(module, "xfg_f64_bits");
+    mixed_bits = (xfg_mixed_bits_fn)GetProcAddress(module, "xfg_mixed_bits");
+    v128x6_slot = (xfg_v128x6_fn volatile *)GetProcAddress(
+        module, "selected_xfg_v128x6");
+    v128x6 = v128x6_slot == NULL ? NULL : *v128x6_slot;
+    pair_fold = (xfg_pair_fold_fn)GetProcAddress(module, "xfg_pair_fold");
+    pair_make = (xfg_pair_make_fn)GetProcAddress(module, "xfg_pair_make");
     run_all = (xfg_run_all_fn)GetProcAddress(module, "xfg_run_all");
     if (i32 == NULL || u64 == NULL || i32x3 == NULL || noargs == NULL ||
         u64x6 == NULL || ptr_read == NULL || ptr_write == NULL ||
+        f32_bits == NULL || f64_bits == NULL || mixed_bits == NULL ||
+        v128x6 == NULL || pair_fold == NULL || pair_make == NULL ||
         run_all == NULL) {
         FreeLibrary(module);
         return 11;
     }
+    f32_first.bits = 0x3F800000u;
+    f32_second.bits = 0x80000000u;
+    f32_third.bits = 0x00800000u;
+    f64_first.bits = 0x3FF0000000000000ui64;
+    f64_second.bits = 0x8000000000000000ui64;
+    pair_value.low = 0x1122334455667788ui64;
+    pair_value.high = 0x8877665544332211ui64;
+    vector_expected = _mm_xor_si128(vector_first, vector_second);
+    vector_expected = _mm_xor_si128(vector_expected, vector_third);
+    vector_expected = _mm_xor_si128(vector_expected, vector_fourth);
+    vector_expected = _mm_xor_si128(vector_expected, vector_fifth);
+    vector_expected = _mm_xor_si128(vector_expected, vector_sixth);
     ok = i32(41) == 374;
     ok = ok && u64(0x1122334455667788ui64, 0x8877665544332211ui64)
         == (((0x1122334455667788ui64 << 3) + 0x1122334455667788ui64)
@@ -357,6 +595,26 @@ static int run_once(const char *path)
     ptr_write(&written, 0x8877665544332211ui64);
     ok = ok && written
         == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
+    f32_result.value = f32_bits(
+        f32_first.value, f32_second.value, f32_third.value);
+    ok = ok && f32_result.bits == 0xBF000000u;
+    f64_result.value = f64_bits(
+        f64_first.value, f64_second.value, 0x0018000000000000ui64);
+    ok = ok && f64_result.bits == 0xBFE8000000000000ui64;
+    f32_result.value = mixed_bits(
+        0x13579BDFu, f32_first.value, 0x2468ACE0u, f32_second.value);
+    ok = ok && f32_result.bits == 0x88BF373Fu;
+    vector_result = v128x6(
+        vector_first, vector_second, vector_third,
+        vector_fourth, vector_fifth, vector_sixth);
+    ok = ok && _mm_movemask_epi8(
+        _mm_cmpeq_epi8(vector_result, vector_expected)) == 0xFFFF;
+    ok = ok && pair_fold(pair_value, 0x0F1E2D3C4B5A6978ui64)
+        == (pair_value.low ^ pair_value.high ^ 0x0F1E2D3C4B5A6978ui64);
+    pair_result = pair_make(
+        0x1020304050607080ui64, 0x8877665544332211ui64);
+    ok = ok && pair_result.low == 0x1020304050607080ui64;
+    ok = ok && pair_result.high == 0x8877665544332211ui64;
     ok = ok && run_all() == 1;
     if (!FreeLibrary(module)) {
         return 12;
@@ -737,21 +995,36 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_u64x6",
         "xfg_ptr_read",
         "xfg_ptr_write",
+        "xfg_f32_bits",
+        "xfg_f64_bits",
+        "xfg_mixed_bits",
+        "xfg_v128x6",
+        "xfg_pair_fold",
+        "xfg_pair_make",
+    )
+    vector_slot_rva, vector_target_rva = _exported_pointer_target_rva(
+        source_image, "selected_xfg_v128x6"
     )
     specs: list[virtualization_plan.FunctionSpec] = []
     for name in names:
-        target_rva = source_image.find_export_rva(name)
-        assert target_rva is not None
-        ret_offset = source_image.read_at_rva(target_rva, 64).find(b"\xC3")
-        assert ret_offset >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
+        if name == "xfg_v128x6":
+            target_rva = vector_target_rva
+        else:
+            target_rva = source_image.find_export_rva(name)
+            assert target_rva is not None
+        target_size = _straight_line_leaf_size(source_image, target_rva)
+        assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
         specs.append(
-            virtualization_plan.FunctionSpec(name, target_rva, ret_offset + 1)
+            virtualization_plan.FunctionSpec(name, target_rva, target_size)
         )
     parsed = pe_analyze.analyze_pe(str(dll))
     assert parsed.is_dll is True
     assert parsed.load_config is not None
     assert parsed.load_config.guard_flags & 0x00800000
     assert parsed.load_config.xfg_present is True
+    assert vector_slot_rva in {
+        relocation.target_rva for relocation in parsed.dir64_relocations
+    }
     run_all_rva = source_image.find_export_rva("xfg_run_all")
     assert run_all_rva is not None
     run_all_runtime = next(
@@ -835,6 +1108,17 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
     assert materialized.parsed.load_config == parsed.load_config
     assert materialized.parsed.generated_cfg_targets == ()
     assert len(materialized.manifest.functions) == len(specs)
+    materialized_vector_slot = pe_analyze._slice_at_rva(
+        materialized.parsed.sections,
+        vector_slot_rva,
+        8,
+        what="materialized vectorcall selected-function slot",
+    )
+    assert (
+        int.from_bytes(materialized_vector_slot, "little")
+        - materialized.parsed.image_base
+        == vector_target_rva
+    )
     thunk_rvas: set[int] = set()
     functions_by_name = {
         function.name: function

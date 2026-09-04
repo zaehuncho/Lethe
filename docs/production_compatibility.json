@@ -239,7 +239,7 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and seven real DLL GPR-class ABI shapes pass natively with XFG call-site type hashes preserved byte-exact through materialization; floating-point, vector, aggregate ABI signatures and clean-VM compatibility evidence remain incomplete.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and thirteen real DLL ABI shapes pass natively with XFG call-site type hashes preserved byte-exact through materialization; SIMD/FP arithmetic, XMM memory forms, extended vector/HVA/HFA and broader aggregate signatures, cross-toolchain compatibility, and clean-VM XFG enforcement remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and seven DLL GPR-class ABI shapes with arities 0, 1, 2, 3, and 6, including fifth/sixth stack arguments, pointer loads/stores, and a void return; each distinct caller XFG type hash is structurally paired with the XFG dispatch call and remains byte-exact through materialization, direct-only virtualized thunks retain native parity without thunk GFIDs, and forged generated-GFID paths are rejected before output."
+          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and thirteen DLL ABI shapes: seven GPR-class signatures plus scalar float transport, mixed scalar-double/GPR transport, mixed ordinal GPR/XMM arguments, six-register __vectorcall __m128i transport, a 16-byte by-value aggregate, and a 16-byte hidden-sret return. Each distinct DLL caller XFG type hash is structurally paired with the XFG dispatch call and remains byte-exact through materialization; direct-only virtualized thunks retain internal and external-host packed parity without thunk GFIDs, while forged generated-GFID paths are rejected before output. Coverage is limited to the emitted legacy register move/XOR and GPR load/store bodies."
         }
       ]
     },
@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit bounded function subset is liftable; legacy register-only XMM moves and bitwise XOR are covered, while XMM memory forms, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing and legacy register-only XMM moves/bitwise XOR are covered, while header/gap/executable/discardable/address-taken RIP targets, XMM memory forms, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -287,6 +287,11 @@
           "claim": "Legacy register-only MOVD/MOVQ, 128-bit MOVAPS/MOVUPS/MOVDQA/MOVDQU, and PXOR/XORPS/XORPD match Unicorn across all XMM lanes and preserve requested GPR/flag state; memory, VEX/EVEX, and SIMD/FP arithmetic forms fail closed."
         },
         {
+          "type": "pytest",
+          "path": "tests/test_lifter_rip_relative.py",
+          "claim": "Mapped non-executable RIP-relative LEA and scalar 8/16/32/64-bit data accesses resolve as runtime image base plus decoded target RVA and match Unicorn after relocation; missing geometry, permissions, header/gap/cross-section/executable/discardable/selected-extent targets, segment overrides, indirect control, and XMM/VEX memory forms fail closed."
+        },
+        {
           "type": "native-pytest",
           "path": "tests/test_lifter_win64_thunk.py",
           "claim": "The Win64 bridge captures volatile XMM arguments, transports an XMM0 return, restores XMM6-XMM15, and executes the bounded XMM subset through plain and rolling entry-thunk paths."
@@ -294,7 +299,7 @@
         {
           "type": "native-pytest",
           "path": "tests/test_native_virtualization_runtime.py",
-          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bytecode from the bounded XMM subset."
+          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative load/store/LEA bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata."
         }
       ]
     },
