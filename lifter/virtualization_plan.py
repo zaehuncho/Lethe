@@ -473,6 +473,7 @@ class VirtualizedFunction:
     capabilities: dict[str, bool]
     internal_call_rvas: tuple[int, ...]
     max_internal_call_depth: int
+    rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -505,6 +506,9 @@ class VirtualizedFunction:
             "capabilities": dict(sorted(self.capabilities.items())),
             "internal_call_rvas": list(self.internal_call_rvas),
             "max_internal_call_depth": self.max_internal_call_depth,
+            "rip_relative_references": [
+                reference.to_dict() for reference in self.rip_relative_references
+            ],
         }
 
 
@@ -570,6 +574,7 @@ class _Compiled:
     descriptor_symbol: str
     thunk_asm: str
     call_analysis: x64_lifter.InternalCallAnalysis
+    rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...]
     program_id: bytes = b""
 
 
@@ -907,6 +912,8 @@ def _compile_one(
     rolling: bool,
     rolling_seed: bytes | None,
     opcode_table: OpcodeTable,
+    image_sections: Sequence[Any] | None,
+    selected_extents: Sequence[tuple[int, int]],
 ) -> _Compiled:
     try:
         original = bytes(reader.read_file_backed_executable(spec.rva, spec.size))
@@ -922,7 +929,18 @@ def _compile_one(
     _decode_exact(spec, original)
     try:
         call_analysis = x64_lifter.analyze_internal_calls(original, base=spec.rva)
-        assembly = x64_lifter.lift_function(original, base=spec.rva)
+        rip_relative_references = x64_lifter.validate_rip_relative_references(
+            original,
+            base=spec.rva,
+            image_sections=image_sections,
+            selected_extents=selected_extents,
+        )
+        assembly = x64_lifter.lift_function(
+            original,
+            base=spec.rva,
+            image_sections=image_sections,
+            selected_extents=selected_extents,
+        )
         program = daedalus_asm.assemble(
             assembly, opcodes=opcode_table.assembler_mapping()
         )
@@ -956,6 +974,7 @@ def _compile_one(
         descriptor_symbol=descriptor_symbol,
         thunk_asm=win64_thunk.render_entry_thunk(thunk_symbol, descriptor_symbol),
         call_analysis=call_analysis,
+        rip_relative_references=rip_relative_references,
     )
 
 
@@ -1051,6 +1070,8 @@ def compile_virtualization_manifest(
             "authenticated page envelopes are incompatible with rolling programs"
         )
 
+    image_sections = getattr(reader, "sections", None)
+    selected_extents = tuple((spec.rva, spec.size) for spec in ordered)
     compiled = tuple(
         _compile_one(
             spec,
@@ -1058,6 +1079,8 @@ def compile_virtualization_manifest(
             rolling=rolling,
             rolling_seed=rolling_seed,
             opcode_table=opcode_table,
+            image_sections=image_sections,
+            selected_extents=selected_extents,
         )
         for spec in ordered
     )
@@ -1214,6 +1237,7 @@ def compile_virtualization_manifest(
             "xmm_register_moves_and_xor_supported": True,
             "simd_fp_arithmetic_supported": False,
             "return_address_shadow_validated": has_internal_calls,
+            "rip_relative_data_addressing_supported": True,
         }
         if descriptor_version == DESCRIPTOR_VERSION_PAGED:
             capabilities["authenticated_bytecode_paging"] = True
@@ -1261,6 +1285,7 @@ def compile_virtualization_manifest(
                 capabilities=capabilities,
                 internal_call_rvas=item.call_analysis.internal_call_rvas,
                 max_internal_call_depth=item.call_analysis.max_call_depth,
+                rip_relative_references=item.rip_relative_references,
             )
         )
 

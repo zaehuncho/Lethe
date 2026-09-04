@@ -36,8 +36,10 @@ from iced_x86 import (
     Decoder,
     EncodingKind,
     FlowControl,
+    InstructionInfoFactory,
     MemorySizeExt,
     Mnemonic,
+    OpAccess,
     OpKind,
     Register,
 )
@@ -111,6 +113,11 @@ MASK16 = (1 << 16) - 1
 SIGN16 = 15
 MASK8 = (1 << 8) - 1
 SIGN8 = 7
+_RVA_LIMIT = 1 << 32
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_SCN_MEM_READ = 0x40000000
+IMAGE_SCN_MEM_WRITE = 0x80000000
+IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 
 
 def _width_mask(width: int) -> int:
@@ -130,6 +137,40 @@ def _width_signbit(width: int) -> int:
 class LiftUnsupported(Exception):
     """Raised when an instruction/operand cannot be faithfully lifted; the packer
     then leaves the whole function native."""
+
+
+def _require_rip_memory_base(instruction) -> None:
+    """Reject address-size-overridden EIP-relative forms before rebasing."""
+    if instruction.memory_base == Register.RIP:
+        return
+    if instruction.memory_base == Register.EIP:
+        raise LiftUnsupported(
+            f"address-size-overridden EIP-relative memory operand at "
+            f"0x{instruction.ip:X}"
+        )
+    raise LiftUnsupported(
+        f"IP-relative memory operand at 0x{instruction.ip:X} is not RIP-relative"
+    )
+
+
+@dataclass(frozen=True)
+class RipRelativeReference:
+    """One decoded RIP-relative reference expressed entirely in RVAs."""
+
+    instruction_rva: int
+    target_rva: int
+    size: int
+    access: str
+    address_only: bool
+
+    def to_dict(self) -> dict[str, int | str | bool]:
+        return {
+            "instruction_rva": self.instruction_rva,
+            "target_rva": self.target_rva,
+            "size": self.size,
+            "access": self.access,
+            "address_only": self.address_only,
+        }
 
 
 @dataclass(frozen=True)
@@ -932,14 +973,19 @@ class _Lifter:
 
     def _emit_effective_address(self, instr) -> None:
         """Push the effective address of the instruction's memory operand.
-        Used by memory load (push_operand) and store (_mov). Bails on
-        RIP-relative, segment overrides, or a non-64-bit base/index (32-bit
-        addressing computes mod 2^32, which our 64-bit arithmetic would not
-        reproduce)."""
-        if instr.is_ip_rel_memory_operand:
-            raise LiftUnsupported("RIP-relative memory operand")
+        Used by memory load (push_operand) and store (_mov). RIP-relative
+        operands are decoded at their source RVA and rebased through the
+        runtime image-base local. Other forms bail on segment overrides or a
+        non-64-bit base/index (32-bit addressing computes mod 2^32, which our
+        64-bit arithmetic would not reproduce)."""
         if instr.segment_prefix != Register.NONE:
             raise LiftUnsupported("segment-overridden memory operand")
+        if instr.is_ip_rel_memory_operand:
+            _require_rip_memory_base(instr)
+            self.rd_local(IMAGE_BASE)
+            self.push_imm(instr.ip_rel_memory_address)
+            self.a("add")
+            return
         base = instr.memory_base
         index = instr.memory_index
         scale = instr.memory_index_scale
@@ -961,10 +1007,15 @@ class _Lifter:
         dst, width = self.require_reg(instr, 0)
         if instr.op_kind(1) != OpKind.MEMORY:
             raise LiftUnsupported("lea without a memory operand")
-        if instr.is_ip_rel_memory_operand:
-            raise LiftUnsupported("lea RIP-relative memory")
         if instr.segment_prefix != Register.NONE:
             raise LiftUnsupported("lea with a segment override")
+        if instr.is_ip_rel_memory_operand:
+            _require_rip_memory_base(instr)
+            self.rd_local(IMAGE_BASE)
+            self.push_imm(instr.ip_rel_memory_address)
+            self.a("add")
+            self.wr_reg(dst)
+            return
         base = instr.memory_base
         index = instr.memory_index
         scale = instr.memory_index_scale
@@ -1420,6 +1471,196 @@ def _decode_exact(code: bytes, base: int):
     return instructions
 
 
+def _rip_access(instruction, operand: int) -> tuple[str, bool]:
+    access = InstructionInfoFactory().info(instruction).op_access(operand)
+    if access in (OpAccess.READ, OpAccess.COND_READ):
+        return "read", False
+    if access in (OpAccess.WRITE, OpAccess.COND_WRITE):
+        return "write", False
+    if access in (OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE):
+        return "read_write", False
+    if access == OpAccess.NO_MEM_ACCESS and instruction.mnemonic == Mnemonic.LEA:
+        return "address", True
+    raise LiftUnsupported(
+        f"unmodeled RIP-relative operand access at 0x{instruction.ip:X}"
+    )
+
+
+def analyze_rip_relative_references(
+    code: bytes, base: int = 0x1000
+) -> tuple[RipRelativeReference, ...]:
+    """Decode RIP-relative references as RVAs, without granting memory access."""
+    instructions = _decode_exact(code, base)
+    references = []
+    for instruction in instructions:
+        if not instruction.is_ip_rel_memory_operand:
+            continue
+        _require_rip_memory_base(instruction)
+        if not 0 <= instruction.ip < _RVA_LIMIT:
+            raise LiftUnsupported("RIP-relative source address is not a 32-bit RVA")
+        target = int(instruction.ip_rel_memory_address)
+        if not 0 <= target < _RVA_LIMIT:
+            raise LiftUnsupported(
+                f"RIP-relative target at 0x{instruction.ip:X} is not a 32-bit RVA"
+            )
+        operands = [
+            index
+            for index in range(instruction.op_count)
+            if instruction.op_kind(index) == OpKind.MEMORY
+        ]
+        if len(operands) != 1:
+            raise LiftUnsupported(
+                f"RIP-relative instruction at 0x{instruction.ip:X} does not have "
+                "one explicit memory operand"
+            )
+        access, address_only = _rip_access(instruction, operands[0])
+        if address_only:
+            size = 1
+        else:
+            try:
+                size = int(MemorySizeExt.size(instruction.memory_size))
+            except (TypeError, ValueError) as exc:
+                raise LiftUnsupported(
+                    f"RIP-relative memory operand at 0x{instruction.ip:X} "
+                    "has no byte width"
+                ) from exc
+            if size <= 0:
+                raise LiftUnsupported(
+                    f"RIP-relative memory operand at 0x{instruction.ip:X} "
+                    "has no byte width"
+                )
+        if target + size > _RVA_LIMIT:
+            raise LiftUnsupported(
+                f"RIP-relative span at 0x{instruction.ip:X} exceeds the 32-bit RVA space"
+            )
+        references.append(
+            RipRelativeReference(
+                instruction_rva=int(instruction.ip),
+                target_rva=target,
+                size=size,
+                access=access,
+                address_only=address_only,
+            )
+        )
+    return tuple(references)
+
+
+def validate_rip_relative_references(
+    code: bytes,
+    base: int = 0x1000,
+    *,
+    image_sections=None,
+    selected_extents=(),
+) -> tuple[RipRelativeReference, ...]:
+    """Prove every RIP reference is bounded mapped non-code image data."""
+    references = analyze_rip_relative_references(code, base)
+    if not references:
+        return ()
+    if image_sections is None:
+        raise LiftUnsupported(
+            "RIP-relative references require mapped image-section geometry"
+        )
+    try:
+        raw_sections = sorted(tuple(image_sections), key=lambda item: int(item.rva))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise LiftUnsupported("invalid mapped image-section geometry") from exc
+    sections = []
+    previous_end = 0
+    for section in raw_sections:
+        try:
+            section_rva = int(section.rva)
+            mapped_size = max(int(section.virtual_size), len(bytes(section.raw)))
+            characteristics = int(section.characteristics)
+            name = str(section.name)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LiftUnsupported("invalid mapped image-section geometry") from exc
+        section_end = section_rva + mapped_size
+        if (
+            section_rva <= 0
+            or mapped_size <= 0
+            or section_end > _RVA_LIMIT
+            or section_rva < previous_end
+        ):
+            raise LiftUnsupported("invalid or overlapping mapped image sections")
+        sections.append(
+            (section_rva, section_end, characteristics, name)
+        )
+        previous_end = section_end
+    extents = tuple(selected_extents)
+    for reference in references:
+        target_end = reference.target_rva + reference.size
+        owner = next(
+            (
+                section
+                for section in sections
+                if section[0] <= reference.target_rva and target_end <= section[1]
+            ),
+            None,
+        )
+        if owner is None:
+            raise LiftUnsupported(
+                f"RIP-relative reference at 0x{reference.instruction_rva:X} "
+                f"targets an unmapped/header/cross-section span at "
+                f"RVA 0x{reference.target_rva:X}+0x{reference.size:X}"
+            )
+        for extent in extents:
+            try:
+                extent_rva, extent_size = int(extent[0]), int(extent[1])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise LiftUnsupported(
+                    "invalid selected-function extent geometry"
+                ) from exc
+            extent_end = extent_rva + extent_size
+            if (
+                extent_rva <= 0
+                or extent_size <= 0
+                or extent_end > _RVA_LIMIT
+            ):
+                raise LiftUnsupported("invalid selected-function extent geometry")
+            if extent_rva < target_end and reference.target_rva < extent_end:
+                raise LiftUnsupported(
+                    f"RIP-relative reference at 0x{reference.instruction_rva:X} "
+                    f"to RVA 0x{reference.target_rva:X} overlaps selected "
+                    f"extent RVA 0x{extent_rva:X}+0x{extent_size:X}"
+                )
+        characteristics = owner[2]
+        owner_name = owner[3]
+        if characteristics & IMAGE_SCN_MEM_DISCARDABLE:
+            raise LiftUnsupported(
+                f"RIP-relative reference at 0x{reference.instruction_rva:X} "
+                f"targets discardable section {owner_name!r} at "
+                f"RVA 0x{reference.target_rva:X}"
+            )
+        if characteristics & IMAGE_SCN_MEM_EXECUTE:
+            kind = (
+                "address-taken executable code"
+                if reference.address_only
+                else "executable bytes"
+            )
+            raise LiftUnsupported(
+                f"RIP-relative reference at 0x{reference.instruction_rva:X} "
+                f"targets {kind} at RVA 0x{reference.target_rva:X} "
+                f"in section {owner_name!r}"
+            )
+        if reference.access in ("read", "read_write") and not (
+            characteristics & IMAGE_SCN_MEM_READ
+        ):
+            raise LiftUnsupported(
+                f"RIP-relative read at 0x{reference.instruction_rva:X} targets "
+                f"RVA 0x{reference.target_rva:X} in non-readable section "
+                f"{owner_name!r}"
+            )
+        if reference.access in ("write", "read_write") and not (
+            characteristics & IMAGE_SCN_MEM_WRITE
+        ):
+            raise LiftUnsupported(
+                f"RIP-relative write at 0x{reference.instruction_rva:X} targets "
+                f"RVA 0x{reference.target_rva:X} in non-writable section "
+                f"{owner_name!r}"
+            )
+    return references
+
+
 def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAnalysis:
     """Prove finite in-extent CALL/RET contexts and classify every RET."""
     instruction_by_ip = {instruction.ip: instruction for instruction in instructions}
@@ -1527,8 +1768,22 @@ def analyze_internal_calls(code: bytes, base: int = 0x1000) -> InternalCallAnaly
     return _analyze_internal_calls(instructions, base, base + len(code))
 
 
-def lift_function(code: bytes, base: int = 0x1000) -> str:
+def lift_function(
+    code: bytes,
+    base: int = 0x1000,
+    *,
+    image_sections=None,
+    selected_extents=(),
+) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
-    `base` is the virtual address the code is decoded at (for branch targets)."""
+    ``base`` is a source RVA. RIP-relative references require mapped section
+    geometry and are emitted as ``runtime IMAGE_BASE + decoded target RVA``.
+    """
+    validate_rip_relative_references(
+        code,
+        base,
+        image_sections=image_sections,
+        selected_extents=selected_extents,
+    )
     return _Lifter(code, base).lift()

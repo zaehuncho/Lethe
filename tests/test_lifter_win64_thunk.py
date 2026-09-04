@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,6 +176,26 @@ def test_generated_thunk_matches_native_leaf(
     xmm_return_program = daedalus_asm.assemble(
         x64_lifter.lift_function(_asm("movaps xmm0, xmm1"), base=0x1000)
     )
+    rip_body = bytes(
+        _KS.asm("mov rax, qword ptr [rip - 0x1007]", addr=0x2000)[0]
+    )
+    rip_program = daedalus_asm.assemble(
+        x64_lifter.lift_function(
+            rip_body,
+            base=0x2000,
+            image_sections=(
+                SimpleNamespace(
+                    name=".data", rva=0x1000, virtual_size=8,
+                    raw=bytes(8), characteristics=0xC0000040,
+                ),
+                SimpleNamespace(
+                    name=".text", rva=0x2000, virtual_size=len(rip_body),
+                    raw=rip_body, characteristics=0x60000020,
+                ),
+            ),
+            selected_extents=((0x2000, len(rip_body)),),
+        )
+    )
     if rolling:
         xmm_program = daedalus_rolling.pack_rolling_blob(
             xmm_program, bytes.fromhex("ffeeddccbbaa99887766554433221100")
@@ -182,6 +203,9 @@ def test_generated_thunk_matches_native_leaf(
         xmm_return_program = daedalus_rolling.pack_rolling_blob(
             xmm_return_program,
             bytes.fromhex("00112233445566778899aabbccddeeff"),
+        )
+        rip_program = daedalus_rolling.pack_rolling_blob(
+            rip_program, bytes.fromhex("aabbccddeeff00112233445566778899")
         )
 
     harness = f"""
@@ -235,6 +259,8 @@ static const uint8_t virtual_xmm_program[] = {{ {_c_bytes(xmm_program)} }};
 static const uint8_t virtual_xmm_return_program[] = {{
     {_c_bytes(xmm_return_program)}
 }};
+static const uint8_t virtual_rip_program[] = {{ {_c_bytes(rip_program)} }};
+static uint64_t virtual_rip_data = UINT64_C(0x123456789ABCDEF0);
 static const uint8_t nonzero_program[] = {{ 0x00, 0x00, 0x02, 0x01, 0x00 }};
 
 const DaedalusX64Descriptor virtual_descriptor = {{
@@ -261,6 +287,12 @@ const DaedalusX64Descriptor virtual_xmm_return_descriptor = {{
     virtual_xmm_return_program,
     virtual_xmm_return_program
 }};
+DaedalusX64Descriptor virtual_rip_descriptor = {{
+    DVM_X64_DESCRIPTOR_VERSION,
+    (uint32_t)sizeof(virtual_rip_program),
+    virtual_rip_program,
+    NULL
+}};
 const DaedalusX64Descriptor zero_base_descriptor = {{
     DVM_X64_DESCRIPTOR_VERSION,
     (uint32_t)sizeof(virtual_program),
@@ -277,6 +309,7 @@ uint64_t virtual_leaf(uint64_t a, uint64_t b, uint64_t c,
                       uint64_t d, uint64_t e);
 uint64_t virtual_xmm(double a, double b);
 double virtual_xmm_return(double a, double b);
+uint64_t virtual_rip(void);
 uint64_t virtual_failure(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e);
 uint64_t virtual_zero_base(uint64_t a, uint64_t b, uint64_t c,
@@ -358,6 +391,8 @@ int main(int argc, char **argv)
         0x01, 0x05, 0x02, 0x00, 0x05, 0x32, 0x01, 0x02
     }};
     (void)argv;
+    virtual_rip_descriptor.image_base =
+        (const uint8_t *)&virtual_rip_data - 0x1000;
     if (argc > 2) {{
         (void)virtual_zero_base(1, 2, 3, 4, 5);
         return 98;
@@ -416,6 +451,8 @@ int main(int argc, char **argv)
     }}
     if (verify_virtual_nonvolatiles() != 0)
         return 20;
+    if (virtual_rip() != virtual_rip_data)
+        return 50;
     return 0;
 }}
 """
@@ -437,6 +474,12 @@ int main(int argc, char **argv)
     (tmp_path / "virtual_xmm_return.asm").write_text(
         win64_thunk.render_entry_thunk(
             "virtual_xmm_return", "virtual_xmm_return_descriptor"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "virtual_rip.asm").write_text(
+        win64_thunk.render_entry_thunk(
+            "virtual_rip", "virtual_rip_descriptor"
         ),
         encoding="utf-8",
     )
@@ -637,6 +680,7 @@ END
         "virtual_failure.asm",
         "virtual_xmm.asm",
         "virtual_xmm_return.asm",
+        "virtual_rip.asm",
         "virtual_zero_base.asm",
         "verifier.asm",
         f'"{(ROOT / "stub/src/daedalus_vm.c").as_posix()}"',

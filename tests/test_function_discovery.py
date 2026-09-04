@@ -25,6 +25,15 @@ def _asm(source: str, rva: int) -> bytes:
     return bytes(encoded)
 
 
+def _rip_instruction(source: str, *, rva: int, target_rva: int) -> bytes:
+    probe = _asm(source.format(mem="[rip]"), rva)
+    displacement = target_rva - (rva + len(probe))
+    sign = "+" if displacement >= 0 else "-"
+    return _asm(
+        source.format(mem=f"[rip {sign} 0x{abs(displacement):X}]"), rva
+    )
+
+
 def _parsed(functions, *, start=None, end=None, path="fixture.exe"):
     ordered = sorted(functions, key=lambda item: item[0])
     section_start = ordered[0][0] if start is None else start
@@ -282,3 +291,66 @@ def test_strict_pe_export_parser_reads_named_runtime_entry(tmp_path):
     assert discovery.parse_pe_exports(parsed) == (
         discovery.ExportSymbol("leaf", 1, 0x1000),
     )
+
+
+def test_rip_data_candidate_matches_planner_gate_and_serializes_reference() -> None:
+    rva = 0x1000
+    data_rva = 0x3000
+    instruction = _rip_instruction(
+        "mov eax, dword ptr {mem}", rva=rva, target_rva=data_rva
+    )
+    code = instruction + _asm("ret", rva + len(instruction))
+    parsed = _parsed([(rva, code, 0)])
+    parsed.sections.append(
+        SimpleNamespace(
+            name=".data",
+            rva=data_rva,
+            virtual_size=0x20,
+            raw=bytes(0x20),
+            characteristics=0xC0000040,
+        )
+    )
+
+    candidate = discovery.discover_functions(parsed, exports=()).candidates[0]
+
+    assert candidate.liftable is True
+    assert candidate.rejection_reason is None
+    assert [item.to_dict() for item in candidate.rip_relative_references] == [
+        {
+            "instruction_rva": rva,
+            "target_rva": data_rva,
+            "size": 4,
+            "access": "read",
+            "address_only": False,
+        }
+    ]
+    assert candidate.to_dict()["rip_relative_references"] == [
+        candidate.rip_relative_references[0].to_dict()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("target_rva", "section_end", "reason"),
+    [
+        (0x200, None, "unmapped/header"),
+        (0x2500, None, "unmapped/header"),
+        (0x1080, 0x1100, "address-taken executable code"),
+    ],
+)
+def test_rip_header_unmapped_and_executable_address_are_reported_exactly(
+    target_rva: int, section_end: int | None, reason: str
+) -> None:
+    rva = 0x1000
+    instruction = _rip_instruction(
+        "lea rax, {mem}", rva=rva, target_rva=target_rva
+    )
+    code = instruction + _asm("ret", rva + len(instruction))
+    parsed = _parsed([(rva, code, 0)], end=section_end)
+
+    candidate = discovery.discover_functions(parsed, exports=()).candidates[0]
+
+    assert candidate.liftable is False
+    assert reason in candidate.rejection_reason
+    assert f"0x{target_rva:X}" in candidate.rejection_reason
+    assert candidate.first_unsupported_instruction.rva == rva
+    assert "lea" in candidate.first_unsupported_instruction.text

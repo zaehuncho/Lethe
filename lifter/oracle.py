@@ -101,8 +101,16 @@ def run_unicorn_xmm(code: bytes, init=None, xmm_init=None, mem=None,
 
 
 def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
-                  lift_base=BASE, image_base=0):
-    blob = daedalus_asm.assemble(L.lift_function(code, base=lift_base))
+                  lift_base=BASE, image_base=0, *, image_sections=None,
+                  selected_extents=()):
+    blob = daedalus_asm.assemble(
+        L.lift_function(
+            code,
+            base=lift_base,
+            image_sections=image_sections,
+            selected_extents=selected_extents,
+        )
+    )
     ds = struct.unpack_from("<H", blob, 0)[0]
     data, prog = blob[2:2 + ds], blob[2 + ds:]
     vm = RefVM(prog, data, args=[],
@@ -244,3 +252,63 @@ def check_function(code: bytes, init=None,
         )
     assert um == dm, f"stack mismatch:\n  unicorn ={um.hex()}\n  daedalus={dm.hex()}"
     return (ur, uf), (dr, df)
+
+
+def check_rip_data(
+    code: bytes,
+    data: bytes,
+    *,
+    code_rva: int,
+    data_rva: int,
+    runtime_image_base: int,
+    init=None,
+    flags=("CF", "PF", "ZF", "SF", "OF"),
+    data_characteristics=L.IMAGE_SCN_MEM_READ | L.IMAGE_SCN_MEM_WRITE,
+):
+    """Differential-check RIP data at a deliberately relocated image base."""
+    init = list(init) if init is not None else _default_init()
+    code_va = runtime_image_base + code_rva
+    data_va = runtime_image_base + data_rva
+    sections = (
+        _OracleSection(".text", code_rva, len(code), code, 0x60000020),
+        _OracleSection(
+            ".data", data_rva, len(data), bytes(data), data_characteristics
+        ),
+    )
+    ur, uf, um = run_unicorn(
+        code,
+        init,
+        data,
+        data_va,
+        code_base=code_va,
+    )
+    dr, df, dm = run_daedalus(
+        code,
+        init,
+        data,
+        data_va,
+        lift_base=code_rva,
+        image_base=runtime_image_base,
+        image_sections=sections,
+        selected_extents=((code_rva, len(code)),),
+    )
+    for index, (native, lifted) in enumerate(zip(ur, dr)):
+        assert native == lifted, (
+            f"reg {L.GPR_NAMES[index]} mismatch: unicorn=0x{native:016X} "
+            f"daedalus=0x{lifted:016X}"
+        )
+    for flag in flags:
+        assert uf[flag] == df[flag], (
+            f"flag {flag} mismatch: unicorn={uf[flag]} daedalus={df[flag]}"
+        )
+    assert um == dm, f"data mismatch:\n  unicorn ={um.hex()}\n  daedalus={dm.hex()}"
+    return (ur, uf, um), (dr, df, dm)
+
+
+class _OracleSection:
+    def __init__(self, name, rva, virtual_size, raw, characteristics):
+        self.name = name
+        self.rva = rva
+        self.virtual_size = virtual_size
+        self.raw = raw
+        self.characteristics = characteristics

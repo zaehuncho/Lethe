@@ -82,16 +82,30 @@ else + a **differential oracle** that proves every lift correct.
 - **Cut 12** — legacy XMM0-XMM15 capture plus register-only `movd`, `movq`,
   `movaps`, `movups`, `movdqa`, `movdqu`, `pxor`, `xorps`, and `xorpd`. Each
   128-bit register occupies two 64-bit VM lanes. Directed and deterministic
-  fuzz cases compare the full XMM/GPR/flags state against Unicorn. Native-frame,
-  entry-thunk, plain, rolling, eager-pack, and memory-guard tests exercise
-  bytecode drawn from this bounded subset. XMM memory operands and VEX/EVEX
-  encodings remain fail-closed.
+  fuzz cases compare the full XMM/GPR/flags state against Unicorn. Native-frame
+  and entry-thunk tests exercise plain and rolling bytecode drawn from this
+  bounded subset; the real XFG DLL pack exercises XMM-shaped Win64 ABI values
+  in eager mode. The memory-guard selected-function proof remains scalar. XMM
+  memory operands and VEX/EVEX encodings remain fail-closed.
+- **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
+  source at its 32-bit RVA; the lift computes each effective address as runtime
+  image base local `504` plus the decoded target RVA, so ASLR never bakes a
+  preferred VA into bytecode. Existing scalar memory operations and `lea` may
+  reference one mapped, non-executable section when the complete byte span has
+  the required PE read/write permissions. Virtual zero-fill is valid. Header,
+  gap, cross-section, discardable-section, executable-byte, address-taken-code,
+  selected-extent, and unknown-layout references remain whole-function rejections. Manifest and
+  discovery JSON record the instruction RVA, target RVA, span, and access kind.
+  Differential tests use a deliberately nonpreferred runtime base; the native
+  eager/memory-guard gate forces relocation of a `/DYNAMICBASE` fixture.
 
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
-(read-modify-write) when LOCK-prefixed, RIP-relative/segment memory, 8/16-bit
+(read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
+RIP targets in headers/gaps/discardable sections/code/selected extents,
+segment memory, 8/16-bit
 shift/rotate, 16-bit `shld`/`shrd`, high-8 `AH/BH/CH/DH`, XMM memory forms,
 SIMD/FP arithmetic, VEX/EVEX encodings, YMM/ZMM state, string ops, and
 indirect/external branches.
@@ -126,6 +140,8 @@ instruction addition remains oracle-gated.
 The oracle models a writable memory region: `oracle.check(code, init, flags,
 mem=<initial bytes>)` maps it in both Unicorn and the reference VM (via the
 additive `RefVM(mem=..., mem_base=...)` param) and compares the final bytes.
+`oracle.check_rip_data(...)` additionally separates source RVA from a relocated
+runtime image base and proves the resolved registers, flags, and data bytes.
 
 ## Runtime integration (build-time C, not in this Python reference)
 The next packer interface is:

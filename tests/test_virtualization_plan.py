@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -34,6 +35,16 @@ _EXEC = 0x60000020
 def _asm(source: str, *, rva: int = 0x1000) -> bytes:
     encoded, _ = _KS.asm(source, addr=rva)
     return bytes(encoded)
+
+
+def _rip_instruction(source: str, *, rva: int, target_rva: int) -> bytes:
+    probe = _asm(source.format(mem="[rip]"), rva=rva)
+    displacement = target_rva - (rva + len(probe))
+    sign = "+" if displacement >= 0 else "-"
+    return _asm(
+        source.format(mem=f"[rip {sign} 0x{abs(displacement):X}]"),
+        rva=rva,
+    )
 
 
 def _image(
@@ -200,6 +211,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         "xmm_register_moves_and_xor_supported": True,
         "simd_fp_arithmetic_supported": False,
         "return_address_shadow_validated": False,
+        "rip_relative_data_addressing_supported": True,
     }
     assert function.internal_call_rvas == ()
     assert function.max_internal_call_depth == 0
@@ -767,4 +779,122 @@ def test_shuffled_production_mapping_is_mandatory_and_hash_checked() -> None:
                if key != "source_exception_metadata"},
             opcode_table=table,
             expected_opcode_mapping_sha256=stub_hash,
+        )
+
+
+@pytest.mark.parametrize("rolling", [False, True], ids=["plain", "rolling"])
+def test_rip_data_reference_is_serialized_for_plain_and_rolling(rolling: bool) -> None:
+    rva = 0x1000
+    data_rva = 0x3000
+    instruction = _rip_instruction(
+        "mov eax, dword ptr {mem}", rva=rva, target_rva=data_rva
+    )
+    raw = instruction + _asm("ret", rva=rva + len(instruction))
+    reader = plan.SectionImage(
+        (
+            plan.SectionBytes(".text", rva, len(raw), raw, _EXEC),
+            plan.SectionBytes(".data", data_rva, 0x20, bytes(0x20), 0xC0000040),
+        )
+    )
+    kwargs = {}
+    if rolling:
+        kwargs = {"rolling": True, "rolling_seed": b"R" * 16}
+    manifest = plan.compile_virtualization_manifest(
+        [plan.FunctionSpec("rip_load", rva, len(raw))],
+        reader,
+        generated_text_rva=0x5000,
+        generated_data_rva=0x7000,
+        **kwargs,
+    )
+    function = manifest.functions[0]
+
+    assert function.capabilities["rip_relative_data_addressing_supported"] is True
+    assert [item.to_dict() for item in function.rip_relative_references] == [
+        {
+            "instruction_rva": rva,
+            "target_rva": data_rva,
+            "size": 4,
+            "access": "read",
+            "address_only": False,
+        }
+    ]
+    encoded = function.to_dict()
+    assert encoded["rip_relative_references"] == [
+        function.rip_relative_references[0].to_dict()
+    ]
+    assert json.loads(manifest.to_json())["functions"][0][
+        "rip_relative_references"
+    ] == encoded["rip_relative_references"]
+
+
+def test_rip_data_reference_can_target_virtual_zero_fill() -> None:
+    rva = 0x1000
+    data_rva = 0x3000
+    instruction = _rip_instruction(
+        "mov qword ptr {mem}, rax", rva=rva, target_rva=data_rva + 0x18
+    )
+    raw = instruction + _asm("ret", rva=rva + len(instruction))
+    reader = plan.SectionImage(
+        (
+            plan.SectionBytes(".text", rva, len(raw), raw, _EXEC),
+            plan.SectionBytes(".bss", data_rva, 0x40, b"", 0xC0000080),
+        )
+    )
+
+    manifest = plan.compile_virtualization_manifest(
+        [plan.FunctionSpec("rip_bss", rva, len(raw))],
+        reader,
+        generated_text_rva=0x5000,
+        generated_data_rva=0x7000,
+    )
+    assert manifest.functions[0].rip_relative_references[0].access == "write"
+
+
+def test_rip_reference_rejects_reader_without_section_geometry() -> None:
+    rva = 0x1000
+    instruction = _rip_instruction(
+        "lea rax, {mem}", rva=rva, target_rva=0x3000
+    )
+    raw = instruction + _asm("ret", rva=rva + len(instruction))
+
+    class _RawReader:
+        def read_file_backed_executable(self, selected_rva: int, size: int) -> bytes:
+            assert (selected_rva, size) == (rva, len(raw))
+            return raw
+
+    with pytest.raises(plan.FunctionRejected, match="section geometry"):
+        plan.compile_virtualization_manifest(
+            [plan.FunctionSpec("rip_unknown", rva, len(raw))],
+            _RawReader(),
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
+        )
+
+
+def test_rip_reference_cannot_address_another_selected_extent() -> None:
+    first_rva = 0x1000
+    second_rva = 0x1100
+    first_instruction = _rip_instruction(
+        "lea rax, {mem}", rva=first_rva, target_rva=second_rva
+    )
+    first = first_instruction + _asm(
+        "ret", rva=first_rva + len(first_instruction)
+    )
+    second = _asm("mov eax, 7; ret", rva=second_rva)
+    text = bytearray(b"\xCC" * (second_rva + len(second) - first_rva))
+    text[:len(first)] = first
+    text[second_rva - first_rva:] = second
+    reader = plan.SectionImage(
+        (plan.SectionBytes(".text", first_rva, len(text), bytes(text), _EXEC),)
+    )
+
+    with pytest.raises(plan.FunctionRejected, match="overlaps selected extent"):
+        plan.compile_virtualization_manifest(
+            [
+                plan.FunctionSpec("first", first_rva, len(first)),
+                plan.FunctionSpec("second", second_rva, len(second)),
+            ],
+            reader,
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
         )

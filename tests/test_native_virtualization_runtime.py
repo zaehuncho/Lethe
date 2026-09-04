@@ -26,11 +26,6 @@ _RUN_GATE = "LETHE_RUN_NATIVE_VM_E2E"
 _STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
 _SHUFFLE_SEED = "3141592653589793238462643383279502884197169399375105820974944592"
-_LEAF_BYTES = bytes.fromhex(
-    "b844332211660f6ec0ba6e332211660f6eca660fefc1660f7ec0c3"
-)
-
-
 def _visual_studio_available() -> bool:
     if shutil.which("cl.exe"):
         return True
@@ -85,6 +80,8 @@ __declspec(noreturn) void fixture_entry(void)
     static const char output[] = "vm-answer=42\\r\\n";
     DWORD written = 0;
     volatile int answer = vm_leaf();
+    if ((ULONG_PTR)GetModuleHandleW(NULL) == (ULONG_PTR)0x7FFE0000u)
+        ExitProcess(4);
     if (answer == 42) {
         WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), output,
                   (DWORD)(sizeof(output) - 1u), &written, NULL);
@@ -98,18 +95,78 @@ __declspec(noreturn) void fixture_entry(void)
     (source / "fixture.asm").write_text(
         r"""
 OPTION CASEMAP:NONE
+.data
+ALIGN 8
+vm_value DWORD 41
+vm_sink DWORD 0
+vm_relocation_anchor QWORD OFFSET vm_value
 .code
 PUBLIC vm_leaf
 vm_leaf PROC
-    mov eax, 11223344h
-    movd xmm0, eax
-    mov edx, 1122336eh
-    movd xmm1, edx
-    pxor xmm0, xmm1
-    movd eax, xmm0
+    mov eax, DWORD PTR vm_value
+    add eax, 1
+    mov DWORD PTR vm_sink, eax
+    lea rdx, vm_sink
+    mov eax, DWORD PTR [rdx]
     ret
 vm_leaf ENDP
 END
+""".lstrip(),
+        encoding="ascii",
+    )
+    (source / "force_aslr.c").write_text(
+        r"""
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+
+int wmain(int argc, wchar_t **argv)
+{
+    SIZE_T bytes = 0;
+    STARTUPINFOEXW startup = {0};
+    PROCESS_INFORMATION process = {0};
+    DWORD64 policy = 0x300;
+    DWORD exit_code = 0xFFFFFFFFu;
+    wchar_t command[32768];
+    if (argc != 2)
+        return 90;
+    if (!InitializeProcThreadAttributeList(NULL, 1, 0, &bytes) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 91;
+    startup.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, bytes);
+    if (!startup.lpAttributeList)
+        return 92;
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &bytes))
+        return 93;
+    if (!UpdateProcThreadAttribute(
+            startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            &policy, sizeof(policy), NULL, NULL))
+        return 94;
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    if (swprintf_s(
+            command, sizeof(command) / sizeof(command[0]),
+            L"\"%s\"", argv[1]) < 0)
+        return 95;
+    if (!CreateProcessW(
+            argv[1], command, NULL, NULL, TRUE,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            NULL, NULL, &startup.StartupInfo, &process))
+        return 96;
+    if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0)
+        return 97;
+    if (!GetExitCodeProcess(process.hProcess, &exit_code))
+        return 98;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, startup.lpAttributeList);
+    return (int)exit_code;
+}
 """.lstrip(),
         encoding="ascii",
     )
@@ -118,12 +175,14 @@ END
 cmake_minimum_required(VERSION 3.20)
 project(lethe_native_vm_fixture C ASM_MASM)
 add_executable(vm_fixture fixture.c fixture.asm)
+add_executable(force_aslr force_aslr.c)
 target_compile_options(vm_fixture PRIVATE
     $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2;/GS-;/guard:cf->)
 target_link_options(vm_fixture PRIVATE
-    /INCREMENTAL:NO /FIXED /DYNAMICBASE:NO /NXCOMPAT /HIGHENTROPYVA:NO /CETCOMPAT:NO
+    /INCREMENTAL:NO /DYNAMICBASE /BASE:0x7ffe0000 /NXCOMPAT /HIGHENTROPYVA:NO /CETCOMPAT:NO
     /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_leaf)
 target_link_libraries(vm_fixture PRIVATE kernel32.lib)
+target_compile_options(force_aslr PRIVATE /W4 /WX /O2)
 """.lstrip(),
         encoding="ascii",
     )
@@ -224,6 +283,20 @@ def _run(executable: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _run_forced_aslr(
+    executable: Path, launcher: Path
+) -> subprocess.CompletedProcess:
+    assert launcher.is_file()
+    return subprocess.run(
+        [str(launcher), str(executable)],
+        cwd=str(executable.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=40,
+        check=False,
+    )
+
+
 def _slice(parsed: pe_analyze.ParsedPE, rva: int, size: int) -> bytes:
     return pe_analyze._slice_at_rva(
         parsed.sections, rva, size, what="native virtualization proof"
@@ -252,12 +325,34 @@ def test_packed_executable_calls_virtualized_leaf(
         leaf_rva = source_image.find_export_rva("vm_leaf")
         assert leaf_rva is not None
         leaf_window = source_image.read_at_rva(leaf_rva, 64)
-        ret_offset = leaf_window.find(b"\xC3")
-        assert ret_offset >= 0
-        leaf_size = ret_offset + 1
-        assert leaf_size == len(_LEAF_BYTES)
-        assert leaf_window[:leaf_size] == _LEAF_BYTES
         parsed_source = pe_analyze.analyze_pe(str(source))
+        assert parsed_source.image_base == 0x7FFE0000
+        assert parsed_source.dir64_relocations
+        from iced_x86 import Decoder, Mnemonic
+
+        decoded_leaf_list = []
+        for instruction in Decoder(64, leaf_window, ip=leaf_rva):
+            decoded_leaf_list.append(instruction)
+            if instruction.mnemonic == Mnemonic.RET:
+                break
+        assert decoded_leaf_list[-1].mnemonic == Mnemonic.RET
+        decoded_leaf = tuple(decoded_leaf_list)
+        leaf_size = sum(instruction.len for instruction in decoded_leaf)
+        decoded_targets = tuple(
+            instruction.ip_rel_memory_address
+            for instruction in decoded_leaf
+            if instruction.is_ip_rel_memory_operand
+        )
+        assert len(decoded_targets) == 3
+        assert all(
+            any(
+                section.rva <= target
+                < section.rva + max(section.virtual_size, len(section.raw))
+                and not section.characteristics & 0x20000000
+                for section in parsed_source.sections
+            )
+            for target in decoded_targets
+        )
         function_spec = virtualization_plan.FunctionSpec(
             "vm_leaf", leaf_rva, leaf_size
         )
@@ -326,6 +421,16 @@ def test_packed_executable_calls_virtualized_leaf(
         materialized = captured["result"]
         function = materialized.manifest.functions[0]
         assert function.program_format == "paged-v1"
+        assert function.capabilities[
+            "rip_relative_data_addressing_supported"
+        ] is True
+        assert tuple(
+            reference.target_rva
+            for reference in function.rip_relative_references
+        ) == decoded_targets
+        assert tuple(
+            reference.access for reference in function.rip_relative_references
+        ) == ("read", "write", "address")
         generated = function.generated_executable_ranges[0]
         entry = _slice(materialized.parsed, leaf_rva, leaf_size)
         assert entry[0] == 0xE9
@@ -380,8 +485,9 @@ def test_packed_executable_calls_virtualized_leaf(
             envelope, captured["page_master_key"]
         )
 
-        original_run = _run(source)
-        packed_run = _run(packed)
+        launcher = source.parent / "force_aslr.exe"
+        original_run = _run_forced_aslr(source, launcher)
+        packed_run = _run_forced_aslr(packed, launcher)
         assert original_run.returncode == 0
         assert original_run.stdout == b"vm-answer=42\r\n"
         assert original_run.stderr == b""

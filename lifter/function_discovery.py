@@ -108,6 +108,7 @@ class FunctionCandidate:
     indirect_target_closure_proven: bool
     internal_direct_call_count: int = 0
     max_internal_call_depth: int = 0
+    rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +132,9 @@ class FunctionCandidate:
             "name": self.name,
             "rejection_reason": self.rejection_reason,
             "rva": self.rva,
+            "rip_relative_references": [
+                reference.to_dict() for reference in self.rip_relative_references
+            ],
             "size": self.size,
             "source": self.source,
             "unwind_flag_names": list(self.unwind_flag_names),
@@ -592,37 +596,74 @@ def _traceback_instruction(exc: BaseException) -> UnsupportedInstruction | None:
 
 
 def _lift_status(
-        extent: _Extent, sections: Sequence[Any]
-) -> tuple[bool, str | None, UnsupportedInstruction | None]:
+    extent: _Extent, sections: Sequence[Any]
+) -> tuple[
+    bool,
+    str | None,
+    UnsupportedInstruction | None,
+    tuple[x64_lifter.RipRelativeReference, ...],
+]:
     if extent.unresolved_reason:
-        return False, extent.unresolved_reason, None
+        return False, extent.unresolved_reason, None, ()
     if extent.unwind_flags:
         return False, (
             "source runtime-function uses unsupported unwind flags "
             + "|".join(_flag_names(extent.unwind_flags))
-        ), None
+        ), None, ()
     if extent.size < 5:
-        return False, "function is too small for a five-byte near-JMP entry patch", None
+        return (
+            False,
+            "function is too small for a five-byte near-JMP entry patch",
+            None,
+            (),
+        )
     try:
         code = _read_executable(sections, extent.rva, extent.size, "candidate")
     except FunctionDiscoveryError as exc:
-        return False, str(exc), None
+        return False, str(exc), None, ()
     _instructions, decode_error, decode_instruction = _strict_decode(code, extent.rva)
     if decode_error:
-        return False, decode_error, decode_instruction
+        return False, decode_error, decode_instruction, ()
     try:
-        assembly = x64_lifter.lift_function(code, base=extent.rva)
+        references = x64_lifter.validate_rip_relative_references(
+            code,
+            base=extent.rva,
+            image_sections=sections,
+            selected_extents=((extent.rva, extent.size),),
+        )
+        assembly = x64_lifter.lift_function(
+            code,
+            base=extent.rva,
+            image_sections=sections,
+            selected_extents=((extent.rva, extent.size),),
+        )
         daedalus_asm.assemble(assembly)
     except (x64_lifter.LiftUnsupported, SyntaxError, ValueError) as exc:
         first = _traceback_instruction(exc)
+        if first is None:
+            match = re.search(r"\bat 0x([0-9A-Fa-f]+)\b", str(exc))
+            if match is not None:
+                rejected_rva = int(match.group(1), 16)
+                rejected_instruction = next(
+                    (
+                        instruction
+                        for instruction in _instructions
+                        if instruction.ip == rejected_rva
+                    ),
+                    None,
+                )
+                if rejected_instruction is not None:
+                    first = UnsupportedInstruction(
+                        rejected_rva, str(rejected_instruction)
+                    )
         reason = f"whole-function lift rejected: {exc}"
         if first is not None:
             if f"0x{first.rva:X}" not in reason:
                 reason += f" at RVA 0x{first.rva:X}"
             if first.text not in reason:
                 reason += f" ({first.text})"
-        return False, reason, first
-    return True, None, None
+        return False, reason, first, ()
+    return True, None, None, references
 
 
 def _coverage_gaps(
@@ -824,7 +865,7 @@ def discover_functions(
 
     candidates = []
     for extent in extents:
-        liftable, rejection, first = _lift_status(extent, sections)
+        liftable, rejection, first, rip_references = _lift_status(extent, sections)
         internal_call_count = 0
         max_internal_call_depth = 0
         if liftable:
@@ -874,6 +915,7 @@ def discover_functions(
             indirect_target_closure_proven=False,
             internal_direct_call_count=internal_call_count,
             max_internal_call_depth=max_internal_call_depth,
+            rip_relative_references=rip_references,
         ))
 
     return FunctionDiscoveryReport(
