@@ -62,7 +62,12 @@ replay. It runs `test_native_runtime_hardening_stress.py`,
 requires all eleven cases without skips, and proves the selected leaf emits a
 paged-v1 program whose eager and memory-guard packed outputs match the original.
 The same rolling-capable candidate DLL must also preserve real MSVC XFG indirect
-call parity for the EXE fixture and all three DLL signature shapes.
+call parity for the EXE fixture and seven DLL GPR-class ABI shapes. Those DLL
+shapes use explicit arities zero, one, two, three, and six; the six-argument
+case covers fifth/sixth stack arguments, while separate two-argument shapes
+cover pointer loads/stores and a void return. Distinct XFG call-site type hashes
+remain byte-exact through selected-function materialization. Floating-point,
+vector, and aggregate ABI signatures remain outside the declared coverage.
 The hardening side also runs a bounded one-minute, minimum-64-launch forced-ASLR
 memory-guard soak and proves that a debugged host rejects an anti-debug protected
 DLL without terminating the host process.

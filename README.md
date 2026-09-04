@@ -188,8 +188,11 @@ Concrete, honest limitations of the offline layer:
   exact behavior parity. Dynamic-value-relocation, CHPE, CodeIntegrity, return-flow
   guard, hotpatch, enclave, UMA, suppressed GFIDs, and CET-specific metadata remain
   fail-closed rather than silently stripped. Selected-function virtualization of
-  an XFG-enabled input also fails preflight until generated thunk GFIDs can carry
-  source-compatible 8-byte XFG function hashes.
+  an XFG-enabled selected function keeps its source GFID at the original RVA,
+  preserves the caller's 8-byte XFG type hash, and reaches its direct-only thunk
+  through an `E9`. Any plan that instead exposes a generated thunk as an indirect
+  XFG target fails preflight because Lethe does not synthesize source-compatible
+  thunk hashes.
 - **Packing disables crash-dump/support triage** on protected binaries. Pack last,
   after live sign-off, and canary an unpacked build before packed goes wide.
 - **The code-hash key binding raises cost, not certainty** — a debugger can still

@@ -239,7 +239,7 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and three real DLL XFG integer signature shapes pass natively, but wider ABI signatures and clean-VM compatibility evidence remain incomplete.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and seven real DLL GPR-class ABI shapes pass natively with XFG call-site type hashes preserved byte-exact through materialization; floating-point, vector, aggregate ABI signatures and clean-VM compatibility evidence remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and three DLL integer signature shapes, reach direct-only virtualized thunks with native parity, emit no thunk GFIDs, and reject forged generated-GFID paths before output."
+          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and seven DLL GPR-class ABI shapes with arities 0, 1, 2, 3, and 6, including fifth/sixth stack arguments, pointer loads/stores, and a void return; each distinct caller XFG type hash is structurally paired with the XFG dispatch call and remains byte-exact through materialization, direct-only virtualized thunks retain native parity without thunk GFIDs, and forged generated-GFID paths are rejected before output."
         }
       ]
     },

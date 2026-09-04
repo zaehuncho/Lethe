@@ -32,6 +32,36 @@ _DLL_GATE = "LETHE_ENABLE_EXPERIMENTAL_DLL"
 _STUB_PATH_ENV = "LETHE_NATIVE_RUNTIME_STUB_PATH"
 
 
+def _xfg_callsite_hashes(
+    body: bytes,
+    *,
+    ip: int,
+    dispatch_slot_va: int,
+) -> tuple[bytes, ...]:
+    """Pair each R10 type hash with its XFG dispatch-slot indirect call."""
+    from iced_x86 import Decoder, Mnemonic, OpKind, Register
+
+    pending: bytes | None = None
+    hashes: list[bytes] = []
+    for instruction in Decoder(64, body, ip=ip):
+        if (
+            instruction.mnemonic == Mnemonic.MOV
+            and instruction.op0_kind == OpKind.REGISTER
+            and instruction.op0_register == Register.R10
+            and instruction.op1_kind == OpKind.IMMEDIATE64
+        ):
+            pending = instruction.immediate64.to_bytes(8, "little")
+        elif (
+            instruction.mnemonic == Mnemonic.CALL
+            and instruction.op0_kind == OpKind.MEMORY
+            and instruction.memory_displacement == dispatch_slot_va
+        ):
+            assert pending is not None, "XFG dispatch call has no paired R10 type hash"
+            hashes.append(pending)
+            pending = None
+    return tuple(hashes)
+
+
 def _visual_studio_available() -> bool:
     if shutil.which("cl.exe"):
         return True
@@ -186,6 +216,81 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_i32x3(
 {
     return ((first + second) ^ third) + 23;
 }
+
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_noargs(void)
+{
+    return 0x123456789ABCDEF0ui64;
+}
+
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_u64x6(
+    unsigned __int64 first,
+    unsigned __int64 second,
+    unsigned __int64 third,
+    unsigned __int64 fourth,
+    unsigned __int64 fifth,
+    unsigned __int64 sixth)
+{
+    return (((first + second) ^ third) + fourth) ^ (fifth + sixth);
+}
+
+__declspec(dllexport) __declspec(noinline) unsigned int __cdecl xfg_ptr_read(
+    const unsigned int *values,
+    unsigned int salt)
+{
+    return values[0] + (values[1] ^ salt);
+}
+
+__declspec(dllexport) __declspec(noinline) void __cdecl xfg_ptr_write(
+    unsigned __int64 *destination,
+    unsigned __int64 value)
+{
+    *destination = value ^ 0x0F1E2D3C4B5A6978ui64;
+}
+
+typedef int (__cdecl *xfg_i32_fn)(int);
+typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
+typedef int (__cdecl *xfg_i32x3_fn)(int, int, int);
+typedef unsigned __int64 (__cdecl *xfg_noargs_fn)(void);
+typedef unsigned __int64 (__cdecl *xfg_u64x6_fn)(
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64);
+typedef unsigned int (__cdecl *xfg_ptr_read_fn)(const unsigned int *, unsigned int);
+typedef void (__cdecl *xfg_ptr_write_fn)(unsigned __int64 *, unsigned __int64);
+
+__declspec(dllexport) xfg_i32_fn volatile selected_xfg_i32 = xfg_i32;
+__declspec(dllexport) xfg_u64_fn volatile selected_xfg_u64 = xfg_u64;
+__declspec(dllexport) xfg_i32x3_fn volatile selected_xfg_i32x3 = xfg_i32x3;
+__declspec(dllexport) xfg_noargs_fn volatile selected_xfg_noargs = xfg_noargs;
+__declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = xfg_u64x6;
+__declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = xfg_ptr_read;
+__declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = xfg_ptr_write;
+
+__declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
+{
+    const unsigned int input[2] = { 13u, 29u };
+    unsigned __int64 written = 0;
+    int ok = selected_xfg_i32(41) == 374;
+    ok = ok && selected_xfg_u64(
+        0x1122334455667788ui64,
+        0x8877665544332211ui64)
+        == (((0x1122334455667788ui64 << 3) + 0x1122334455667788ui64)
+            ^ (0x8877665544332211ui64 + 0x102030405060708ui64));
+    ok = ok && selected_xfg_i32x3(19, 37, 11)
+        == (((19 + 37) ^ 11) + 23);
+    ok = ok && selected_xfg_noargs() == 0x123456789ABCDEF0ui64;
+    ok = ok && selected_xfg_u64x6(3, 5, 7, 11, 13, 17)
+        == ((((3ui64 + 5ui64) ^ 7ui64) + 11ui64) ^ (13ui64 + 17ui64));
+    ok = ok && selected_xfg_ptr_read(input, 0x55AAu)
+        == (13u + (29u ^ 0x55AAu));
+    selected_xfg_ptr_write(&written, 0x8877665544332211ui64);
+    ok = ok && written
+        == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
+    return ok;
+}
 """.lstrip(),
         encoding="utf-8",
     )
@@ -197,6 +302,17 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_i32x3(
 typedef int (__cdecl *xfg_i32_fn)(int);
 typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
 typedef int (__cdecl *xfg_i32x3_fn)(int, int, int);
+typedef unsigned __int64 (__cdecl *xfg_noargs_fn)(void);
+typedef unsigned __int64 (__cdecl *xfg_u64x6_fn)(
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64,
+    unsigned __int64);
+typedef unsigned int (__cdecl *xfg_ptr_read_fn)(const unsigned int *, unsigned int);
+typedef void (__cdecl *xfg_ptr_write_fn)(unsigned __int64 *, unsigned __int64);
+typedef int (__cdecl *xfg_run_all_fn)(void);
 
 static int run_once(const char *path)
 {
@@ -204,6 +320,13 @@ static int run_once(const char *path)
     xfg_i32_fn i32;
     xfg_u64_fn u64;
     xfg_i32x3_fn i32x3;
+    xfg_noargs_fn noargs;
+    xfg_u64x6_fn u64x6;
+    xfg_ptr_read_fn ptr_read;
+    xfg_ptr_write_fn ptr_write;
+    xfg_run_all_fn run_all;
+    const unsigned int input[2] = { 13u, 29u };
+    unsigned __int64 written = 0;
     int ok;
     if (module == NULL) {
         return 10;
@@ -211,7 +334,14 @@ static int run_once(const char *path)
     i32 = (xfg_i32_fn)GetProcAddress(module, "xfg_i32");
     u64 = (xfg_u64_fn)GetProcAddress(module, "xfg_u64");
     i32x3 = (xfg_i32x3_fn)GetProcAddress(module, "xfg_i32x3");
-    if (i32 == NULL || u64 == NULL || i32x3 == NULL) {
+    noargs = (xfg_noargs_fn)GetProcAddress(module, "xfg_noargs");
+    u64x6 = (xfg_u64x6_fn)GetProcAddress(module, "xfg_u64x6");
+    ptr_read = (xfg_ptr_read_fn)GetProcAddress(module, "xfg_ptr_read");
+    ptr_write = (xfg_ptr_write_fn)GetProcAddress(module, "xfg_ptr_write");
+    run_all = (xfg_run_all_fn)GetProcAddress(module, "xfg_run_all");
+    if (i32 == NULL || u64 == NULL || i32x3 == NULL || noargs == NULL ||
+        u64x6 == NULL || ptr_read == NULL || ptr_write == NULL ||
+        run_all == NULL) {
         FreeLibrary(module);
         return 11;
     }
@@ -220,6 +350,14 @@ static int run_once(const char *path)
         == (((0x1122334455667788ui64 << 3) + 0x1122334455667788ui64)
             ^ (0x8877665544332211ui64 + 0x102030405060708ui64));
     ok = ok && i32x3(19, 37, 11) == (((19 + 37) ^ 11) + 23);
+    ok = ok && noargs() == 0x123456789ABCDEF0ui64;
+    ok = ok && u64x6(3, 5, 7, 11, 13, 17)
+        == ((((3ui64 + 5ui64) ^ 7ui64) + 11ui64) ^ (13ui64 + 17ui64));
+    ok = ok && ptr_read(input, 0x55AAu) == (13u + (29u ^ 0x55AAu));
+    ptr_write(&written, 0x8877665544332211ui64);
+    ok = ok && written
+        == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
+    ok = ok && run_all() == 1;
     if (!FreeLibrary(module)) {
         return 12;
     }
@@ -591,7 +729,15 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
     dll = real_msvc_xfg_dll_bundle.dll
     host = real_msvc_xfg_dll_bundle.host
     source_image = assemble._StubImage(dll.read_bytes())
-    names = ("xfg_i32", "xfg_u64", "xfg_i32x3")
+    names = (
+        "xfg_i32",
+        "xfg_u64",
+        "xfg_i32x3",
+        "xfg_noargs",
+        "xfg_u64x6",
+        "xfg_ptr_read",
+        "xfg_ptr_write",
+    )
     specs: list[virtualization_plan.FunctionSpec] = []
     for name in names:
         target_rva = source_image.find_export_rva(name)
@@ -601,12 +747,31 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         specs.append(
             virtualization_plan.FunctionSpec(name, target_rva, ret_offset + 1)
         )
-
     parsed = pe_analyze.analyze_pe(str(dll))
     assert parsed.is_dll is True
     assert parsed.load_config is not None
     assert parsed.load_config.guard_flags & 0x00800000
     assert parsed.load_config.xfg_present is True
+    run_all_rva = source_image.find_export_rva("xfg_run_all")
+    assert run_all_rva is not None
+    run_all_runtime = next(
+        runtime
+        for runtime in parsed.runtime_functions
+        if runtime.begin_rva == run_all_rva
+    )
+    run_all_size = run_all_runtime.end_rva - run_all_runtime.begin_rva
+    dispatch_slot_va = (
+        parsed.image_base
+        + parsed.load_config.guard_xfg_dispatch_function_pointer_rva
+    )
+    source_callsite_hashes = _xfg_callsite_hashes(
+        source_image.read_at_rva(run_all_rva, run_all_size),
+        ip=parsed.image_base + run_all_rva,
+        dispatch_slot_va=dispatch_slot_va,
+    )
+    assert len(source_callsite_hashes) == len(specs)
+    assert all(value != bytes(8) for value in source_callsite_hashes)
+    assert len(set(source_callsite_hashes)) == len(specs)
     source_gfids = {
         target.rva: target
         for target in parsed.load_config.guard_cf_targets
@@ -683,6 +848,8 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["direct_only_thunk"] is True
         assert function.capabilities["cfg_target_declared"] is False
         assert function.capabilities["xfg_function_hash_emitted"] is False
+        assert function.capabilities["stack_arguments_supported"] is True
+        assert function.capabilities["xmm_state_supported"] is False
         thunk_rva = function.generated_executable_ranges[0].rva
         thunk_rvas.add(thunk_rva)
         entry = pe_analyze._slice_at_rva(
@@ -694,6 +861,20 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert entry[0] == 0xE9
         displacement = int.from_bytes(entry[1:5], "little", signed=True)
         assert spec.rva + 5 + displacement == thunk_rva
+    materialized_callsite_hashes = _xfg_callsite_hashes(
+        pe_analyze._slice_at_rva(
+            materialized.parsed.sections,
+            run_all_rva,
+            run_all_size,
+            what="materialized XFG call-site hash body",
+        ),
+        ip=materialized.parsed.image_base + run_all_rva,
+        dispatch_slot_va=(
+            materialized.parsed.image_base
+            + materialized.parsed.load_config.guard_xfg_dispatch_function_pointer_rva
+        ),
+    )
+    assert materialized_callsite_hashes == source_callsite_hashes
 
     preserved_plan = cfg_preservation.build_cfg_preservation_plan(
         materialized.parsed, materialized.manifest
