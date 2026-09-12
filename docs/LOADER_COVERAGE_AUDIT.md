@@ -18,7 +18,7 @@ builder (`packer/`) handle, so real packed EXEs still run.*
 | Entry point (EXE / DLL / none) | **EXE SUPPORTED; DLL EXPERIMENTAL** | The release path is unmanaged x64 EXEs. DLL packing is fail-closed unless explicitly acknowledged because initialization currently runs under loader lock. |
 | **Managed / .NET PE** | **FIXED** | Was: silently packed → broken. Now: `analyze_pe` **refuses** a CLR runtime header (`pe_analyze.py`). |
 | **Delay-load imports** | **UNVERIFIED** | No explicit handling. Section bytes are preserved, so the app's own `__delayLoadHelper2` *probably* resolves them at runtime — but this is untested. **Needs a live `/DELAYLOAD` round-trip test.** |
-| Load Config / CFG | **FAIL-CLOSED** | The analyzer inventories PE32+ Guard CF, address-taken IAT, long-jump, and EH-continuation targets. Because the output does not yet emit an equivalent load-config directory or prove its runtime semantics, every input with a present load config is rejected before output mutation. No mitigation downgrade is accepted silently. |
+| Load Config / CFG | **PARTIAL; FAIL-CLOSED OUTSIDE THE PROVEN ENVELOPE** | Supported PE32+ inputs emit a loader-visible `.lcfg` with bound relocations, exact Guard CF/IAT/long-jump/EH-continuation inventories, authenticated shadow copies of loader-populated SecurityCookie/GuardCF/XFG/CastGuard/GuardMemcpy slots, and runtime target registration. Current-SDK CastGuard (`0x01000000`) and guarded-memcpy (`0x02000000`) flags require their complete load-config slots, while a zero pre-load pointer remains valid. Unsupported families and generated-thunk XFG hashes fail before output mutation. Local native coverage exists; clean-VM enforcement evidence remains outstanding, so the production mitigation row stays partial. |
 | Bound imports | **LIKELY OK** | Re-resolved via the normal INT/IAT; low risk. |
 | Digital signature (cert dir) | **N/A** | Packing invalidates any Authenticode signature by design; re-sign the packed output (release pipeline does). |
 
@@ -28,11 +28,18 @@ builder (`packer/`) handle, so real packed EXEs still run.*
 2. **Static TLS confidentiality.** Windows must read a DLL's raw TLS initializer before its entry point, including for threads that predate `LoadLibrary`. Lethe mirrors up to 4096 bytes into the outer TLS anchor for correctness; do not treat that initializer as encrypted payload data.
 3. **Delay-load imports (UNVERIFIED).** Build a sample that delay-loads a DLL, pack it, and confirm the delayed call resolves at runtime.
 4. **TLS > 4096 bytes** is refused rather than emitted as a broken artifact. Forced thread/process termination also bypasses detach callbacks, matching Windows notification semantics.
-5. **Load-config preservation is not implemented.** Every input carrying a load-config directory, including GuardCF inputs, is rejected before packing until the emitted directory, guard-pointer initialization, and runtime target registration are proven.
+5. **Load-config coverage is bounded.** Supported GuardCF/XFG-slot,
+   CastGuard, GuardMemcpy, volatile-metadata, and target-table shapes preserve the
+   emitted outer contract. Dynamic-value-relocation, CHPE, CodeIntegrity,
+   return-flow guard, hotpatch, enclave, UMA, generated-thunk XFG hashes, and
+   unrecognized GuardFlags remain blocked rather than stripped. Clean-VM CFG/XFG
+   enforcement is still required before the mitigation row can advance.
 
 ## Verification still owed
 
 - Force a nonzero relocation delta and exercise anti-debug/memory-guard variants on supported Windows versions.
+- Re-run current-SDK GuardCF/XFG/CastGuard/GuardMemcpy fixtures on the declared
+  clean-VM matrix and retain loader-enforcement evidence for the exact candidate.
 - Round-trip `/DELAYLOAD`, large-TLS, and resource-heavy EXE fixtures. Native EXE and DLL callback fixtures cover the loading/main thread, a worker created after unpack/`LoadLibrary`, and a thread predating dynamic DLL load.
 - Redesign DLL initialization outside loader lock and add both static-import and dynamic-load hosts before promoting DLL support.
 

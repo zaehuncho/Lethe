@@ -310,6 +310,100 @@ def test_live_load_config_merges_outer_targets_and_shadows_os_slots() -> None:
     assert all(target >= 0x7000 for target in live.relocation_target_rvas)
 
 
+def test_current_sdk_loader_slots_are_shadowed_and_relocated_exactly() -> None:
+    parsed = _parsed(interior=False)
+    raw_load_config = bytearray(parsed.load_config.raw)
+    struct.pack_into("<I", raw_load_config, 0, len(raw_load_config))
+    struct.pack_into(
+        "<I", raw_load_config, 144,
+        parsed.load_config.guard_flags | 0x01000000 | 0x02000000)
+    struct.pack_into("<Q", raw_load_config, 304, parsed.image_base + 0x3420)
+    struct.pack_into("<Q", raw_load_config, 312, parsed.image_base + 0x3428)
+    parsed.load_config = replace(
+        parsed.load_config,
+        guard_flags=parsed.load_config.guard_flags | 0x01000000 | 0x02000000,
+        cast_guard_os_determined_failure_mode_rva=0x3420,
+        guard_memcpy_function_pointer_rva=0x3428,
+        raw=bytes(raw_load_config),
+    )
+    source = bytearray(0x1000)
+    values = {
+        0x3400: 0x1122334455667788,
+        0x3410: parsed.image_base + 0x2100,
+        0x3418: parsed.image_base + 0x2200,
+        0x3420: parsed.image_base + 0x2300,
+        0x3428: 0x7FFA123456781234,
+    }
+    for rva, value in values.items():
+        struct.pack_into("<Q", source, rva - 0x3000, value)
+    parsed.sections = [pe_analyze.ParsedSection(
+        ".data", 0x3000, 0x1000, bytes(source), 0xC0000040)]
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed)
+
+    live = cfg_preservation.build_live_load_config(
+        parsed, plan, section_rva=0x7000, image_base=parsed.image_base)
+
+    assert live is not None
+    copies = {copy.name: copy for copy in live.runtime_slot_copies}
+    assert set(copies) == {
+        "SecurityCookie",
+        "GuardCFCheckFunctionPointer",
+        "GuardCFDispatchFunctionPointer",
+        "CastGuardOsDeterminedFailureMode",
+        "GuardMemcpyFunctionPointer",
+    }
+    for field_offset, name, source_rva in (
+        (304, "CastGuardOsDeterminedFailureMode", 0x3420),
+        (312, "GuardMemcpyFunctionPointer", 0x3428),
+    ):
+        copy = copies[name]
+        field_va, = struct.unpack_from("<Q", live.data, field_offset)
+        shadow_value, = struct.unpack_from(
+            "<Q", live.data, copy.shadow_rva - live.section_rva)
+        assert field_va == parsed.image_base + copy.shadow_rva
+        assert copy.source_rva == source_rva
+        assert shadow_value == values[source_rva]
+        assert live.section_rva + field_offset in live.relocation_target_rvas
+
+    cast_shadow = copies["CastGuardOsDeterminedFailureMode"].shadow_rva
+    memcpy_shadow = copies["GuardMemcpyFunctionPointer"].shadow_rva
+    assert cast_shadow in live.relocation_target_rvas
+    assert memcpy_shadow not in live.relocation_target_rvas
+
+    relocated = bytearray(live.data)
+    delta = 0x200000
+    for target_rva in live.relocation_target_rvas:
+        offset = target_rva - live.section_rva
+        value, = struct.unpack_from("<Q", relocated, offset)
+        struct.pack_into("<Q", relocated, offset, value + delta)
+    cast_after, = struct.unpack_from(
+        "<Q", relocated, cast_shadow - live.section_rva)
+    memcpy_after, = struct.unpack_from(
+        "<Q", relocated, memcpy_shadow - live.section_rva)
+    assert cast_after == values[0x3420] + delta
+    assert memcpy_after == values[0x3428]
+
+    outer_sections = [
+        pe_analyze.ParsedSection(
+            ".text", 0x1000, 0x2000, b"\x90" * 0x2000, 0x60000020),
+        pe_analyze.ParsedSection(
+            ".lcfg", live.section_rva, len(live.data), live.data,
+            cfg_preservation.LIVE_SECTION_CHARACTERISTICS),
+    ]
+    reparsed = pe_analyze._parse_load_config(
+        live.data[:live.directory_size],
+        live.directory_rva,
+        image_base=parsed.image_base,
+        image_size=0x9000,
+        sections=outer_sections,
+    )
+    assert reparsed is not None
+    assert reparsed.guard_flags & 0x01000000
+    assert reparsed.guard_flags & 0x02000000
+    assert reparsed.cast_guard_os_determined_failure_mode_rva == cast_shadow
+    assert reparsed.guard_memcpy_function_pointer_rva == memcpy_shadow
+
+
 def test_runtime_recipe_carries_slots_and_exact_target_flags() -> None:
     slots = (
         cfg_preservation.RuntimeSlotCopy(0x3400, 0x7200, "cookie"),

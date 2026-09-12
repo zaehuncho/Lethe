@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 _PREFERRED_BASE = 0x140000000
 _SECTION_RVA = 0x1000
 _TABLE_RVA = 0x1150
-_SHADOW_RVA = 0x1160
+_CHECK_SHADOW_RVA = 0x1160
+_CAST_SHADOW_RVA = 0x1168
+_MEMCPY_SHADOW_RVA = 0x1170
 _PACKED_SIZE = 0x3000
 
 
@@ -55,11 +57,27 @@ def _binding_fixture() -> tuple[bytes, bytes]:
     data = bytearray(0x180)
     struct.pack_into("<Q", data, 128, _PREFERRED_BASE + _TABLE_RVA)
     struct.pack_into("<Q", data, 136, 1)
-    struct.pack_into("<I", data, 144, 0x10000500)
+    struct.pack_into("<I", data, 144, 0x13000500)
+    struct.pack_into("<Q", data, 304, _PREFERRED_BASE + _CAST_SHADOW_RVA)
+    struct.pack_into("<Q", data, 312, _PREFERRED_BASE + _MEMCPY_SHADOW_RVA)
     struct.pack_into("<IB", data, _TABLE_RVA - _SECTION_RVA, 0x2000, 0)
-    struct.pack_into("<Q", data, _SHADOW_RVA - _SECTION_RVA, _PREFERRED_BASE + 0x2100)
+    struct.pack_into(
+        "<Q", data, _CHECK_SHADOW_RVA - _SECTION_RVA,
+        _PREFERRED_BASE + 0x2200)
+    struct.pack_into(
+        "<Q", data, _CAST_SHADOW_RVA - _SECTION_RVA,
+        _PREFERRED_BASE + 0x2300)
+    struct.pack_into(
+        "<Q", data, _MEMCPY_SHADOW_RVA - _SECTION_RVA,
+        0x7FFA123456781234)
     slots = (
-        cfg_preservation.RuntimeSlotCopy(0x2100, _SHADOW_RVA, "check"),
+        cfg_preservation.RuntimeSlotCopy(
+            0x2100, _CHECK_SHADOW_RVA, "GuardCFCheckFunctionPointer"),
+        cfg_preservation.RuntimeSlotCopy(
+            0x2110, _CAST_SHADOW_RVA,
+            "CastGuardOsDeterminedFailureMode"),
+        cfg_preservation.RuntimeSlotCopy(
+            0x2118, _MEMCPY_SHADOW_RVA, "GuardMemcpyFunctionPointer"),
     )
     targets = (
         cfg_preservation.PlannedCfgTarget(0x2000, b"\0", "source"),
@@ -70,7 +88,13 @@ def _binding_fixture() -> tuple[bytes, bytes]:
         directory_rva=_SECTION_RVA,
         directory_size=0x140,
         data=bytes(data),
-        relocation_target_rvas=(_SECTION_RVA + 128, _SHADOW_RVA),
+        relocation_target_rvas=(
+            _SECTION_RVA + 128,
+            _SECTION_RVA + 304,
+            _SECTION_RVA + 312,
+            _CHECK_SHADOW_RVA,
+            _CAST_SHADOW_RVA,
+        ),
         runtime_slot_copies=slots,
     )
     recipe = cfg_preservation.build_runtime_slot_blob(
@@ -144,6 +168,15 @@ static void put64(uint8_t *out, uint64_t value)
         out[i] = (uint8_t)(value >> (i * 8u));
 }}
 
+static uint64_t get64(const uint8_t *in)
+{{
+    uint64_t value = 0;
+    unsigned int i;
+    for (i = 0; i < 8u; ++i)
+        value |= (uint64_t)in[i] << (i * 8u);
+    return value;
+}}
+
 static void reset_image(void)
 {{
     uint8_t *optional = image + OPTIONAL_OFFSET;
@@ -169,7 +202,19 @@ static void reset_image(void)
     memcpy(image + SECTION_RVA, section_template, sizeof(section_template));
     put64(image + SECTION_RVA + 128u,
           (uint64_t)(uintptr_t)(image + 0x{_TABLE_RVA:X}u));
-    put64(image + 0x{_SHADOW_RVA:X}u, UINT64_C(0x7FFA123456781234));
+    put64(image + SECTION_RVA + 304u,
+          (uint64_t)(uintptr_t)(image + 0x{_CAST_SHADOW_RVA:X}u));
+    put64(image + SECTION_RVA + 312u,
+          (uint64_t)(uintptr_t)(image + 0x{_MEMCPY_SHADOW_RVA:X}u));
+    put64(image + 0x{_CHECK_SHADOW_RVA:X}u,
+          UINT64_C(0x7FFA111122223333));
+    put64(image + 0x{_CAST_SHADOW_RVA:X}u,
+          UINT64_C(0x7FFA444455556666));
+    put64(image + 0x{_MEMCPY_SHADOW_RVA:X}u,
+          UINT64_C(0x7FFA777788889999));
+    put64(image + 0x2100u, UINT64_C(0xAAAAAAAAAAAAAAAA));
+    put64(image + 0x2110u, UINT64_C(0xBBBBBBBBBBBBBBBB));
+    put64(image + 0x2118u, UINT64_C(0xCCCCCCCCCCCCCCCC));
 }}
 
 static int accepted(void)
@@ -182,8 +227,14 @@ int main(void)
 {{
     reset_image();
     if (!accepted()) return 10;
-    image[0x{_SHADOW_RVA:X}u] ^= 0x5Au;
-    if (!accepted()) return 11;
+    if (lethe_load_config_slots_restore_verified(
+            image, 0x2800u, PACKED_SIZE,
+            recipe, (uint32_t)sizeof(recipe)) != 0) return 11;
+    if (get64(image + 0x2100u) != UINT64_C(0x7FFA111122223333)) return 12;
+    if (get64(image + 0x2110u) != UINT64_C(0x7FFA444455556666)) return 13;
+    if (get64(image + 0x2118u) != UINT64_C(0x7FFA777788889999)) return 14;
+    image[0x{_MEMCPY_SHADOW_RVA:X}u] ^= 0x5Au;
+    if (!accepted()) return 15;
 
     reset_image();
     image[SECTION_RVA + 144u] ^= 1u;

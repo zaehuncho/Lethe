@@ -14,4 +14,10 @@ int lethe_load_config_binding_verify(const uint8_t *image,
                                      const uint8_t *recipe,
                                      uint32_t recipe_size);
 
+int lethe_load_config_slots_restore_verified(uint8_t *image,
+                                             uint32_t original_image_size,
+                                             uint32_t packed_image_size,
+                                             const uint8_t *recipe,
+                                             uint32_t recipe_size);
+
 #endif

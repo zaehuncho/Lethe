@@ -74,6 +74,57 @@ static int lcfg_name_matches(const uint8_t *name)
     return 1;
 }
 
+int lethe_load_config_slots_restore_verified(uint8_t *image,
+                                             uint32_t original_image_size,
+                                             uint32_t packed_image_size,
+                                             const uint8_t *recipe,
+                                             uint32_t recipe_size)
+{
+    uint32_t slot_count;
+    uint32_t target_count;
+    uint32_t relocation_count;
+    uint32_t i;
+
+    if (!image || !recipe || recipe_size < LETHE_LCFG_RUNTIME_HEADER_SIZE ||
+        original_image_size > packed_image_size ||
+        recipe[0] != 'L' || recipe[1] != 'C' || recipe[2] != 'F' ||
+        recipe[3] != 'G' || recipe[4] != 'R' || recipe[5] != 'T' ||
+        recipe[6] != '1' || recipe[7] != '\0' ||
+        lcfg_u32(recipe + 8u) != LETHE_LCFG_RUNTIME_VERSION)
+        return 1;
+    slot_count = lcfg_u32(recipe + 12u);
+    target_count = lcfg_u32(recipe + 16u);
+    relocation_count = lcfg_u32(recipe + LCFG_RECIPE_RELOCATION_COUNT);
+    if ((uint64_t)LETHE_LCFG_RUNTIME_HEADER_SIZE +
+            (uint64_t)slot_count * LETHE_LCFG_RUNTIME_ENTRY_SIZE +
+            (uint64_t)target_count * LETHE_LCFG_RUNTIME_TARGET_SIZE +
+            (uint64_t)relocation_count * LETHE_LCFG_RUNTIME_RELOCATION_SIZE !=
+        recipe_size)
+        return 1;
+
+    for (i = 0; i < slot_count; ++i) {
+        const uint8_t *entry = recipe + LETHE_LCFG_RUNTIME_HEADER_SIZE +
+                               (uint64_t)i * LETHE_LCFG_RUNTIME_ENTRY_SIZE;
+        uint32_t source_rva = lcfg_u32(entry);
+        uint32_t shadow_rva = lcfg_u32(entry + 4u);
+        uint32_t j;
+        if ((source_rva & 7u) != 0 || (shadow_rva & 7u) != 0 ||
+            !lcfg_range(source_rva, 8u, original_image_size) ||
+            !lcfg_range(shadow_rva, 8u, packed_image_size))
+            return 1;
+        for (j = 0; j < i; ++j) {
+            const uint8_t *prior = recipe + LETHE_LCFG_RUNTIME_HEADER_SIZE +
+                                   (uint64_t)j *
+                                       LETHE_LCFG_RUNTIME_ENTRY_SIZE;
+            if (lcfg_u32(prior) == source_rva ||
+                lcfg_u32(prior + 4u) == shadow_rva)
+                return 1;
+        }
+        lcfg_put_u64(image + source_rva, lcfg_u64(image + shadow_rva));
+    }
+    return 0;
+}
+
 static int lcfg_shadow_overlap(const uint8_t *recipe, uint32_t slot_count,
                                uint32_t relocation_rva,
                                int *out_exact_shadow)

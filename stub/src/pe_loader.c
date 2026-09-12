@@ -655,7 +655,6 @@ static int restore_load_config_slots(uint8_t *base, uint32_t packed_size,
     uint32_t target_count;
     uint32_t relocation_count;
     uint32_t recipe_size;
-    uint32_t i;
 
     if (!(pi->flags & LETHE_FLAG_LOAD_CONFIG))
         return 0;
@@ -665,28 +664,9 @@ static int restore_load_config_slots(uint8_t *base, uint32_t packed_size,
         return 1;
     (void)target_count;
     (void)relocation_count;
-    (void)recipe_size;
 
-    for (i = 0; i < slot_count; ++i) {
-        const uint8_t *entry = recipe + LCFG_RUNTIME_HDR_SIZE +
-                               i * LCFG_RUNTIME_ENTRY_SIZE;
-        uint32_t source_rva = *(const uint32_t *)(const void *)entry;
-        uint32_t shadow_rva = *(const uint32_t *)(const void *)(entry + 4);
-        uint32_t j;
-        if ((source_rva & 7u) != 0 || (shadow_rva & 7u) != 0 ||
-            (uint64_t)source_rva + 8u > pi->original_size_of_image ||
-            (uint64_t)shadow_rva + 8u > packed_size)
-            return 1;
-        for (j = 0; j < i; ++j) {
-            const uint8_t *prior = recipe + LCFG_RUNTIME_HDR_SIZE +
-                                   j * LCFG_RUNTIME_ENTRY_SIZE;
-            if (*(const uint32_t *)(const void *)prior == source_rva)
-                return 1;
-        }
-        *(uint64_t *)(void *)(base + source_rva) =
-            *(const uint64_t *)(const void *)(base + shadow_rva);
-    }
-    return 0;
+    return lethe_load_config_slots_restore_verified(
+        base, pi->original_size_of_image, packed_size, recipe, recipe_size);
 }
 
 static int register_load_config_targets(uint8_t *base,

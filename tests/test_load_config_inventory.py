@@ -28,7 +28,13 @@ def _fixture() -> tuple[bytes, list[pe_analyze.ParsedSection]]:
     struct.pack_into("<Q", blob, 112, IMAGE_BASE + 0x2410)
     struct.pack_into("<Q", blob, 120, IMAGE_BASE + 0x2418)
 
-    guard_flags = 0x10000000 | 0x00000100 | 0x00000400
+    guard_flags = (
+        0x10000000
+        | 0x00000100
+        | 0x00000400
+        | 0x01000000
+        | 0x02000000
+    )
     struct.pack_into("<I", blob, 144, guard_flags)
     cf_table = b"".join((struct.pack("<IB", 0x1000, 0), struct.pack("<IB", 0x1010, 2)))
     raw[0x1200:0x1200 + len(cf_table)] = cf_table
@@ -54,6 +60,8 @@ def _fixture() -> tuple[bytes, list[pe_analyze.ParsedSection]]:
     struct.pack_into("<QQ", blob, 264, IMAGE_BASE + 0x2340, 2)
     flags, = struct.unpack_from("<I", blob, 144)
     struct.pack_into("<I", blob, 144, flags | 0x00400000)
+    struct.pack_into("<Q", blob, 304, IMAGE_BASE + 0x2420)
+    struct.pack_into("<Q", blob, 312, IMAGE_BASE + 0x2428)
 
     raw[LOAD_CONFIG_RVA - 0x1000:LOAD_CONFIG_RVA - 0x1000 + len(blob)] = blob
     return bytes(blob), [
@@ -110,6 +118,10 @@ def test_strict_load_config_inventory_converts_vas_and_preserves_metadata() -> N
         0x1020, 0x1030)
     assert tuple(target.rva for target in parsed.guard_eh_continuation_targets) == (
         0x1033, 0x1045)
+    assert parsed.guard_flags & 0x01000000
+    assert parsed.guard_flags & 0x02000000
+    assert parsed.cast_guard_os_determined_failure_mode_rva == 0x2420
+    assert parsed.guard_memcpy_function_pointer_rva == 0x2428
     assert parsed.has_guard_cf is True
     assert parsed.unsupported_features == ()
     assert parsed.raw == blob
@@ -151,6 +163,69 @@ def test_load_config_directory_rva_must_be_naturally_aligned() -> None:
             image_size=IMAGE_SIZE,
             sections=sections,
         )
+
+
+@pytest.mark.parametrize(
+    ("flag", "size", "name", "minimum"),
+    [
+        (0x01000000, 308, "IMAGE_GUARD_CASTGUARD_PRESENT", "0x138"),
+        (0x02000000, 316, "IMAGE_GUARD_MEMCPY_PRESENT", "0x140"),
+    ],
+)
+def test_current_sdk_guard_flag_requires_complete_loader_slot(
+    flag: int,
+    size: int,
+    name: str,
+    minimum: str,
+) -> None:
+    original, sections = _fixture()
+    blob = bytearray(original[:size])
+    struct.pack_into("<I", blob, 0, size)
+    existing, = struct.unpack_from("<I", blob, 144)
+    existing &= ~(0x01000000 | 0x02000000)
+    struct.pack_into("<I", blob, 144, existing | flag)
+    sections = _replace_blob_in_sections(bytes(blob), sections)
+
+    with pytest.raises(ValueError, match=rf"{name} requires.*{minimum}"):
+        _parse(bytes(blob), sections)
+
+
+def test_current_sdk_guard_flags_allow_loader_populated_zero_slots() -> None:
+    original, sections = _fixture()
+    blob = bytearray(original[:320])
+    struct.pack_into("<I", blob, 0, len(blob))
+    struct.pack_into("<QQ", blob, 304, 0, 0)
+    sections = _replace_blob_in_sections(bytes(blob), sections)
+
+    parsed = _parse(bytes(blob), sections)
+
+    assert parsed is not None
+    assert parsed.guard_flags & 0x01000000
+    assert parsed.guard_flags & 0x02000000
+    assert parsed.cast_guard_os_determined_failure_mode_rva == 0
+    assert parsed.guard_memcpy_function_pointer_rva == 0
+
+
+def test_reserved_guard_flag_and_language_handler_gfid_remain_fail_closed() -> None:
+    blob, sections = _fixture()
+    reserved = bytearray(blob)
+    flags, = struct.unpack_from("<I", reserved, 144)
+    struct.pack_into("<I", reserved, 144, flags | 0x00200000)
+    with pytest.raises(ValueError, match="unsupported load-config GuardFlags"):
+        _parse(bytes(reserved), sections)
+
+    section = sections[0]
+    raw = bytearray(section.raw)
+    raw[0x1204] = 0x04
+    language_handler_sections = [pe_analyze.ParsedSection(
+        section.name,
+        section.rva,
+        section.virtual_size,
+        bytes(raw),
+        section.characteristics,
+    )]
+    with pytest.raises(ValueError, match="target metadata flags 0x04"):
+        _parse(blob, language_handler_sections)
 
 
 def test_guard_table_pointer_count_range_and_sorting_are_strict() -> None:

@@ -103,6 +103,8 @@ _GUARD_RF_STRICT = 0x00080000
 _GUARD_RETPOLINE_PRESENT = 0x00100000
 _GUARD_EH_CONTINUATION_TABLE_PRESENT = 0x00400000
 _GUARD_XFG_ENABLED = 0x00800000
+_GUARD_CASTGUARD_PRESENT = 0x01000000
+_GUARD_MEMCPY_PRESENT = 0x02000000
 _GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT = 28
 _GUARD_CF_FUNCTION_TABLE_SIZE_MASK = 0xF0000000
 _KNOWN_GUARD_FLAGS = (
@@ -121,6 +123,8 @@ _KNOWN_GUARD_FLAGS = (
     | _GUARD_RETPOLINE_PRESENT
     | _GUARD_EH_CONTINUATION_TABLE_PRESENT
     | _GUARD_XFG_ENABLED
+    | _GUARD_CASTGUARD_PRESENT
+    | _GUARD_MEMCPY_PRESENT
     | _GUARD_CF_FUNCTION_TABLE_SIZE_MASK
 )
 
@@ -1360,6 +1364,15 @@ def _parse_load_config(
         blob, declared_size, 136, "<Q", "GuardCFFunctionCount")
     guard_flags = _load_config_field(
         blob, declared_size, 144, "<I", "GuardFlags")
+    for flag, minimum_size, name in (
+        (_GUARD_CASTGUARD_PRESENT, 312, "IMAGE_GUARD_CASTGUARD_PRESENT"),
+        (_GUARD_MEMCPY_PRESENT, 320, "IMAGE_GUARD_MEMCPY_PRESENT"),
+    ):
+        if guard_flags & flag and declared_size < minimum_size:
+            raise ValueError(
+                "malformed load-config directory: "
+                f"{name} requires declared size at least 0x{minimum_size:X}"
+            )
     code_integrity = bytes(blob[148:160]) if declared_size >= 160 else b""
     if 148 < declared_size < 160:
         raise ValueError(
