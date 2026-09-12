@@ -630,8 +630,6 @@ def test_fuzz_mem_ops():
     "ret 8",                # callee stack cleanup cannot use the common thunk
     "movsb",                # string op
     # unsupported one-operand multiply encodings stay fail-closed
-    "mul ah",               # high-8 source alias
-    "imul ah",              # high-8 source alias
     "mul qword ptr fs:[rbx]",  # segment-overridden source
     # lea forms outside the faithful subset
     "lea rax, [rip+0x10]",  # RIP-relative lea
@@ -640,13 +638,6 @@ def test_fuzz_mem_ops():
     "lea rax, fs:[rbx]",    # segment-overridden lea
     # memory forms still outside the faithful subset
     "mov rax, fs:[rbx]",    # segment-overridden load
-    # High-8 aliases remain deliberately unsupported; low-8/16 are modeled.
-    "mov ah, 5",
-    "add bh, ch",
-    # Narrow shift/rotate count semantics are a separate batch.
-    "sar al, 1",            # 8-bit arithmetic shift
-    "rol al, 1",            # 8-bit rotate
-    "ror bl, cl",           # 8-bit rotate by CL
     # Atomic memory exchange and LOCK-prefixed RMW are not synthesized.
     "xchg [rbx], eax",
     "lock add dword ptr [rbx], 1",

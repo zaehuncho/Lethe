@@ -99,14 +99,22 @@ else + a **differential oracle** that proves every lift correct.
   Differential tests use a deliberately nonpreferred runtime base; the native
   eager/memory-guard gate forces relocation of a `/DYNAMICBASE` fixture.
 
+
+- **Cut 14** - legacy high-byte `AH/BH/CH/DH`, `CBW/CWDE/CDQE/CWD/CDQ/CQO`,
+  two-/three-operand 16-bit `imul`, and register-target `bt/bts/btr/btc`.
+  Ordinary register and memory `shl/shr/sar/rol/ror` now cover 8/16/32/64-bit
+  destinations with the architectural five-/six-bit count mask, rotate-width
+  reduction, zero-count behavior, and defined flag results. Dead-flag
+  elimination is not enabled by the default lift path.
+
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
 RIP targets in headers/gaps/discardable sections/code/selected extents,
-segment memory, 8/16-bit
-shift/rotate, 16-bit `shld`/`shrd`, high-8 `AH/BH/CH/DH`, XMM memory forms,
+segment memory, 16-bit `shld`/`shrd`, memory-target `bt/bts/btr/btc` bit strings,
+XMM memory forms,
 SIMD/FP arithmetic, VEX/EVEX encodings, YMM/ZMM state, string ops, and
 indirect/external branches.
 
