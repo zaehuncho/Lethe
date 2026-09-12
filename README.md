@@ -142,6 +142,10 @@ decision explicitly, preserving the canonical compact sorted-key JSON encoding.
 At pack time the orchestrator recomputes all bindings against its private source
 snapshot and then runs the existing production direct-control-flow audit; the
 manifest cannot waive a stale byte, a new edge, or any failed current proof.
+When both report and manifest files are requested, the tool constructs and
+source-revalidates both before a transactional sibling-file publication. Path
+identity aliases, hardlinks between the three roles, and reparse-based output
+paths reject without changing either prior output.
 
 ### Server shard mode
 
