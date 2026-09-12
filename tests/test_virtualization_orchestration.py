@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from daedalus import shuffle_opcodes
-from lifter import direct_control_flow
+from lifter import direct_control_flow, function_discovery, virtualization_plan
 from packer import (
     assemble, container, keyed_validation, orchestrator, payload, pe_analyze, report,
-    virtualize,
+    virtualization_selection, virtualize,
 )
 
 
@@ -228,6 +228,112 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
                and "1 indirect transfer" in line for line in progress)
     assert any("virtualized 1 selected function" in line for line in progress)
     assert any("rolling-capable VM stub verified" in line for line in progress)
+
+
+def test_core_consumes_verified_manifest_as_current_direct_only_request(
+        monkeypatch, tmp_path):
+    source = tmp_path / "app.exe"
+    output = tmp_path / "app.packed.exe"
+    manifest_path = tmp_path / "selection.json"
+    source.write_bytes(b"source")
+    manifest_path.write_text("{}", encoding="ascii")
+    stub, _stub_bytes, _manifest = _write_candidate(tmp_path, rolling=True)
+    source_parsed = SimpleNamespace(is_dll=False)
+    materialized_parsed = SimpleNamespace(is_dll=False, materialized=True)
+    current_report = object()
+    captures = {}
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+    monkeypatch.setattr(pe_analyze, "analyze_pe", lambda _path: source_parsed)
+    monkeypatch.setattr(
+        function_discovery, "discover_functions", lambda parsed: current_report)
+
+    def fake_load(path, **kwargs):
+        captures["manifest_path"] = path
+        captures["manifest_parsed"] = kwargs["parsed"]
+        captures["manifest_report"] = kwargs["report"]
+        captures["source_sha256"] = kwargs["source_sha256"]
+        return virtualization_selection.VerifiedSelection(
+            functions=(virtualization_selection.SelectedFunction(
+                "Init", 0x1000, 16),),
+            gaps=(virtualization_selection.GapAcknowledgement(
+                0x2000, 16, "reviewed linker padding"),),
+            tail_exits=(virtualization_selection.TailExitApproval(
+                0x1000, 0x1004, 0x3000, "reviewed tail"),),
+            acknowledge_unproven_indirect_targets=True,
+        )
+
+    monkeypatch.setattr(virtualization_selection, "load_and_verify", fake_load)
+
+    def fake_proof(parsed, specs, **kwargs):
+        captures["proof_specs"] = specs
+        captures["proof_gaps"] = kwargs["coverage_acknowledgements"]
+        captures["proof_tails"] = kwargs["tail_exit_policy"].approvals
+        return SimpleNamespace(
+            direct_transfers=(), coverage_gaps=(),
+            acknowledged_coverage_gaps=(), indirect_transfers=(),
+            direct_reference_gate_passed=True,
+            indirect_target_closure_proven=False,
+        )
+
+    monkeypatch.setattr(
+        direct_control_flow, "analyze_direct_control_flow", fake_proof)
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions",
+        lambda parsed, specs, **kwargs: SimpleNamespace(
+            parsed=materialized_parsed,
+            manifest=SimpleNamespace(functions=(object(),)),
+        ),
+    )
+    _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
+
+    result = orchestrator.pack_file(
+        str(source),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=False, stub_path=str(stub),
+            virtualization_selection_manifest=str(manifest_path),
+            _allow_unverified_stub_for_tests=True,
+        ),
+    )
+
+    assert result.ok, result.error
+    assert captures["manifest_path"] == str(manifest_path.resolve())
+    assert captures["manifest_parsed"] is source_parsed
+    assert captures["manifest_report"] is current_report
+    assert captures["source_sha256"] == hashlib.sha256(b"source").hexdigest()
+    assert captures["proof_specs"] == (
+        virtualization_plan.FunctionSpec("Init", 0x1000, 16),
+    )
+    assert captures["proof_gaps"] == (
+        direct_control_flow.CoverageGapAcknowledgement(
+            0x2000, 16, "reviewed linker padding"),
+    )
+    assert captures["proof_tails"] == (
+        direct_control_flow.TailExitApproval(
+            0x1000, 0x1004, 0x3000, "reviewed tail"),
+    )
+
+
+def test_core_rejects_manifest_mixed_with_explicit_selection_before_snapshot(
+        monkeypatch, tmp_path):
+    source = tmp_path / "app.exe"
+    output = tmp_path / "app.packed.exe"
+    source.write_bytes(b"source")
+    output.write_bytes(b"previous")
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+
+    result = orchestrator.pack_file(
+        str(source),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=False, stub_path="fresh.dll",
+            virtualization_selection_manifest="selection.json",
+            virtualization_specs=(
+                orchestrator.VirtualizationSpec("Init", 0x1000, 16),),
+        ),
+    )
+
+    assert not result.ok
+    assert "incompatible" in result.error
+    assert output.read_bytes() == b"previous"
 
 
 def test_core_virtualization_gate_failure_is_transactional(monkeypatch, tmp_path):

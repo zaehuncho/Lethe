@@ -51,10 +51,12 @@ def test_cli_defaults_are_release_safe():
     assert args.enable_experimental_server_shard is False
     assert args.enable_experimental_virtualization is False
     assert args.virtualize_function == []
+    assert args.virtualization_selection_manifest is None
     assert args.virtualization_gap == []
     assert args.virtualization_tail_exit == []
     assert args.acknowledge_unproven_indirect_targets is False
     assert orchestrator.PackOptions().virtualization_specs == ()
+    assert orchestrator.PackOptions().virtualization_selection_manifest is None
     assert orchestrator.PackOptions().virtualization_gap_acknowledgements == ()
     assert orchestrator.PackOptions().virtualization_tail_exit_approvals == ()
     assert orchestrator.PackOptions().acknowledge_unproven_indirect_targets is False
@@ -244,6 +246,56 @@ def test_cli_passes_immutable_virtualization_specs(monkeypatch, tmp_path):
             0x1200, 0x1204, 0x2000, "known tail"),
     )
     assert captured["indirect"] is True
+
+
+def test_cli_passes_explicit_selection_manifest_without_legacy_options(
+        monkeypatch, tmp_path):
+    input_path = tmp_path / "input.exe"
+    input_path.write_bytes(b"test fixture")
+    manifest = tmp_path / "selection.json"
+    manifest.write_text("{}", encoding="ascii")
+    captured = {}
+
+    def fake_pack(_path, options, progress=None):
+        captured["options"] = options
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    rc = lethe.main([
+        str(input_path),
+        "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll",
+        "--virtualization-selection-manifest", str(manifest),
+    ])
+
+    assert rc == lethe.EXIT_OK
+    assert captured["options"].virtualization_selection_manifest == str(manifest)
+    assert captured["options"].virtualization_specs == ()
+    assert captured["options"].virtualization_gap_acknowledgements == ()
+    assert captured["options"].acknowledge_unproven_indirect_targets is False
+
+
+@pytest.mark.parametrize("extra", [
+    ["--virtualize-function", "Init:0x1000:16"],
+    ["--virtualization-gap", "0x2000:16:padding"],
+    ["--virtualization-tail-exit", "0x1000:0x1004:0x2000:tail"],
+    ["--acknowledge-unproven-indirect-targets"],
+])
+def test_cli_rejects_selection_manifest_mixed_with_legacy_proof_options(
+        extra, tmp_path, capsys):
+    input_path = tmp_path / "input.exe"
+    input_path.write_bytes(b"test fixture")
+    manifest = tmp_path / "selection.json"
+    manifest.write_text("{}", encoding="ascii")
+    rc = lethe.main([
+        str(input_path),
+        "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll",
+        "--virtualization-selection-manifest", str(manifest),
+        *extra,
+    ])
+    assert rc == lethe.EXIT_USAGE
+    assert "incompatible" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

@@ -68,6 +68,10 @@ python lethe.py yourapp.exe yourapp.packed.exe
 # inventory exact function candidates and lift blockers without modifying input
 python tools/virtualization_report.py yourapp.exe --format table
 
+# emit a canonical source-bound starter selection (acknowledgements default off)
+python tools/virtualization_report.py yourapp.exe `
+  --emit-selection-manifest selection.json
+
 # GUI (QML front-end): batch queue, options, presets, post-pack validation, reports
 python gui/venice.py            # or the widgets twin: python gui/app.py
 
@@ -103,6 +107,7 @@ python lethe.py INPUT [OUTPUT] [--anti-debug {on,off}]
                                [--memory-guard] [--process-hardening]
                                [--level N]
                                [--virtualize-function NAME:RVA:SIZE]
+                               [--virtualization-selection-manifest PATH]
                                [--enable-experimental-virtualization]
                                [--stub-path PATH] [--verbose]
 ```
@@ -115,6 +120,7 @@ python lethe.py INPUT [OUTPUT] [--anti-debug {on,off}]
 | `--memory-guard` | off | experimental on-demand page decryption; not release-approved |
 | `--process-hardening` | off | opt in to irreversible EXE process mitigations and restricted default DLL search directories; unavailable for DLL mode |
 | `--virtualize-function NAME:RVA:SIZE` | none | select one exact first-party function extent; repeatable |
+| `--virtualization-selection-manifest PATH` | none | consume a strict canonical version-2 selection bound to the exact source PE and current proof; incompatible with separate selection/proof flags |
 | `--enable-experimental-virtualization` | off | acknowledge the selected-function path; requires an explicit fresh `--stub-path` |
 | `--level N` | `9` | deflate compression level (0–9) |
 | `--stub-path PATH` | tracked prebuilt | use a fresh stub without promoting it |
@@ -126,6 +132,16 @@ supports dynamic and static import consumers plus tested TLS, unwind, attach,
 detach, unload, and reload lifecycles, but is not release-approved until every
 required DLL compatibility row is proven. Experimental behavior must not be used
 for release artifacts.
+
+The report tool's selection manifest binds the full source SHA-256, its
+signing-stable PE content identity, PE kind, AMD64 machine, image base,
+`SizeOfImage`, and every selected function's complete runtime-function extent,
+bytes, record identity, gaps, and direct-reference verdict. It deliberately
+emits gap and indirect-closure acknowledgements as `false`. Review and set each
+decision explicitly, preserving the canonical compact sorted-key JSON encoding.
+At pack time the orchestrator recomputes all bindings against its private source
+snapshot and then runs the existing production direct-control-flow audit; the
+manifest cannot waive a stale byte, a new edge, or any failed current proof.
 
 ### Server shard mode
 

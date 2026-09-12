@@ -1,10 +1,12 @@
 """CLI contracts for the read-only virtualization report tool."""
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 
 from lifter import function_discovery
+from packer.virtualization_selection import canonical_json
 from tools import virtualization_report
 
 
@@ -40,8 +42,26 @@ def test_tool_writes_report_and_safe_starter_manifest(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         virtualization_report.pe_analyze, "analyze_pe",
-        lambda path: SimpleNamespace(path=path),
+        lambda path: SimpleNamespace(
+            path=path,
+            is_dll=False,
+            image_base=0x140000000,
+            size_of_image=0x3000,
+            sections=(SimpleNamespace(
+                rva=0x1000,
+                raw=b"\x90" * 6,
+                characteristics=0x60000020,
+            ),),
+            runtime_functions=(SimpleNamespace(
+                begin_rva=0x1000,
+                end_rva=0x1006,
+                unwind_info_rva=0x2000,
+                unwind_flags=0,
+            ),),
+        ),
     )
+    monkeypatch.setattr(
+        virtualization_report, "pe_content_id", lambda _path: "b" * 64)
     monkeypatch.setattr(
         virtualization_report.function_discovery, "discover_functions",
         lambda _parsed, **_kwargs: report,
@@ -57,7 +77,17 @@ def test_tool_writes_report_and_safe_starter_manifest(monkeypatch, tmp_path):
     assert json.loads(output.read_text(encoding="utf-8"))["schema"] == \
         function_discovery.REPORT_SCHEMA
     manifest = json.loads(selection.read_text(encoding="utf-8"))
-    assert manifest["functions"] == [{"name": "exact", "rva": 0x1000, "size": 6}]
+    assert selection.read_bytes() == canonical_json(manifest)
+    assert manifest["schema"] == "lethe.virtualization-selection"
+    assert manifest["version"] == 2
+    assert manifest["selections"][0]["name"] == "exact"
+    assert manifest["selections"][0]["source_extent"] == {
+        "rva": 0x1000, "size": 6,
+    }
+    assert manifest["source"]["sha256"] == hashlib.sha256(before).hexdigest()
+    assert manifest["selections"][0]["indirect_target_closure"] == {
+        "acknowledged": False, "proven": False,
+    }
 
 
 def test_tool_reports_map_read_failure_cleanly(tmp_path, capsys):

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
+from dataclasses import replace
 import os
 import sys
+import tempfile
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +15,11 @@ if ROOT not in sys.path:
 
 from lifter import function_discovery  # noqa: E402
 from packer import pe_analyze  # noqa: E402
+from packer.pe_content_id import pe_content_id, snapshot_file  # noqa: E402
+from packer.virtualization_selection import (  # noqa: E402
+    build_manifest,
+    canonical_json,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +55,7 @@ def _same_path(left: str, right: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    snapshot_path = None
     try:
         write_targets = [
             path for path in (args.output, args.emit_selection_manifest) if path
@@ -57,7 +64,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("report output must not overwrite the inspected PE")
         if len(write_targets) == 2 and _same_path(*write_targets):
             raise ValueError("report and selection outputs must use different paths")
-        parsed = pe_analyze.analyze_pe(args.input)
+        source = snapshot_file(args.input, what="inspected PE")
+        suffix = os.path.splitext(args.input)[1]
+        descriptor, snapshot_path = tempfile.mkstemp(
+            prefix=".lethe-virtualization-report-", suffix=suffix)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(source.data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        parsed = pe_analyze.analyze_pe(snapshot_path)
         map_text = None
         if args.map_path:
             with open(args.map_path, "r", encoding="utf-8-sig") as stream:
@@ -65,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         report = function_discovery.discover_functions(
             parsed, map_text=map_text, leaf_cap=args.leaf_cap
         )
+        report = replace(report, image_path=os.path.abspath(args.input))
         rendered = (
             report.to_json() if args.format == "json"
             else function_discovery.render_table(report)
@@ -75,17 +91,31 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.write(rendered)
         if args.emit_selection_manifest:
-            selection = json.dumps(
-                report.starter_selection_manifest(), indent=2, sort_keys=True
-            ) + "\n"
+            selection = canonical_json(build_manifest(
+                report,
+                parsed,
+                source_sha256=source.sha256,
+                source_pe_content_id=pe_content_id(snapshot_path),
+            ))
             with open(
-                args.emit_selection_manifest, "w", encoding="utf-8", newline="\n"
+                args.emit_selection_manifest, "wb"
             ) as stream:
                 stream.write(selection)
+                stream.flush()
+                os.fsync(stream.fileno())
+        current = snapshot_file(args.input, what="inspected PE")
+        if current.sha256 != source.sha256 or current.size != source.size:
+            raise ValueError("inspected PE changed while the report was generated")
         return 0
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if snapshot_path is not None:
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

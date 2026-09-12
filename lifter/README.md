@@ -22,7 +22,9 @@ else + a **differential oracle** that proves every lift correct.
   deterministic JSON/starter manifests. Export-only leaf sizing is deliberately
   heuristic, capped, labelled, and never selected for production automatically.
 - `../tools/virtualization_report.py` — CLI renderer for that report; it does
-  not invoke the packer or mutate the inspected image.
+  not invoke the packer or mutate the inspected image. Its optional canonical
+  version-2 selection manifest binds the exact PE and runtime-function evidence;
+  human gap and indirect-closure acknowledgements default to fail-closed.
 
 ## Fixed model (do NOT change without updating both sides)
 - 16 GPRs → VM locals at offsets `0,8,…,120` (`REG_OFF`, order = `GPR_NAMES`).

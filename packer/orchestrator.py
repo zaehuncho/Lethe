@@ -117,6 +117,7 @@ class PackOptions:
     acknowledge_unproven_indirect_targets: bool = False
     # Internal harness capability. The public CLI never exposes or derives it.
     _allow_unverified_stub_for_tests: bool = False
+    virtualization_selection_manifest: Optional[str] = None
 
 
 @dataclass
@@ -673,20 +674,38 @@ def pack_file(input_path: str, options: PackOptions,
 
         virtualization_specs = _validate_virtualization_specs(
             getattr(options, "virtualization_specs", ()))
+        selection_manifest = getattr(
+            options, "virtualization_selection_manifest", None)
+        if selection_manifest is not None and (
+                not isinstance(selection_manifest, str)
+                or not selection_manifest or "\0" in selection_manifest):
+            raise ValueError("virtualization_selection_manifest must be a path string")
+        if selection_manifest and (
+                virtualization_specs
+                or getattr(options, "virtualization_gap_acknowledgements", ())
+                or getattr(options, "virtualization_tail_exit_approvals", ())
+                or getattr(options, "acknowledge_unproven_indirect_targets", False)):
+            raise ValueError(
+                "virtualization selection manifest is incompatible with explicit "
+                "function/proof options")
+        has_virtualization_selection = bool(
+            virtualization_specs or selection_manifest)
         virtualization_enabled = os.environ.get(_VIRTUALIZATION_GATE) == "1"
-        if virtualization_specs and not virtualization_enabled:
+        if has_virtualization_selection and not virtualization_enabled:
             raise ValueError(
                 "selected functions require the named experimental "
                 "virtualization acknowledgment")
-        if virtualization_enabled and not virtualization_specs:
+        if virtualization_enabled and not has_virtualization_selection:
             raise ValueError(
                 "experimental virtualization acknowledgment requires at least "
-                "one explicit function spec")
-        if virtualization_specs and not getattr(options, "stub_path", None):
+                "one explicit function spec or selection manifest")
+        if has_virtualization_selection and not getattr(options, "stub_path", None):
             raise ValueError(
                 "experimental virtualization requires an explicit fresh stub_path")
-        virtualization_gap_acknowledgements, virtualization_tail_exit_approvals = \
-            _validate_virtualization_controls(options, virtualization_specs)
+        if not selection_manifest:
+            virtualization_gap_acknowledgements, \
+                virtualization_tail_exit_approvals = \
+                _validate_virtualization_controls(options, virtualization_specs)
 
         # --- shard config sanity (fail loud BEFORE we key anything) ----------
         # assemble.py XORs the server shard into the key whenever server_shard
@@ -763,6 +782,59 @@ def pack_file(input_path: str, options: PackOptions,
         _analyze = getattr(pe_analyze, "analyze_pe", None) or \
             getattr(pe_analyze, "analyze")
         parsed = _analyze(source_snapshot_path)
+
+        if selection_manifest:
+            from lifter import function_discovery
+            try:
+                from . import virtualization_selection
+            except ImportError:  # flat / frozen layout
+                import virtualization_selection  # type: ignore
+            manifest_path = os.path.abspath(selection_manifest)
+            for other_path, label in (
+                    (input_path, "input"), (output_path, "output"),
+                    (eff.stub_path, "stub")):
+                if other_path and _same_file_or_path(manifest_path, other_path):
+                    raise ValueError(
+                        f"virtualization selection manifest must not alias {label}")
+            current_report = function_discovery.discover_functions(parsed)
+            verified = virtualization_selection.load_and_verify(
+                manifest_path,
+                parsed=parsed,
+                report=current_report,
+                source_sha256=source_sha256,
+                source_snapshot_path=source_snapshot_path,
+            )
+            virtualization_specs = tuple(
+                VirtualizationSpec(item.name, item.rva, item.size)
+                for item in verified.functions
+            )
+            eff = replace(
+                eff,
+                virtualization_specs=virtualization_specs,
+                virtualization_gap_acknowledgements=tuple(
+                    VirtualizationGapAcknowledgement(
+                        item.rva, item.size, item.rationale)
+                    for item in verified.gaps
+                ),
+                virtualization_tail_exit_approvals=tuple(
+                    VirtualizationTailExitApproval(
+                        item.function_rva, item.instruction_rva,
+                        item.target_rva, item.rationale)
+                    for item in verified.tail_exits
+                ),
+                acknowledge_unproven_indirect_targets=(
+                    verified.acknowledge_unproven_indirect_targets),
+            )
+            _emit(
+                progress,
+                f"verified source-bound virtualization selection manifest "
+                f"({len(virtualization_specs)} function(s))",
+            )
+
+        if selection_manifest:
+            virtualization_gap_acknowledgements, \
+                virtualization_tail_exit_approvals = \
+                _validate_virtualization_controls(eff, virtualization_specs)
 
         # Function virtualization is an explicit, experimental transform of the
         # analyzed original image. Its generated sections then flow through the

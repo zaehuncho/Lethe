@@ -23,7 +23,8 @@ Usage
 -----
     python lethe.py INPUT [OUTPUT]
                         [--anti-debug {on,off}] [--memory-guard]
-                        [--process-hardening] [--level N] [--verbose]
+                        [--process-hardening] [--level N]
+                        [--virtualization-selection-manifest PATH] [--verbose]
 
 The release-supported input is an unmanaged x64 EXE. DLL and server-shard
 paths require explicit experimental acknowledgments and are not release-ready.
@@ -330,6 +331,13 @@ def build_parser() -> argparse.ArgumentParser:
               "or 0x-prefixed RVA/size"),
     )
     parser.add_argument(
+        "--virtualization-selection-manifest",
+        default=None,
+        metavar="PATH",
+        help=("strict canonical source-bound selection manifest emitted by "
+              "tools/virtualization_report.py"),
+    )
+    parser.add_argument(
         "--enable-experimental-virtualization",
         action="store_true",
         help=("acknowledge the experimental explicit-function virtualization "
@@ -440,17 +448,27 @@ def main(
         print("error: --enable-experimental-server-shard requires --server-shard",
               file=sys.stderr)
         return EXIT_USAGE
-    if args.virtualize_function and not args.enable_experimental_virtualization:
-        print("error: --virtualize-function requires "
+    has_virtualization_selection = bool(
+        args.virtualize_function or args.virtualization_selection_manifest)
+    if has_virtualization_selection and not args.enable_experimental_virtualization:
+        print("error: selected-function virtualization requires "
               "--enable-experimental-virtualization", file=sys.stderr)
         return EXIT_USAGE
-    if args.enable_experimental_virtualization and not args.virtualize_function:
+    if args.enable_experimental_virtualization and not has_virtualization_selection:
         print("error: --enable-experimental-virtualization requires at least one "
-              "--virtualize-function", file=sys.stderr)
+              "--virtualize-function or --virtualization-selection-manifest",
+              file=sys.stderr)
         return EXIT_USAGE
-    if args.virtualize_function and not args.stub_path:
-        print("error: --virtualize-function requires an explicit fresh "
+    if has_virtualization_selection and not args.stub_path:
+        print("error: selected-function virtualization requires an explicit fresh "
               "--stub-path", file=sys.stderr)
+        return EXIT_USAGE
+    if args.virtualization_selection_manifest and (
+            args.virtualize_function or args.virtualization_gap
+            or args.virtualization_tail_exit
+            or args.acknowledge_unproven_indirect_targets):
+        print("error: --virtualization-selection-manifest is incompatible with "
+              "--virtualize-function and separate proof options", file=sys.stderr)
         return EXIT_USAGE
     if ((args.virtualization_gap or args.virtualization_tail_exit
          or args.acknowledge_unproven_indirect_targets)
@@ -505,6 +523,8 @@ def main(
         shard_pin_pem=(args.shard_pin_pem
                        or os.environ.get("LETHE_SHARD_PIN_PEM")),
         stub_path=args.stub_path,
+        virtualization_selection_manifest=(
+            args.virtualization_selection_manifest),
         virtualization_specs=tuple(
             VirtualizationSpec(name, rva, size)
             for name, rva, size in virtualization_specs
