@@ -216,6 +216,13 @@ multi-process evidence workflows. Reload requires an independently retained
 context pin and revalidates exact retained material; persistence does not
 renew challenge expiry or grant release authority.
 
+Phase D adds [strict finalized-bundle reload and historical replay](EXTERNAL_EVIDENCE_PHASE_D.md).
+It requires independently retained context and manifest hashes, current trust
+bytes, and an explicit bytes-only Authenticode verifier. Current-time
+reverification runs before an exact recorded-time replay. This remains
+evidence-only, always leaves release authority false, and is not integrated
+with `tools/release_stub.py`.
+
 ```powershell
 uv run python tools/release_stub.py `
   --candidate-dir <candidate-directory> `

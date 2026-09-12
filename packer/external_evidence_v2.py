@@ -805,6 +805,58 @@ def verify_detached_receipt_snapshots(
     return result
 
 
+def verify_detached_receipt_lazy(
+    envelope: Any,
+    *,
+    challenge: dict[str, Any],
+    trust_policy: dict[str, Any],
+    prepared_snapshot: FileSnapshot,
+    get_signed_subject: Callable[[int], FileSnapshot],
+    get_backing: Callable[[str, int, str], FileSnapshot],
+    now: datetime | None = None,
+) -> VerifiedReceipt:
+    """Verify signed metadata before asking adapters for size-bound bytes.
+
+    The receipt signature, challenge, subject, observation, and the complete
+    backing metadata set are validated before either callback runs.  Callbacks
+    receive only sizes authenticated by the provider signature.  This keeps
+    untrusted manifest sizes from becoming allocation budgets while allowing a
+    durable-bundle adapter to snapshot each material file exactly once.
+    """
+    private_envelope, private_challenge, private_policy = _private_verification_inputs(
+        envelope, challenge, trust_policy)
+    prepared = _validated_snapshot(prepared_snapshot, "prepared unsigned subject")
+    if not callable(get_signed_subject) or not callable(get_backing):
+        raise ExternalEvidenceV2Error("lazy receipt snapshot callbacks are required")
+
+    receipt = private_envelope.get("receipt") if isinstance(private_envelope, dict) else None
+
+    def subjects() -> tuple[FileSnapshot, FileSnapshot]:
+        subject = receipt.get("subject") if isinstance(receipt, dict) else None
+        size = subject.get("signed_subject_size_bytes") if isinstance(subject, dict) else None
+        if type(size) is not int or size <= 0:
+            raise ExternalEvidenceV2Error("receipt signed subject size is invalid")
+        return prepared, get_signed_subject(size)
+
+    def backing(relative: str, what: str) -> FileSnapshot:
+        backings = receipt.get("backings") if isinstance(receipt, dict) else None
+        if not isinstance(backings, list):
+            raise ExternalEvidenceV2Error("receipt backing set is incomplete")
+        matches = [
+            item for item in backings
+            if type(item) is dict and item.get("path") == relative
+        ]
+        if len(matches) != 1 or type(matches[0].get("size_bytes")) is not int:
+            raise ExternalEvidenceV2Error(f"{what} metadata is missing or duplicated")
+        return get_backing(relative, matches[0]["size_bytes"], what)
+
+    return _verify_detached_receipt_private(
+        private_envelope, challenge=private_challenge, trust_policy=private_policy,
+        get_subjects=subjects, get_backing=backing,
+        now=_normalized_now(now),
+    )
+
+
 def _verify_detached_receipt_private(
     envelope: Any,
     *,
@@ -884,6 +936,43 @@ def _verify_detached_receipt_private(
             or subject["signed_subject_size_bytes"] <= 0):
         raise ExternalEvidenceV2Error("receipt signed subject size is invalid")
 
+    _validate_observation(role, receipt.get("observation"), requirement)
+    backings = receipt.get("backings")
+    if not isinstance(backings, list) or len(backings) != len(REQUIRED_BACKING_IDS[role]):
+        raise ExternalEvidenceV2Error("receipt backing set is incomplete")
+    backing_index: dict[str, dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    validated_backings: list[tuple[str, str, str, int]] = []
+    for index, backing in enumerate(backings):
+        if not isinstance(backing, dict) or set(backing) != BACKING_FIELDS:
+            raise ExternalEvidenceV2Error(f"receipt backing[{index}] is malformed")
+        backing_id = _identifier(backing.get("id"), f"receipt backing[{index}] id")
+        relative = backing.get("path")
+        expected_hash = _nonzero_hex(
+            backing.get("sha256"), SHA256_RE, f"receipt backing[{index}] hash")
+        if type(backing.get("size_bytes")) is not int or backing["size_bytes"] <= 0:
+            raise ExternalEvidenceV2Error(f"receipt backing[{index}] size is invalid")
+        _normalized_backing_path(relative, f"receipt backing[{index}]")
+        normalized_path = relative.casefold()
+        if backing_id in backing_index or normalized_path in seen_paths:
+            raise ExternalEvidenceV2Error("receipt backing identity is duplicated")
+        backing_index[backing_id] = backing
+        validated_backings.append((backing_id, relative, expected_hash, backing["size_bytes"]))
+        seen_paths.add(normalized_path)
+    if set(backing_index) != REQUIRED_BACKING_IDS[role]:
+        raise ExternalEvidenceV2Error("receipt backing roles are incomplete")
+    if (role == "clean-vm"
+            and backing_index["runner"]["sha256"] != requirement["runner_sha256"]):
+        raise ExternalEvidenceV2Error("clean-VM runner does not match challenge")
+    if (role == "application"
+            and backing_index["workflow-definition"]["sha256"]
+                != requirement["definition_sha256"]):
+        raise ExternalEvidenceV2Error(
+            "application workflow definition does not match challenge")
+
+    # No adapter callback runs until every provider-signed metadata field above
+    # has passed validation.  In particular, a malformed later backing cannot
+    # trigger an earlier backing read or leak a raw KeyError/TypeError.
     try:
         prepared_snapshot, signed_snapshot = get_subjects()
         prepared_snapshot = _validated_snapshot(prepared_snapshot, "prepared unsigned subject")
@@ -902,27 +991,10 @@ def _verify_detached_receipt_private(
             or signing_delta.signed.size != subject["signed_subject_size_bytes"]):
         raise ExternalEvidenceV2Error("signed subject bytes do not match receipt")
 
-    _validate_observation(role, receipt.get("observation"), requirement)
-    backings = receipt.get("backings")
-    if not isinstance(backings, list) or len(backings) != len(REQUIRED_BACKING_IDS[role]):
-        raise ExternalEvidenceV2Error("receipt backing set is incomplete")
-    backing_index: dict[str, dict[str, Any]] = {}
     verified_backings: list[VerifiedBacking] = []
-    seen_paths: set[str] = set()
     seen_filesystem_identities: set[tuple[int, int]] = set()
-    for index, backing in enumerate(backings):
-        if not isinstance(backing, dict) or set(backing) != BACKING_FIELDS:
-            raise ExternalEvidenceV2Error(f"receipt backing[{index}] is malformed")
-        backing_id = _identifier(backing.get("id"), f"receipt backing[{index}] id")
-        relative = backing.get("path")
-        expected_hash = _nonzero_hex(
-            backing.get("sha256"), SHA256_RE, f"receipt backing[{index}] hash")
-        if type(backing.get("size_bytes")) is not int or backing["size_bytes"] <= 0:
-            raise ExternalEvidenceV2Error(f"receipt backing[{index}] size is invalid")
-        _normalized_backing_path(relative, f"receipt backing[{index}]")
-        normalized_path = relative.casefold()
-        if backing_id in backing_index or normalized_path in seen_paths:
-            raise ExternalEvidenceV2Error("receipt backing identity is duplicated")
+    for index, (backing_id, relative, expected_hash, expected_size) in enumerate(
+            validated_backings):
         try:
             backing_snapshot = _validated_snapshot(
                 get_backing(relative, f"receipt backing[{index}]"),
@@ -936,28 +1008,16 @@ def _verify_detached_receipt_private(
                 and filesystem_identity in seen_filesystem_identities):
             raise ExternalEvidenceV2Error(
                 "receipt backing filesystem identity is duplicated")
-        if (backing_snapshot.size != backing["size_bytes"]
+        if (backing_snapshot.size != expected_size
                 or backing_snapshot.sha256 != expected_hash):
             raise ExternalEvidenceV2Error(f"receipt backing[{index}] bytes do not match")
-        backing_index[backing_id] = backing
         verified_backings.append(VerifiedBacking(
             backing_id=backing_id,
             relative_path=relative,
             snapshot=backing_snapshot,
         ))
-        seen_paths.add(normalized_path)
         if filesystem_identity is not None:
             seen_filesystem_identities.add(filesystem_identity)
-    if set(backing_index) != REQUIRED_BACKING_IDS[role]:
-        raise ExternalEvidenceV2Error("receipt backing roles are incomplete")
-    if (role == "clean-vm"
-            and backing_index["runner"]["sha256"] != requirement["runner_sha256"]):
-        raise ExternalEvidenceV2Error("clean-VM runner does not match challenge")
-    if (role == "application"
-            and backing_index["workflow-definition"]["sha256"]
-                != requirement["definition_sha256"]):
-        raise ExternalEvidenceV2Error(
-            "application workflow definition does not match challenge")
     return VerifiedReceipt(
         role=role,
         provider_key_id=key_id,
@@ -995,5 +1055,6 @@ __all__ = [
     "validate_challenge",
     "validate_evidence_trust_store_v2",
     "verify_detached_receipt",
+    "verify_detached_receipt_lazy",
     "verify_detached_receipt_snapshots",
 ]
