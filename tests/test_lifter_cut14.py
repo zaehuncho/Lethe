@@ -1,4 +1,4 @@
-"""Differential coverage for the bounded Cut 11 scalar expansion."""
+"""Differential coverage for the bounded Cut 14 scalar expansion."""
 from __future__ import annotations
 
 import pytest
