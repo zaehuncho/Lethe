@@ -2,13 +2,65 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+from pathlib import Path
+import shutil
 import struct
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from packer import assemble, cfg_preservation, container, pe_analyze
+from packer import (
+    assemble,
+    cfg_preservation,
+    container,
+    keyed_validation,
+    payload,
+    pe_analyze,
+    report,
+)
+
+
+@pytest.fixture(scope="module")
+def current_sdk_assembly_stub(tmp_path_factory) -> Path:
+    if os.name != "nt" or not shutil.which("cmake"):
+        pytest.skip("Windows CMake and the Visual Studio x64 toolchain are required")
+    root = Path(__file__).resolve().parents[1]
+    build = tmp_path_factory.mktemp("load-config-assembly-stub") / "build"
+    configured = subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(root / "stub"),
+            "-B",
+            str(build),
+            "-G",
+            "Visual Studio 17 2022",
+            "-A",
+            "x64",
+            "-DDVM_ROLLING=ON",
+            "-DDVM_ROLL_POISON=OFF",
+            "-DDVM_SHUFFLE_SEED=8f74bf0efc4a34c35ee8f123dff69bf4",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if configured.returncode != 0:
+        pytest.skip("Visual Studio x64 configuration is unavailable")
+    compiled = subprocess.run(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    stub = build / "Release/lethe_stub_x64.dll"
+    assert stub.is_file()
+    return stub
 
 
 def _load_config(*, interior: bool = True, unsupported=()):
@@ -402,6 +454,166 @@ def test_current_sdk_loader_slots_are_shadowed_and_relocated_exactly() -> None:
     assert reparsed.guard_flags & 0x02000000
     assert reparsed.cast_guard_os_determined_failure_mode_rva == cast_shadow
     assert reparsed.guard_memcpy_function_pointer_rva == memcpy_shadow
+
+
+def test_assembled_pe_binds_current_sdk_slots_and_relocations(
+    tmp_path,
+    current_sdk_assembly_stub: Path,
+) -> None:
+    load_config = _load_config(interior=False)
+    load_config_raw = bytearray(load_config.raw)
+    guard_flags = load_config.guard_flags | 0x01000000 | 0x02000000
+    struct.pack_into("<I", load_config_raw, 0, 0x140)
+    struct.pack_into("<I", load_config_raw, 144, guard_flags)
+    struct.pack_into("<Q", load_config_raw, 304, 0x140003420)
+    struct.pack_into("<Q", load_config_raw, 312, 0x140003428)
+    load_config = replace(
+        load_config,
+        guard_flags=guard_flags,
+        cast_guard_os_determined_failure_mode_rva=0x3420,
+        guard_memcpy_function_pointer_rva=0x3428,
+        raw=bytes(load_config_raw),
+    )
+    data = bytearray(0x1000)
+    for rva, value in (
+        (0x3400, 0x1122334455667788),
+        (0x3410, 0x140002100),
+        (0x3418, 0x140002200),
+        (0x3420, 0x140002300),
+        (0x3428, 0x7FFA123456781234),
+    ):
+        struct.pack_into("<Q", data, rva - 0x3000, value)
+    parsed = pe_analyze.ParsedPE(
+        path="",
+        is_dll=False,
+        image_base=0x140000000,
+        size_of_image=0x6000,
+        oep_rva=0x1000,
+        sections=[
+            pe_analyze.ParsedSection(
+                ".text", 0x1000, 0x2000, b"\xC3" * 0x2000, 0x60000020),
+            pe_analyze.ParsedSection(
+                ".data", 0x3000, 0x1000, bytes(data), 0xC0000040),
+        ],
+        imports=[],
+        reloc_blob=b"",
+        tls=None,
+        pdata_rva=0,
+        pdata_count=0,
+        rsrc_rva=0,
+        file_characteristics=0x22,
+        dll_characteristics=0x4160,
+        load_config=load_config,
+    )
+    options = SimpleNamespace(
+        anti_debug=False,
+        memory_guard=False,
+        process_hardening=False,
+        compression_level=1,
+        server_shard=False,
+    )
+    artifacts = payload.build_payload(parsed, options)
+    output = tmp_path / "current-sdk-load-config.exe"
+    assembly = assemble.build_output_pe(
+        parsed,
+        artifacts,
+        str(output),
+        options=options,
+        stub_path=str(current_sdk_assembly_stub),
+        allow_unverified_stub_for_tests=True,
+    )
+    image = assemble._StubImage(output.read_bytes())
+    load_config_rva, load_config_size = image.dir(assemble.DIR_LOAD_CONFIG)
+    assert load_config_size == 0x140
+    outer = image.read_at_rva(load_config_rva, load_config_size)
+    assert struct.unpack_from("<I", outer, 0)[0] == 0x140
+    cast_shadow = struct.unpack_from("<Q", outer, 304)[0] - parsed.image_base
+    memcpy_shadow = struct.unpack_from("<Q", outer, 312)[0] - parsed.image_base
+    assert cast_shadow != memcpy_shadow
+
+    reloc_rva, reloc_size = image.dir(assemble.DIR_BASERELOC)
+    reloc_blob = image.read_at_rva(reloc_rva, reloc_size)
+    dir64_targets = set()
+    cursor = 0
+    while cursor < len(reloc_blob):
+        page_rva, block_size = struct.unpack_from("<II", reloc_blob, cursor)
+        assert block_size >= 8 and cursor + block_size <= len(reloc_blob)
+        for entry_offset in range(cursor + 8, cursor + block_size, 2):
+            entry, = struct.unpack_from("<H", reloc_blob, entry_offset)
+            if entry >> 12 == assemble.IMAGE_REL_BASED_DIR64:
+                dir64_targets.add(page_rva + (entry & 0xFFF))
+        cursor += block_size
+    assert load_config_rva + 304 in dir64_targets
+    assert load_config_rva + 312 in dir64_targets
+    assert cast_shadow in dir64_targets
+    assert memcpy_shadow not in dir64_targets
+
+    recipe = bytes(artifacts.load_config_blob)
+    (
+        magic,
+        version,
+        slot_count,
+        target_count,
+        relocation_count,
+        _dll_characteristics,
+        recipe_directory_rva,
+        recipe_directory_size,
+        recipe_section_rva,
+        recipe_section_size,
+        _section_characteristics,
+        expected_digest,
+    ) = cfg_preservation.RUNTIME_HEADER.unpack_from(recipe)
+    assert magic == cfg_preservation.RUNTIME_MAGIC
+    assert version == cfg_preservation.RUNTIME_VERSION
+    assert (recipe_directory_rva, recipe_directory_size) == (
+        load_config_rva, 0x140)
+    entries = tuple(
+        cfg_preservation.RUNTIME_ENTRY.unpack_from(
+            recipe,
+            cfg_preservation.RUNTIME_HEADER.size
+            + index * cfg_preservation.RUNTIME_ENTRY.size,
+        )
+        for index in range(slot_count)
+    )
+    assert (0x3420, cast_shadow) in entries
+    assert (0x3428, memcpy_shadow) in entries
+
+    canonical = bytearray(
+        image.read_at_rva(recipe_section_rva, recipe_section_size))
+    shadow_rvas = {shadow_rva for _source_rva, shadow_rva in entries}
+    for shadow_rva in shadow_rvas:
+        struct.pack_into("<Q", canonical, shadow_rva - recipe_section_rva, 0)
+    relocation_offset = (
+        cfg_preservation.RUNTIME_HEADER.size
+        + slot_count * cfg_preservation.RUNTIME_ENTRY.size
+        + target_count * cfg_preservation.RUNTIME_TARGET.size
+    )
+    recipe_relocations = tuple(
+        cfg_preservation.RUNTIME_RELOCATION.unpack_from(
+            recipe,
+            relocation_offset
+            + index * cfg_preservation.RUNTIME_RELOCATION.size,
+        )[0]
+        for index in range(relocation_count)
+    )
+    for relocation in recipe_relocations:
+        if relocation in shadow_rvas:
+            continue
+        offset = relocation - recipe_section_rva
+        value, = struct.unpack_from("<Q", canonical, offset)
+        struct.pack_into("<Q", canonical, offset, value - parsed.image_base)
+    assert hashlib.sha256(canonical).digest() == expected_digest
+
+    structural = report.validate_packed(str(output))
+    assert structural.ok, structural.summary()
+    keyed = keyed_validation.validate_staged_output(
+        str(output),
+        artifacts,
+        expected_stub_text_rva=assembly.stub_text_rva,
+        expected_stub_text_size=assembly.stub_text_size,
+        structural=structural,
+    )
+    assert keyed.ok, keyed.summary()
 
 
 def test_runtime_recipe_carries_slots_and_exact_target_flags() -> None:

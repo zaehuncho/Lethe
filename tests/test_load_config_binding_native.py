@@ -223,6 +223,25 @@ static int accepted(void)
         image, (uint32_t)sizeof(image), recipe, (uint32_t)sizeof(recipe)) == 0;
 }}
 
+static int rejected_without_writes(uint32_t index,
+                                   uint32_t source_rva,
+                                   uint32_t shadow_rva)
+{{
+    uint8_t forged[sizeof(recipe)];
+    uint8_t before[sizeof(image)];
+    uint32_t entry_offset = 80u + index * 8u;
+    reset_image();
+    memcpy(forged, recipe, sizeof(forged));
+    put32(forged + entry_offset, source_rva);
+    put32(forged + entry_offset + 4u, shadow_rva);
+    memcpy(before, image, sizeof(before));
+    if (lethe_load_config_slots_restore_verified(
+            image, 0x2800u, PACKED_SIZE,
+            forged, (uint32_t)sizeof(forged)) == 0)
+        return 0;
+    return memcmp(image, before, sizeof(image)) == 0;
+}}
+
 int main(void)
 {{
     reset_image();
@@ -235,6 +254,18 @@ int main(void)
     if (get64(image + 0x2118u) != UINT64_C(0x7FFA777788889999)) return 14;
     image[0x{_MEMCPY_SHADOW_RVA:X}u] ^= 0x5Au;
     if (!accepted()) return 15;
+
+    if (!rejected_without_writes(2u, 0x2800u,
+                                 0x{_MEMCPY_SHADOW_RVA:X}u)) return 30;
+    if (!rejected_without_writes(2u, 0x2118u, PACKED_SIZE)) return 31;
+    if (!rejected_without_writes(2u, 0x2100u,
+                                 0x{_MEMCPY_SHADOW_RVA:X}u)) return 32;
+    if (!rejected_without_writes(2u, 0x2118u,
+                                 0x{_CHECK_SHADOW_RVA:X}u)) return 33;
+    if (!rejected_without_writes(2u, 0x{_CHECK_SHADOW_RVA:X}u,
+                                 0x{_MEMCPY_SHADOW_RVA:X}u)) return 34;
+    if (!rejected_without_writes(2u, 0x2118u, 0x2100u)) return 35;
+    if (!rejected_without_writes(2u, 0x2118u, 0x2118u)) return 36;
 
     reset_image();
     image[SECTION_RVA + 144u] ^= 1u;

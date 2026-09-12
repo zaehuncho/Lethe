@@ -110,16 +110,25 @@ int lethe_load_config_slots_restore_verified(uint8_t *image,
         uint32_t j;
         if ((source_rva & 7u) != 0 || (shadow_rva & 7u) != 0 ||
             !lcfg_range(source_rva, 8u, original_image_size) ||
-            !lcfg_range(shadow_rva, 8u, packed_image_size))
+            !lcfg_range(shadow_rva, 8u, packed_image_size) ||
+            source_rva == shadow_rva)
             return 1;
         for (j = 0; j < i; ++j) {
             const uint8_t *prior = recipe + LETHE_LCFG_RUNTIME_HEADER_SIZE +
                                    (uint64_t)j *
                                        LETHE_LCFG_RUNTIME_ENTRY_SIZE;
             if (lcfg_u32(prior) == source_rva ||
-                lcfg_u32(prior + 4u) == shadow_rva)
+                lcfg_u32(prior + 4u) == shadow_rva ||
+                lcfg_u32(prior) == shadow_rva ||
+                lcfg_u32(prior + 4u) == source_rva)
                 return 1;
         }
+    }
+    for (i = 0; i < slot_count; ++i) {
+        const uint8_t *entry = recipe + LETHE_LCFG_RUNTIME_HEADER_SIZE +
+                               (uint64_t)i * LETHE_LCFG_RUNTIME_ENTRY_SIZE;
+        uint32_t source_rva = lcfg_u32(entry);
+        uint32_t shadow_rva = lcfg_u32(entry + 4u);
         lcfg_put_u64(image + source_rva, lcfg_u64(image + shadow_rva));
     }
     return 0;
