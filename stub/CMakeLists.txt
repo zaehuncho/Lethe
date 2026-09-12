@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(lethe_stub C ASM_MASM)
 
+include(CTest)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(lethe_stub_x64 SHARED
     src/stub_main.c
     src/pe_loader.c
+    src/load_config_binding.c
     src/crypto.c
+    src/bytecode_pages.c
+    src/metadata_aad.c
     src/key_scatter.c
     src/tls_anchor.c
     src/stubrt.c
@@ -15,28 +20,40 @@ add_library(lethe_stub_x64 SHARED
     src/antidump.c
     src/memguard.c
     src/daedalus_vm.c
+    src/stub_entrypoints.asm
     src/daedalus_trampoline.asm
+    src/daedalus_x64_thunk.asm
     src/miniz.c
     src/chkstk.asm
 )
 
 target_include_directories(lethe_stub_x64 PRIVATE src)
-target_link_libraries(lethe_stub_x64 PRIVATE kernel32)
+target_link_libraries(lethe_stub_x64 PRIVATE kernel32 bcrypt)
+target_compile_definitions(lethe_stub_x64 PRIVATE DVM_PAGED_RUNTIME)
+
+if(BUILD_TESTING)
+    add_executable(LetheMetadataAADTest
+        tests/metadata_aad_test.c
+        src/metadata_aad.c
+    )
+    target_include_directories(LetheMetadataAADTest PRIVATE src)
+    if(MSVC)
+        target_compile_options(LetheMetadataAADTest PRIVATE /W4 /WX /O2)
+    endif()
+    add_test(NAME LetheMetadataAADVector COMMAND LetheMetadataAADTest)
+endif()
 
 # Freestanding: no CRT, no default libs, no DLL entry point.
 target_link_options(lethe_stub_x64 PRIVATE
     /NODEFAULTLIB
     /NOENTRY
+    /INCREMENTAL:NO
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
-)
-
-# Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer),
-# lower warning level (we don't own this code).
-set_source_files_properties(src/miniz.c PROPERTIES
-    COMPILE_OPTIONS "/W3;/WX-"
-    COMPILE_DEFINITIONS "LETHE_FREESTANDING_ALLOC;MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+    /EXPORT:StubExeEntry
+    /EXPORT:StubDllMain
+    /EXPORT:daedalus_x64_enter_common
 )
 
 # Key-binding integrity: the builder hashes .text to derive the AES key.
@@ -55,6 +72,15 @@ else()
     )
 endif()
 
+# Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer).
+# Apply this after the shared C-source properties so its warning policy is not
+# overwritten. NDEBUG is source-local and mandatory because the stub is linked
+# without the CRT, so assert() must never emit _wassert references.
+set_source_files_properties(src/miniz.c PROPERTIES
+    COMPILE_OPTIONS "/W3;/WX-;/GS-;/Oi;/O2"
+    COMPILE_DEFINITIONS "NDEBUG;LETHE_FREESTANDING_ALLOC;MINIZ_NO_STDIO;MINIZ_NO_TIME;MINIZ_NO_DEFLATE_APIS;MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+)
+
 # Strip /guard:cf that CMake may inject via CMAKE_C_FLAGS or toolchain files.
 foreach(_flag CMAKE_C_FLAGS CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_RELWITHDEBINFO)
     string(REPLACE "/guard:cf" "" ${_flag} "${${_flag}}")
@@ -71,10 +97,10 @@ endforeach()
 option(DVM_ROLLING "Compile+emit history-keyed rolling-bytecode virtualization" OFF)
 # Observation-poison: fold an anti-instrumentation signal into the rolling
 # accumulator so a debugger silently mis-keys (zero-FP on clean runs). Kill-
-# switch; default ON when rolling is on.
-# NOTE: keep DVM_ROLLING/DVM_ROLL_POISON OFF for any build you intend to attach a
-# debugger to yourself -- the poison's failure mode is an opaque decrypt failure,
-# not a clean exit, so a self-debug session would look like corruption.
+# switch; default ON when rolling is on. Production and candidate builds compile
+# rolling support but explicitly set DVM_ROLL_POISON=OFF: rolling containers are
+# debugger-compatible without the poison signal, while selected-function pages
+# continue to use the independent authenticated paging runtime.
 option(DVM_ROLL_POISON "Fold anti-instrumentation poison into rolling decode" ON)
 if(DVM_ROLLING)
     target_sources(lethe_stub_x64 PRIVATE src/daedalus_rolling.c)

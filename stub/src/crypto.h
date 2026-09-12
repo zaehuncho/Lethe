@@ -69,8 +69,8 @@ int lethe_derive_meta_key(const uint8_t master_key[32], const uint8_t salt[16],
  * and derived subkeys after use. */
 void orion_secure_wipe(void *ptr, size_t len);
 
-/* Fill buf[0..len) with cryptographically secure random bytes. Resolves
- * BCryptGenRandom dynamically (no static bcrypt import). 0 on success. */
+/* Fill buf[0..len) with cryptographically secure random bytes. BCryptGenRandom
+ * is statically imported so DLL dependencies are resolved before DllMain. */
 int crypto_csprng(void *buf, size_t len);
 
 #ifdef __cplusplus

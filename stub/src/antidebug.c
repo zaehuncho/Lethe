@@ -23,16 +23,15 @@
  *   2.  PEB->NtGlobalFlag heap bits     (PEB + 0xBC, mask 0x70)
  *   3.  PEB->ProcessHeap Flags/ForceFlags (heap debug bits)
  *   4.  CheckRemoteDebuggerPresent(GetCurrentProcess())
- *   5.  Hardware breakpoints            (DR0-DR3 via GetThreadContext)
- *   6.  NtQueryInformationProcess(ProcessDebugPort)        [dynamic resolve]
- *   7.  NtQueryInformationProcess(ProcessDebugObjectHandle)[dynamic resolve]
- *   8.  DBI / instrumentation modules   (Frida/Pin/DynamoRIO/x64dbg/ScyllaHide)
- *   9.  Parent process is a known debugger (NtQIP(ProcessBasicInformation) ->
+ *   5.  NtQueryInformationProcess(ProcessDebugPort)        [dynamic resolve]
+ *   6.  NtQueryInformationProcess(ProcessDebugObjectHandle)[dynamic resolve]
+ *   7.  DBI / instrumentation modules   (Frida/Pin/DynamoRIO/x64dbg/ScyllaHide)
+ *   8.  Parent process is a known debugger (NtQIP(ProcessBasicInformation) ->
  *       parent PID -> QueryFullProcessImageNameA -> basename match)
- *   10. RDTSC timing gate around a trivial op          (min-of-N)
- *   11. RDTSC timing gate around a GetTickCount64 call  (min-of-N)
- *   12. QueryPerformanceCounter wall-clock gate         (min-of-N)
- *   13. RDTSC vs QPC crosscheck (catches a spoofed/hooked single clock)
+ *   9.  RDTSC timing gate around a trivial op          (min-of-N)
+ *   10. RDTSC timing gate around a GetTickCount64 call  (min-of-N)
+ *   11. QueryPerformanceCounter wall-clock gate         (min-of-N)
+ *   12. RDTSC vs QPC crosscheck (catches a spoofed/hooked single clock)
  *
  * DELIBERATELY EXCLUDED (AV red flags):
  *   NtSetInformationThread(ThreadHideFromDebugger), int 2d / int 3 tricks,
@@ -63,6 +62,7 @@
 #include <stdint.h>
 
 #include "stub_hooks.h"
+#include "key_scatter.h"
 #include "daedalus_strings.h"
 #include "daedalus_str_data.h"
 
@@ -102,6 +102,7 @@
  *      cycles). TIGHTENED from the former 0x100000 (1,048,576) threshold,
  *      which a lightweight stepping debugger could slip under. */
 #define RDTSC_ITERATIONS     8
+#define RDTSC_WINDOWS        3
 #define RDTSC_THRESHOLD      200000ull
 
 /* (11) RDTSC gate around a real API call (GetTickCount64 -- reads
@@ -131,6 +132,7 @@
  *      workloads differ 8x. Flag only a >4x divergence. */
 #define XCHK_ITERS_A         40000
 #define XCHK_ITERS_B         320000
+#define XCHK_RUNS            5
 #define XCHK_TOLERANCE       4ull
 
 /* Read PEB->BeingDebugged. Returns 1 if a debugger flag is set, else 0. */
@@ -188,24 +190,6 @@ static int check_remote_debugger(void)
     if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &present) && present) {
         return 1;
     }
-    return 0;
-}
-
-/*
- * Hardware breakpoint detection: DR0-DR3 hold linear addresses of HW
- * breakpoints. Analysts use these to break on specific API calls without
- * patching INT3 (bypasses software-BP scans). If any DR0-DR3 is nonzero,
- * a hardware breakpoint is set. (CONTEXT is __declspec(align(16)); a stack
- * instance is correctly aligned for GetThreadContext.)
- */
-static int check_hardware_breakpoints(void)
-{
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(GetCurrentThread(), &ctx))
-        return 0;
-    if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3)
-        return 1;
     return 0;
 }
 
@@ -426,7 +410,7 @@ static int check_parent_process(void)
  * (10) Trivial-op RDTSC gate. Keep the smallest delta across N iterations; flag
  *      only if that minimum exceeds RDTSC_THRESHOLD.
  */
-static int check_rdtsc_timing(void)
+static int rdtsc_window_is_slow(void)
 {
     uint64_t best = ~0ull;
     int i;
@@ -451,6 +435,16 @@ static int check_rdtsc_timing(void)
     }
 
     return best > RDTSC_THRESHOLD ? 1 : 0;
+}
+
+static int check_rdtsc_timing(void)
+{
+    int window;
+    for (window = 0; window < RDTSC_WINDOWS; ++window) {
+        if (!rdtsc_window_is_slow())
+            return 0;
+    }
+    return 1;
 }
 
 /*
@@ -520,54 +514,76 @@ static int check_qpc_timing(void)
 
 /*
  * (13) RDTSC vs QPC crosscheck. See the XCHK_* comment above for the theory.
- *      Robust to preemption: a stall inflates a measurement's tsc AND qpc
- *      together, preserving the ratio identity.
+ *      The QPC and TSC brackets cannot be sampled atomically: a preemption in
+ *      either narrow outer-bracket gap can inflate only QPC and make one honest
+ *      sample look divergent. Require every repeated sample to diverge; any
+ *      consistent sample makes this heuristic inconclusive rather than turning
+ *      ordinary scheduler jitter into a loader rejection.
  */
 static int check_timing_crosscheck(void)
 {
-    LARGE_INTEGER f, a0, a1, b0, b1;
-    uint64_t ta0, ta1, tb0, tb1;
-    uint64_t tsc_a, tsc_b, qpc_a, qpc_b, cross1, cross2, lo, hi;
-    volatile uint64_t sink = 0;
-    int i;
+    typedef struct TimingProduct {
+        uint64_t low;
+        uint64_t high;
+    } TimingProduct;
+    LARGE_INTEGER f;
+    int run;
 
     if (!QueryPerformanceFrequency(&f) || f.QuadPart == 0)
         return 0;
 
-    /* Measurement A: small workload. */
-    QueryPerformanceCounter(&a0);
-    _mm_lfence(); ta0 = __rdtsc(); _mm_lfence();
-    for (i = 0; i < XCHK_ITERS_A; ++i)
-        sink += (uint64_t)i;
-    _mm_lfence(); ta1 = __rdtsc(); _mm_lfence();
-    QueryPerformanceCounter(&a1);
+    for (run = 0; run < XCHK_RUNS; ++run) {
+        LARGE_INTEGER a0, a1, b0, b1;
+        uint64_t ta0, ta1, tb0, tb1;
+        uint64_t tsc_a, tsc_b, qpc_a, qpc_b;
+        TimingProduct cross1, cross2, smaller, larger, scaled;
+        uint64_t scale_carry;
+        volatile uint64_t sink = 0;
+        int i;
 
-    /* Measurement B: 8x workload, identical bracketing. */
-    QueryPerformanceCounter(&b0);
-    _mm_lfence(); tb0 = __rdtsc(); _mm_lfence();
-    for (i = 0; i < XCHK_ITERS_B; ++i)
-        sink += (uint64_t)i;
-    _mm_lfence(); tb1 = __rdtsc(); _mm_lfence();
-    QueryPerformanceCounter(&b1);
+        QueryPerformanceCounter(&a0);
+        _mm_lfence(); ta0 = __rdtsc(); _mm_lfence();
+        for (i = 0; i < XCHK_ITERS_A; ++i)
+            sink += (uint64_t)i;
+        _mm_lfence(); ta1 = __rdtsc(); _mm_lfence();
+        QueryPerformanceCounter(&a1);
 
-    tsc_a = ta1 - ta0;
-    tsc_b = tb1 - tb0;
-    qpc_a = (uint64_t)(a1.QuadPart - a0.QuadPart);
-    qpc_b = (uint64_t)(b1.QuadPart - b0.QuadPart);
+        QueryPerformanceCounter(&b0);
+        _mm_lfence(); tb0 = __rdtsc(); _mm_lfence();
+        for (i = 0; i < XCHK_ITERS_B; ++i)
+            sink += (uint64_t)i;
+        _mm_lfence(); tb1 = __rdtsc(); _mm_lfence();
+        QueryPerformanceCounter(&b1);
 
-    /* If any interval registered zero, the granularity is too coarse to judge
-       (or a clock stalled); treat as inconclusive rather than false-positive. */
-    if (tsc_a == 0 || tsc_b == 0 || qpc_a == 0 || qpc_b == 0)
-        return 0;
+        tsc_a = ta1 - ta0;
+        tsc_b = tb1 - tb0;
+        qpc_a = (uint64_t)(a1.QuadPart - a0.QuadPart);
+        qpc_b = (uint64_t)(b1.QuadPart - b0.QuadPart);
+        if (tsc_a == 0 || tsc_b == 0 || qpc_a == 0 || qpc_b == 0)
+            return 0;
 
-    /* Honest hardware: tsc_a*qpc_b == tsc_b*qpc_a. Flag a >4x divergence. */
-    cross1 = tsc_a * qpc_b;
-    cross2 = tsc_b * qpc_a;
-    lo = cross1 < cross2 ? cross1 : cross2;
-    hi = cross1 < cross2 ? cross2 : cross1;
-    if (hi > lo * XCHK_TOLERANCE)
-        return 1;
-    return 0;
+        cross1.low = _umul128(tsc_a, qpc_b, &cross1.high);
+        cross2.low = _umul128(tsc_b, qpc_a, &cross2.high);
+        if (cross1.high < cross2.high ||
+            (cross1.high == cross2.high && cross1.low < cross2.low)) {
+            smaller = cross1;
+            larger = cross2;
+        } else {
+            smaller = cross2;
+            larger = cross1;
+        }
+        if (smaller.high == 0 && smaller.low == 0)
+            return 0;
+        scaled.low = _umul128(
+            smaller.low, XCHK_TOLERANCE, &scale_carry);
+        if (smaller.high > (~0ull - scale_carry) / XCHK_TOLERANCE)
+            return 0;
+        scaled.high = smaller.high * XCHK_TOLERANCE + scale_carry;
+        if (larger.high < scaled.high ||
+            (larger.high == scaled.high && larger.low <= scaled.low))
+            return 0;
+    }
+    return 1;
 }
 
 /*
@@ -584,6 +600,7 @@ static void wipe_master_key(void)
        clean void* (drops the volatile qualifier without a C4090 diagnostic);
        SecureZeroMemory / RtlSecureZeroMemory is a FORCEINLINE volatile byte
        loop in winnt.h, so the wipe is never elided and needs no CRT/import. */
+    key_scatter_invalidate();
     SecureZeroMemory((void *)(uintptr_t)g_packinfo.aes_key_enc,
                      sizeof(g_packinfo.aes_key_enc));
     SecureZeroMemory((void *)(uintptr_t)g_packinfo.kdf_salt,
@@ -594,7 +611,7 @@ static void wipe_master_key(void)
  * ---- Scattered tripwire checks (defense-in-depth) -------------------------
  *
  * Each tripwire uses a DIFFERENT anti-debug technique and independently wipes
- * key material + calls ExitProcess on detection. Called at multiple points
+ * key material + returns detection to its caller. Called at multiple points
  * during the unpack flow (pe_loader.c, stub_main.c) so that NOP'ing the main
  * antidbg_check() prologue ("xor eax,eax; ret") does NOT defeat all detection.
  *
@@ -604,64 +621,48 @@ static void wipe_master_key(void)
  */
 
 /* Tripwire 1: PEB->BeingDebugged (placed after section decryption). */
-__declspec(noinline) void antidbg_tripwire_peb(void)
+__declspec(noinline) int antidbg_tripwire_peb(void)
 {
     const uint8_t *peb = (const uint8_t *)__readgsqword(0x60);
     if (peb && peb[PEB_BEINGDEBUGGED_OFF] != 0) {
         wipe_master_key();
-        ExitProcess(0);
+        return 1;
     }
+    return 0;
 }
 
 /* Tripwire 2: NtGlobalFlag heap-debug bits (placed after import resolution). */
-__declspec(noinline) void antidbg_tripwire_ntgf(void)
+__declspec(noinline) int antidbg_tripwire_ntgf(void)
 {
     const uint8_t *peb = (const uint8_t *)__readgsqword(0x60);
     if (peb) {
         uint32_t flags = *(const uint32_t *)(peb + PEB_NTGLOBALFLAG_OFF);
         if (flags & NTGLOBALFLAG_HEAP_DEBUG_BITS) {
             wipe_master_key();
-            ExitProcess(0);
+            return 1;
         }
     }
+    return 0;
 }
 
 /* Tripwire 3: RDTSC timing gate (placed before OEP transfer in stub_main). */
-__declspec(noinline) void antidbg_tripwire_rdtsc(void)
+__declspec(noinline) int antidbg_tripwire_rdtsc(void)
 {
-    uint64_t best = ~0ull;
-    int i;
-    for (i = 0; i < RDTSC_ITERATIONS; ++i) {
-        uint64_t t0, t1, delta;
-        volatile int trivial = i;
-        _mm_lfence();
-        t0 = __rdtsc();
-        _mm_lfence();
-        trivial = trivial + 1;
-        _mm_lfence();
-        t1 = __rdtsc();
-        _mm_lfence();
-        delta = t1 - t0;
-        if (delta < best)
-            best = delta;
-    }
-    if (best > RDTSC_THRESHOLD) {
+    if (check_rdtsc_timing()) {
         wipe_master_key();
-        ExitProcess(0);
+        return 1;
     }
+    return 0;
 }
 
-/* Tripwire 4: Hardware breakpoints DR0-DR3 (placed after relocation). */
-__declspec(noinline) void antidbg_tripwire_hwbp(void)
+/* Tripwire 4: kernel debug-port recheck (placed after relocation). */
+__declspec(noinline) int antidbg_tripwire_debug_port(void)
 {
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), &ctx)) {
-        if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
-            wipe_master_key();
-            ExitProcess(0);
-        }
+    if (check_debug_port()) {
+        wipe_master_key();
+        return 1;
     }
+    return 0;
 }
 
 /*
@@ -679,7 +680,6 @@ int antidbg_check(void)
     else if (check_ntglobalflag(peb))       detected = 1;
     else if (check_heap_flags(peb))         detected = 1;
     else if (check_remote_debugger())       detected = 1;
-    else if (check_hardware_breakpoints())  detected = 1;
     else if (check_debug_port())            detected = 1;
     else if (check_debug_object())          detected = 1;
     else if (check_instrumentation())       detected = 1;

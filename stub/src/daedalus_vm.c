@@ -1,16 +1,16 @@
 /*
  * daedalus_vm.c -- Daedalus VM (DVM) interpreter for the Lethe stub.
  *
- * A stack-based bytecode machine used to virtualize the stub's crypto-critical
- * paths (key derivation, shard XOR fold, key scattering). The dispatch loop is
- * intentionally generic: all domain knowledge lives in the (encrypted) bytecode
- * a builder emits, not in readable x64 here.
+ * A stack-based bytecode machine used for the stub's crypto-critical paths and
+ * selected target-application functions emitted by the x64 lifter. The dispatch
+ * loop is intentionally generic: all domain knowledge lives in the (encrypted)
+ * bytecode a builder emits, not in readable x64 here.
  *
  * Freestanding / no-CRT context (mirrors crypto.c / key_scatter.c):
  *   - No memcpy/memset/malloc/printf. Copies and zeroing are byte loops.
  *   - Sensitive wipes use `volatile uint8_t *` so the compiler cannot elide
  *     them (dead-store elimination).
- *   - All VM state is stack-allocated (the DaedalusVM struct is ~0.8 KB).
+ *   - All VM state is stack-allocated (about 5 KiB with authenticated paging).
  *   - The VM trusts its own bytecode for pointer/length values: memory ops
  *     just cast and dereference. Only structural invariants (stack depth, code
  *     bounds, jump targets, div-by-zero) are checked; on violation exec fails.
@@ -22,7 +22,25 @@
 
 #ifdef DVM_SHUFFLED
 #include "daedalus_opcodes_shuffled.h"
+#else
+#define DVM_OPCODE_MAPPING_SHA256 \
+    "d7279c7aa1c36515a0cc03f935fbf8f83c07648547ffb46b3541e07899fac5ff"
+#define DVM_HANDLER_VARIANT_SHA256 \
+    "41b31ad73ed541bd478cc97567fdee815d4154666608703b7e1ac2ebcc8b873d"
+#define DVM_HANDLER_VARIANT_ADD    0
+#define DVM_HANDLER_VARIANT_SUB    0
+#define DVM_HANDLER_VARIANT_XOR    0
+#define DVM_HANDLER_VARIANT_AND    0
+#define DVM_HANDLER_VARIANT_OR     0
+#define DVM_HANDLER_VARIANT_NEG    0
+#define DVM_HANDLER_VARIANT_CMP_EQ 0
+#define DVM_HANDLER_VARIANT_CMP_NE 0
 #endif
+
+__declspec(dllexport) const char daedalus_opcode_mapping_sha256[] =
+    DVM_OPCODE_MAPPING_SHA256;
+__declspec(dllexport) const char daedalus_handler_variant_sha256[] =
+    DVM_HANDLER_VARIANT_SHA256;
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -80,13 +98,142 @@ static __forceinline uint64_t dvm_rd_u64(const uint8_t *p)
     return (uint64_t)dvm_rd_u32(p) | ((uint64_t)dvm_rd_u32(p + 4) << 32);
 }
 
+#ifdef DVM_PAGED_RUNTIME
+static int dvm_identity_equal(const uint8_t left[16], const uint8_t right[16])
+{
+    uint8_t difference = 0;
+    uint32_t i;
+    for (i = 0; i < 16; ++i)
+        difference |= (uint8_t)(left[i] ^ right[i]);
+    return difference == 0;
+}
+
+static int dvm_paged_read(DaedalusVM *vm, uint32_t offset,
+                          uint8_t *out, uint32_t size)
+{
+    DvmPageCache *cache = &vm->page_cache;
+    uint32_t page_index;
+    uint32_t within_page;
+    uint32_t i;
+    uint8_t master_key[DVM_PAGE_MASTER_KEY_SIZE];
+    DvmPageStatus status;
+
+    if (size == 0)
+        return 0;
+    if ((uint64_t)offset + size > cache->view.plaintext_size)
+        return 1;
+    page_index = offset / cache->view.page_size;
+    within_page = offset % cache->view.page_size;
+    if (cache->cached_index == page_index &&
+        (uint64_t)within_page + size <= cache->cached_size) {
+        for (i = 0; i < size; ++i)
+            out[i] = cache->page[within_page + i];
+        return 0;
+    }
+    if (key_scatter_get(master_key) != 0) {
+        orion_secure_wipe(master_key, sizeof(master_key));
+        return 1;
+    }
+    status = dvm_page_cache_read(cache, master_key, offset, out, size);
+    orion_secure_wipe(master_key, sizeof(master_key));
+    return status == DVM_PAGE_OK ? 0 : 1;
+}
+#endif
+
+/* Per-build handler-body variants. All arithmetic is uint64_t, so wraparound
+ * is defined and every formula is bit-exact. Volatile intermediates keep the
+ * optimizer from collapsing the diversified forms back into one instruction
+ * sequence at /O2. The generated header records and hashes every selection. */
+static __forceinline uint64_t dvm_sem_add(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_ADD == 0
+    return a + b;
+#else
+    volatile uint64_t neg_b = (~b) + 1u;
+    return a - neg_b;
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_sub(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_SUB == 0
+    return a - b;
+#else
+    volatile uint64_t neg_b = (~b) + 1u;
+    return a + neg_b;
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_xor(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_XOR == 0
+    return a ^ b;
+#else
+    volatile uint64_t either = a | b;
+    volatile uint64_t both = a & b;
+    return either & ~both;
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_and(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_AND == 0
+    return a & b;
+#else
+    volatile uint64_t not_a = ~a;
+    volatile uint64_t not_b = ~b;
+    return ~(not_a | not_b);
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_or(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_OR == 0
+    return a | b;
+#else
+    volatile uint64_t not_a = ~a;
+    volatile uint64_t not_b = ~b;
+    return ~(not_a & not_b);
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_neg(uint64_t a)
+{
+#if DVM_HANDLER_VARIANT_NEG == 0
+    return ~a + 1u;
+#else
+    return UINT64_C(0) - a;
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_cmp_eq(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_CMP_EQ == 0
+    return (uint64_t)(a == b ? 1u : 0u);
+#else
+    volatile uint64_t difference = a ^ b;
+    return (uint64_t)(difference == 0 ? 1u : 0u);
+#endif
+}
+
+static __forceinline uint64_t dvm_sem_cmp_ne(uint64_t a, uint64_t b)
+{
+#if DVM_HANDLER_VARIANT_CMP_NE == 0
+    return (uint64_t)(a != b ? 1u : 0u);
+#else
+    volatile uint64_t difference = a ^ b;
+    return (uint64_t)(difference != 0 ? 1u : 0u);
+#endif
+}
+
 /* ---- interpreter -------------------------------------------------------- */
 
 static int dvm_run(DaedalusVM *vm)
 {
     while (1) {
         uint8_t op;
-        const uint8_t *ip;   /* plaintext of the CURRENT instruction         */
+        const uint8_t *ip = NULL;
+                                /* plaintext of the CURRENT instruction      */
 #ifdef DVM_ROLLING
         uint8_t dvm_win[DVM_ROLL_MAX_INSTR];
 #endif
@@ -94,6 +241,18 @@ static int dvm_run(DaedalusVM *vm)
         if (vm->pc >= vm->code_size)
             return -1;                       /* ran past code without HALT   */
 
+#ifdef DVM_PAGED_RUNTIME
+        if (vm->paged) {
+            uint32_t remaining = vm->code_size - vm->pc;
+            uint32_t fetch_size = remaining < sizeof(vm->fetch_window) ?
+                                  remaining : (uint32_t)sizeof(vm->fetch_window);
+            orion_secure_wipe(vm->fetch_window, sizeof(vm->fetch_window));
+            if (dvm_paged_read(vm, 2u + vm->pc,
+                               vm->fetch_window, fetch_size) != 0)
+                return -1;
+            ip = vm->fetch_window;
+        }
+#endif
 #ifdef DVM_ROLLING
         if (vm->rolling) {
             uint32_t dvm_ilen;
@@ -102,12 +261,13 @@ static int dvm_run(DaedalusVM *vm)
             if (dvm_rolling_fetch(&vm->roll, vm->pc, dvm_win, &dvm_ilen) != 0)
                 return -1;
             ip = dvm_win;
-        } else {
+        }
+#endif
+        if (ip == NULL) {
+            if (vm->code == NULL)
+                return -1;
             ip = vm->code + vm->pc;
         }
-#else
-        ip = vm->code + vm->pc;
-#endif
         op = ip[0];
 #ifdef DVM_SHUFFLED
         op = DVM_OPCODE_UNMAP[op];
@@ -177,11 +337,11 @@ static int dvm_run(DaedalusVM *vm)
             uint64_t a, b, r;
             if (dvm_pop(vm, &b) || dvm_pop(vm, &a)) return -1;
             switch (op) {
-            case DVM_ADD: r = a + b;  break;
-            case DVM_SUB: r = a - b;  break;
-            case DVM_XOR: r = a ^ b;  break;
-            case DVM_AND: r = a & b;  break;
-            case DVM_OR:  r = a | b;  break;
+            case DVM_ADD: r = dvm_sem_add(a, b); break;
+            case DVM_SUB: r = dvm_sem_sub(a, b); break;
+            case DVM_XOR: r = dvm_sem_xor(a, b); break;
+            case DVM_AND: r = dvm_sem_and(a, b); break;
+            case DVM_OR:  r = dvm_sem_or(a, b);  break;
             /* Mask the shift count to 6 bits: shifting a uint64_t by >= 64 is
              * C undefined behavior, and the reference oracle (daedalus_ref.py)
              * masks with (b & 63) -- match it so C and Python never diverge. */
@@ -244,7 +404,7 @@ static int dvm_run(DaedalusVM *vm)
         case DVM_CMP_EQ: {
             uint64_t a, b;
             if (dvm_pop(vm, &b) || dvm_pop(vm, &a)) return -1;
-            if (dvm_push(vm, (uint64_t)(a == b ? 1u : 0u))) return -1;
+            if (dvm_push(vm, dvm_sem_cmp_eq(a, b))) return -1;
             vm->pc += 1;
             break;
         }
@@ -518,7 +678,7 @@ static int dvm_run(DaedalusVM *vm)
         case DVM_NEG: {
             uint64_t a;
             if (dvm_pop(vm, &a)) return -1;
-            if (dvm_push(vm, ~a + 1)) return -1;
+            if (dvm_push(vm, dvm_sem_neg(a))) return -1;
             vm->pc += 1;
             break;
         }
@@ -548,7 +708,7 @@ static int dvm_run(DaedalusVM *vm)
         case DVM_CMP_NE: {
             uint64_t a, b;
             if (dvm_pop(vm, &b) || dvm_pop(vm, &a)) return -1;
-            if (dvm_push(vm, (uint64_t)(a != b ? 1u : 0u))) return -1;
+            if (dvm_push(vm, dvm_sem_cmp_ne(a, b))) return -1;
             vm->pc += 1;
             break;
         }
@@ -607,97 +767,266 @@ static int dvm_run(DaedalusVM *vm)
         default:
             return -1;                       /* unknown / trap opcode */
         }
+#ifdef DVM_PAGED_RUNTIME
+        if (vm->paged)
+            orion_secure_wipe(vm->fetch_window, sizeof(vm->fetch_window));
+#endif
     }
 }
 
-/* ---- public API --------------------------------------------------------- */
+/* ---- shared execution setup -------------------------------------------- */
 
-int daedalus_vm_exec(const uint8_t *program, uint32_t program_size,
-                   const uint64_t *args, int arg_count)
+static void dvm_state_wipe(DaedalusVM *vm)
 {
-    DaedalusVM vm;
-    int rc;
+    volatile uint8_t *z = (volatile uint8_t *)vm;
+    uint32_t n;
+    for (n = 0; n < (uint32_t)sizeof(*vm); n++)
+        z[n] = 0;
+}
 
+static int dvm_prepare(DaedalusVM *vm,
+                       const uint8_t *program, uint32_t program_size,
+                       const uint64_t *args, int arg_count)
+{
+    int i;
+
+    dvm_state_wipe(vm);
     if (!program || program_size < 2u)
         return -1;
 
-    /* Zero the whole VM state up front (no CRT memset; volatile byte loop). */
-    {
-        volatile uint8_t *z = (volatile uint8_t *)&vm;
-        uint32_t n;
-        for (n = 0; n < (uint32_t)sizeof(vm); n++)
-            z[n] = 0;
-    }
-
 #ifdef DVM_ROLLING
-    /*
-     * Rolling container: [2 'VR'][16 seed][u16 ds][data][u16 nlead]
-     *                    [u32 leader…][code_ct]. History-keyed self-decrypting
-     * bytecode -- one instruction is reconstructed at a time in dvm_run.
-     */
     if (program_size >= (uint32_t)(2 + DVM_ROLL_SEED_LEN + 2)
         && program[0] == (uint8_t)DVM_ROLL_MAGIC0
         && program[1] == (uint8_t)DVM_ROLL_MAGIC1) {
         uint32_t off = 2;
-        const uint8_t *seed = program + off; off += DVM_ROLL_SEED_LEN;
-        uint16_t ds = (uint16_t)(program[off] | (program[off + 1] << 8));
-        uint16_t nlead;
+        const uint8_t *seed = program + off;
+        uint16_t data_size;
+        uint16_t leader_count;
         const uint8_t *leaders;
+
+        off += DVM_ROLL_SEED_LEN;
+        data_size = dvm_rd_u16(program + off);
         off += 2;
-        if ((uint32_t)off + ds + 2u > program_size) return -1;
-        vm.data = program + off; vm.data_size = ds; off += ds;
-        nlead = (uint16_t)(program[off] | (program[off + 1] << 8)); off += 2;
-        if ((uint64_t)off + (uint64_t)nlead * 4u > (uint64_t)program_size)
+        if ((uint64_t)off + data_size + 2u > (uint64_t)program_size)
             return -1;
-        leaders = program + off; off += (uint32_t)nlead * 4u;
-        vm.code = program + off;
-        vm.code_size = program_size - off;
-        vm.pc = 0;
-        vm.sp = 0;
-        vm.rolling = 1;
-        dvm_rolling_init(&vm.roll, vm.code, vm.code_size, seed, leaders, nlead);
+        vm->data = program + off;
+        vm->data_size = data_size;
+        off += data_size;
+        leader_count = dvm_rd_u16(program + off);
+        off += 2;
+        if ((uint64_t)off + (uint64_t)leader_count * 4u
+                > (uint64_t)program_size)
+            return -1;
+        leaders = program + off;
+        off += (uint32_t)leader_count * 4u;
+        vm->code = program + off;
+        vm->code_size = program_size - off;
+        vm->rolling = 1;
+        dvm_rolling_init(&vm->roll, vm->code, vm->code_size,
+                         seed, leaders, leader_count);
     } else
 #endif
     {
-    /* Header: u16 data_size (little-endian), followed by data[], then code[]. */
-    vm.data_size = (uint16_t)(program[0] | (program[1] << 8));
-    if ((uint32_t)2u + vm.data_size > program_size)
-        return -1;                           /* data runs past the blob */
-
-    vm.data      = program + 2;
-    vm.code      = program + 2 + vm.data_size;
-    vm.code_size = program_size - 2u - vm.data_size;
-    vm.pc        = 0;
-    vm.sp        = 0;
+        vm->data_size = dvm_rd_u16(program);
+        if ((uint64_t)2u + vm->data_size > (uint64_t)program_size)
+            return -1;
+        vm->data = program + 2;
+        vm->code = program + 2 + vm->data_size;
+        vm->code_size = program_size - 2u - vm->data_size;
 #ifdef DVM_ROLLING
-    vm.rolling   = 0;
+        vm->rolling = 0;
 #endif
     }
 
-    /* Copy up to 8 caller arguments (the rest of args[] stays zeroed). */
-    vm.arg_count = 0;
     if (args && arg_count > 0) {
-        int c = (arg_count > 8) ? 8 : arg_count;
-        for (int i = 0; i < c; i++)
-            vm.args[i] = args[i];
-        vm.arg_count = c;
+        int count = (arg_count > 8) ? 8 : arg_count;
+        for (i = 0; i < count; i++)
+            vm->args[i] = args[i];
+        vm->arg_count = count;
     }
+    return 0;
+}
 
+#ifdef DVM_PAGED_RUNTIME
+static int dvm_prepare_paged(DaedalusVM *vm,
+                             const uint8_t *envelope,
+                             uint32_t envelope_size,
+                             const uint8_t expected_program_id[16])
+{
+    uint8_t master_key[DVM_PAGE_MASTER_KEY_SIZE];
+    uint8_t program_header[2];
+    DvmPageStatus status;
+
+    dvm_state_wipe(vm);
+    if (!envelope || !expected_program_id || envelope_size < DVM_PAGE_HEADER_SIZE)
+        return -1;
+    if (key_scatter_get(master_key) != 0) {
+        orion_secure_wipe(master_key, sizeof(master_key));
+        return -1;
+    }
+    status = dvm_page_cache_init(
+        &vm->page_cache, envelope, envelope_size, master_key);
+    orion_secure_wipe(master_key, sizeof(master_key));
+    if (status != DVM_PAGE_OK)
+        return -1;
+    if (!dvm_identity_equal(
+            vm->page_cache.view.program_id, expected_program_id)) {
+        dvm_page_cache_wipe(&vm->page_cache);
+        return -1;
+    }
+    if (vm->page_cache.view.plaintext_size <= sizeof(program_header) ||
+        dvm_paged_read(vm, 0, program_header, sizeof(program_header)) != 0 ||
+        dvm_rd_u16(program_header) != 0) {
+        orion_secure_wipe(program_header, sizeof(program_header));
+        dvm_page_cache_wipe(&vm->page_cache);
+        return -1;
+    }
+    orion_secure_wipe(program_header, sizeof(program_header));
+    vm->code = NULL;
+    vm->code_size = vm->page_cache.view.plaintext_size - 2u;
+    vm->data = NULL;
+    vm->data_size = 0;
+    vm->paged = 1;
+#ifdef DVM_ROLLING
+    vm->rolling = 0;
+#endif
+    return 0;
+}
+#endif
+
+/* ---- public API --------------------------------------------------------- */
+
+int daedalus_vm_exec(const uint8_t *program, uint32_t program_size,
+                     const uint64_t *args, int arg_count)
+{
+    DaedalusVM vm;
+    int rc;
+
+    if (dvm_prepare(&vm, program, program_size, args, arg_count) != 0) {
+        dvm_state_wipe(&vm);
+        return -1;
+    }
     rc = dvm_run(&vm);
-
-    /*
-     * Wipe the ENTIRE VM state (not just locals/stack/ret_stack): args[] may
-     * hold key pointers/derived values, and under DVM_ROLLING vm.roll holds a
-     * copy of the rolling seed + the live accumulator. Zeroing the whole struct
-     * after capturing rc honors the "behind the PC the plaintext is gone" claim
-     * and leaves no key material on the frame. volatile => not elided.
-     */
-    {
-        volatile uint8_t *z = (volatile uint8_t *)&vm;
-        uint32_t n;
-        for (n = 0; n < (uint32_t)sizeof(vm); n++)
-            z[n] = 0;
-    }
-
+    dvm_state_wipe(&vm);
     return rc;
 }
+
+/* ---- x64 lifter execution boundary ------------------------------------- */
+
+static void dvm_x64_local_write(DaedalusVM *vm, uint32_t off, uint64_t value)
+{
+    uint32_t i;
+    for (i = 0; i < 8; i++)
+        vm->locals[off + i] = (uint8_t)(value >> (i * 8));
+}
+
+static uint64_t dvm_x64_local_read(const DaedalusVM *vm, uint32_t off)
+{
+    uint64_t value = 0;
+    uint32_t i;
+    for (i = 0; i < 8; i++)
+        value |= (uint64_t)vm->locals[off + i] << (i * 8);
+    return value;
+}
+
+static void dvm_x64_import(DaedalusVM *vm,
+                           const DaedalusX64Context *context,
+                           const uint8_t *image_base)
+{
+    uint32_t i;
+    const uint64_t flags = context->rflags;
+
+    for (i = 0; i < DVM_X64_GPR_COUNT; i++)
+        dvm_x64_local_write(vm, i * 8u, context->gpr[i]);
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {
+        const uint32_t off = DVM_X64_LOCAL_XMM_BASE + i * DVM_X64_XMM_STRIDE;
+        dvm_x64_local_write(vm, off, context->xmm[i][0]);
+        dvm_x64_local_write(vm, off + 8u, context->xmm[i][1]);
+    }
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_CF,
+                        (flags & DVM_X64_RFLAGS_CF) ? 1u : 0u);
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_PF,
+                        (flags & DVM_X64_RFLAGS_PF) ? 1u : 0u);
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_ZF,
+                        (flags & DVM_X64_RFLAGS_ZF) ? 1u : 0u);
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_SF,
+                        (flags & DVM_X64_RFLAGS_SF) ? 1u : 0u);
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_OF,
+                        (flags & DVM_X64_RFLAGS_OF) ? 1u : 0u);
+    dvm_x64_local_write(vm, DVM_X64_LOCAL_IMAGE_BASE,
+                        (uint64_t)(uintptr_t)image_base);
+}
+
+static void dvm_x64_export(const DaedalusVM *vm,
+                           DaedalusX64Context *context)
+{
+    uint32_t i;
+    uint64_t flags = context->rflags & ~DVM_X64_RFLAGS_MASK;
+
+    for (i = 0; i < DVM_X64_GPR_COUNT; i++)
+        context->gpr[i] = dvm_x64_local_read(vm, i * 8u);
+    for (i = 0; i < DVM_X64_XMM_COUNT; i++) {
+        const uint32_t off = DVM_X64_LOCAL_XMM_BASE + i * DVM_X64_XMM_STRIDE;
+        context->xmm[i][0] = dvm_x64_local_read(vm, off);
+        context->xmm[i][1] = dvm_x64_local_read(vm, off + 8u);
+    }
+    if (dvm_x64_local_read(vm, DVM_X64_LOCAL_CF) & 1u)
+        flags |= DVM_X64_RFLAGS_CF;
+    if (dvm_x64_local_read(vm, DVM_X64_LOCAL_PF) & 1u)
+        flags |= DVM_X64_RFLAGS_PF;
+    if (dvm_x64_local_read(vm, DVM_X64_LOCAL_ZF) & 1u)
+        flags |= DVM_X64_RFLAGS_ZF;
+    if (dvm_x64_local_read(vm, DVM_X64_LOCAL_SF) & 1u)
+        flags |= DVM_X64_RFLAGS_SF;
+    if (dvm_x64_local_read(vm, DVM_X64_LOCAL_OF) & 1u)
+        flags |= DVM_X64_RFLAGS_OF;
+    context->rflags = flags;
+}
+
+int daedalus_vm_exec_x64(const uint8_t *program, uint32_t program_size,
+                         DaedalusX64Context *context,
+                         const uint8_t *image_base)
+{
+    DaedalusVM vm;
+    int rc;
+
+    if (!context || !image_base)
+        return -1;
+    if (dvm_prepare(&vm, program, program_size, NULL, 0) != 0) {
+        dvm_state_wipe(&vm);
+        return -1;
+    }
+
+    dvm_x64_import(&vm, context, image_base);
+    rc = dvm_run(&vm);
+    if (rc == 0)
+        dvm_x64_export(&vm, context);
+    dvm_state_wipe(&vm);
+    return rc;
+}
+
+#ifdef DVM_PAGED_RUNTIME
+int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
+                               uint32_t envelope_size,
+                               const uint8_t expected_program_id[16],
+                               DaedalusX64Context *context,
+                               const uint8_t *image_base)
+{
+    DaedalusVM vm;
+    int rc;
+
+    if (!context || !image_base)
+        return -1;
+    if (dvm_prepare_paged(
+            &vm, envelope, envelope_size, expected_program_id) != 0) {
+        dvm_state_wipe(&vm);
+        return -1;
+    }
+    dvm_x64_import(&vm, context, image_base);
+    rc = dvm_run(&vm);
+    if (rc == 0)
+        dvm_x64_export(&vm, context);
+    dvm_state_wipe(&vm);
+    return rc;
+}
+#endif

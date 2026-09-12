@@ -1,0 +1,689 @@
+"""Guard CF preservation planning and immutable outer metadata emission."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from packer import (
+    assemble,
+    cfg_preservation,
+    container,
+    keyed_validation,
+    payload,
+    pe_analyze,
+    report,
+)
+
+
+@pytest.fixture(scope="module")
+def current_sdk_assembly_stub(tmp_path_factory) -> Path:
+    if os.name != "nt" or not shutil.which("cmake"):
+        pytest.skip("Windows CMake and the Visual Studio x64 toolchain are required")
+    root = Path(__file__).resolve().parents[1]
+    build = tmp_path_factory.mktemp("load-config-assembly-stub") / "build"
+    configured = subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(root / "stub"),
+            "-B",
+            str(build),
+            "-G",
+            "Visual Studio 17 2022",
+            "-A",
+            "x64",
+            "-DDVM_ROLLING=ON",
+            "-DDVM_ROLL_POISON=OFF",
+            "-DDVM_SHUFFLE_SEED=8f74bf0efc4a34c35ee8f123dff69bf4",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if configured.returncode != 0:
+        pytest.skip("Visual Studio x64 configuration is unavailable")
+    compiled = subprocess.run(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    stub = build / "Release/lethe_stub_x64.dll"
+    assert stub.is_file()
+    return stub
+
+
+def _load_config(*, interior: bool = True, unsupported=()):
+    targets = [
+        pe_analyze.ParsedGuardTarget(0x1000, b"\0"),
+        pe_analyze.ParsedGuardTarget(0x2000, b"\0"),
+    ]
+    if interior:
+        targets.insert(1, pe_analyze.ParsedGuardTarget(0x1010, b"\0"))
+    return pe_analyze.ParsedLoadConfig(
+        directory_rva=0x3000,
+        directory_size=320,
+        declared_size=320,
+        major_version=0,
+        minor_version=0,
+        guard_flags=0x10000500,
+        security_cookie_rva=0x3400,
+        guard_cf_check_function_pointer_rva=0x3410,
+        guard_cf_dispatch_function_pointer_rva=0x3418,
+        guard_cf_function_table_rva=0x3200,
+        guard_cf_targets=tuple(targets),
+        guard_address_taken_iat_entry_table_rva=0,
+        guard_address_taken_iat_entries=(),
+        guard_long_jump_target_table_rva=0,
+        guard_long_jump_targets=(),
+        guard_eh_continuation_table_rva=0,
+        guard_eh_continuation_targets=(),
+        dynamic_value_relocations_present=(
+            "dynamic_value_relocations" in unsupported),
+        chpe_metadata_present=("chpe_metadata" in unsupported),
+        xfg_present=("xfg" in unsupported),
+        unsupported_features=tuple(unsupported),
+        raw=b"\0" * 320,
+    )
+
+
+def _parsed(*, interior: bool = True, unsupported=()):
+    return SimpleNamespace(
+        image_base=0x140000000,
+        size_of_image=0x6000,
+        section_alignment=0x1000,
+        sections=(pe_analyze.ParsedSection(
+            ".text", 0x1000, 0x1000, b"\xC3", 0x60000020),),
+        oep_rva=0x1000,
+        is_dll=False,
+        dll_characteristics=0x4160,
+        load_config=_load_config(interior=interior, unsupported=unsupported),
+    )
+
+
+def _manifest():
+    return SimpleNamespace(functions=(SimpleNamespace(
+        target_rva=0x1000,
+        target_size=0x20,
+        cfg_target_rvas=(),
+        generated_executable_ranges=(SimpleNamespace(rva=0x5000, size=0x40),),
+        capabilities={"direct_only_thunk": True},
+    ),))
+
+
+def _indirect_target_manifest():
+    return SimpleNamespace(functions=(SimpleNamespace(
+        target_rva=0x1000,
+        target_size=0x20,
+        cfg_target_rvas=(0x5000,),
+        generated_executable_ranges=(SimpleNamespace(rva=0x5000, size=0x40),),
+        capabilities={"direct_only_thunk": False},
+    ),))
+
+
+def test_cfg_plan_retains_source_entry_without_declaring_direct_only_thunk() -> None:
+    plan = cfg_preservation.build_cfg_preservation_plan(_parsed(), _manifest())
+
+    assert [target.rva for target in plan.source_targets] == [
+        0x1000, 0x1010, 0x2000]
+    assert [target.rva for target in plan.retained_source_targets] == [
+        0x1000, 0x2000]
+    assert [target.rva for target in plan.removed_tombstoned_interior_targets] == [
+        0x1010]
+    assert plan.generated_thunk_targets == ()
+    assert [target.rva for target in plan.merged_declared_targets] == [
+        0x1000, 0x2000]
+    assert plan.preservation_supported is False
+    assert any("tombstoned interiors" in blocker for blocker in plan.blockers)
+
+
+def test_guard_cf_plan_claims_only_the_implemented_runtime_contract() -> None:
+    plan = cfg_preservation.build_cfg_preservation_plan(
+        _parsed(interior=False), _manifest())
+
+    assert plan.live_load_config_emitted is True
+    assert plan.guard_pointer_initialization_proven is True
+    assert plan.runtime_target_registration_proven is True
+    assert plan.preservation_supported is True
+    assert plan.blockers == ()
+
+
+def test_unsupported_source_features_are_preserved_as_precise_blockers() -> None:
+    plan = cfg_preservation.build_cfg_preservation_plan(
+        _parsed(interior=False, unsupported=(
+            "dynamic_value_relocations", "chpe_metadata")),
+        _manifest(),
+    )
+    assert plan.unsupported_source_features == (
+        "dynamic_value_relocations", "chpe_metadata")
+    assert "dynamic_value_relocations, chpe_metadata" in plan.blockers[-1]
+
+
+def test_non_guard_source_does_not_invent_cfg_activation() -> None:
+    parsed = SimpleNamespace(dll_characteristics=0, load_config=None)
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
+
+    assert plan.source_guard_cf_enabled is False
+    assert plan.generated_thunk_targets == ()
+    assert plan.preservation_supported is True
+    assert plan.live_load_config_emitted is False
+
+
+def test_present_non_guard_load_config_is_not_silently_dropped() -> None:
+    load_config = replace(
+        _load_config(interior=False),
+        guard_flags=0,
+        guard_cf_check_function_pointer_rva=0,
+        guard_cf_dispatch_function_pointer_rva=0,
+        guard_cf_function_table_rva=0,
+        guard_cf_targets=(),
+    )
+    parsed = SimpleNamespace(dll_characteristics=0, load_config=load_config)
+
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed)
+
+    assert plan.source_load_config_present is True
+    assert plan.source_guard_cf_enabled is False
+    assert plan.preservation_supported is True
+    assert plan.live_load_config_emitted is True
+    assert cfg_preservation.require_cfg_preservation_supported(parsed) == plan
+
+
+def test_global_xfg_preserves_source_identity_for_direct_only_thunk() -> None:
+    load_config = replace(
+        _load_config(interior=False),
+        xfg_present=True,
+        guard_cf_targets=(
+            pe_analyze.ParsedGuardTarget(0x1000, b"\0"),
+            pe_analyze.ParsedGuardTarget(0x2000, b"\0"),
+        ),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = load_config
+
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
+
+    assert plan.preservation_supported is True
+    assert plan.generated_thunk_targets == ()
+    assert [target.rva for target in plan.merged_declared_targets] == [
+        0x1000, 0x2000]
+    assert plan.blockers == ()
+
+
+def test_direct_only_xfg_retains_selected_source_metadata_byte_exact() -> None:
+    source_targets = (
+        pe_analyze.ParsedGuardTarget(0x1000, b"\x08"),
+        pe_analyze.ParsedGuardTarget(0x2000, b"\x02"),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = replace(
+        parsed.load_config,
+        xfg_present=True,
+        guard_cf_targets=source_targets,
+    )
+
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
+
+    assert plan.preservation_supported is True
+    assert plan.source_targets == tuple(
+        cfg_preservation.PlannedCfgTarget(target.rva, target.metadata, "source")
+        for target in source_targets
+    )
+    assert plan.retained_source_targets == plan.source_targets
+    assert plan.merged_declared_targets == plan.source_targets
+    assert plan.generated_thunk_targets == ()
+
+
+def test_global_xfg_crafted_generated_gfid_fails_closed() -> None:
+    load_config = replace(
+        _load_config(interior=False),
+        xfg_present=True,
+        guard_cf_targets=(
+            pe_analyze.ParsedGuardTarget(0x1000, b"\0"),
+            pe_analyze.ParsedGuardTarget(0x2000, b"\0"),
+        ),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = load_config
+
+    plan = cfg_preservation.build_cfg_preservation_plan(
+        parsed, _indirect_target_manifest())
+
+    assert plan.preservation_supported is False
+    assert [target.rva for target in plan.generated_thunk_targets] == [0x5000]
+    assert any("8-byte XFG function hashes" in blocker for blocker in plan.blockers)
+
+
+def test_direct_only_thunk_rejects_sideband_generated_cfg_inventory() -> None:
+    parsed = _parsed(interior=False)
+    parsed.generated_cfg_targets = (
+        pe_analyze.ParsedGuardTarget(0x5000, b"\0"),
+    )
+
+    with pytest.raises(ValueError, match="direct-only.*generated CFG inventory"):
+        cfg_preservation.build_cfg_preservation_plan(parsed, _manifest())
+
+
+def test_suppressed_source_targets_are_preserved_by_outer_loader_metadata() -> None:
+    load_config = replace(
+        _load_config(interior=False),
+        guard_cf_targets=(
+            pe_analyze.ParsedGuardTarget(0x1000, b"\x01"),
+            pe_analyze.ParsedGuardTarget(0x2000, b"\x02"),
+        ),
+    )
+    parsed = _parsed(interior=False)
+    parsed.load_config = load_config
+
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed)
+
+    assert plan.preservation_supported is True
+    assert [target.metadata for target in plan.merged_declared_targets] == [
+        b"\x01", b"\x02"]
+
+
+def test_default_assembler_rejects_unsupported_load_config_before_output(tmp_path) -> None:
+    output = tmp_path / "must-not-exist.exe"
+    artifacts = SimpleNamespace(is_dll=False)
+    parsed = _parsed(
+        interior=False, unsupported=("dynamic_value_relocations",))
+
+    with pytest.raises(assemble.AssembleError, match="Guard CF preservation blocked") \
+            as rejected:
+        assemble.build_output_pe(
+            parsed,
+            artifacts,
+            str(output),
+        )
+
+    assert rejected.value.preservation_plan.source_guard_cf_enabled is True
+    assert rejected.value.preservation_plan.unsupported_source_features == (
+        "dynamic_value_relocations",)
+    assert output.exists() is False
+
+
+def test_guard_cf_with_memory_guard_fails_before_stub_or_output(tmp_path) -> None:
+    output = tmp_path / "must-not-exist.exe"
+    artifacts = SimpleNamespace(
+        is_dll=False, flags=container.FLAG_MEMGUARD)
+
+    with pytest.raises(assemble.AssembleError, match="memory guard") as rejected:
+        assemble.build_output_pe(
+            _parsed(interior=False), artifacts, str(output))
+
+    assert rejected.value.preservation_plan.source_guard_cf_enabled is True
+    assert output.exists() is False
+
+
+def test_live_load_config_merges_outer_targets_and_shadows_os_slots() -> None:
+    parsed = _parsed(interior=False)
+    source = bytearray(0x1000)
+    for rva, value in (
+        (0x3400, 0x1122334455667788),
+        (0x3410, parsed.image_base + 0x2100),
+        (0x3418, parsed.image_base + 0x2200),
+    ):
+        source[rva - 0x3000:rva - 0x3000 + 8] = value.to_bytes(8, "little")
+    parsed.sections = [pe_analyze.ParsedSection(
+        ".data", 0x3000, 0x1000, bytes(source), 0xC0000040)]
+    plan = cfg_preservation.build_cfg_preservation_plan(
+        parsed, _manifest())
+
+    live = cfg_preservation.build_live_load_config(
+        parsed, plan, section_rva=0x7000, image_base=parsed.image_base,
+        outer_target_rvas=(0x8000,))
+
+    assert live is not None
+    table_va = int.from_bytes(live.data[128:136], "little")
+    table_rva = table_va - parsed.image_base
+    count = int.from_bytes(live.data[136:144], "little")
+    assert count == 3
+    table_offset = table_rva - live.section_rva
+    entries = [
+        int.from_bytes(live.data[table_offset + i * 5:table_offset + i * 5 + 4],
+                       "little")
+        for i in range(count)
+    ]
+    assert entries == [0x1000, 0x2000, 0x8000]
+    assert [copy.source_rva for copy in live.runtime_slot_copies] == [
+        0x3400, 0x3410, 0x3418]
+    assert live.directory_rva == 0x7000
+    assert live.directory_size == 320
+    assert all(target >= 0x7000 for target in live.relocation_target_rvas)
+
+
+def test_current_sdk_loader_slots_are_shadowed_and_relocated_exactly() -> None:
+    parsed = _parsed(interior=False)
+    raw_load_config = bytearray(parsed.load_config.raw)
+    struct.pack_into("<I", raw_load_config, 0, len(raw_load_config))
+    struct.pack_into(
+        "<I", raw_load_config, 144,
+        parsed.load_config.guard_flags | 0x01000000 | 0x02000000)
+    struct.pack_into("<Q", raw_load_config, 304, parsed.image_base + 0x3420)
+    struct.pack_into("<Q", raw_load_config, 312, parsed.image_base + 0x3428)
+    parsed.load_config = replace(
+        parsed.load_config,
+        guard_flags=parsed.load_config.guard_flags | 0x01000000 | 0x02000000,
+        cast_guard_os_determined_failure_mode_rva=0x3420,
+        guard_memcpy_function_pointer_rva=0x3428,
+        raw=bytes(raw_load_config),
+    )
+    source = bytearray(0x1000)
+    values = {
+        0x3400: 0x1122334455667788,
+        0x3410: parsed.image_base + 0x2100,
+        0x3418: parsed.image_base + 0x2200,
+        0x3420: parsed.image_base + 0x2300,
+        0x3428: 0x7FFA123456781234,
+    }
+    for rva, value in values.items():
+        struct.pack_into("<Q", source, rva - 0x3000, value)
+    parsed.sections = [pe_analyze.ParsedSection(
+        ".data", 0x3000, 0x1000, bytes(source), 0xC0000040)]
+    plan = cfg_preservation.build_cfg_preservation_plan(parsed)
+
+    live = cfg_preservation.build_live_load_config(
+        parsed, plan, section_rva=0x7000, image_base=parsed.image_base)
+
+    assert live is not None
+    copies = {copy.name: copy for copy in live.runtime_slot_copies}
+    assert set(copies) == {
+        "SecurityCookie",
+        "GuardCFCheckFunctionPointer",
+        "GuardCFDispatchFunctionPointer",
+        "CastGuardOsDeterminedFailureMode",
+        "GuardMemcpyFunctionPointer",
+    }
+    for field_offset, name, source_rva in (
+        (304, "CastGuardOsDeterminedFailureMode", 0x3420),
+        (312, "GuardMemcpyFunctionPointer", 0x3428),
+    ):
+        copy = copies[name]
+        field_va, = struct.unpack_from("<Q", live.data, field_offset)
+        shadow_value, = struct.unpack_from(
+            "<Q", live.data, copy.shadow_rva - live.section_rva)
+        assert field_va == parsed.image_base + copy.shadow_rva
+        assert copy.source_rva == source_rva
+        assert shadow_value == values[source_rva]
+        assert live.section_rva + field_offset in live.relocation_target_rvas
+
+    cast_shadow = copies["CastGuardOsDeterminedFailureMode"].shadow_rva
+    memcpy_shadow = copies["GuardMemcpyFunctionPointer"].shadow_rva
+    assert cast_shadow in live.relocation_target_rvas
+    assert memcpy_shadow not in live.relocation_target_rvas
+
+    relocated = bytearray(live.data)
+    delta = 0x200000
+    for target_rva in live.relocation_target_rvas:
+        offset = target_rva - live.section_rva
+        value, = struct.unpack_from("<Q", relocated, offset)
+        struct.pack_into("<Q", relocated, offset, value + delta)
+    cast_after, = struct.unpack_from(
+        "<Q", relocated, cast_shadow - live.section_rva)
+    memcpy_after, = struct.unpack_from(
+        "<Q", relocated, memcpy_shadow - live.section_rva)
+    assert cast_after == values[0x3420] + delta
+    assert memcpy_after == values[0x3428]
+
+    outer_sections = [
+        pe_analyze.ParsedSection(
+            ".text", 0x1000, 0x2000, b"\x90" * 0x2000, 0x60000020),
+        pe_analyze.ParsedSection(
+            ".lcfg", live.section_rva, len(live.data), live.data,
+            cfg_preservation.LIVE_SECTION_CHARACTERISTICS),
+    ]
+    reparsed = pe_analyze._parse_load_config(
+        live.data[:live.directory_size],
+        live.directory_rva,
+        image_base=parsed.image_base,
+        image_size=0x9000,
+        sections=outer_sections,
+    )
+    assert reparsed is not None
+    assert reparsed.guard_flags & 0x01000000
+    assert reparsed.guard_flags & 0x02000000
+    assert reparsed.cast_guard_os_determined_failure_mode_rva == cast_shadow
+    assert reparsed.guard_memcpy_function_pointer_rva == memcpy_shadow
+
+
+def test_assembled_pe_binds_current_sdk_slots_and_relocations(
+    tmp_path,
+    current_sdk_assembly_stub: Path,
+) -> None:
+    load_config = _load_config(interior=False)
+    load_config_raw = bytearray(load_config.raw)
+    guard_flags = load_config.guard_flags | 0x01000000 | 0x02000000
+    struct.pack_into("<I", load_config_raw, 0, 0x140)
+    struct.pack_into("<I", load_config_raw, 144, guard_flags)
+    struct.pack_into("<Q", load_config_raw, 304, 0x140003420)
+    struct.pack_into("<Q", load_config_raw, 312, 0x140003428)
+    load_config = replace(
+        load_config,
+        guard_flags=guard_flags,
+        cast_guard_os_determined_failure_mode_rva=0x3420,
+        guard_memcpy_function_pointer_rva=0x3428,
+        raw=bytes(load_config_raw),
+    )
+    data = bytearray(0x1000)
+    for rva, value in (
+        (0x3400, 0x1122334455667788),
+        (0x3410, 0x140002100),
+        (0x3418, 0x140002200),
+        (0x3420, 0x140002300),
+        (0x3428, 0x7FFA123456781234),
+    ):
+        struct.pack_into("<Q", data, rva - 0x3000, value)
+    parsed = pe_analyze.ParsedPE(
+        path="",
+        is_dll=False,
+        image_base=0x140000000,
+        size_of_image=0x6000,
+        oep_rva=0x1000,
+        sections=[
+            pe_analyze.ParsedSection(
+                ".text", 0x1000, 0x2000, b"\xC3" * 0x2000, 0x60000020),
+            pe_analyze.ParsedSection(
+                ".data", 0x3000, 0x1000, bytes(data), 0xC0000040),
+        ],
+        imports=[],
+        reloc_blob=b"",
+        tls=None,
+        pdata_rva=0,
+        pdata_count=0,
+        rsrc_rva=0,
+        file_characteristics=0x22,
+        dll_characteristics=0x4160,
+        load_config=load_config,
+    )
+    options = SimpleNamespace(
+        anti_debug=False,
+        memory_guard=False,
+        process_hardening=False,
+        compression_level=1,
+        server_shard=False,
+    )
+    artifacts = payload.build_payload(parsed, options)
+    output = tmp_path / "current-sdk-load-config.exe"
+    assembly = assemble.build_output_pe(
+        parsed,
+        artifacts,
+        str(output),
+        options=options,
+        stub_path=str(current_sdk_assembly_stub),
+        allow_unverified_stub_for_tests=True,
+    )
+    image = assemble._StubImage(output.read_bytes())
+    load_config_rva, load_config_size = image.dir(assemble.DIR_LOAD_CONFIG)
+    assert load_config_size == 0x140
+    outer = image.read_at_rva(load_config_rva, load_config_size)
+    assert struct.unpack_from("<I", outer, 0)[0] == 0x140
+    cast_shadow = struct.unpack_from("<Q", outer, 304)[0] - parsed.image_base
+    memcpy_shadow = struct.unpack_from("<Q", outer, 312)[0] - parsed.image_base
+    assert cast_shadow != memcpy_shadow
+
+    reloc_rva, reloc_size = image.dir(assemble.DIR_BASERELOC)
+    reloc_blob = image.read_at_rva(reloc_rva, reloc_size)
+    dir64_targets = set()
+    cursor = 0
+    while cursor < len(reloc_blob):
+        page_rva, block_size = struct.unpack_from("<II", reloc_blob, cursor)
+        assert block_size >= 8 and cursor + block_size <= len(reloc_blob)
+        for entry_offset in range(cursor + 8, cursor + block_size, 2):
+            entry, = struct.unpack_from("<H", reloc_blob, entry_offset)
+            if entry >> 12 == assemble.IMAGE_REL_BASED_DIR64:
+                dir64_targets.add(page_rva + (entry & 0xFFF))
+        cursor += block_size
+    assert load_config_rva + 304 in dir64_targets
+    assert load_config_rva + 312 in dir64_targets
+    assert cast_shadow in dir64_targets
+    assert memcpy_shadow not in dir64_targets
+
+    recipe = bytes(artifacts.load_config_blob)
+    (
+        magic,
+        version,
+        slot_count,
+        target_count,
+        relocation_count,
+        _dll_characteristics,
+        recipe_directory_rva,
+        recipe_directory_size,
+        recipe_section_rva,
+        recipe_section_size,
+        _section_characteristics,
+        expected_digest,
+    ) = cfg_preservation.RUNTIME_HEADER.unpack_from(recipe)
+    assert magic == cfg_preservation.RUNTIME_MAGIC
+    assert version == cfg_preservation.RUNTIME_VERSION
+    assert (recipe_directory_rva, recipe_directory_size) == (
+        load_config_rva, 0x140)
+    entries = tuple(
+        cfg_preservation.RUNTIME_ENTRY.unpack_from(
+            recipe,
+            cfg_preservation.RUNTIME_HEADER.size
+            + index * cfg_preservation.RUNTIME_ENTRY.size,
+        )
+        for index in range(slot_count)
+    )
+    assert (0x3420, cast_shadow) in entries
+    assert (0x3428, memcpy_shadow) in entries
+
+    canonical = bytearray(
+        image.read_at_rva(recipe_section_rva, recipe_section_size))
+    shadow_rvas = {shadow_rva for _source_rva, shadow_rva in entries}
+    for shadow_rva in shadow_rvas:
+        struct.pack_into("<Q", canonical, shadow_rva - recipe_section_rva, 0)
+    relocation_offset = (
+        cfg_preservation.RUNTIME_HEADER.size
+        + slot_count * cfg_preservation.RUNTIME_ENTRY.size
+        + target_count * cfg_preservation.RUNTIME_TARGET.size
+    )
+    recipe_relocations = tuple(
+        cfg_preservation.RUNTIME_RELOCATION.unpack_from(
+            recipe,
+            relocation_offset
+            + index * cfg_preservation.RUNTIME_RELOCATION.size,
+        )[0]
+        for index in range(relocation_count)
+    )
+    for relocation in recipe_relocations:
+        if relocation in shadow_rvas:
+            continue
+        offset = relocation - recipe_section_rva
+        value, = struct.unpack_from("<Q", canonical, offset)
+        struct.pack_into("<Q", canonical, offset, value - parsed.image_base)
+    assert hashlib.sha256(canonical).digest() == expected_digest
+
+    structural = report.validate_packed(str(output))
+    assert structural.ok, structural.summary()
+    keyed = keyed_validation.validate_staged_output(
+        str(output),
+        artifacts,
+        expected_stub_text_rva=assembly.stub_text_rva,
+        expected_stub_text_size=assembly.stub_text_size,
+        structural=structural,
+    )
+    assert keyed.ok, keyed.summary()
+
+
+def test_runtime_recipe_carries_slots_and_exact_target_flags() -> None:
+    slots = (
+        cfg_preservation.RuntimeSlotCopy(0x3400, 0x7200, "cookie"),
+        cfg_preservation.RuntimeSlotCopy(0x3410, 0x7208, "check"),
+    )
+    targets = (
+        cfg_preservation.PlannedCfgTarget(0x1000, b"\0", "source"),
+        cfg_preservation.PlannedCfgTarget(0x2000, b"\x08", "source"),
+    )
+
+    live_data = bytearray(0x220)
+    struct.pack_into("<Q", live_data, 0x80, 0x140000000 + 0x7100)
+    live = cfg_preservation.LiveLoadConfigImage(
+        image_base=0x140000000,
+        section_rva=0x7000,
+        directory_rva=0x7000,
+        directory_size=0x140,
+        data=bytes(live_data),
+        relocation_target_rvas=(0x7080, 0x7200, 0x7208),
+        runtime_slot_copies=slots,
+    )
+    blob = cfg_preservation.build_runtime_slot_blob(
+        slots,
+        targets,
+        live_load_config=live,
+        dll_characteristics=0x4160,
+    )
+    (
+        magic,
+        version,
+        slot_count,
+        target_count,
+        relocation_count,
+        dll_characteristics,
+        directory_rva,
+        directory_size,
+        section_rva,
+        section_size,
+        section_characteristics,
+        section_sha256,
+    ) = cfg_preservation.RUNTIME_HEADER.unpack_from(blob)
+
+    assert magic == cfg_preservation.RUNTIME_MAGIC
+    assert version == cfg_preservation.RUNTIME_VERSION
+    assert (slot_count, target_count) == (2, 2)
+    assert relocation_count == 3
+    assert dll_characteristics == 0x4160
+    assert (directory_rva, directory_size) == (0x7000, 0x140)
+    assert (section_rva, section_size, section_characteristics) == (
+        0x7000,
+        len(live_data),
+        cfg_preservation.LIVE_SECTION_CHARACTERISTICS,
+    )
+    assert len(section_sha256) == 32 and any(section_sha256)
+    target_offset = cfg_preservation.RUNTIME_HEADER.size + (
+        slot_count * cfg_preservation.RUNTIME_ENTRY.size)
+    assert cfg_preservation.RUNTIME_TARGET.unpack_from(blob, target_offset) == (
+        0x1000, 0)
+    assert cfg_preservation.RUNTIME_TARGET.unpack_from(
+        blob, target_offset + cfg_preservation.RUNTIME_TARGET.size) == (
+            0x2000, 0x08)
+    relocation_offset = target_offset + (
+        target_count * cfg_preservation.RUNTIME_TARGET.size
+    )
+    assert [
+        cfg_preservation.RUNTIME_RELOCATION.unpack_from(
+            blob,
+            relocation_offset + index * cfg_preservation.RUNTIME_RELOCATION.size,
+        )[0]
+        for index in range(relocation_count)
+    ] == [0x7080, 0x7200, 0x7208]

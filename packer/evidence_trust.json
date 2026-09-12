@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "algorithm": "ed25519",
+  "providers": [],
+  "authenticode": {
+    "allowed_signer_thumbprints": [],
+    "allowed_tsa_thumbprints": []
+  }
+}

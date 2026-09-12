@@ -3,26 +3,23 @@
     Build the Lethe stub DLL (lethe_stub_x64.dll).
 .DESCRIPTION
     Configures and builds the stub using CMake + VS2022 x64. Ordinary builds
-    remain in stub/build. Promotion is an explicit, clean-build-only action
-    that publishes the DLL and its provenance manifest together.
+    remain in stub/build. This script never updates the tracked prebuilt.
 .PARAMETER Clean
     Remove the build directory before configuring.
 .PARAMETER Config
     Build configuration: Release (default) or RelWithDebInfo.
 .PARAMETER Promote
-    Explicitly copy the built DLL and provenance manifest to stub/prebuilt/.
+    Retired compatibility switch. It fails closed and points to the staged
+    release-candidate workflow.
 .PARAMETER ShuffleSeed
     Optional hexadecimal opcode-shuffle seed for a reproducible release build.
-.PARAMETER PythonExe
-    Locked Python interpreter used by mandatory promotion acceptance tests.
 #>
 param(
     [switch]$Clean,
     [switch]$Promote,
     [ValidateSet('Release','RelWithDebInfo')]
     [string]$Config = 'Release',
-    [string]$ShuffleSeed = '',
-    [string]$PythonExe = ''
+    [string]$ShuffleSeed = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,19 +31,13 @@ $RepoDir  = Split-Path $StubDir -Parent
 if ($ShuffleSeed -and $ShuffleSeed -notmatch '^[0-9A-Fa-f]+$') {
     throw 'ShuffleSeed must contain hexadecimal characters only.'
 }
+if ($Promote) {
+    throw 'Direct prebuilt promotion is disabled. Use tools/promote_stub.py to produce a fully gated staging bundle; review and publication remain separate.'
+}
 
 $SourceCommit = (& git -C $RepoDir rev-parse HEAD 2>$null)
 if (-not $SourceCommit) { $SourceCommit = 'unknown' }
 $SourceDirty = [bool](& git -C $RepoDir status --porcelain --untracked-files=all 2>$null)
-if ($Promote -and $SourceCommit -eq 'unknown') {
-    throw 'Refusing to promote without an identifiable Git source commit.'
-}
-if ($Promote -and $SourceDirty) {
-    throw 'Refusing to promote a prebuilt stub from a dirty tree. Commit or stash every tracked and untracked change first.'
-}
-if ($Promote -and -not $Clean) {
-    throw 'Refusing to promote from a reused CMake cache. Pass -Clean for a fresh release build.'
-}
 
 if ($Clean -and (Test-Path $BuildDir)) {
     Write-Host "Cleaning $BuildDir ..."
@@ -86,9 +77,15 @@ if (-not (Test-Path -LiteralPath $Built)) {
 
 $SeedFile = Join-Path $BuildDir 'daedalus_opcodes_shuffled.py'
 $EffectiveSeed = ''
+$HandlerVariantHash = ''
 if (Test-Path -LiteralPath $SeedFile) {
     $SeedLine = Select-String -LiteralPath $SeedFile -Pattern '^BUILD_SEED\s*=\s*[''\"]([0-9a-fA-F]+)[''\"]' | Select-Object -First 1
     if ($SeedLine) { $EffectiveSeed = $SeedLine.Matches[0].Groups[1].Value }
+    $HandlerHashLine = Select-String -LiteralPath $SeedFile -Pattern '^HANDLER_VARIANT_SHA256\s*=\s*[''\"]([0-9a-fA-F]{64})[''\"]' | Select-Object -First 1
+    if ($HandlerHashLine) { $HandlerVariantHash = $HandlerHashLine.Matches[0].Groups[1].Value.ToLowerInvariant() }
+}
+if ($HandlerVariantHash -notmatch '^[0-9a-f]{64}$') {
+    throw "Generated native-handler provenance is missing or malformed: $SeedFile"
 }
 
 $BuiltInfo = Get-Item -LiteralPath $Built
@@ -109,21 +106,6 @@ function Get-CMakeBool([string]$Name) {
 $DvmRolling = Get-CMakeBool 'DVM_ROLLING'
 $MemguardKalypso = Get-CMakeBool 'MEMGUARD_KALYPSO'
 $NativeRoundtrip = 'not-run'
-if ($Promote) {
-    if (-not $PythonExe) {
-        $PythonExe = Join-Path $RepoDir '.venv\Scripts\python.exe'
-    }
-    if (-not (Test-Path -LiteralPath $PythonExe)) {
-        throw "Promotion requires the locked Python interpreter: $PythonExe"
-    }
-    Write-Host "`n=== Native promotion acceptance ==="
-    & (Join-Path $RepoDir 'tests\build_samples.ps1')
-    if (-not $?) { throw 'Native fixture build failed; refusing promotion.' }
-    & (Join-Path $RepoDir 'tests\roundtrip.ps1') `
-        -StubPath $Built -PythonExe $PythonExe
-    if (-not $?) { throw 'Native round-trip failed; refusing promotion.' }
-    $NativeRoundtrip = 'passed-9-of-9'
-}
 $ProvenanceStatus = if ($SourceCommit -eq 'unknown') {
     'partial'
 } elseif ($SourceDirty) {
@@ -143,10 +125,12 @@ $Manifest = [ordered]@{
     cmake_version      = ((& cmake --version | Select-Object -First 1) -replace '^cmake version\s+', '')
     python_version     = (& python --version 2>&1) -replace '^Python\s+', ''
     dvm_shuffle_seed   = $EffectiveSeed
+    dvm_handler_variant_sha256 = $HandlerVariantHash
     dvm_rolling        = $DvmRolling
+    dvm_paged_runtime  = $true
     memguard_kalypso   = $MemguardKalypso
     native_roundtrip   = $NativeRoundtrip
-    validation_utc     = if ($Promote) { (Get-Date).ToUniversalTime().ToString('o') } else { $null }
+    validation_utc     = $null
     provenance_status  = $ProvenanceStatus
 }
 $ManifestPath = "$Built.manifest.json"
@@ -154,51 +138,6 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText(
     $ManifestPath, (($Manifest | ConvertTo-Json) + [Environment]::NewLine), $Utf8NoBom)
 
-if ($Promote) {
-    $PrebuiltDir = Join-Path $StubDir 'prebuilt'
-    $Prebuilt = Join-Path $PrebuiltDir 'lethe_stub_x64.dll'
-    $PrebuiltManifest = Join-Path $PrebuiltDir 'lethe_stub_x64.manifest.json'
-    New-Item -ItemType Directory -Path $PrebuiltDir -Force | Out-Null
-    $DllStage = Join-Path $PrebuiltDir ('.lethe_stub_x64.dll.' + [guid]::NewGuid().ToString('N') + '.tmp')
-    $ManifestStage = Join-Path $PrebuiltDir ('.lethe_stub_x64.manifest.' + [guid]::NewGuid().ToString('N') + '.tmp')
-    $DllBackup = Join-Path $PrebuiltDir ('.lethe_stub_x64.dll.' + [guid]::NewGuid().ToString('N') + '.bak')
-    $ManifestBackup = Join-Path $PrebuiltDir ('.lethe_stub_x64.manifest.' + [guid]::NewGuid().ToString('N') + '.bak')
-    $HadDll = Test-Path -LiteralPath $Prebuilt
-    $HadManifest = Test-Path -LiteralPath $PrebuiltManifest
-    try {
-        Copy-Item -LiteralPath $Built -Destination $DllStage
-        Copy-Item -LiteralPath $ManifestPath -Destination $ManifestStage
-        if ($HadDll) { Copy-Item -LiteralPath $Prebuilt -Destination $DllBackup }
-        if ($HadManifest) { Copy-Item -LiteralPath $PrebuiltManifest -Destination $ManifestBackup }
-        Move-Item -LiteralPath $DllStage -Destination $Prebuilt -Force
-        Move-Item -LiteralPath $ManifestStage -Destination $PrebuiltManifest -Force
-        $PromotedHash = (Get-FileHash -LiteralPath $Prebuilt -Algorithm SHA256).Hash.ToLowerInvariant()
-        $PromotedMetadata = Get-Content -LiteralPath $PrebuiltManifest -Raw | ConvertFrom-Json
-        if ($PromotedMetadata.sha256 -ne $PromotedHash) {
-            throw 'Promoted prebuilt and manifest hash do not match.'
-        }
-    } catch {
-        if ($HadDll) {
-            Move-Item -LiteralPath $DllBackup -Destination $Prebuilt -Force
-        } else {
-            Remove-Item -LiteralPath $Prebuilt -Force -ErrorAction SilentlyContinue
-        }
-        if ($HadManifest) {
-            Move-Item -LiteralPath $ManifestBackup -Destination $PrebuiltManifest -Force
-        } else {
-            Remove-Item -LiteralPath $PrebuiltManifest -Force -ErrorAction SilentlyContinue
-        }
-        throw
-    } finally {
-        Remove-Item -LiteralPath $DllStage -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $ManifestStage -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $DllBackup -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $ManifestBackup -Force -ErrorAction SilentlyContinue
-    }
-    Write-Host "`nPromoted stub: $Prebuilt"
-    Write-Host "Manifest:      $PrebuiltManifest"
-} else {
-    Write-Host "`nStub ready: $Built ($([math]::Round($BuiltInfo.Length / 1KB, 1)) KB)"
-    Write-Host "Manifest:  $ManifestPath"
-    Write-Host 'Use -Promote only for an intentional prebuilt release update.'
-}
+Write-Host "`nStub ready: $Built ($([math]::Round($BuiltInfo.Length / 1KB, 1)) KB)"
+Write-Host "Manifest:  $ManifestPath"
+Write-Host 'Tracked prebuilt files were not modified.'

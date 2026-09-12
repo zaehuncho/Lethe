@@ -116,6 +116,8 @@ def test_header_flag_bits_match_container():
     assert _define_int(text, "LETHE_FLAG_HAS_EXCEPTIONS") == container.FLAG_HAS_EXCEPTIONS
     assert _define_int(text, "LETHE_FLAG_ANTIDEBUG") == container.FLAG_ANTIDEBUG
     assert _define_int(text, "LETHE_FLAG_MEMGUARD") == container.FLAG_MEMGUARD
+    assert (_define_int(text, "LETHE_FLAG_PROCESS_HARDENING") ==
+            container.FLAG_PROCESS_HARDENING)
 
 
 def test_header_hash_marker_matches_container():

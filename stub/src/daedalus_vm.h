@@ -25,6 +25,10 @@
 
 #include <stdint.h>
 
+#ifdef DVM_PAGED_RUNTIME
+#include "bytecode_pages.h"
+#endif
+
 #ifdef DVM_ROLLING
 #include "daedalus_rolling.h"   /* VvmRolling (history-keyed decode context) */
 #endif
@@ -38,6 +42,91 @@ extern "C" {
 #define DVM_STACK_SIZE  64
 #define DVM_LOCAL_SIZE  1024
 #define DVM_RET_STACK_SIZE 32
+
+/* x64-lifter runtime frame. Keep this register order and local layout in sync
+ * with lifter/x64_lifter.py (GPR_NAMES / REG_OFF / CF..PF). The frame API is
+ * deliberately separate from the legacy args[] API: lifted target functions
+ * read and write machine state through locals, not PUSH_ARG. */
+#define DVM_X64_GPR_COUNT       16
+#define DVM_X64_RAX             0
+#define DVM_X64_RCX             1
+#define DVM_X64_RDX             2
+#define DVM_X64_RBX             3
+#define DVM_X64_RSP             4
+#define DVM_X64_RBP             5
+#define DVM_X64_RSI             6
+#define DVM_X64_RDI             7
+#define DVM_X64_R8              8
+#define DVM_X64_R9              9
+#define DVM_X64_R10            10
+#define DVM_X64_R11            11
+#define DVM_X64_R12            12
+#define DVM_X64_R13            13
+#define DVM_X64_R14            14
+#define DVM_X64_R15            15
+
+#define DVM_X64_LOCAL_CF       128
+#define DVM_X64_LOCAL_ZF       136
+#define DVM_X64_LOCAL_SF       144
+#define DVM_X64_LOCAL_OF       152
+#define DVM_X64_LOCAL_PF       232
+#define DVM_X64_LOCAL_CALL_DEPTH 240
+#define DVM_X64_LOCAL_CALL_RET_BASE 248
+#define DVM_X64_LOCAL_IMAGE_BASE 504
+#define DVM_X64_XMM_COUNT       16
+#define DVM_X64_XMM_LANES       2
+#define DVM_X64_LOCAL_XMM_BASE  512
+#define DVM_X64_XMM_STRIDE      16
+#define DVM_X64_LOCALS_REQUIRED 768
+
+#define DVM_X64_RFLAGS_CF (UINT64_C(1) << 0)
+#define DVM_X64_RFLAGS_PF (UINT64_C(1) << 2)
+#define DVM_X64_RFLAGS_ZF (UINT64_C(1) << 6)
+#define DVM_X64_RFLAGS_SF (UINT64_C(1) << 7)
+#define DVM_X64_RFLAGS_OF (UINT64_C(1) << 11)
+#define DVM_X64_RFLAGS_MASK \
+    (DVM_X64_RFLAGS_CF | DVM_X64_RFLAGS_PF | DVM_X64_RFLAGS_ZF | \
+     DVM_X64_RFLAGS_SF | DVM_X64_RFLAGS_OF)
+
+#if DVM_X64_LOCALS_REQUIRED > DVM_LOCAL_SIZE
+#error "x64 lifter frame no longer fits in Daedalus locals"
+#endif
+
+typedef struct DaedalusX64Context {
+    uint64_t gpr[DVM_X64_GPR_COUNT];
+    uint64_t rflags;
+    uint64_t xmm[DVM_X64_XMM_COUNT][DVM_X64_XMM_LANES];
+} DaedalusX64Context;
+
+/* Versions 3/4 include a separately relocated image base. Older descriptors
+ * are rejected by the common bridge instead of running with stale CALL VAs. */
+#define DVM_X64_DESCRIPTOR_VERSION 3u
+#define DVM_X64_DESCRIPTOR_SIZE    24u
+#define DVM_X64_PAGED_DESCRIPTOR_VERSION 4u
+#define DVM_X64_PAGED_DESCRIPTOR_SIZE    40u
+#define DVM_X64_CONTEXT_SIZE       392u
+
+typedef struct DaedalusX64Descriptor {
+    uint32_t version;
+    uint32_t program_size;
+    const uint8_t *program;
+    const uint8_t *image_base;
+} DaedalusX64Descriptor;
+
+typedef struct DaedalusX64PagedDescriptor {
+    uint32_t version;
+    uint32_t envelope_size;
+    const uint8_t *envelope;
+    uint8_t program_id[16];
+    const uint8_t *image_base;
+} DaedalusX64PagedDescriptor;
+
+typedef char DaedalusX64ContextSizeGuard[
+    sizeof(DaedalusX64Context) == DVM_X64_CONTEXT_SIZE ? 1 : -1];
+typedef char DaedalusX64DescriptorSizeGuard[
+    sizeof(DaedalusX64Descriptor) == DVM_X64_DESCRIPTOR_SIZE ? 1 : -1];
+typedef char DaedalusX64PagedDescriptorSizeGuard[
+    sizeof(DaedalusX64PagedDescriptor) == DVM_X64_PAGED_DESCRIPTOR_SIZE ? 1 : -1];
 
 /* ---- opcodes ------------------------------------------------------------ */
 
@@ -139,6 +228,11 @@ typedef struct DaedalusVM {
     uint16_t       data_size;
     uint64_t       args[8];
     int            arg_count;
+#ifdef DVM_PAGED_RUNTIME
+    int            paged;
+    DvmPageCache   page_cache;
+    uint8_t        fetch_window[9];
+#endif
 #ifdef DVM_ROLLING
     int            rolling;    /* 1 => code is a rolling ('VR') container    */
     VvmRolling     roll;       /* history-keyed decode state (per-run)       */
@@ -161,6 +255,29 @@ typedef struct DaedalusVM {
  */
 int daedalus_vm_exec(const uint8_t *program, uint32_t program_size,
                    const uint64_t *args, int arg_count);
+
+/* Execute a program emitted by lifter/x64_lifter.py against a captured x64
+ * register frame. GPRs and CF/PF/ZF/SF/OF are imported into the lifter's fixed
+ * local slots before dispatch and committed back only after a successful HALT.
+ * Other RFLAGS bits are preserved. A generated Win64 entry thunk will capture
+ * the real caller frame and invoke this boundary; until then callers may build
+ * a frame explicitly for leaf-function integration and native testing.
+ *
+ * image_base must be the loader-relocated base of the source module; it is
+ * imported into a reserved local for ASLR-correct internal CALL return slots.
+ * Lifted programs conventionally HALT with 0. Returns that HALT status, or -1
+ * on malformed bytecode / VM failure. On failure, *context is unchanged. */
+int daedalus_vm_exec_x64(const uint8_t *program, uint32_t program_size,
+                         DaedalusX64Context *context,
+                         const uint8_t *image_base);
+
+/* Execute an authenticated page envelope. The expected identity comes from
+ * the outer-section-authenticated descriptor and must match the envelope. */
+int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
+                               uint32_t envelope_size,
+                               const uint8_t expected_program_id[16],
+                               DaedalusX64Context *context,
+                               const uint8_t *image_base);
 
 #ifdef __cplusplus
 }

@@ -24,11 +24,32 @@ jobs:
           python -m pip install uv==0.11.29
           uv sync --frozen --group dev
       - name: Core Python tests
-        run: uv run pytest -q -p no:cacheprovider --ignore=tests/test_lifter.py
-      - name: Lifter oracle tests
+        run: >-
+          uv run pytest -q -p no:cacheprovider
+          --ignore=tests/test_lifter.py
+          --ignore=tests/test_lifter_internal_calls.py
+          --ignore=tests/test_lifter_native_runtime.py
+          --ignore=tests/test_lifter_scalar_batch.py
+      - name: Validate production compatibility contract
+        run: uv run python tools/production_gate.py --validate-only
+      - name: Validate release-candidate preflight
+        shell: powershell
+        run: |
+          $commit = (git rev-parse HEAD).Trim()
+          .\.venv\Scripts\python.exe .\tools\promote_stub.py `
+            --source-commit $commit `
+            --shuffle-seed 00112233445566778899aabbccddeeff `
+            --dry-run
+      - name: Unicorn-backed lifter tests
         # Unicorn uses handled Windows access violations internally. Pytest's
         # faulthandler turns those into megabytes of false-fatal diagnostics.
-        run: uv run pytest tests/test_lifter.py -q -p no:cacheprovider -p no:faulthandler
+        run: >-
+          uv run pytest
+          tests/test_lifter.py
+          tests/test_lifter_internal_calls.py
+          tests/test_lifter_native_runtime.py
+          tests/test_lifter_scalar_batch.py
+          -q -p no:cacheprovider -p no:faulthandler
 
   native-roundtrip:
     runs-on: windows-latest
@@ -57,13 +78,23 @@ jobs:
       - name: Build native fixtures
         shell: powershell
         run: .\tests\build_samples.ps1
+      - name: Build production compatibility corpus
+        shell: powershell
+        run: .\tests\build_production_corpus.ps1
       - name: EXE and DLL round trips using freshly built stub
         shell: powershell
         run: >-
           .\tests\roundtrip.ps1
           -StubPath .\stub\build\Release\lethe_stub_x64.dll
           -PythonExe .\.venv\Scripts\python.exe
+      - name: Resource, ASLR, relocation, and delay-import corpus
+        shell: powershell
+        run: >-
+          .\tests\production_corpus.ps1
+          -StubPath .\stub\build\Release\lethe_stub_x64.dll
+          -PythonExe .\.venv\Scripts\python.exe
+          -EvidencePath .\tests\production-build\production-evidence.json
       - name: Generated source must remain unchanged
         run: git diff --exit-code -- daedalus/daedalus_opcodes_shuffled.py stub/prebuilt
-      - name: Public release policy
-        run: .\.venv\Scripts\python.exe .\tools\release_check.py
+      - name: Validate production matrix contract
+        run: .\.venv\Scripts\python.exe .\tools\production_gate.py --validate-only

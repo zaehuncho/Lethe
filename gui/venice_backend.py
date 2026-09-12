@@ -338,7 +338,7 @@ class PackWorker(QThread):
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._jobs = list(jobs)         # list[(row, input_path)]
-        self._options = dict(options)   # anti_debug, memory_guard, level, out_dir
+        self._options = dict(options)   # runtime flags, level, out_dir
         self._cancel = False
 
     def cancel(self) -> None:
@@ -368,6 +368,8 @@ class PackWorker(QThread):
             options = PackOptions(
                 anti_debug=bool(self._options.get("anti_debug", False)),
                 memory_guard=bool(self._options.get("memory_guard", False)),
+                process_hardening=bool(
+                    self._options.get("process_hardening", False)),
                 compression_level=int(self._options.get("compression_level", 9)),
                 output_path=self._output_for(input_path),
                 is_dll=None,  # auto-detect authoritatively in the core
@@ -396,19 +398,23 @@ _MAX_LOG_LINES = 5000
 # them in ~/.lethe/presets.json.
 _BUILTIN_PRESETS = {
     "Balanced (recommended)": {
-        "anti_debug": False, "memory_guard": False,
+        "anti_debug": False, "memory_guard": False, "process_hardening": False,
         "compression_level": 9, "validate_after_pack": True,
     },
     "Memory guard (experimental)": {
-        "anti_debug": False, "memory_guard": True,
+        "anti_debug": False, "memory_guard": True, "process_hardening": False,
+        "compression_level": 9, "validate_after_pack": True,
+    },
+    "Process hardening (experimental)": {
+        "anti_debug": False, "memory_guard": False, "process_hardening": True,
         "compression_level": 9, "validate_after_pack": True,
     },
     "Fast (dev)": {
-        "anti_debug": False, "memory_guard": False,
+        "anti_debug": False, "memory_guard": False, "process_hardening": False,
         "compression_level": 3, "validate_after_pack": False,
     },
 }
-_PRESET_KEYS = ("anti_debug", "memory_guard", "compression_level",
+_PRESET_KEYS = ("anti_debug", "memory_guard", "process_hardening", "compression_level",
                 "validate_after_pack")
 
 
@@ -442,6 +448,7 @@ class VeniceBackend(QObject):
 
     antiDebugChanged = Signal()
     memoryGuardChanged = Signal()
+    processHardeningChanged = Signal()
     compressionLevelChanged = Signal()
     outputDirectoryChanged = Signal()
     isPackingChanged = Signal()
@@ -455,6 +462,7 @@ class VeniceBackend(QObject):
         super().__init__(parent)
         self._anti_debug = False
         self._memory_guard = False
+        self._process_hardening = False
         self._compression_level = 9
         self._output_directory = ""
         self._is_packing = False
@@ -502,6 +510,20 @@ class VeniceBackend(QObject):
 
     memoryGuard = Property(bool, _get_memory_guard, _set_memory_guard,
                            notify=memoryGuardChanged)
+
+    # -- processHardening (r/w) -------------------------------------------
+    def _get_process_hardening(self) -> bool:
+        return self._process_hardening
+
+    def _set_process_hardening(self, value: bool) -> None:
+        value = bool(value)
+        if self._process_hardening != value:
+            self._process_hardening = value
+            self.processHardeningChanged.emit()
+
+    processHardening = Property(bool, _get_process_hardening,
+                                _set_process_hardening,
+                                notify=processHardeningChanged)
 
     # -- validateAfterPack (r/w) ------------------------------------------
     def _get_validate_after_pack(self) -> bool:
@@ -618,6 +640,7 @@ class VeniceBackend(QObject):
         options = {
             "anti_debug": self._anti_debug,
             "memory_guard": self._memory_guard,
+            "process_hardening": self._process_hardening,
             "compression_level": self._compression_level,
             "output_directory": self._output_directory or None,
         }
@@ -625,6 +648,7 @@ class VeniceBackend(QObject):
             f"packing {len(jobs)} file(s)  ·  "
             f"anti-debug={'on' if self._anti_debug else 'off'}  "
             f"memory-guard={'on' if self._memory_guard else 'off'}  "
+            f"process-hardening={'on' if self._process_hardening else 'off'}  "
             f"level={self._compression_level}  "
             + (f"out={self._output_directory}" if self._output_directory
                else "out=beside input")
@@ -790,6 +814,8 @@ class VeniceBackend(QObject):
             self._set_anti_debug(bool(cfg["anti_debug"]))
         if "memory_guard" in cfg:
             self._set_memory_guard(bool(cfg["memory_guard"]))
+        if "process_hardening" in cfg:
+            self._set_process_hardening(bool(cfg["process_hardening"]))
         if "compression_level" in cfg:
             self._set_compression_level(int(cfg["compression_level"]))
         if "validate_after_pack" in cfg:
@@ -808,6 +834,7 @@ class VeniceBackend(QObject):
         self._user_presets[name] = {
             "anti_debug": self._anti_debug,
             "memory_guard": self._memory_guard,
+            "process_hardening": self._process_hardening,
             "compression_level": self._compression_level,
             "validate_after_pack": self._validate_after_pack,
         }
