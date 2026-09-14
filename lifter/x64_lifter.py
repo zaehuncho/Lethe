@@ -22,13 +22,17 @@ MOVSXD, SETcc/CMOVcc, register XCHG, BSWAP, ADC, and SBB. High-8 aliases,
 scalar memory destinations, immediate stores, parity conditions, and balanced
 PUSH/POP/LEAVE stack frames are covered. Direct non-recursive calls to proven
 instruction boundaries inside the same selected extent preserve architectural
-stack effects and use shadow-validated VM returns. Legacy XMM moves and bitwise
-XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar memory
-transfers and unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported.
-Register-target BT/BTS/BTR/BTC are supported; memory bit strings remain closed.
-Floating-point/SIMD arithmetic, aligned XMM memory forms, VEX/EVEX encodings,
-atomic XCHG/LOCK forms, external/indirect/recursive calls, and unmodeled widths
-remain explicit whole-function bailouts.
+stack effects and use shadow-validated VM returns. Direct RIP-relative import
+calls (`call qword ptr [rip+disp32]`) are bridged through the Win64 native-call
+trampoline: the slot pointer is resolved at runtime and the already-lifted
+register/stack arguments are marshalled into the call. Legacy XMM moves and
+bitwise XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar
+memory transfers and unaligned MOVUPS/MOVDQU 128-bit memory transfers are
+supported. Register-target BT/BTS/BTR/BTC are supported; memory bit strings
+remain closed. Floating-point/SIMD arithmetic, aligned XMM memory forms,
+VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
+calls, recursive calls, and unmodeled widths remain explicit whole-function
+bailouts.
 """
 from __future__ import annotations
 
@@ -173,6 +177,33 @@ def _require_rip_memory_base(instruction) -> None:
     raise LiftUnsupported(
         f"IP-relative memory operand at 0x{instruction.ip:X} is not RIP-relative"
     )
+
+
+def _is_rip_import_call(instruction) -> bool:
+    """True for the standard MSVC ``call qword ptr [rip+disp32]`` import form.
+
+    This is the only external-call shape the lifter bridges: a direct near call
+    whose target pointer lives in a RIP-relative 8-byte slot (an IAT entry or a
+    RIP-relative global function pointer). The loader has populated that slot by
+    the time virtualized code runs, so the bridge reads the live pointer and
+    calls it through the Win64 native-call trampoline. Register-indirect
+    (``call rax``), base/index-indirect (``call [rax]``/``call [rax+8]``), far,
+    and segment-overridden calls stay native -- their target is not knowable as
+    a fixed image RVA here."""
+    if instruction.mnemonic != Mnemonic.CALL:
+        return False
+    if instruction.op_count < 1 or instruction.op_kind(0) != OpKind.MEMORY:
+        return False
+    if not instruction.is_ip_rel_memory_operand:
+        return False
+    if instruction.memory_base != Register.RIP:
+        return False
+    if instruction.segment_prefix != Register.NONE:
+        return False
+    try:
+        return int(MemorySizeExt.size(instruction.memory_size)) == 8
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -1543,8 +1574,57 @@ class _Lifter:
             raise LiftUnsupported("branch target outside lifted function")
         return tgt
 
+    def _import_call(self, instr) -> None:
+        """Bridge a direct RIP-relative import call through the Win64 native-
+        call trampoline (the DVM ``n_call_ptr`` path).
+
+        Because the lifted body IS the caller, the Win64 argument setup (the
+        movs into RCX/RDX/R8/R9 and the ``[RSP+0x20+]`` outgoing stack slots,
+        the ``sub rsp`` shadow reservation) is already in the instruction stream
+        ahead of this call and has been lifted as ordinary register/memory
+        writes. So at the call site the VM RCX/RDX/R8/R9 locals and the mapped
+        stack region above RSP already hold the arguments per the Win64 ABI.
+
+        The bridge only has to: resolve the live target pointer from the slot,
+        marshal the four register arguments plus the first four outgoing stack
+        slots into the trampoline's argv, invoke it, and store the returned RAX
+        back. A near call/RET pair is architecturally RSP-neutral for the
+        caller, so the VM RSP local is intentionally left unchanged. Volatile
+        registers (RCX/RDX/R8-R11) and RFLAGS are ABI-scratch across a call and
+        are not reproduced; nonvolatile registers are preserved by the callee
+        and by the trampoline, and any output-parameter memory is written by the
+        real callee through the caller-supplied pointers."""
+        slot_rva = int(instr.ip_rel_memory_address)
+        # argv is popped in reverse by n_call_ptr, so push argument 0 first
+        # (deepest) and the trampoline func_ptr last (TOS). argc is fixed at the
+        # trampoline's maximum (8): the four register arguments followed by the
+        # first four outgoing stack slots at [RSP+0x20/0x28/0x30/0x38]. A callee
+        # taking fewer arguments ignores the surplus; the reads stay inside the
+        # mapped caller stack frame, so they never fault.
+        self.rd_reg(Register.RCX)
+        self.rd_reg(Register.RDX)
+        self.rd_reg(Register.R8)
+        self.rd_reg(Register.R9)
+        for disp in (0x20, 0x28, 0x30, 0x38):
+            self.rd_reg(Register.RSP)
+            self.push_imm(disp)
+            self.a("add")
+            self.a("load64")
+        self.push_imm(8)                          # argc
+        # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
+        # RIP-relative so ASLR never bakes a preferred VA into the bytecode.
+        self.rd_local(IMAGE_BASE)
+        self.push_imm(slot_rva)
+        self.a("add")
+        self.a("load64")
+        self.a("n_call_ptr")                      # -> trampoline RAX on TOS
+        self.wr_reg(Register.RAX)                 # commit the scalar return
+
     def _call(self, instr) -> None:
         """Emit a direct in-extent x64 CALL plus Daedalus control transfer."""
+        if _is_rip_import_call(instr):
+            self._import_call(instr)
+            return
         target = self._branch_target(instr)
         return_ip = instr.ip + instr.len
         depth_ok = self._new_label()
@@ -2046,8 +2126,13 @@ def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAn
         return target
 
     # Reject unsupported call shapes even when their bytes are unreachable.
+    # A direct RIP-relative import call transfers to an external routine and
+    # returns to the following instruction, so it never enters the in-extent
+    # CALL/RET graph and is not recorded as an internal call.
     for instruction in instructions:
-        if instruction.mnemonic == Mnemonic.CALL:
+        if instruction.mnemonic == Mnemonic.CALL and not _is_rip_import_call(
+            instruction
+        ):
             direct_target(instruction, "call")
             calls.append(instruction.ip)
 
@@ -2075,7 +2160,11 @@ def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAn
         next_ip = instruction.ip + instruction.len
         mnemonic = instruction.mnemonic
 
-        if mnemonic == Mnemonic.CALL:
+        if mnemonic == Mnemonic.CALL and _is_rip_import_call(instruction):
+            # External call: control returns to the next instruction without
+            # touching the in-extent return context.
+            pending.append((next_ip, return_stack, call_entries))
+        elif mnemonic == Mnemonic.CALL:
             target = direct_target(instruction, "call")
             if target in call_entries:
                 raise LiftUnsupported(

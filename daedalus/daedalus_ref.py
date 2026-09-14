@@ -138,10 +138,17 @@ class RefVM:
     """
 
     def __init__(self, code: bytes, data: bytes, args=None,
-                 decoder=None, mem=None, mem_base=0):
+                 decoder=None, mem=None, mem_base=0, native_call_hook=None):
         self.code = code
         self.data = bytes(data)
         self.args = list(args or [])
+        # Optional, test-only model for the native ``n_call_ptr`` trampoline.
+        # Production and every existing caller leave this None, in which case a
+        # dispatched n_* op still raises NativeOpUnsupported exactly as before.
+        # When supplied it is invoked as hook(vm, func_ptr, argc, argv) -> u64,
+        # letting the differential harness model an external callee that both a
+        # Unicorn call-out and this reference interpreter drive identically.
+        self.native_call_hook = native_call_hook
         self.stack: list[int] = []
         self.ret_stack: list[int] = []
         self.locals = bytearray(DVM_LOCAL_SIZE)
@@ -313,6 +320,17 @@ class RefVM:
                     raise DaedalusError("ret stack underflow")
                 self.pc = self.ret_stack.pop()
                 continue
+            elif m == 'n_call_ptr' and self.native_call_hook is not None:
+                # Mirror daedalus_vm.c DVM_N_CALL_PTR: pop func_ptr, pop argc,
+                # then pop argc arguments (argv[argc-1] first). argc is bounded
+                # to the trampoline's 0..8 like the C guard.
+                func_ptr = self._pop()
+                argc = self._pop()
+                if argc > 8:
+                    raise DaedalusError("n_call_ptr argc out of range")
+                argv = [self._pop() for _ in range(argc)][::-1]
+                self._push(self.native_call_hook(self, func_ptr, argc, argv)
+                           & MASK64)
             elif m.startswith('n_'):
                 raise NativeOpUnsupported(m)
             else:

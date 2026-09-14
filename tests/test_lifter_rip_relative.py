@@ -306,7 +306,6 @@ def test_existing_scalar_rip_memory_routes_compile(source: str) -> None:
 @pytest.mark.parametrize(
     ("source", "reason"),
     [
-        ("call qword ptr {mem}", "indirect / non-near call"),
         ("jmp qword ptr {mem}", "indirect / non-near branch"),
         ("vmovdqu xmm0, xmmword ptr {mem}", "mnemonic"),
     ],
@@ -321,3 +320,18 @@ def test_indirect_control_and_vex_xmm_memory_remain_rejected(
             base=0x1000,
             image_sections=_sections(code, bytes(16)),
         )
+
+
+def test_rip_relative_import_call_bridges_through_native_path() -> None:
+    # The standard MSVC ``call qword ptr [rip+disp32]`` import form now lifts to
+    # the Win64 native-call bridge instead of failing closed, as long as the
+    # slot resolves to mapped readable (non-executable) image data.
+    code = _program([("call qword ptr {mem}", 0x4000)], code_rva=0x1000)
+    assembly = lifter.lift_function(
+        code,
+        base=0x1000,
+        image_sections=_sections(code, bytes(16)),
+        selected_extents=((0x1000, len(code)),),
+    )
+    assert "n_call_ptr" in assembly
+    assert f"local_addr {lifter.IMAGE_BASE}" in assembly

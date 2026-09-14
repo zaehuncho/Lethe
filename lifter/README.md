@@ -122,9 +122,39 @@ else + a **differential oracle** that proves every lift correct.
   fault leaves the first lane unchanged. Aligned `movaps`/`movdqa` memory forms
   remain closed until their alignment-fault behavior is modeled; this cut does
   not add floating-point/SIMD arithmetic or VEX/AVX encodings.
+- **Cut 16** - the external-call ABI bridge: the standard MSVC
+  `call qword ptr [rip+disp32]` import form (an IAT slot or a RIP-relative
+  global function pointer). Because the lifted body is the caller, the Win64
+  argument setup (RCX/RDX/R8/R9, the `[RSP+0x20+]` outgoing slots, the shadow
+  reservation) is already lifted as ordinary register/memory writes, so the
+  bridge only resolves the live target pointer from the slot, marshals the four
+  register arguments plus the first four outgoing stack slots into the existing
+  `n_call_ptr` trampoline (a full Win64 pass-through: sets the argument
+  registers, provides 32-byte shadow space, forwards up to four stack
+  arguments, returns RAX), and commits the returned RAX. The call target RVA is
+  decoded RIP-relative and validated as mapped, readable, non-executable,
+  non-discardable image data outside every selected extent, so ASLR never bakes
+  a preferred VA into bytecode and a slot pointing at code is rejected. A
+  near call/RET pair is architecturally RSP-neutral for the caller, so the VM
+  RSP local is left unchanged; volatile registers (RCX/RDX/R8-R11) and RFLAGS
+  are ABI-scratch across a call and are intentionally not reproduced, while
+  nonvolatile registers are preserved by the callee and by the trampoline and
+  output-parameter memory is written by the real callee through the
+  caller-supplied pointers. A native runtime differential test executes the
+  bridge against a real deterministic callee (four register + two stack
+  arguments + an output pointer) and a real Win32 API, asserting the return
+  value, output memory, and preserved nonvolatiles/RSP match a direct native
+  call; a Unicorn/reference-VM oracle test proves the register marshalling and
+  slot resolution against a mock callee both sides invoke identically.
+  Register-indirect (`call reg`), base/index-indirect (`call [reg]`,
+  `call [reg+idx*s+disp]`), far, and segment-overridden calls stay native, and a
+  callee taking more than eight arguments is out of the trampoline's envelope.
 
-Still **bails** (left native — correctness over coverage): external, indirect,
-recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
+Still **bails** (left native — correctness over coverage): register-indirect
+(`call reg`) and base/index-indirect (`call [reg…]`), far, and
+segment-overridden calls; import calls whose slot is not mapped readable
+non-executable data outside the selected extents; recursive, over-depth, or
+context-ambiguous internal `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
@@ -157,8 +187,9 @@ return flags are ABI-volatile and are not restored by the legal
 fail-fast path. Descriptor versions 3 (plain, 24 bytes) and 4 (paged, 40 bytes)
 carry a separate loader-relocated image-base pointer. The bridge rejects a zero
 base and imports it into VM local 504, so internal CALL return slots remain exact
-after ASLR. Native/external calls still require a rigorously typed ABI bridge;
-they are not routed through the legacy generic pointer-call opcode. Each
+after ASLR. Direct RIP-relative import calls (`call qword ptr [rip+disp32]`) are
+now bridged through the existing `n_call_ptr` Win64 pass-through trampoline
+(Cut 16); register/base-indirect and far calls still stay native. Each
 instruction addition remains oracle-gated.
 
 The oracle models a writable memory region: `oracle.check(code, init, flags,
