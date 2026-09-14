@@ -32,9 +32,9 @@ extern "C" {
 int  antidbg_check(void);
 
 /*
- * Extended anti-debug: runs all checks from antidbg_check() PLUS an INT3
- * (0xCC) scan of the stub's own .text section. Needs the image base and
- * stub .text bounds from PackInfo. Called after g_packinfo is located.
+ * Extended anti-debug entry. The image/text parameters are retained for ABI
+ * stability; current MSVC padding makes byte-pattern INT3 scans unsound, so it
+ * delegates to the layered checks in antidbg_check().
  */
 int  antidbg_check_extended(const void *image_base, uint32_t text_rva,
                             uint32_t text_size);
@@ -43,17 +43,17 @@ int  antidbg_check_extended(const void *image_base, uint32_t text_rva,
  * Scattered anti-debug tripwires (defense-in-depth).
  *
  * Each performs a SINGLE lightweight anti-debug check using a different
- * technique and independently wipes key material (g_packinfo.aes_key_enc,
- * kdf_salt) + calls ExitProcess on detection. Designed to be called at
- * multiple points during the unpack flow so that patching the main
+ * technique and independently wipes key material (g_packinfo.aes_key_enc and
+ * kdf_salt), then returns detection to the EXE/DLL-aware caller. Designed to
+ * run at multiple points during the unpack flow so patching the main
  * antidbg_check() prologue alone does NOT defeat all detection.
  *
  * Each call site must be gated by (flags & LETHE_FLAG_ANTIDEBUG).
  */
-void antidbg_tripwire_peb(void);    /* PEB->BeingDebugged              */
-void antidbg_tripwire_ntgf(void);   /* PEB->NtGlobalFlag heap bits     */
-void antidbg_tripwire_rdtsc(void);  /* RDTSC timing gate               */
-void antidbg_tripwire_hwbp(void);   /* Hardware breakpoints (DR0-DR3)  */
+int antidbg_tripwire_peb(void);    /* PEB->BeingDebugged              */
+int antidbg_tripwire_ntgf(void);   /* PEB->NtGlobalFlag heap bits     */
+int antidbg_tripwire_rdtsc(void);  /* RDTSC timing gate               */
+int antidbg_tripwire_debug_port(void); /* NtQIP ProcessDebugPort recheck */
 
 /*
  * Post-load hardening (late phase).
@@ -62,7 +62,7 @@ void antidbg_tripwire_hwbp(void);   /* Hardware breakpoints (DR0-DR3)  */
  * imports/relocs/TLS/exceptions applied, final page protections set) and just
  * before control transfers to the original entry point.
  *
- * PE headers are already destroyed by antidump_erase_headers() (called
+ * PE headers are already sanitized by antidump_erase_headers() (called
  * immediately after section decryption, before imports).  This late call
  * performs only:
  *   1. Payload envelope wipe -- zero the compressed/encrypted metadata envelope
@@ -70,42 +70,38 @@ void antidbg_tripwire_hwbp(void);   /* Hardware breakpoints (DR0-DR3)  */
  *      (Per-section stored ciphertext is wiped by the loader as it decrypts
  *      each non-guarded section; guarded sections are left for memguard.)
  *
- * Must tolerate being called exactly once and must never fail the process.
+ * Called exactly once. Returns nonzero if the envelope cannot be wiped and its
+ * prior page protection restored and verified; the loader then fails closed.
  * NOTE: must not wipe anything the running program still needs (e.g. the .rsrc
  * or the restored .pdata registered with RtlAddFunctionTable).
  */
-void antidump_harden(void *image_base, const PackInfo *pi);
+int antidump_harden(void *image_base, const PackInfo *pi);
 
 /*
- * Early header erasure.
+ * Early header sanitization.
  *
  * Called by the loader immediately after section decryption -- before import
- * resolution, relocations, TLS, or final page protections -- to destroy the
- * in-memory PE headers (MZ/PE signatures, section table, DOS stub, Rich
- * header) while sections are still RW.  This closes the window where a
- * breakpoint between section decryption and the late antidump_harden call
- * could yield a clean dump with intact PE headers + all plaintext sections.
+ * resolution, relocations, TLS, or final page protections -- to clear the DOS
+ * stub/Rich bytes, original entry point, checksum, and consumed directories.
+ * The MZ/PE chain and section table remain valid because Windows resource,
+ * module-introspection, and export APIs continue to parse them after startup.
  *
  * Import resolution, relocations, and TLS all consume the decrypted metadata
- * blob, never the in-memory PE headers, so erasure at this point is safe.
+ * blob, never the in-memory PE headers, so sanitization at this point is safe.
  * The payload envelope wipe remains in antidump_harden (it is independent of
  * the dump-readiness window).
  */
-void antidump_erase_headers(void *image_base, int is_dll);
+int antidump_erase_headers(void *image_base, int is_dll);
 
 /*
- * Early pre-import hardening.
+ * Explicit irreversible process hardening.
  *
- * Called by the loader BEFORE resolve_imports() so the process-mitigation
- * policies (extension-point disable, image-load hardening) and DLL search-
- * order pinning are in place BEFORE any LoadLibraryA calls. This prevents
- * injection via AppInit_DLLs or DLL-planting during import resolution.
- *
- * For a packed EXE: sets mitigation policies + pins DLL search order.
- * For a packed DLL: pins DLL search order only (must not impose process-
- * wide mitigations on the host).
+ * Called only when authenticated LETHE_FLAG_PROCESS_HARDENING is set, after
+ * fallback imports are loaded. For an EXE it verifies mitigation policy and
+ * pins default DLL search directories. DLLs are rejected because these are
+ * process-global host mutations. Returns nonzero on missing/failed policy.
  */
-void antidump_harden_early(int is_dll);
+int antidump_harden_early(int is_dll);
 
 /*
  * Returns nonzero iff the memory guard is requested for this image
@@ -125,15 +121,16 @@ int  memguard_set_relocs(const uint8_t *reloc_blob, uint32_t reloc_size,
                          int64_t delta);
 
 /* Wipe and release a staged relocation recipe that memguard_install() did not
- * consume. Idempotent; used by every eager-fallback and loader-failure path. */
+ * consume. Idempotent; used by every loader-failure path. */
 void memguard_discard_pending_relocs(void);
 
 /*
  * Install the memory guard (on-demand page decryption).
  *
  * Marks guarded (executable) sections PAGE_NOACCESS and registers a Vectored
- * Exception Handler that decrypts a page on first access (and may re-encrypt
- * cold pages) so that only the active working set is ever plaintext.
+ * Exception Handler that decrypts a page on first access. Activated native
+ * pages remain immutable RX for the module lifetime; VM bytecode uses the
+ * separately authenticated one-page cache when bounded plaintext is required.
  *
  * CONTRACT: when memguard is enabled, the loader MUST NOT eagerly decrypt the
  * guarded executable sections -- memguard owns their contents and decrypts
@@ -142,8 +139,8 @@ void memguard_discard_pending_relocs(void);
  * SectionDesc[pi->section_count] (from the decrypted metadata buffer); memguard
  * needs their per-section nonce/tag to decrypt pages on demand.
  *
- * Returns 0 on success; nonzero on failure, in which case the loader falls back
- * to eager decryption of all sections.
+ * Returns 0 on success; nonzero on failure. An authenticated request is
+ * mandatory, so the loader fails startup instead of exposing eager plaintext.
  */
 int  memguard_install(void *image_base, const PackInfo *pi,
                       const SectionDesc *secs);

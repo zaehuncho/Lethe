@@ -41,13 +41,21 @@ from typing import List, Tuple
 # ---------------------------------------------------------------------------
 
 MAGIC = b"LETHE01\x00"          # 8 bytes incl. trailing NUL; identifies PackInfo
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # PackInfo.flags bits
 FLAG_HAS_TLS        = 1 << 0
 FLAG_HAS_EXCEPTIONS = 1 << 1
 FLAG_ANTIDEBUG      = 1 << 2
 FLAG_MEMGUARD       = 1 << 3
+FLAG_PAGED_DVM      = 1 << 4
+FLAG_LOAD_CONFIG    = 1 << 5
+FLAG_DLL_PRELOAD_IAT = 1 << 6
+FLAG_PROCESS_HARDENING = 1 << 7
+
+LOAD_CONFIG_INDEX_MAGIC = b"LCFGIDX1"
+_LOAD_CONFIG_INDEX = struct.Struct("<8sII")
+LOAD_CONFIG_INDEX_SIZE = _LOAD_CONFIG_INDEX.size
 
 # Import descriptor: a function is imported by ordinal when this bit is set in
 # its ``id`` field (low 16 bits = ordinal); otherwise ``id`` is a string-pool
@@ -84,6 +92,16 @@ HKDF_INFO_SECTION  = b"\x8a\x3c\x01\xf7\x92\xb5\x6d\xe4\x11\x0a\x7f\x53\x2e\x73"
 HKDF_INFO_META     = b"\x8a\x3c\x01\xf7\x92\xb5\x6d\xe4\x11\x0a\x7f\x53\x2e\x6d"
 HKDF_INFO_SHARD    = b"\x8a\x3c\x01\xf7\x92\xb5\x6d\xe4\x11\x0a\x7f\x53\x2e\x67"
 
+# Canonical metadata AES-GCM AAD (format v2). The explicit domain prevents the
+# same tag from being meaningful in another protocol; every integer is encoded
+# little-endian at its declared PackInfo width. Keep metadata_aad.[ch] in the C
+# loader byte-for-byte identical.
+METADATA_AAD_DOMAIN = b"LETHE-META-AAD2\x00"
+_METADATA_AAD = struct.Struct("<16sIIQ" + "I" * 19 + "16s")
+METADATA_AAD_SIZE = _METADATA_AAD.size
+assert len(METADATA_AAD_DOMAIN) == 16
+assert METADATA_AAD_SIZE == 124
+
 # ---------------------------------------------------------------------------
 # PackInfo (fixed 192 bytes)
 # ---------------------------------------------------------------------------
@@ -94,8 +112,9 @@ HKDF_INFO_SHARD    = b"\x8a\x3c\x01\xf7\x92\xb5\x6d\xe4\x11\x0a\x7f\x53\x2e\x67"
 # meta_nonce(12s) meta_tag(16s)
 # sections_off(I) imports_off(I) imports_size(I) relocs_off(I) relocs_size(I)
 # tls_off(I) pdata_rva(I) pdata_count(I)
-# aes_key_enc(32s) kdf_salt(16s) stub_text_rva(I) stub_text_size(I) reserved(24s)
-_PACKINFO = struct.Struct("<8sIIQIIIIIII12s16sIIIIIIII32s16sII24s")
+# aes_key_enc(32s) kdf_salt(16s) stub_text_rva(I) stub_text_size(I)
+# dll_export_rva(I) dll_export_size(I) dll_export_sha256_128(16s)
+_PACKINFO = struct.Struct("<8sIIQIIIIIII12s16sIIIIIIII32s16sIIII16s")
 PACKINFO_SIZE = _PACKINFO.size
 assert PACKINFO_SIZE == 192, f"PackInfo must be 192 bytes, got {PACKINFO_SIZE}"
 
@@ -129,6 +148,12 @@ class PackInfo:
     kdf_salt: bytes = b"\x00" * 16
     stub_text_rva: int = 0
     stub_text_size: int = 0
+    # The loader-visible export snapshot exists before DLL initialization.
+    # Its truncated SHA-256 is authenticated by the metadata AAD and verified
+    # by the stub before any protected source section is restored.
+    dll_export_rva: int = 0
+    dll_export_size: int = 0
+    dll_export_sha256_128: bytes = b"\x00" * 16
 
     def pack(self) -> bytes:
         if len(self.aes_key_enc) != 32:
@@ -139,6 +164,8 @@ class PackInfo:
             raise ValueError("meta_tag must be 16 bytes")
         if len(self.kdf_salt) != 16:
             raise ValueError("kdf_salt must be 16 bytes")
+        if len(self.dll_export_sha256_128) != 16:
+            raise ValueError("dll_export_sha256_128 must be 16 bytes")
         return _PACKINFO.pack(
             MAGIC, FORMAT_VERSION, self.flags, self.original_image_base,
             self.original_size_of_image, self.oep_rva, self.is_dll,
@@ -147,7 +174,8 @@ class PackInfo:
             self.sections_off, self.imports_off, self.imports_size,
             self.relocs_off, self.relocs_size, self.tls_off,
             self.pdata_rva, self.pdata_count, self.aes_key_enc, self.kdf_salt,
-            self.stub_text_rva, self.stub_text_size, b"\x00" * 24,
+            self.stub_text_rva, self.stub_text_size, self.dll_export_rva,
+            self.dll_export_size, self.dll_export_sha256_128,
         )
 
     @classmethod
@@ -155,7 +183,8 @@ class PackInfo:
         (magic, ver, flags, imgbase, soi, oep, is_dll, sc, meta_rva,
          meta_stored, meta_uncomp, meta_nonce, meta_tag, sections_off,
          imports_off, imports_size, relocs_off, relocs_size, tls_off, pdata_rva,
-         pdata_count, key, salt, st_rva, st_sz, _rsv) = _PACKINFO.unpack(
+         pdata_count, key, salt, st_rva, st_sz, export_rva, export_size,
+         export_hash) = _PACKINFO.unpack(
             data[:PACKINFO_SIZE])
         if magic != MAGIC:
             raise ValueError("bad PackInfo magic")
@@ -164,7 +193,46 @@ class PackInfo:
         return cls(imgbase, soi, oep, is_dll, flags, sc, meta_rva, meta_stored,
                    meta_uncomp, meta_nonce, meta_tag, sections_off, imports_off,
                    imports_size, relocs_off, relocs_size, tls_off, pdata_rva,
-                   pdata_count, key, salt, st_rva, st_sz)
+                   pdata_count, key, salt, st_rva, st_sz, export_rva,
+                   export_size, export_hash)
+
+
+def build_metadata_aad(info: PackInfo) -> bytes:
+    """Serialize the format-v2 metadata AES-GCM authentication context.
+
+    Only fields available before metadata is opened are included. Crypto key
+    bytes and nonce/tag are excluded. The stable stub code locator is included:
+    it is known before sealing and also selects the bytes used by the independent
+    code-hash/master-key binding, so there is no circular dependency.
+    """
+    if not isinstance(info, PackInfo):
+        raise TypeError("metadata AAD requires a PackInfo instance")
+    return _METADATA_AAD.pack(
+        METADATA_AAD_DOMAIN,
+        FORMAT_VERSION,
+        info.flags,
+        info.original_image_base,
+        info.original_size_of_image,
+        info.oep_rva,
+        info.is_dll,
+        info.section_count,
+        info.meta_rva,
+        info.meta_stored_size,
+        info.meta_uncompressed_size,
+        info.sections_off,
+        info.imports_off,
+        info.imports_size,
+        info.relocs_off,
+        info.relocs_size,
+        info.tls_off,
+        info.pdata_rva,
+        info.pdata_count,
+        info.stub_text_rva,
+        info.stub_text_size,
+        info.dll_export_rva,
+        info.dll_export_size,
+        info.dll_export_sha256_128,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +296,7 @@ def pack_section_descs(descs: List[SectionDesc]) -> bytes:
 #       u32 iat_rva                  where the stub writes the resolved ptr
 #       u16 hint_or_ordinal          0xFFFF = by-hash; else ordinal number
 #       u32 func_name_hash           FNV-1a of function name (case-sensitive)
+#       u32 preload_iat_rva          outer DLL IAT slot, zero for EXEs
 #   u32 terminator (0)               marks end of DLL entries
 
 @dataclass
@@ -236,6 +305,7 @@ class ImportFunc:
     by_ordinal: bool = False
     ordinal: int = 0
     name: str = ""
+    preload_iat_rva: int = 0
 
 
 @dataclass
@@ -294,6 +364,7 @@ def build_import_blob(dlls: List[ImportDll]) -> bytes:
             else:
                 entries += struct.pack("<H", IMPORT_HINT_BY_HASH)
                 entries += struct.pack("<I", _import_hash(f.name))
+            entries += struct.pack("<I", f.preload_iat_rva)
 
     # Terminator
     entries += struct.pack("<I", 0)
@@ -345,15 +416,59 @@ def parse_import_blob(blob: bytes) -> List[ImportDll]:
             pos += 2
             (_func_hash,) = struct.unpack_from("<I", blob, pos)
             pos += 4
+            (preload_iat_rva,) = struct.unpack_from("<I", blob, pos)
+            pos += 4
 
             if hint_or_ordinal == IMPORT_HINT_BY_HASH:
-                funcs.append(ImportFunc(iat_rva, False, 0, ""))
+                funcs.append(ImportFunc(
+                    iat_rva, False, 0, "", preload_iat_rva))
             else:
-                funcs.append(ImportFunc(iat_rva, True, hint_or_ordinal, ""))
+                funcs.append(ImportFunc(
+                    iat_rva, True, hint_or_ordinal, "", preload_iat_rva))
 
         dlls.append(ImportDll(dll_name, funcs))
 
     return dlls
+
+
+def bind_preload_iat_rvas(blob: bytes, preload_iat_rvas: List[int]) -> bytes:
+    """Bind authenticated source-import entries to outer DLL IAT slots."""
+    out = bytearray(blob)
+    if len(out) < 8:
+        raise ValueError("import blob is truncated")
+    enc_pool_size = struct.unpack_from("<I", out, 0)[0]
+    if enc_pool_size > len(out) - 4:
+        raise ValueError("import blob string pool is truncated")
+    pos = 4 + enc_pool_size
+    index = 0
+    while True:
+        if pos + 4 > len(out):
+            raise ValueError("import blob terminator is missing")
+        dll_hash = struct.unpack_from("<I", out, pos)[0]
+        pos += 4
+        if dll_hash == 0:
+            if pos != len(out):
+                raise ValueError("import blob has trailing bytes")
+            break
+        if pos + 9 > len(out):
+            raise ValueError("import blob DLL entry is truncated")
+        enc_offset = struct.unpack_from("<I", out, pos + 1)[0]
+        func_count = struct.unpack_from("<I", out, pos + 5)[0]
+        pos += 9
+        if enc_offset >= enc_pool_size or func_count > (len(out) - pos) // 14:
+            raise ValueError("import blob DLL entry is malformed")
+        for _ in range(func_count):
+            if index >= len(preload_iat_rvas):
+                raise ValueError("preload IAT map has too few entries")
+            preload_rva = int(preload_iat_rvas[index])
+            if not 0 < preload_rva <= 0xFFFF_FFF7 or preload_rva % 8:
+                raise ValueError("preload IAT map contains an invalid RVA")
+            struct.pack_into("<I", out, pos + 10, preload_rva)
+            pos += 14
+            index += 1
+    if index != len(preload_iat_rvas):
+        raise ValueError("preload IAT map has too many entries")
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
@@ -361,12 +476,13 @@ def parse_import_blob(blob: bytes) -> List[ImportDll]:
 # ---------------------------------------------------------------------------
 #
 #   u32 index_rva; u32 raw_start_rva; u32 raw_end_rva; u32 zero_fill;
-#   u32 callback_count; u32 callbacks[callback_count]   (callback RVAs)
+#   u32 characteristics; u32 callback_count; u32 callbacks[callback_count]
 
 def build_tls_blob(index_rva: int, raw_start_rva: int, raw_end_rva: int,
-                   zero_fill: int, callback_rvas: List[int]) -> bytes:
-    out = struct.pack("<IIIII", index_rva, raw_start_rva, raw_end_rva,
-                      zero_fill, len(callback_rvas))
+                   zero_fill: int, callback_rvas: List[int],
+                   characteristics: int = 0) -> bytes:
+    out = struct.pack("<IIIIII", index_rva, raw_start_rva, raw_end_rva,
+                      zero_fill, characteristics, len(callback_rvas))
     out += b"".join(struct.pack("<I", r) for r in callback_rvas)
     return out
 
@@ -383,10 +499,13 @@ class MetadataOffsets:
     relocs_off: int
     relocs_size: int
     tls_off: int
+    load_config_off: int = 0
+    load_config_size: int = 0
 
 
 def build_metadata(section_descs_blob: bytes, import_blob: bytes,
-                   reloc_blob: bytes, tls_blob: bytes
+                   reloc_blob: bytes, tls_blob: bytes,
+                   load_config_blob: bytes = b"",
                    ) -> Tuple[bytes, MetadataOffsets]:
     """Lay out the metadata buffer: ``[SectionDesc[]][imports][relocs][tls]``,
     each 4-byte aligned. Returns (buffer, offsets); the offsets go into PackInfo.
@@ -410,9 +529,20 @@ def build_metadata(section_descs_blob: bytes, import_blob: bytes,
     align4()
     tls_off = len(buf)
     buf += tls_blob
+    load_config_off = 0
+    load_config_size = 0
+    if load_config_blob:
+        align4()
+        load_config_off = len(buf)
+        load_config_size = len(load_config_blob)
+        buf += load_config_blob
+        align4()
+        buf += _LOAD_CONFIG_INDEX.pack(
+            LOAD_CONFIG_INDEX_MAGIC, load_config_off, load_config_size)
     return bytes(buf), MetadataOffsets(
         sections_off, imports_off, len(import_blob),
-        relocs_off, len(reloc_blob), tls_off)
+        relocs_off, len(reloc_blob), tls_off,
+        load_config_off, load_config_size)
 
 
 # ---------------------------------------------------------------------------

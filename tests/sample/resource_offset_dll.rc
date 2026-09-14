@@ -1,0 +1,7 @@
+#include <windows.h>
+
+301 RCDATA
+BEGIN
+    "LETHE_DLL_OFFSET_RESOURCE_V1"
+    0
+END

@@ -1,21 +1,12 @@
 /*
  * Lethe stub -- key_scatter.c
  *
- * Implements key_scatter.h: split the 32-byte runtime AES key into 8 x 4-byte
- * fragments, each XOR-masked with a per-fragment pad and buried at a random
- * offset inside its own page of random noise. The descriptor table (page
- * pointer + offset + pad per fragment) is itself kept XOR-encrypted at rest
- * with a random table key, so a static scan of this module's data does not
- * reveal where the fragments live.
+ * The scattered key is protected by a process-local SRW lock. Readers hold a
+ * shared lease for the complete descriptor-copy/page-read interval; migration,
+ * revocation, and destruction hold the exclusive lease. State is published as
+ * unavailable before any backing page is wiped or released.
  *
- * Threat model note: get() only reads the (encrypted) global table into a local
- * copy -- it never mutates globals -- so concurrent get() calls from the
- * memguard VEH are safe. init()/migrate()/destroy() mutate globals and are only
- * driven single-threaded by the loader before control reaches the target code.
- *
- * Freestanding / no-CRT context (mirrors crypto.c / pe_loader.c): Win32 +
- * bcrypt + MSVC intrinsics only. No libc, no static writable payload beyond the
- * fixed globals below.
+ * Freestanding / no-CRT: Win32 + crypto_csprng + MSVC intrinsics only.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,29 +21,32 @@
 
 #include "key_scatter.h"
 #include "crypto.h"
-
 #include "stub_intrin.h"
 
 #define FRAGMENT_COUNT   8u
-#define FRAGMENT_SIZE    4u      /* 8 x 4 = 32 bytes                       */
-#define KS_PAGE_MIN      4096u  /* minimum allocation (one OS page)         */
-#define KS_PAGE_MAX      65536u /* upper bound — 16 pages at most           */
+#define FRAGMENT_SIZE    4u
+#define KS_PAGE_MIN      4096u
+#define KS_PAGE_MAX      65536u
 #define KS_TABLE_KEY_LEN 16u
 
-typedef struct FragDesc {
-    uint8_t *page;      /* VirtualAlloc'd page                              */
-    uint32_t page_size; /* actual allocation size (varies per fragment)     */
-    uint32_t offset;    /* random offset within page where fragment lives  */
-    uint32_t xor_pad;   /* XOR encryption pad for this fragment            */
-} FragDesc;
+#define KS_STATE_EMPTY   0
+#define KS_STATE_READY   1
+#define KS_STATE_REVOKED 2
 
-static FragDesc     g_frags[FRAGMENT_COUNT];
-static uint8_t      g_table_key[KS_TABLE_KEY_LEN];
-static volatile LONG g_initialized = 0;
+typedef struct FragDesc {
+    uint8_t *page;
+    uint32_t page_size;
+    uint32_t offset;
+    uint32_t xor_pad;
+    uint32_t locked;
+} FragDesc;
 
 #define KS_TABLE_BYTES (FRAGMENT_COUNT * sizeof(FragDesc))
 
-/* ---- tiny local helpers (no CRT) ---------------------------------------- */
+static SRWLOCK       g_key_lock = SRWLOCK_INIT;
+static FragDesc      g_frags[FRAGMENT_COUNT];
+static uint8_t       g_table_key[KS_TABLE_KEY_LEN];
+static volatile LONG g_state = KS_STATE_EMPTY;
 
 static void ks_zero(void *p, size_t n)
 {
@@ -75,174 +69,278 @@ static int ks_rand(void *buf, size_t len)
     return crypto_csprng(buf, len);
 }
 
-static int ks_is_init(void)
+static LONG ks_state(void)
 {
-    return g_initialized != 0;
+    return InterlockedCompareExchange(&g_state, KS_STATE_EMPTY, KS_STATE_EMPTY);
 }
 
-static void ks_table_crypt(FragDesc *tbl)
+static void ks_table_crypt(FragDesc *table,
+                           const uint8_t table_key[KS_TABLE_KEY_LEN])
 {
-    uint8_t *b = (uint8_t *)tbl;
+    uint8_t *bytes = (uint8_t *)table;
     size_t i;
-    for (i = 0; i < KS_TABLE_BYTES; i++) {
-        b[i] = (uint8_t)(b[i] ^ g_table_key[i & (KS_TABLE_KEY_LEN - 1u)]);
+    for (i = 0; i < KS_TABLE_BYTES; ++i) {
+        bytes[i] = (uint8_t)(bytes[i] ^
+            table_key[i & (KS_TABLE_KEY_LEN - 1u)]);
     }
 }
 
-static void ks_raw_free_all(void)
+static void ks_free_plain(FragDesc table[FRAGMENT_COUNT])
 {
     uint32_t i;
-    for (i = 0; i < FRAGMENT_COUNT; i++) {
-        if (g_frags[i].page) {
-            uint32_t sz = g_frags[i].page_size ? g_frags[i].page_size : KS_PAGE_MIN;
-            ks_zero(g_frags[i].page, sz);
-            VirtualFree(g_frags[i].page, 0, MEM_RELEASE);
+    for (i = 0; i < FRAGMENT_COUNT; ++i) {
+        if (table[i].page) {
+            uint32_t size = table[i].page_size;
+            if (size >= KS_PAGE_MIN && size <= KS_PAGE_MAX) {
+                ks_zero(table[i].page, size);
+            }
+            if (table[i].locked && table[i].page_size >= FRAGMENT_SIZE &&
+                table[i].offset <= table[i].page_size - FRAGMENT_SIZE) {
+                VirtualUnlock(table[i].page + table[i].offset, FRAGMENT_SIZE);
+            }
+            VirtualFree(table[i].page, 0, MEM_RELEASE);
         }
     }
-    ks_zero(g_frags, sizeof(g_frags));
-    ks_zero(g_table_key, sizeof(g_table_key));
+    ks_zero(table, KS_TABLE_BYTES);
 }
 
-/* ---- public API --------------------------------------------------------- */
+static int ks_build_encrypted(const uint8_t key[32],
+                              FragDesc table[FRAGMENT_COUNT],
+                              uint8_t table_key[KS_TABLE_KEY_LEN])
+{
+    uint32_t i, j;
+
+    ks_zero(table, KS_TABLE_BYTES);
+    ks_zero(table_key, KS_TABLE_KEY_LEN);
+    if (ks_rand(table_key, KS_TABLE_KEY_LEN) != 0) {
+        return 1;
+    }
+
+    for (i = 0; i < FRAGMENT_COUNT; ++i) {
+        uint8_t *page;
+        uint32_t offset = 0;
+        uint32_t pad = 0;
+        uint32_t allocation_size = 0;
+
+        if (ks_rand(&allocation_size, sizeof(allocation_size)) != 0) {
+            ks_free_plain(table);
+            ks_zero(table_key, KS_TABLE_KEY_LEN);
+            return 1;
+        }
+        allocation_size = KS_PAGE_MIN +
+            (allocation_size % (KS_PAGE_MAX - KS_PAGE_MIN + 1u));
+        allocation_size = (allocation_size + (KS_PAGE_MIN - 1u)) &
+            ~(KS_PAGE_MIN - 1u);
+
+        page = (uint8_t *)VirtualAlloc(NULL, allocation_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!page) {
+            ks_free_plain(table);
+            ks_zero(table_key, KS_TABLE_KEY_LEN);
+            return 1;
+        }
+        table[i].page = page;
+        table[i].page_size = allocation_size;
+
+        if (ks_rand(page, allocation_size) != 0 ||
+            ks_rand(&offset, sizeof(offset)) != 0 ||
+            ks_rand(&pad, sizeof(pad)) != 0) {
+            ks_free_plain(table);
+            ks_zero(table_key, KS_TABLE_KEY_LEN);
+            return 1;
+        }
+        offset %= allocation_size - FRAGMENT_SIZE + 1u;
+        for (j = 0; j < FRAGMENT_SIZE; ++j) {
+            uint8_t key_byte = key[i * FRAGMENT_SIZE + j];
+            uint8_t pad_byte = (uint8_t)((pad >> (8u * j)) & 0xFFu);
+            page[offset + j] = (uint8_t)(key_byte ^ pad_byte);
+        }
+        table[i].offset = offset;
+        table[i].xor_pad = pad;
+        /* Only the one or two hardware pages containing the fragment need to
+           be resident. Lock before the descriptor can ever be published. */
+        if (!VirtualLock(page + offset, FRAGMENT_SIZE)) {
+            ks_free_plain(table);
+            ks_zero(table_key, KS_TABLE_KEY_LEN);
+            return 1;
+        }
+        table[i].locked = 1u;
+    }
+
+    ks_table_crypt(table, table_key);
+    return 0;
+}
+
+static int ks_snapshot_plain_locked(FragDesc local[FRAGMENT_COUNT])
+{
+    uint32_t i;
+
+    ks_copy(local, g_frags, KS_TABLE_BYTES);
+    ks_table_crypt(local, g_table_key);
+    for (i = 0; i < FRAGMENT_COUNT; ++i) {
+        if (!local[i].page ||
+            local[i].page_size < KS_PAGE_MIN ||
+            local[i].page_size > KS_PAGE_MAX ||
+            (local[i].page_size & (KS_PAGE_MIN - 1u)) != 0 ||
+            local[i].offset > local[i].page_size - FRAGMENT_SIZE ||
+            local[i].locked != 1u) {
+            ks_zero(local, KS_TABLE_BYTES);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ks_read_locked(uint8_t out_key[32])
+{
+    FragDesc local[FRAGMENT_COUNT];
+    uint32_t i, j;
+
+    if (ks_snapshot_plain_locked(local) != 0) {
+        ks_zero(out_key, 32u);
+        return 1;
+    }
+    for (i = 0; i < FRAGMENT_COUNT; ++i) {
+        volatile const uint8_t *source = local[i].page + local[i].offset;
+        uint32_t pad = local[i].xor_pad;
+        for (j = 0; j < FRAGMENT_SIZE; ++j) {
+            uint8_t pad_byte = (uint8_t)((pad >> (8u * j)) & 0xFFu);
+            out_key[i * FRAGMENT_SIZE + j] =
+                (uint8_t)(source[j] ^ pad_byte);
+        }
+    }
+    ks_zero(local, KS_TABLE_BYTES);
+    return 0;
+}
+
+static void ks_release_ready_locked(LONG next_state)
+{
+    FragDesc local[FRAGMENT_COUNT];
+
+    ks_copy(local, g_frags, KS_TABLE_BYTES);
+    ks_table_crypt(local, g_table_key);
+
+    /* Publish unavailability while every prior reader is excluded. */
+    InterlockedExchange(&g_state, next_state);
+    ks_zero(g_frags, KS_TABLE_BYTES);
+    ks_zero(g_table_key, KS_TABLE_KEY_LEN);
+    ks_free_plain(local);
+}
 
 int key_scatter_init(uint8_t key[32])
 {
-    uint32_t i, j;
+    FragDesc new_table[FRAGMENT_COUNT];
+    uint8_t new_table_key[KS_TABLE_KEY_LEN];
+    int result = 1;
 
     if (!key) {
         return 1;
     }
-    if (ks_is_init()) {
-        return 1;
+
+    ks_zero(new_table, sizeof(new_table));
+    ks_zero(new_table_key, sizeof(new_table_key));
+
+    AcquireSRWLockExclusive(&g_key_lock);
+    if (ks_state() == KS_STATE_EMPTY &&
+        ks_build_encrypted(key, new_table, new_table_key) == 0) {
+        ks_copy(g_frags, new_table, KS_TABLE_BYTES);
+        ks_copy(g_table_key, new_table_key, KS_TABLE_KEY_LEN);
+        InterlockedExchange(&g_state, KS_STATE_READY);
+        ks_zero(key, 32u);
+        result = 0;
     }
-
-    ks_zero(g_frags, sizeof(g_frags));
-
-    if (ks_rand(g_table_key, KS_TABLE_KEY_LEN)) {
-        ks_zero(g_table_key, sizeof(g_table_key));
-        return 1;
-    }
-
-    for (i = 0; i < FRAGMENT_COUNT; i++) {
-        uint8_t *page;
-        uint32_t off = 0, pad = 0, alloc_size = 0;
-
-        if (ks_rand(&alloc_size, sizeof(alloc_size))) {
-            ks_raw_free_all();
-            return 1;
-        }
-        alloc_size = KS_PAGE_MIN +
-                     (alloc_size % (KS_PAGE_MAX - KS_PAGE_MIN + 1u));
-        alloc_size = (alloc_size + (KS_PAGE_MIN - 1u)) & ~(KS_PAGE_MIN - 1u);
-
-        page = (uint8_t *)VirtualAlloc(NULL, alloc_size,
-                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!page) {
-            ks_raw_free_all();
-            return 1;
-        }
-        g_frags[i].page = page;
-        g_frags[i].page_size = alloc_size;
-
-        if (ks_rand(page, alloc_size)) {
-            ks_raw_free_all();
-            return 1;
-        }
-        if (ks_rand(&off, sizeof(off))) {
-            ks_raw_free_all();
-            return 1;
-        }
-        off = off % (alloc_size - FRAGMENT_SIZE + 1u);
-        if (ks_rand(&pad, sizeof(pad))) {
-            ks_raw_free_all();
-            return 1;
-        }
-        for (j = 0; j < FRAGMENT_SIZE; j++) {
-            uint8_t kb = key[i * FRAGMENT_SIZE + j];
-            uint8_t pb = (uint8_t)((pad >> (8u * j)) & 0xFFu);
-            page[off + j] = (uint8_t)(kb ^ pb);
-        }
-        g_frags[i].offset  = off;
-        g_frags[i].xor_pad = pad;
-    }
-
-    ks_zero(key, 32);
-    ks_table_crypt(g_frags);
-    InterlockedExchange(&g_initialized, 1);
-    return 0;
+    ks_zero(new_table, KS_TABLE_BYTES);
+    ks_zero(new_table_key, KS_TABLE_KEY_LEN);
+    ReleaseSRWLockExclusive(&g_key_lock);
+    return result;
 }
 
 int key_scatter_get(uint8_t out_key[32])
 {
-    FragDesc local[FRAGMENT_COUNT];
-    uint32_t i, j;
+    int result;
 
-    if (!out_key || !ks_is_init()) {
+    if (!out_key) {
         return 1;
     }
-
-    ks_copy(local, g_frags, KS_TABLE_BYTES);
-    ks_table_crypt(local);
-
-    for (i = 0; i < FRAGMENT_COUNT; i++) {
-        volatile const uint8_t *src;
-        uint32_t pad = local[i].xor_pad;
-
-        if (!local[i].page) {
-            ks_zero(out_key, 32);
-            ks_zero(local, sizeof(local));
-            return 1;
-        }
-        src = (volatile const uint8_t *)(local[i].page + local[i].offset);
-        for (j = 0; j < FRAGMENT_SIZE; j++) {
-            uint8_t pb = (uint8_t)((pad >> (8u * j)) & 0xFFu);
-            out_key[i * FRAGMENT_SIZE + j] = (uint8_t)(src[j] ^ pb);
-        }
+    AcquireSRWLockShared(&g_key_lock);
+    if (ks_state() != KS_STATE_READY) {
+        ks_zero(out_key, 32u);
+        result = 1;
+    } else {
+        result = ks_read_locked(out_key);
     }
-
-    ks_zero(local, sizeof(local));
-    return 0;
+    ReleaseSRWLockShared(&g_key_lock);
+    return result;
 }
 
 void key_scatter_migrate(void)
 {
-    uint8_t tmp[32];
+    uint8_t key[32];
+    FragDesc old_table[FRAGMENT_COUNT];
+    FragDesc new_table[FRAGMENT_COUNT];
+    uint8_t new_table_key[KS_TABLE_KEY_LEN];
+    int new_table_built = 0;
+    int committed = 0;
 
-    if (!ks_is_init()) {
-        return;
+    ks_zero(key, sizeof(key));
+    ks_zero(old_table, sizeof(old_table));
+    ks_zero(new_table, sizeof(new_table));
+    ks_zero(new_table_key, sizeof(new_table_key));
+
+    AcquireSRWLockExclusive(&g_key_lock);
+    if (ks_state() != KS_STATE_READY || ks_read_locked(key) != 0)
+        goto migrate_done;
+    if (ks_build_encrypted(key, new_table, new_table_key) != 0)
+        goto migrate_done;
+    new_table_built = 1;
+    if (ks_snapshot_plain_locked(old_table) != 0)
+        goto migrate_done;
+
+    InterlockedExchange(&g_state, KS_STATE_EMPTY);
+    ks_zero(g_frags, KS_TABLE_BYTES);
+    ks_zero(g_table_key, KS_TABLE_KEY_LEN);
+    ks_copy(g_frags, new_table, KS_TABLE_BYTES);
+    ks_copy(g_table_key, new_table_key, KS_TABLE_KEY_LEN);
+    ks_free_plain(old_table);
+    InterlockedExchange(&g_state, KS_STATE_READY);
+    committed = 1;
+
+migrate_done:
+    ReleaseSRWLockExclusive(&g_key_lock);
+
+    ks_zero(key, sizeof(key));
+    if (new_table_built && !committed) {
+        ks_table_crypt(new_table, new_table_key);
+        ks_free_plain(new_table);
     }
-    if (key_scatter_get(tmp) != 0) {
-        ks_zero(tmp, sizeof(tmp));
-        return;
-    }
-    key_scatter_destroy();
-    (void)key_scatter_init(tmp);
-    ks_zero(tmp, sizeof(tmp));
+    ks_zero(new_table, sizeof(new_table));
+    ks_zero(new_table_key, sizeof(new_table_key));
 }
 
 void key_scatter_destroy(void)
 {
-    FragDesc local[FRAGMENT_COUNT];
-    uint32_t i;
+    LONG state;
 
-    if (!ks_is_init()) {
-        ks_zero(g_frags, sizeof(g_frags));
-        ks_zero(g_table_key, sizeof(g_table_key));
-        return;
+    AcquireSRWLockExclusive(&g_key_lock);
+    state = ks_state();
+    if (state == KS_STATE_READY) {
+        ks_release_ready_locked(KS_STATE_EMPTY);
+    } else {
+        ks_zero(g_frags, KS_TABLE_BYTES);
+        ks_zero(g_table_key, KS_TABLE_KEY_LEN);
     }
+    ReleaseSRWLockExclusive(&g_key_lock);
+}
 
-    ks_copy(local, g_frags, KS_TABLE_BYTES);
-    ks_table_crypt(local);
-    for (i = 0; i < FRAGMENT_COUNT; i++) {
-        if (local[i].page) {
-            uint32_t sz = local[i].page_size ? local[i].page_size : KS_PAGE_MIN;
-            ks_zero(local[i].page, sz);
-            VirtualFree(local[i].page, 0, MEM_RELEASE);
-        }
+void key_scatter_invalidate(void)
+{
+    AcquireSRWLockExclusive(&g_key_lock);
+    if (ks_state() == KS_STATE_READY) {
+        ks_release_ready_locked(KS_STATE_REVOKED);
+    } else {
+        InterlockedExchange(&g_state, KS_STATE_REVOKED);
+        ks_zero(g_frags, KS_TABLE_BYTES);
+        ks_zero(g_table_key, KS_TABLE_KEY_LEN);
     }
-
-    ks_zero(local, sizeof(local));
-    ks_zero(g_frags, sizeof(g_frags));
-    ks_zero(g_table_key, sizeof(g_table_key));
-    InterlockedExchange(&g_initialized, 0);
+    ReleaseSRWLockExclusive(&g_key_lock);
 }

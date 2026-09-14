@@ -5,11 +5,11 @@
  * OPT-IN (LETHE_FLAG_MEMGUARD) Vectored-Exception-Handler on-demand decryptor.
  * Off by default; enabled per-image by the builder's --memory-guard flag.
  *
- * GOAL: at ANY instant, a memory snapshot of the process holds at most a small,
- * bounded working set of plaintext code pages -- never the whole program.
+ * GOAL: executable pages remain encrypted until first use. Native pages then
+ * stay immutable RX so concurrent threads never race in-place re-encryption.
  *
  * -------------------------------------------------------------------------
- * v2 SCHEME -- per-page working set with LRU + periodic re-encryption
+ * v3 SCHEME -- race-free monotonic per-page activation
  * -------------------------------------------------------------------------
  * The container format still stores each guarded (executable) section as ONE
  * AES-256-GCM blob (compressed then encrypted as a unit; the GCM tag covers the
@@ -18,7 +18,7 @@
  * managed at PAGE granularity with a cheap, reversible per-page XOR cipher:
  *
  *   Section states:  SEC_ENCRYPTED -> SEC_SPLIT
- *   Page states:     PG_UNINIT -> PG_XOR_ENC <-> PG_ACTIVE
+ *   Page states:     PG_UNINIT -> PG_XOR_ENC -> PG_ACTIVE
  *
  * memguard_install():
  *   - Snapshots the per-section AES descriptors into an OWN VirtualAlloc'd
@@ -28,29 +28,26 @@
  *     guard").
  *   - Registers a FIRST-chance VEH (index 1) so it runs before debugger handlers.
  *   - Verifies the ntdll exception-dispatch path is not inline-hooked; if it is,
- *     it declines to arm (returns failure -> loader eager-decrypts) rather than
- *     risk a bypassed VEH crashing the host.
+ *     it declines to arm and the loader fails startup rather than silently
+ *     weakening an authenticated memory-guard request.
  *   - Marks every guarded section PAGE_NOACCESS.
- *   - Spawns a background sweeper thread that re-encrypts idle pages.
  *
  * On the FIRST fault into a guarded section (SEC_ENCRYPTED), the VEH:
  *   1. AES-256-GCM decrypts + inflates the WHOLE section into its VA.
  *   2. Computes a CRC32 baseline of every page's plaintext.
  *   3. Immediately XOR-re-encrypts every page EXCEPT the faulting one and marks
  *      the whole section NOACCESS -> only the faulting page is left plaintext.
- *   4. Brings the faulting page up: RX + added to the working set (evicting the
- *      LRU page first if the set is full). Marks the section SEC_SPLIT.
+ *   4. Brings the faulting page up RX. Marks the section SEC_SPLIT.
  *
  * On any later fault into a SEC_SPLIT section, the page is PG_XOR_ENC: the VEH
  * XOR-decrypts just that one page (no AES, no inflate -- the hot path), verifies
  * its CRC32 against the baseline (tamper check), sets it RX, and adds it to the
- * working set (evicting the LRU page if full).
- *
- * Working set cap (MEMGUARD_MAX_ACTIVE_PAGES): when full, the least-recently
- * activated page is XOR-re-encrypted and set NOACCESS before a new page is
- * decrypted. A sweeper thread additionally re-encrypts any active page idle for
- * more than MEMGUARD_IDLE_MS so the steady-state plaintext footprint decays even
- * without new faults.
+ * resident set. An activated native-code page remains RX for the module's
+ * lifetime. Re-encrypting executable bytes while another thread may already be
+ * executing or prefetching them is not a race a process-local lock can close.
+ * Monotonic activation keeps cold pages encrypted without corrupting concurrent
+ * execution. Aggressive bounded plaintext paging belongs in the bytecode VM,
+ * where the interpreter owns every fetch and can enforce page leases safely.
  *
  * Re-encryption uses XOR with the page's random 32-byte key (repeating pad), not
  * AES: a page fault cannot afford AES. Speed over strength here is the accepted
@@ -58,14 +55,19 @@
  * layer only bounds how much plaintext a snapshot can scrape between faults.
  *
  * -------------------------------------------------------------------------
- * RESIDUAL LIMITATION
+ * RESIDUAL LIMITATIONS
  * -------------------------------------------------------------------------
  * The whole-section AES decrypt+inflate (step 1 above) briefly materializes the
  * entire section in plaintext before step 3 re-encrypts the cold pages. That
  * window is short (a single inflate + XOR sweep) and occurs once per section on
- * its first touch -- it is inherent to a per-section GCM tag. Steady state after
- * that touch is bounded by the working set. True per-page AES would need per-page
- * GCM tags (a container/ABI change) and is out of scope here.
+ * its first touch -- it is inherent to a per-section GCM tag. A long-running
+ * process can eventually activate every native page. Authenticated per-page AES
+ * paging is implemented for VM bytecode, where fetch ownership is explicit.
+ *
+ * Native pages are never re-encrypted after activation. This is intentional:
+ * VirtualProtect plus a critical section cannot prove that another core has
+ * stopped executing already-fetched instructions. The production path therefore
+ * chooses deterministic multithreaded correctness over an unsafe LRU illusion.
  *
  * Freestanding / no-CRT: Win32 (kernel32) + MSVC intrinsics + the parallel
  * crypto.c (pure C crypto + dynamic BCryptGenRandom) / miniz.c symbols.
@@ -92,28 +94,33 @@
 
 #include "stub_intrin.h"
 
+/* Native stress builds can deterministically exercise the mandatory key-page
+ * lock failure without changing the production ABI or adding a runtime hook. */
+#if defined(LETHE_MEMGUARD_TEST_FAIL_VIRTUAL_LOCK)
+#define VirtualLock(address, size) ((void)(address), (void)(size), FALSE)
+#endif
+
 /* --- tunables ------------------------------------------------------------ */
-#define MEMGUARD_MAX_ACTIVE_PAGES 12     /* plaintext working-set cap        */
-#define MEMGUARD_IDLE_MS          50u    /* re-encrypt after this much idle  */
-#define MEMGUARD_SWEEP_MS         100u   /* sweeper cadence                  */
 #define MG_PAGE_SIZE              4096u  /* x64 page (named MG_* to be safe)  */
 
 /* Section state (managed under g_lock). */
 #define SEC_ENCRYPTED  0L   /* stored bytes still AES-encrypted; pages NOACCESS */
 #define SEC_SPLIT      1L   /* section inflated + broken into XOR-guarded pages  */
+#define SEC_FAILED     2L   /* section transition failed; forward future faults */
 
 /* Per-page state. */
 #define PG_UNINIT      0L   /* section not yet decrypted (initial)              */
 #define PG_XOR_ENC     1L   /* page XOR-encrypted in place; NOACCESS            */
-#define PG_ACTIVE      2L   /* page plaintext + RX; in the working set          */
+#define PG_ACTIVE      2L   /* page plaintext + immutable RX                   */
+#define PG_TRANSITION  3L   /* locked transition; never service as resident      */
+#define PG_FAILED      4L   /* protection/data state cannot be safely recovered  */
 
 typedef struct GuardPage {
     uint8_t      *va;          /* page base (image_base + rva + page*4096)      */
-    uint64_t      last_access; /* GetTickCount64() at last activation           */
     uint32_t      size;        /* valid bytes in this page (<= MG_PAGE_SIZE)    */
     uint32_t      sec_index;   /* owning section index                          */
     uint32_t      crc;         /* CRC32 of plaintext (baseline, set at split)   */
-    volatile LONG state;       /* PG_UNINIT / PG_XOR_ENC / PG_ACTIVE            */
+    volatile LONG state;       /* PG_* state above                              */
 } GuardPage;
 
 typedef struct GuardSection {
@@ -138,14 +145,10 @@ typedef struct MemGuardCtx {
     GuardPage       *pages;         /* -> inside the guarded region             */
     uint8_t        (*keys)[32];     /* per-page XOR keys, inside guarded region  */
     void            *region_base;   /* VirtualAlloc base (leading guard page)   */
-    HANDLE           reenc_thread;  /* sweeper thread                           */
     SIZE_T           region_total;  /* full reservation byte count              */
     SIZE_T           data_bytes;    /* committed middle byte count              */
     uint32_t         sec_count;
     uint32_t         page_count;
-    int              active_count;
-    volatile LONG    shutting_down;
-    int              active[MEMGUARD_MAX_ACTIVE_PAGES]; /* global page indices  */
     uint8_t          kdf_salt[16];  /* snapshot — g_packinfo is wiped post-load */
     uint8_t         *reloc_blob;    /* OWN copy of the original reloc directory  */
     uint32_t         reloc_size;
@@ -157,8 +160,8 @@ static MemGuardCtx * volatile g_ctx = NULL;
 static CRITICAL_SECTION       g_lock;
 static volatile LONG          g_lock_ready = 0;
 
-/* memguard_shutdown(): optional clean teardown (stops the sweeper thread,
- * removes the VEH, wipes + frees the guarded region). No hook drives it today;
+/* memguard_shutdown(): optional clean teardown (removes the VEH, wipes + frees
+ * the guarded region). No hook drives it today;
  * process exit tears everything down otherwise. Declared here to keep it a
  * referenced external symbol. */
 void memguard_shutdown(void);
@@ -187,7 +190,8 @@ static void mg_apply_relocs_in_range(const MemGuardCtx *ctx,
     const uint8_t *blob, *end;
     uint8_t *base;
     int64_t delta;
-    uint32_t sec_rva, sec_end_rva;
+    uint32_t sec_rva;
+    uint64_t sec_end_rva;
     if (!ctx->reloc_blob || !ctx->reloc_size || ctx->reloc_delta == 0)
         return;
     blob  = ctx->reloc_blob;
@@ -195,7 +199,7 @@ static void mg_apply_relocs_in_range(const MemGuardCtx *ctx,
     base  = (uint8_t *)ctx->image_base;
     delta = ctx->reloc_delta;
     sec_rva     = (uint32_t)(sec_va - base);
-    sec_end_rva = sec_rva + sec_vsize;
+    sec_end_rva = (uint64_t)sec_rva + sec_vsize;
     while (blob + 8 <= end) {
         uint32_t page_rva   = *(const uint32_t *)blob;
         uint32_t block_size = *(const uint32_t *)(blob + 4);
@@ -208,9 +212,9 @@ static void mg_apply_relocs_in_range(const MemGuardCtx *ctx,
             uint16_t entry  = entries[j];
             uint8_t  type   = (uint8_t)(entry >> 12);
             uint32_t offset = entry & 0x0FFF;
-            uint32_t rva    = page_rva + offset;
-            if (type == 10 && rva >= sec_rva && rva + 8 <= sec_end_rva) {
-                uint64_t *slot = (uint64_t *)(base + rva);
+            uint64_t rva = (uint64_t)page_rva + offset;
+            if (type == 10 && rva >= sec_rva && rva + 8u <= sec_end_rva) {
+                uint64_t *slot = (uint64_t *)(base + (SIZE_T)rva);
                 *slot += (uint64_t)delta;
             }
         }
@@ -218,14 +222,32 @@ static void mg_apply_relocs_in_range(const MemGuardCtx *ctx,
     }
 }
 
-static SIZE_T mg_align8(SIZE_T n)
+static int mg_size_add(SIZE_T a, SIZE_T b, SIZE_T *out)
 {
-    return (n + (SIZE_T)7u) & ~(SIZE_T)7u;
+    if (!out || a > (SIZE_T)-1 - b)
+        return 1;
+    *out = a + b;
+    return 0;
 }
 
-static SIZE_T mg_align_page(SIZE_T n)
+static int mg_size_mul(SIZE_T a, SIZE_T b, SIZE_T *out)
 {
-    return (n + (SIZE_T)(MG_PAGE_SIZE - 1u)) & ~(SIZE_T)(MG_PAGE_SIZE - 1u);
+    if (!out || (a != 0 && b > (SIZE_T)-1 / a))
+        return 1;
+    *out = a * b;
+    return 0;
+}
+
+static int mg_size_align(SIZE_T n, SIZE_T alignment, SIZE_T *out)
+{
+    SIZE_T mask;
+    if (!out || alignment == 0 || (alignment & (alignment - 1u)) != 0)
+        return 1;
+    mask = alignment - 1u;
+    if (n > (SIZE_T)-1 - mask)
+        return 1;
+    *out = (n + mask) & ~mask;
+    return 0;
 }
 
 static int mg_rand(void *buf, SIZE_T len)
@@ -245,8 +267,8 @@ static uint32_t mg_crc32(const void *p, uint32_t n)
  * MEMGUARD_KALYPSO: use Kalypso (ChaCha12 core) keyed by the page's
  * random 32-byte key, replacing the old repeating-XOR pad (which a single known
  * page of plaintext trivially breaks). The AES-256-GCM section decrypt remains
- * the cryptographic gate; this layer only bounds how much plaintext a snapshot
- * can scrape between faults, so 12 rounds (fast + sound) is the right point.
+ * the cryptographic gate; this layer delays native plaintext exposure until a
+ * page is first used, so 12 rounds (fast + sound) is the right point.
  * Each page has a unique random key, so a fixed zero nonce/counter is safe (no
  * two pages share a keystream, and a code page's plaintext is constant). Falls
  * back to the repeating-XOR pad when the define is off (kill-switch). */
@@ -310,60 +332,58 @@ static int mg_veh_path_hooked(void)
     return 0;
 }
 
-/* ---- page (de)activation (all callers hold g_lock) ---------------------- */
+/* ---- page activation (all callers hold g_lock) -------------------------- */
 
-/*
- * Re-encrypt an ACTIVE page back to XOR_ENC + NOACCESS.
- * Ordering is chosen so no thread can execute stale/garbage bytes:
- *   1. NOACCESS  -- fences out any concurrent access (faulters block on g_lock).
- *   2. READWRITE -- writable but non-executable (DEP), touched only by us.
- *   3. XOR       -- scramble in place.
- *   4. NOACCESS  -- final resting protection.
- * Does NOT touch the active[] set; the caller manages that.
- */
-static void mg_reencrypt_page(MemGuardCtx *ctx, uint32_t gp)
+/* Convert a known-plaintext, currently inaccessible page into the encrypted
+ * resting state after a first-touch failure. Every protection edge is checked;
+ * PG_FAILED prevents a later VEH pass from guessing at unknown bytes. */
+static int mg_park_plain_page(MemGuardCtx *ctx, uint32_t gp)
 {
     GuardPage *g = &ctx->pages[gp];
     DWORD old = 0;
 
-    if (g->state != PG_ACTIVE) {
-        return;
+    g->state = PG_TRANSITION;
+    if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_READWRITE, &old)) {
+        g->state = PG_FAILED;
+        return -1;
     }
-    /* Flip the state first (still under g_lock): the lock-free fast path in the
-     * VEH must never see PG_ACTIVE once the page is about to go NOACCESS, or a
-     * faulter could spin re-faulting until we finish. Only the locked path acts
-     * on the bytes, and it is blocked on g_lock until we return. */
-    g->state = PG_XOR_ENC;
-    VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS,  &old);
-    VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_READWRITE, &old);
     mg_xor_page(g->va, ctx->keys[gp], g->size);
-    VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS,  &old);
+    g->state = PG_XOR_ENC;
+    if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old)) {
+        /* Still encrypted and non-executable under the successful RW protect. */
+        return -1;
+    }
+    return 0;
 }
 
-/* Evict the least-recently-activated page from the working set. */
-static void mg_evict_lru(MemGuardCtx *ctx)
+/* Apply the section-wide dark state. A failed whole-range protect is retried
+ * page by page so a transient range-boundary failure does not leave plaintext
+ * broadly readable. Failure still propagates; callers never declare a split
+ * section ready unless every page was made inaccessible. */
+static int mg_dark_section(GuardSection *S)
 {
-    int i, lru = 0;
-    uint64_t best;
+    DWORD old = 0;
+    uint32_t k;
 
-    if (ctx->active_count <= 0) {
-        return;
+    if (VirtualProtect(S->va, S->virtual_size, PAGE_NOACCESS, &old)) {
+        return 0;
     }
-    best = ctx->pages[ctx->active[0]].last_access;
-    for (i = 1; i < ctx->active_count; ++i) {
-        uint64_t la = ctx->pages[ctx->active[i]].last_access;
-        if (la < best) {
-            best = la;
-            lru = i;
+    for (k = 0; k < S->page_count; ++k) {
+        uint32_t off = k * MG_PAGE_SIZE;
+        SIZE_T size = (SIZE_T)((S->virtual_size - off < MG_PAGE_SIZE)
+                                  ? (S->virtual_size - off)
+                                  : MG_PAGE_SIZE);
+        if (!VirtualProtect(S->va + off, size, PAGE_NOACCESS, &old)) {
+            return -1;
         }
     }
-    mg_reencrypt_page(ctx, (uint32_t)ctx->active[lru]);
-    ctx->active[lru] = ctx->active[ctx->active_count - 1];
-    ctx->active_count--;
+    return 0;
 }
 
 /*
- * Bring a PG_XOR_ENC page up to plaintext + RX and into the working set.
+ * Bring a PG_XOR_ENC page up to plaintext + RX. Activation is monotonic:
+ * native executable bytes are never rewritten after another thread could have
+ * observed the RX mapping.
  * Hot path: XOR + CRC + two VirtualProtects, no allocation, no AES, no inflate.
  * Returns 0 on success, nonzero on failure (leaves the page dark on failure).
  */
@@ -376,10 +396,9 @@ static int mg_activate_page(MemGuardCtx *ctx, uint32_t gp)
     if (g->state == PG_ACTIVE) {
         return 0;   /* already resident (raced with another thread) */
     }
-    if (ctx->active_count >= MEMGUARD_MAX_ACTIVE_PAGES) {
-        mg_evict_lru(ctx);
+    if (g->state != PG_XOR_ENC) {
+        return -1;
     }
-
     /* Page is NOACCESS. Make it writable (non-executable under DEP) to decrypt. */
     if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_READWRITE, &old)) {
         return -1;
@@ -390,20 +409,24 @@ static int mg_activate_page(MemGuardCtx *ctx, uint32_t gp)
     crc = mg_crc32(g->va, g->size);
     if (crc != g->crc) {
         mg_xor_page(g->va, ctx->keys[gp], g->size);           /* restore ct */
-        VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old);
+        if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old)) {
+            /* Ciphertext remains non-executable under PAGE_READWRITE. */
+            g->state = PG_XOR_ENC;
+        }
         return -1;
     }
 
     if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_EXECUTE_READ, &old)) {
         mg_xor_page(g->va, ctx->keys[gp], g->size);           /* restore ct */
-        VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old);
+        if (!VirtualProtect(g->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old)) {
+            /* Ciphertext remains non-executable under PAGE_READWRITE. */
+            g->state = PG_XOR_ENC;
+        }
         return -1;
     }
     FlushInstructionCache(GetCurrentProcess(), g->va, g->size);
 
     g->state = PG_ACTIVE;
-    g->last_access = GetTickCount64();
-    ctx->active[ctx->active_count++] = (int)gp;
     return 0;
 }
 
@@ -422,7 +445,6 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
     DWORD     old = 0;
     mz_ulong  dlen;
     uint32_t  k, gp_active;
-    uint64_t  now;
     int       rc;
 
     if (S->stored_size == 0 || S->uncompressed_size == 0) {
@@ -437,12 +459,17 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
     if (!scratch) {
         return -1;
     }
-    VirtualLock(scratch, S->stored_size);
+    if (!VirtualLock(scratch, S->stored_size)) {
+        mg_zero(scratch, S->stored_size);
+        VirtualFree(scratch, 0, MEM_RELEASE);
+        return -1;
+    }
 
     /* Prefer the scattered key the loader left alive; else re-derive it. */
     if (key_scatter_get(key) != 0 &&
         crypto_derive_key(ctx->pi, ctx->image_base, key) != 0) {
         mg_zero(key, sizeof(key));
+        VirtualUnlock(scratch, S->stored_size);
         VirtualFree(scratch, 0, MEM_RELEASE);
         return -1;
     }
@@ -454,6 +481,7 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
         if (lethe_derive_section_key(key, ctx->kdf_salt,
                                      rva_aad, skey) != 0) {
             mg_zero(key, sizeof(key));
+            VirtualUnlock(scratch, S->stored_size);
             VirtualFree(scratch, 0, MEM_RELEASE);
             return -1;
         }
@@ -465,6 +493,7 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
     }
     if (rc != 0) {
         mg_zero(scratch, S->stored_size);
+        VirtualUnlock(scratch, S->stored_size);
         VirtualFree(scratch, 0, MEM_RELEASE);
         return -1;
     }
@@ -472,6 +501,7 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
     /* Whole section RW (non-executable under DEP) so we can inflate into it. */
     if (!VirtualProtect(S->va, S->virtual_size, PAGE_READWRITE, &old)) {
         mg_zero(scratch, S->stored_size);
+        VirtualUnlock(scratch, S->stored_size);
         VirtualFree(scratch, 0, MEM_RELEASE);
         return -1;
     }
@@ -480,10 +510,12 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
     rc = mz_uncompress((unsigned char *)S->va, &dlen,
                        (const unsigned char *)scratch, (mz_ulong)S->stored_size);
     mg_zero(scratch, S->stored_size);
+    VirtualUnlock(scratch, S->stored_size);
     VirtualFree(scratch, 0, MEM_RELEASE);
 
     if (rc != MZ_OK || dlen != (mz_ulong)S->uncompressed_size) {
-        VirtualProtect(S->va, S->virtual_size, PAGE_NOACCESS, &old);
+        S->state = SEC_FAILED;
+        (void)mg_dark_section(S);
         return -1;
     }
 
@@ -503,29 +535,24 @@ static int mg_decrypt_section(MemGuardCtx *ctx, GuardSection *S,
 
     /* Darken the whole section; the faulting page's plaintext survives (it was
      * not XORed) but is momentarily NOACCESS until we set it RX below. */
-    VirtualProtect(S->va, S->virtual_size, PAGE_NOACCESS, &old);
+    if (mg_dark_section(S) != 0) {
+        S->state = SEC_FAILED;
+        return -1;
+    }
     S->state = SEC_SPLIT;
 
-    /* Bring the faulting page into the working set. */
-    now = GetTickCount64();
+    /* Bring the faulting page up RX. Once active it remains immutable. */
     gp_active = S->first_page + active_local;
     {
         GuardPage *ga = &ctx->pages[gp_active];
-        if (ctx->active_count >= MEMGUARD_MAX_ACTIVE_PAGES) {
-            mg_evict_lru(ctx);
-        }
         if (!VirtualProtect(ga->va, MG_PAGE_SIZE, PAGE_EXECUTE_READ, &old)) {
             /* Fall back: re-encrypt it so nothing plaintext lingers. Section is
              * already SEC_SPLIT, so a retry will route through mg_activate_page. */
-            mg_xor_page(ga->va, ctx->keys[gp_active], ga->size);
-            VirtualProtect(ga->va, MG_PAGE_SIZE, PAGE_NOACCESS, &old);
-            ga->state = PG_XOR_ENC;
+            (void)mg_park_plain_page(ctx, gp_active);
             return -1;
         }
         FlushInstructionCache(GetCurrentProcess(), ga->va, ga->size);
         ga->state = PG_ACTIVE;
-        ga->last_access = now;
-        ctx->active[ctx->active_count++] = (int)gp_active;
     }
     return 0;
 }
@@ -539,6 +566,7 @@ static LONG NTAPI memguard_veh(PEXCEPTION_POINTERS ep)
 {
     MemGuardCtx *ctx = g_ctx;
     EXCEPTION_RECORD *er;
+    ULONG_PTR access;
     ULONG_PTR fault;
     uint32_t i;
 
@@ -550,6 +578,14 @@ static LONG NTAPI memguard_veh(PEXCEPTION_POINTERS ep)
         er->NumberParameters < 2) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    access = er->ExceptionInformation[0];
+    /* Guarded code may fault while being read as data or fetched for execute.
+     * A write AV is a real attempted mutation of resident RX code: forwarding
+     * it is mandatory. Returning CONTINUE_EXECUTION for PG_ACTIVE here would
+     * otherwise create an endless write-fault retry loop. */
+    if (access != 0u && access != 8u) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     fault = (ULONG_PTR)er->ExceptionInformation[1]; /* faulting VA */
 
     for (i = 0; i < ctx->sec_count; ++i) {
@@ -558,6 +594,7 @@ static LONG NTAPI memguard_veh(PEXCEPTION_POINTERS ep)
         ULONG_PTR hi = lo + S->virtual_size;
         uint32_t local, gp;
         LONG result;
+        int managed_failure = 0;
 
         if (fault < lo || fault >= hi) {
             continue;
@@ -574,61 +611,43 @@ static LONG NTAPI memguard_veh(PEXCEPTION_POINTERS ep)
         EnterCriticalSection(&g_lock);
         if (ctx->pages[gp].state == PG_ACTIVE) {
             result = EXCEPTION_CONTINUE_EXECUTION;
-        } else if (S->state != SEC_SPLIT) {
-            result = (mg_decrypt_section(ctx, S, local) == 0)
-                         ? EXCEPTION_CONTINUE_EXECUTION
-                         : EXCEPTION_CONTINUE_SEARCH;
+        } else if (S->state == SEC_ENCRYPTED) {
+            if (mg_decrypt_section(ctx, S, local) == 0) {
+                result = EXCEPTION_CONTINUE_EXECUTION;
+            } else {
+                result = EXCEPTION_CONTINUE_SEARCH;
+                managed_failure = 1;
+            }
+        } else if (S->state == SEC_SPLIT) {
+            if (mg_activate_page(ctx, gp) == 0) {
+                result = EXCEPTION_CONTINUE_EXECUTION;
+            } else {
+                result = EXCEPTION_CONTINUE_SEARCH;
+                managed_failure = 1;
+            }
         } else {
-            result = (mg_activate_page(ctx, gp) == 0)
-                         ? EXCEPTION_CONTINUE_EXECUTION
-                         : EXCEPTION_CONTINUE_SEARCH;
+            result = EXCEPTION_CONTINUE_SEARCH;
+            managed_failure = 1;
         }
         LeaveCriticalSection(&g_lock);
+        /* A read/execute fault in a page owned by this handler is recoverable
+         * only when its authenticated transition completes. Returning SEARCH
+         * after a GCM/CRC/protection failure lets Windows exception reporting
+         * touch the still-NOACCESS instruction page again, recursively
+         * redispatching this VEH until STATUS_STACK_OVERFLOW. Memory guard is
+         * EXE-only, so terminate this process deterministically after releasing
+         * the lock; never resume unauthenticated or ambiguously protected code. */
+        if (managed_failure) {
+            (void)TerminateProcess(GetCurrentProcess(), ERROR_INVALID_DATA);
+            /* TerminateProcess on the current process normally never returns.
+             * If the kernel rejects it, do not fall back into recursive VEH
+             * dispatch on the same inaccessible instruction page. */
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
         return result;
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
-}
-
-/*
- * Background sweeper: periodically re-encrypt working-set pages that have been
- * idle for more than MEMGUARD_IDLE_MS, so plaintext decays even without new
- * faults. A hot page that keeps executing without faulting will be re-encrypted
- * here and immediately re-faulted back in by the VEH (correct, just a little
- * churn) -- re-encryption sets NOACCESS first, so no thread ever executes the
- * scrambled bytes.
- */
-static DWORD WINAPI memguard_reencrypt_thread(LPVOID param)
-{
-    MemGuardCtx *ctx = (MemGuardCtx *)param;
-    if (!ctx) {
-        return 0;
-    }
-    while (!ctx->shutting_down) {
-        uint64_t now;
-        int i;
-
-        Sleep(MEMGUARD_SWEEP_MS);
-        if (ctx->shutting_down) {
-            break;
-        }
-        now = GetTickCount64();
-
-        EnterCriticalSection(&g_lock);
-        i = 0;
-        while (i < ctx->active_count) {
-            int gp = ctx->active[i];
-            if (now - ctx->pages[gp].last_access > (uint64_t)MEMGUARD_IDLE_MS) {
-                mg_reencrypt_page(ctx, (uint32_t)gp);
-                ctx->active[i] = ctx->active[ctx->active_count - 1];
-                ctx->active_count--;   /* re-check the swapped-in slot */
-            } else {
-                ++i;
-            }
-        }
-        LeaveCriticalSection(&g_lock);
-    }
-    return 0;
 }
 
 /* Zero + unlock + release the guarded region. ctx lives INSIDE it, so capture
@@ -697,8 +716,8 @@ int memguard_enabled(const PackInfo *pi)
 }
 
 /*
- * Install the guard. Returns 0 on success; nonzero on any failure (loader then
- * falls back to eager decryption of all sections).
+ * Install the guard. Returns 0 on success; nonzero on any failure. The caller
+ * treats an authenticated memory-guard request as mandatory and fails startup.
  */
 int memguard_install(void *image_base, const PackInfo *pi,
                      const SectionDesc *secs)
@@ -706,6 +725,7 @@ int memguard_install(void *image_base, const PackInfo *pi,
     MemGuardCtx *ctx;
     uint8_t     *region, *data;
     SIZE_T       off_secs, off_pages, off_keys, data_bytes, reserve_total;
+    SIZE_T       term, aligned_data;
     uint32_t     sec_count = 0, page_count = 0, i, j, gp;
     DWORD        old = 0;
 
@@ -720,8 +740,11 @@ int memguard_install(void *image_base, const PackInfo *pi,
     for (i = 0; i < pi->section_count; ++i) {
         if ((secs[i].characteristics & IMAGE_SCN_MEM_EXECUTE) &&
             secs[i].virtual_size != 0) {
+            uint32_t pages = ((secs[i].virtual_size - 1u) / MG_PAGE_SIZE) + 1u;
+            if (sec_count == UINT32_MAX || page_count > UINT32_MAX - pages)
+                return 1;
             ++sec_count;
-            page_count += (secs[i].virtual_size + MG_PAGE_SIZE - 1u) / MG_PAGE_SIZE;
+            page_count += pages;
         }
     }
     if (sec_count == 0) {
@@ -731,8 +754,7 @@ int memguard_install(void *image_base, const PackInfo *pi,
     }
 
     /* If the exception dispatch path is inline-hooked, an installed VEH could be
-     * bypassed -> arming NOACCESS would then crash on the first code fault.
-     * Decline to arm and let the loader eager-decrypt (contracted fallback). */
+     * bypassed -> arming NOACCESS would then crash on the first code fault. */
     if (mg_veh_path_hooked()) {
         return 1;
     }
@@ -743,15 +765,23 @@ int memguard_install(void *image_base, const PackInfo *pi,
     }
 
     /* Region layout: [ctx][secs[]][pages[]][keys[]], carved from one block. */
-    off_secs   = mg_align8(sizeof(MemGuardCtx));
-    off_pages  = mg_align8(off_secs  + (SIZE_T)sec_count  * sizeof(GuardSection));
-    off_keys   = mg_align8(off_pages + (SIZE_T)page_count * sizeof(GuardPage));
-    data_bytes = off_keys + (SIZE_T)page_count * 32u;
+    if (mg_size_align(sizeof(MemGuardCtx), 8u, &off_secs) != 0 ||
+        mg_size_mul((SIZE_T)sec_count, sizeof(GuardSection), &term) != 0 ||
+        mg_size_add(off_secs, term, &term) != 0 ||
+        mg_size_align(term, 8u, &off_pages) != 0 ||
+        mg_size_mul((SIZE_T)page_count, sizeof(GuardPage), &term) != 0 ||
+        mg_size_add(off_pages, term, &term) != 0 ||
+        mg_size_align(term, 8u, &off_keys) != 0 ||
+        mg_size_mul((SIZE_T)page_count, 32u, &term) != 0 ||
+        mg_size_add(off_keys, term, &data_bytes) != 0 ||
+        mg_size_align(data_bytes, MG_PAGE_SIZE, &aligned_data) != 0 ||
+        mg_size_add(MG_PAGE_SIZE, aligned_data, &term) != 0 ||
+        mg_size_add(term, MG_PAGE_SIZE, &reserve_total) != 0) {
+        return 1;
+    }
 
     /* Guard the guard: reserve [guard page][data...][guard page]; commit + lock
      * only the middle. The flanking pages stay reserved (any touch faults). */
-    reserve_total = (SIZE_T)MG_PAGE_SIZE + mg_align_page(data_bytes) +
-                    (SIZE_T)MG_PAGE_SIZE;
     region = (uint8_t *)VirtualAlloc(NULL, reserve_total, MEM_RESERVE,
                                      PAGE_NOACCESS);
     if (!region) {
@@ -763,7 +793,11 @@ int memguard_install(void *image_base, const PackInfo *pi,
         VirtualFree(region, 0, MEM_RELEASE);
         return 1;
     }
-    VirtualLock(data, data_bytes);   /* best-effort: keep keys out of the pagefile */
+    if (!VirtualLock(data, data_bytes)) {
+        mg_zero(data, data_bytes);
+        VirtualFree(region, 0, MEM_RELEASE);
+        return 1;
+    }
 
     ctx = (MemGuardCtx *)data;       /* committed memory is zero-filled */
     ctx->image_base   = image_base;
@@ -774,13 +808,10 @@ int memguard_install(void *image_base, const PackInfo *pi,
     ctx->pages        = (GuardPage *)(data + off_pages);
     ctx->keys         = (uint8_t (*)[32])(data + off_keys);
     ctx->region_base  = region;
-    ctx->reenc_thread = NULL;
     ctx->region_total = reserve_total;
     ctx->data_bytes   = data_bytes;
     ctx->sec_count    = sec_count;
     ctx->page_count   = page_count;
-    ctx->active_count = 0;
-    ctx->shutting_down = 0;
     ctx->reloc_blob   = s_pending_reloc_blob;
     ctx->reloc_size   = s_pending_reloc_size;
     ctx->reloc_delta  = s_pending_reloc_delta;
@@ -821,7 +852,7 @@ int memguard_install(void *image_base, const PackInfo *pi,
         mg_copy(S->nonce, sd->gcm_nonce, sizeof(S->nonce));
         mg_copy(S->tag,   sd->gcm_tag,   sizeof(S->tag));
 
-        pc = (vs + MG_PAGE_SIZE - 1u) / MG_PAGE_SIZE;
+        pc = ((vs - 1u) / MG_PAGE_SIZE) + 1u;
         S->first_page = gp;
         S->page_count = pc;
         for (k = 0; k < pc; ++k) {
@@ -831,7 +862,6 @@ int memguard_install(void *image_base, const PackInfo *pi,
             g->size       = (vs - off < MG_PAGE_SIZE) ? (vs - off) : MG_PAGE_SIZE;
             g->sec_index  = (uint32_t)(j - 1u);
             g->crc        = 0;
-            g->last_access = 0;
             g->state      = PG_UNINIT;
             ++gp;
         }
@@ -854,10 +884,14 @@ int memguard_install(void *image_base, const PackInfo *pi,
         GuardSection *S = &ctx->secs[j];
         if (!VirtualProtect(S->va, S->virtual_size, PAGE_NOACCESS, &old)) {
             uint32_t m;
+            int rollback_failed = 0;
             for (m = 0; m < j; ++m) {
                 DWORD t = 0;
-                VirtualProtect(ctx->secs[m].va, ctx->secs[m].virtual_size,
-                               PAGE_READWRITE, &t);
+                if (!VirtualProtect(ctx->secs[m].va,
+                                    ctx->secs[m].virtual_size,
+                                    PAGE_READWRITE, &t)) {
+                    rollback_failed = 1;
+                }
             }
             RemoveVectoredExceptionHandler(ctx->veh);
             g_ctx = NULL;
@@ -865,25 +899,16 @@ int memguard_install(void *image_base, const PackInfo *pi,
             mg_zero(data, data_bytes);
             VirtualUnlock(data, data_bytes);
             VirtualFree(region, 0, MEM_RELEASE);
-            return 1;
+            return rollback_failed ? 2 : 1;
         }
     }
 
-    /* Start the idle-page sweeper for EXEs. A DLL cannot safely wait for its
-     * worker during DLL_PROCESS_DETACH: the worker's DLL_THREAD_DETACH also
-     * needs the loader lock, so joining it from DllMain deadlocks FreeLibrary.
-     * DLLs retain the strict LRU working-set cap without the periodic sweep. */
-    if (!pi->is_dll) {
-        ctx->reenc_thread = CreateThread(NULL, 0, memguard_reencrypt_thread,
-                                         ctx, 0, NULL);
-    }
     return 0;
 }
 
 /*
- * Optional clean teardown. Stops the sweeper, removes the VEH, and wipes +
- * frees the guarded region (page keys included). Safe to call once; a no-op if
- * memguard was never installed.
+ * Optional clean teardown. Removes the VEH and wipes + frees the guarded region
+ * (page keys included). Safe to call once; a no-op if memguard was not installed.
  */
 void memguard_shutdown(void)
 {
@@ -891,12 +916,6 @@ void memguard_shutdown(void)
     if (!ctx) {
         memguard_discard_pending_relocs();
         return;
-    }
-    InterlockedExchange(&ctx->shutting_down, 1);
-    if (ctx->reenc_thread) {
-        WaitForSingleObject(ctx->reenc_thread, INFINITE);
-        CloseHandle(ctx->reenc_thread);
-        ctx->reenc_thread = NULL;
     }
     if (ctx->veh) {
         RemoveVectoredExceptionHandler(ctx->veh);

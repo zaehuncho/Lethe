@@ -63,14 +63,18 @@ SHUFFLED_OPCODES = {
     'store16'       : (0x02, 0, 'none'),
     'rot3'          : (0xB3, 0, 'none'),
     'pick'          : (0x97, 1, 'imm'),
+    'store128'      : (0x72, 0, 'none'),
 }
 
 # Decoy wire bytes (single-byte no-op instructions for noise insertion)
-DECOY_WIRE_BYTES = [0x72, 0xFC, 0xF8, 0xB5, 0xDE, 0x5C, 0x83, 0xD0, 0x9A, 0x3A, 0x5A, 0x7A, 0x3B, 0x19, 0xC2, 0x78, 0x1D]
+DECOY_WIRE_BYTES = [0xFC, 0xF8, 0xB5, 0xDE, 0x5C, 0x83, 0xD0, 0x9A, 0x3A, 0x5A, 0x7A, 0x3B, 0x19, 0xC2, 0x78, 0x1D, 0x73]
 
 # Fraction of real instructions to pad with randomly-inserted decoy bytes
 NOISE_RATIO = 0.15
 
 # Reproducible build seed (hex)
 BUILD_SEED = 'a8088df29c2372fba7637e9d737e308b4d4c667752d7e986da66d51581dad14d'
+OPCODE_MAPPING_SHA256 = 'e1bdf970d375092774649675d3ae4ffca45e75d422d1b1d753eee1e0c6448a95'
+HANDLER_VARIANTS = {'add': 1, 'sub': 0, 'xor': 1, 'and': 0, 'or': 0, 'neg': 0, 'cmp_eq': 1, 'cmp_ne': 0}
+HANDLER_VARIANT_SHA256 = 'ad5d30f90147d20e34ac5653cd66c164cbb9430208f47be0ee18173a863f2235'
 

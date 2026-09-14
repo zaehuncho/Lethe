@@ -1,0 +1,3 @@
+LIBRARY LetheForwarderDotModule
+EXPORTS
+    LetheDottedForward=kernel32.dll.Sleep

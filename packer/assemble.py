@@ -41,7 +41,9 @@ RVA-bearing tables need rewriting:
 
 The output header carries the stub's import, base-reloc, and minimal TLS-anchor
 directories. The anchor lets Windows reserve a real static-TLS slot on every
-thread; the stub fills that block from the encrypted original TLS recipe.
+thread. Its loader-visible initializer mirrors the protected template so DLLs
+loaded after worker creation preserve native pre-existing-thread semantics; the
+authenticated recipe drives callbacks and later thread initialization.
 The original exception directory remains absent and is registered at runtime.
 """
 
@@ -54,14 +56,20 @@ import struct
 import tempfile
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 # --- container ABI (import only; never edit) -------------------------------
-try:                                    # normal: imported as ``packer.assemble``
-    from . import container
-except ImportError:                     # fallback: flat import / direct run
+if __package__:                         # normal: imported as ``packer.assemble``
+    from . import (cfg_preservation, container, dll_preload, pe_analyze,
+                   release_attestation)
+else:                                   # fallback: flat import / direct run
+    import cfg_preservation  # type: ignore
     import container  # type: ignore
+    import dll_preload  # type: ignore
+    import pe_analyze  # type: ignore
+    import release_attestation  # type: ignore
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -96,7 +104,7 @@ IMAGE_SCN_MEM_WRITE                 = 0x80000000
 # Data-directory indices
 DIR_EXPORT, DIR_IMPORT, DIR_RESOURCE, DIR_EXCEPTION = 0, 1, 2, 3
 DIR_SECURITY, DIR_BASERELOC, DIR_DEBUG = 4, 5, 6
-DIR_TLS, DIR_LOAD_CONFIG, DIR_IAT = 9, 10, 12
+DIR_TLS, DIR_LOAD_CONFIG, DIR_IAT, DIR_DELAY_IMPORT = 9, 10, 12, 13
 NUM_DATA_DIRECTORIES = 16
 
 # Base relocation types
@@ -105,6 +113,7 @@ IMAGE_REL_BASED_DIR64    = 10
 
 IMAGE_ORDINAL_FLAG64 = 0x8000000000000000
 MASK64 = (1 << 64) - 1
+_STUB_TLS_PROTECTED_CAPACITY = 4096
 
 # HKDF ``info`` strings are defined in container.py (the canonical ABI source);
 # use container.HKDF_INFO_CODEHASH / container.HKDF_INFO_SHARD here.
@@ -195,8 +204,109 @@ def _align_up(v: int, a: int) -> int:
     return (v + a - 1) & ~(a - 1)
 
 
+def _merge_dir64_relocations(blob: bytes,
+                             extra_target_rvas: Iterable[int]) -> bytes:
+    """Canonicalize the stub relocation directory plus generated VA fields."""
+    targets: set[int] = set()
+    pos = 0
+    while pos < len(blob):
+        if len(blob) - pos < 8:
+            raise AssembleError("stub relocation directory has a partial block")
+        page_rva, block_size = struct.unpack_from("<II", blob, pos)
+        if block_size < 8 or block_size % 4 or pos + block_size > len(blob):
+            raise AssembleError("stub relocation directory has invalid geometry")
+        for offset in range(pos + 8, pos + block_size, 2):
+            entry, = struct.unpack_from("<H", blob, offset)
+            kind, within_page = entry >> 12, entry & 0xFFF
+            if kind == IMAGE_REL_BASED_ABSOLUTE:
+                continue
+            if kind != IMAGE_REL_BASED_DIR64:
+                raise AssembleError(
+                    f"unexpected base-reloc type {kind} while merging load config")
+            targets.add(page_rva + within_page)
+        pos += block_size
+
+    for target in extra_target_rvas:
+        if type(target) is not int or not 0 < target <= 0xFFFF_FFF8:
+            raise AssembleError("load-config relocation target is outside RVA space")
+        targets.add(target)
+
+    by_page: dict[int, list[int]] = {}
+    for target in sorted(targets):
+        by_page.setdefault(target & ~0xFFF, []).append(target & 0xFFF)
+    blocks = bytearray()
+    for page_rva in sorted(by_page):
+        entries = [IMAGE_REL_BASED_DIR64 << 12 | offset
+                   for offset in by_page[page_rva]]
+        if len(entries) & 1:
+            entries.append(0)
+        block_size = 8 + len(entries) * 2
+        blocks += struct.pack("<II", page_rva, block_size)
+        blocks += struct.pack(f"<{len(entries)}H", *entries)
+    return bytes(blocks)
+
+
+def _grafted_stub_guard_targets(stub: "_StubImage", img: "_Image", *,
+                                graft_delta: int, image_base: int,
+                                is_dll: bool) -> tuple[int, tuple[int, ...]]:
+    """Return the output entry point and every OS-invoked stub TLS callback.
+
+    Once GUARD_CF is asserted on the outer image, these entry paths belong in
+    its GFID table alongside the protected image's eventual code targets.
+    """
+    entry_name = "StubDllMain" if is_dll else "StubExeEntry"
+    entry_stub_rva = stub.find_export_rva(entry_name) or stub.entry_rva
+    if not entry_stub_rva:
+        raise AssembleError(f"stub has no {entry_name} entry point")
+
+    def validate_target(output_rva: int, kind: str) -> None:
+        if not 0 < output_rva < 0x1_0000_0000 or output_rva % 16:
+            raise AssembleError(
+                f"{kind} target RVA 0x{output_rva:X} is not a 16-byte-aligned RVA")
+        source_rva = output_rva - graft_delta
+        section = stub.section_containing(source_rva)
+        if section is None or not (section.characteristics & IMAGE_SCN_MEM_EXECUTE):
+            raise AssembleError(
+                f"{kind} target RVA 0x{output_rva:X} is outside executable stub code")
+
+    entry_rva = entry_stub_rva + graft_delta
+    validate_target(entry_rva, entry_name)
+
+    tls_stub_rva, tls_size = stub.dir(DIR_TLS)
+    if not tls_stub_rva:
+        return entry_rva, ()
+    if tls_size < 40:
+        raise AssembleError("stub TLS directory is smaller than IMAGE_TLS_DIRECTORY64")
+
+    tls_output_rva = tls_stub_rva + graft_delta
+    tls_directory = img.read(tls_output_rva, 40)
+    callbacks_va, = struct.unpack_from("<Q", tls_directory, 24)
+    if callbacks_va == 0:
+        return entry_rva, ()
+    if callbacks_va < image_base or callbacks_va - image_base >= 0x1_0000_0000:
+        raise AssembleError("stub TLS callback array VA is outside output RVA space")
+    callback_table_rva = callbacks_va - image_base
+
+    callbacks: list[int] = []
+    for index in range(64):
+        callback_va, = struct.unpack(
+            "<Q", img.read(callback_table_rva + index * 8, 8))
+        if callback_va == 0:
+            return entry_rva, tuple(callbacks)
+        if callback_va < image_base or callback_va - image_base >= 0x1_0000_0000:
+            raise AssembleError("stub TLS callback VA is outside output RVA space")
+        callback_rva = callback_va - image_base
+        validate_target(callback_rva, "stub TLS callback")
+        callbacks.append(callback_rva)
+    raise AssembleError("stub TLS callback array has no terminator within 64 entries")
+
+
 class AssembleError(RuntimeError):
     """Raised for any unrecoverable layout / graft problem (caught upstream)."""
+
+    def __init__(self, message: str, *, preservation_plan=None) -> None:
+        self.preservation_plan = preservation_plan
+        super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
@@ -382,19 +492,50 @@ class AssembleResult:
     server_shard: Optional[bytes] = None
 
 
+@dataclass(frozen=True)
+class _FinalizedMetadata:
+    """Complete metadata envelope committed atomically to payload artifacts."""
+
+    meta_stored: bytes
+    meta_nonce: bytes
+    meta_tag: bytes
+    meta_uncompressed_size: int
+    offsets: "container.MetadataOffsets"
+
+    @property
+    def meta_stored_size(self) -> int:
+        return len(self.meta_stored)
+
+
+def _commit_finalized_metadata(artifacts, env: _FinalizedMetadata) -> None:
+    """Publish one coherent final envelope or fail before PE serialization."""
+    try:
+        artifacts.metadata = env
+    except Exception as exc:
+        raise AssembleError(
+            "payload artifacts cannot accept finalized metadata state; "
+            "provide reseal_metadata(aad_info) or a writable metadata attribute"
+        ) from exc
+    if getattr(artifacts, "metadata", None) is not env:
+        raise AssembleError(
+            "payload artifacts did not retain the finalized metadata state"
+        )
+
+
 # ---------------------------------------------------------------------------
 # metadata finalize -- bake the freshly-assigned stored_rva into the envelope
 # ---------------------------------------------------------------------------
 def _finalize_metadata(artifacts, descs: List["container.SectionDesc"],
-                       level: int) -> Tuple[bytes, bytes, bytes, int, int,
-                                            container.MetadataOffsets]:
+                       level: int, aad_info: "container.PackInfo",
+                       ) -> _FinalizedMetadata:
     """Produce the FINAL encrypted metadata envelope after the assembler has
     assigned every ``SectionDesc.stored_rva``.
 
-    Returns (meta_ct, meta_nonce, meta_tag, meta_stored_size,
-             meta_uncompressed_size, offsets).
+    Returns a single immutable envelope and commits that same object to
+    ``artifacts.metadata``. This keeps later keyed validation coherent with the
+    exact bytes serialized into the staged PE.
 
-    PRIMARY path: the payload exposes ``reseal_metadata()`` -- the authoritative
+    PRIMARY path: the payload exposes ``reseal_metadata(aad_info)`` -- the authoritative
     sealer. It re-serializes ``[SectionDesc[]][imports][relocs][tls]`` from the
     CURRENT (live) ``desc.stored_rva`` values and compresses+encrypts EXACTLY as
     the stub decodes (zlib/miniz + AES-256-GCM). We never second-guess its
@@ -407,15 +548,17 @@ def _finalize_metadata(artifacts, descs: List["container.SectionDesc"],
     """
     reseal = getattr(artifacts, "reseal_metadata", None)
     if callable(reseal):
-        env = reseal()                        # reads the live desc.stored_rva
-        offsets = _get(env, "offsets", "meta_offsets")
-        meta_ct = bytes(_get(env, "meta_stored", "meta_ciphertext"))
-        return (meta_ct,
-                bytes(_get(env, "meta_nonce")),
-                bytes(_get(env, "meta_tag")),
-                len(meta_ct),
-                int(_get(env, "meta_uncompressed_size", "meta_uncomp_size")),
-                offsets)
+        sealed = reseal(aad_info)             # reads the live desc.stored_rva
+        env = _FinalizedMetadata(
+            meta_stored=bytes(_get(sealed, "meta_stored", "meta_ciphertext")),
+            meta_nonce=bytes(_get(sealed, "meta_nonce")),
+            meta_tag=bytes(_get(sealed, "meta_tag")),
+            meta_uncompressed_size=int(_get(
+                sealed, "meta_uncompressed_size", "meta_uncomp_size")),
+            offsets=_get(sealed, "offsets", "meta_offsets"),
+        )
+        _commit_finalized_metadata(artifacts, env)
+        return env
 
     # --- fallback: seal it ourselves (zlib, matching the stub's miniz) -------
     raw_key = _get(artifacts, "aes_key", "key", "raw_key")
@@ -430,14 +573,34 @@ def _finalize_metadata(artifacts, descs: List["container.SectionDesc"],
     import_blob = _get(artifacts, "import_blob", "imports_blob")
     reloc_blob = _get(artifacts, "reloc_blob", "relocs_blob")
     tls_blob = _get(artifacts, "tls_blob")
+    load_config_blob = _get(artifacts, "load_config_blob", default=b"")
     meta_plain, offsets = container.build_metadata(
-        container.pack_section_descs(descs), import_blob, reloc_blob, tls_blob)
+        container.pack_section_descs(descs), import_blob, reloc_blob, tls_blob,
+        load_config_blob)
     compressed = zlib.compress(meta_plain, max(0, min(9, level)))
     nonce = os.urandom(12)
-    flags = int(getattr(artifacts, "flags", 0))
-    meta_aad = struct.pack("<I", flags)
+    final_info = replace(
+        aad_info,
+        meta_stored_size=len(compressed),
+        meta_uncompressed_size=len(meta_plain),
+        sections_off=offsets.sections_off,
+        imports_off=offsets.imports_off,
+        imports_size=offsets.imports_size,
+        relocs_off=offsets.relocs_off,
+        relocs_size=offsets.relocs_size,
+        tls_off=offsets.tls_off,
+    )
+    meta_aad = container.build_metadata_aad(final_info)
     out = AESGCM(meta_key).encrypt(nonce, compressed, meta_aad)
-    return (out[:-16], nonce, out[-16:], len(out) - 16, len(meta_plain), offsets)
+    env = _FinalizedMetadata(
+        meta_stored=out[:-16],
+        meta_nonce=nonce,
+        meta_tag=out[-16:],
+        meta_uncompressed_size=len(meta_plain),
+        offsets=offsets,
+    )
+    _commit_finalized_metadata(artifacts, env)
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -523,49 +686,45 @@ def _release_manifest_path(stub_path: str) -> str:
 
 
 def _validate_release_stub_manifest(stub_path: str, blob: bytes) -> None:
-    """Require integrity and clean-source provenance for the bundled stub."""
-    manifest_path = _release_manifest_path(stub_path)
+    """Require a signed production attestation from a pinned release key."""
+    path = Path(stub_path).absolute()
+    if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(blob).digest():
+        raise AssembleError("release stub changed before attestation verification")
     try:
-        with open(manifest_path, "r", encoding="utf-8-sig") as manifest_file:
-            metadata = json.load(manifest_file)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise AssembleError(
-            f"release stub manifest is missing or invalid: {manifest_path}. "
-            "Build and explicitly promote a clean stub with "
-            "stub/build_stub.ps1 -Promote.") from exc
-
-    digest = hashlib.sha256(blob).hexdigest()
-    if metadata.get("schema") != 1:
-        raise AssembleError("release stub manifest has an unsupported schema")
-    if metadata.get("artifact") != os.path.basename(stub_path):
-        raise AssembleError("release stub manifest names a different artifact")
-    if metadata.get("size_bytes") != len(blob):
-        raise AssembleError("release stub size does not match its manifest")
-    if metadata.get("sha256") != digest:
-        raise AssembleError("release stub SHA-256 does not match its manifest")
-    if metadata.get("provenance_status") != "clean" or metadata.get("source_dirty") is not False:
-        raise AssembleError(
-            "bundled stub provenance is not release-approved (requires "
-            "provenance_status='clean' and source_dirty=false). Build a fresh "
-            "candidate and pass --stub-path for validation, or explicitly "
-            "promote a clean release stub with stub/build_stub.ps1 -Promote.")
-    if metadata.get("native_roundtrip") != "passed-9-of-9":
-        raise AssembleError(
-            "bundled stub is missing the required 9/9 native round-trip "
-            "acceptance evidence; promote it through stub/build_stub.ps1.")
+        release_attestation.verify_release_bundle(path)
+    except (OSError, release_attestation.ReleaseAttestationError) as exc:
+        raise AssembleError(f"bundled stub release attestation is invalid: {exc}") from exc
 
 
-def _load_stub(stub_path: str, *, require_release_manifest: bool = False) -> _StubImage:
+def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
+               expected_sha256: Optional[str] = None,
+               allow_unverified_stub_for_tests: bool = False) -> _StubImage:
     if not os.path.isfile(stub_path):
         raise AssembleError(
             f"prebuilt stub not found: {stub_path}\n"
             "Build a validation stub with stub/build_stub.ps1 and pass it via "
-            "--stub-path, or explicitly promote a release stub with "
-            "stub/build_stub.ps1 -Promote.")
+            "--stub-path. Implicit/default use requires a separately attested "
+            "production release.")
     with open(stub_path, "rb") as stub_file:
         blob = stub_file.read()
+    if expected_sha256 is not None:
+        normalized = expected_sha256.strip().lower()
+        if (len(normalized) != 64
+                or any(char not in "0123456789abcdef" for char in normalized)):
+            raise AssembleError("expected stub SHA-256 is malformed")
+        if hashlib.sha256(blob).hexdigest() != normalized:
+            raise AssembleError(
+                "stub changed after virtualization geometry was computed")
     if require_release_manifest:
         _validate_release_stub_manifest(stub_path, blob)
+    else:
+        if not allow_unverified_stub_for_tests:
+            try:
+                release_attestation.validate_candidate_identity(Path(stub_path))
+            except (OSError, release_attestation.ReleaseAttestationError) as exc:
+                raise AssembleError(
+                    "explicit stub is not a verified candidate bundle; raw native "
+                    "stubs require the test-only opt-out") from exc
 
     # Mandated: load + validate with LIEF. We keep the LIEF surface tiny (parse
     # only) and do field extraction with the version-stable raw reader below,
@@ -613,7 +772,9 @@ def _require_experimental_runtime_paths(*, is_dll: bool, server_shard: bool) -> 
 def build_output_pe(parsed, artifacts, output_path: str, *,
                     input_path: Optional[str] = None,
                     options=None,
-                    stub_path: Optional[str] = None) -> AssembleResult:
+                    stub_path: Optional[str] = None,
+                    expected_stub_sha256: Optional[str] = None,
+                    allow_unverified_stub_for_tests: bool = False) -> AssembleResult:
     """Assemble and write the packed output PE. Raises ``AssembleError`` on any
     unrecoverable problem (the orchestrator turns that into ``PackResult.ok=False``)."""
     # -- pull the semantic inputs (tolerant to field-name drift) -------------
@@ -622,15 +783,57 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
                         "original_size_of_image"))
     is_dll = bool(_get(artifacts, "is_dll", default=_get(parsed, "is_dll",
                                                          default=False)))
+    flags = int(_get(artifacts, "flags", default=0))
     server_shard_requested = bool(options and getattr(options, "server_shard", False))
     _require_experimental_runtime_paths(
         is_dll=is_dll, server_shard=server_shard_requested)
 
+    cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed)
+    if not cfg_plan.preservation_supported:
+        raise AssembleError(
+            str(cfg_preservation.CfgPreservationBlocked(cfg_plan)),
+            preservation_plan=cfg_plan,
+        )
+    if (cfg_plan.source_guard_cf_enabled and
+            flags & container.FLAG_MEMGUARD):
+        raise AssembleError(
+            "Guard CF preservation blocked: memory guard leaves executable "
+            "pages unavailable during exact call-target registration",
+            preservation_plan=cfg_plan,
+        )
+
     resolved_stub_path = stub_path or _default_stub_path()
     stub = _load_stub(
-        resolved_stub_path, require_release_manifest=(stub_path is None))
+        resolved_stub_path, require_release_manifest=(stub_path is None),
+        expected_sha256=expected_stub_sha256,
+        allow_unverified_stub_for_tests=allow_unverified_stub_for_tests)
+    stub_packinfo_rva = stub.find_packinfo_rva()
+    stub_packinfo_header = stub.read_at_rva(stub_packinfo_rva, 12)
+    if len(stub_packinfo_header) != 12:
+        raise AssembleError("stub PackInfo sentinel is truncated")
+    stub_format = struct.unpack_from("<I", stub_packinfo_header, 8)[0]
+    if stub_format != container.FORMAT_VERSION:
+        raise AssembleError(
+            f"stub container format v{stub_format} is incompatible with builder "
+            f"format v{container.FORMAT_VERSION}; rebuild the stub from matching "
+            "sources before packing")
+    if is_dll:
+        dll_preload_abi_rva = stub.find_export_rva("lethe_dll_preload_abi")
+        if (dll_preload_abi_rva is None or
+                stub.cstr_at_rva(dll_preload_abi_rva) != "1"):
+            raise AssembleError(
+                "DLL packing requires a stub with lethe_dll_preload_abi=1; "
+                "rebuild the stub from matching sources")
 
-    flags = int(_get(artifacts, "flags", default=0))
+    try:
+        pe_analyze._validate_sections(
+            _get(parsed, "sections"), orig_soi,
+            int(_get(parsed, "section_alignment", default=0x1000)))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AssembleError(
+            f"source PE geometry is incompatible with fixed 0x1000 output "
+            f"alignment: {exc}") from exc
+
     oep_rva = int(_get(artifacts, "oep_rva", default=_get(parsed, "oep_rva")))
     pdata_rva = int(_get(artifacts, "pdata_rva", default=_get(parsed, "pdata_rva",
                                                               default=0)))
@@ -712,6 +915,7 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
 
     # -- 4. rewrite imports (descriptor RVAs + by-name thunks += delta) ------
     import_rva, import_size = stub.dir(DIR_IMPORT)
+    stub_import_descriptors: List[bytes] = []
     if import_rva and import_size:
         g_imp = import_rva + graft_delta
         pos = 0
@@ -739,12 +943,59 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
                         img.write(t + k * 8,
                                   struct.pack("<Q", (thunk + graft_delta) & MASK64))
                     k += 1
+            stub_import_descriptors.append(img.read(g_imp + pos, 20))
             pos += 20
 
     # The TLS directory contains absolute VAs. Its pointer fields were adjusted
     # by the generic DIR64 loop above; only the data-directory RVA needs the
     # same single graft delta at serialization time.
     tls_rva, tls_size = stub.dir(DIR_TLS)
+    if tls_rva and (flags & container.FLAG_HAS_TLS):
+        source_tls = _get(parsed, "tls")
+        source_raw_start = int(_get(source_tls, "raw_start_rva"))
+        source_raw_end = int(_get(source_tls, "raw_end_rva"))
+        source_zero_fill = int(_get(source_tls, "zero_fill", default=0))
+        source_tls_characteristics = int(
+            _get(source_tls, "characteristics", default=0))
+        if source_raw_end < source_raw_start:
+            raise AssembleError("source TLS raw-data range is reversed")
+        source_raw_size = source_raw_end - source_raw_start
+        source_total_size = source_raw_size + source_zero_fill
+        if source_total_size > _STUB_TLS_PROTECTED_CAPACITY:
+            raise AssembleError(
+                "source TLS template exceeds the stub anchor capacity")
+
+        grafted_tls_rva = tls_rva + graft_delta
+        anchor_start_va, anchor_end_va = struct.unpack(
+            "<QQ", img.read(grafted_tls_rva, 16))
+        if (anchor_start_va < out_base or anchor_end_va < anchor_start_va or
+                anchor_end_va - anchor_start_va < _STUB_TLS_PROTECTED_CAPACITY):
+            raise AssembleError("stub TLS anchor raw-data geometry is invalid")
+        anchor_start_rva = anchor_start_va - out_base
+        if (anchor_start_rva >= 0x1_0000_0000 or
+                not img.contains(anchor_start_rva,
+                                 _STUB_TLS_PROTECTED_CAPACITY)):
+            raise AssembleError("stub TLS anchor initializer is outside the graft")
+
+        source_template = b""
+        if source_raw_size:
+            source_template = pe_analyze._slice_at_rva(
+                _get(parsed, "sections"), source_raw_start, source_raw_size,
+                what="source TLS initializer")
+            if len(source_template) != source_raw_size:
+                raise AssembleError("source TLS initializer is truncated")
+
+        # Windows initializes static TLS for threads that predate LoadLibrary
+        # directly from this loader-visible range and sends them no THREAD_ATTACH.
+        # Preseed the protected portion so their first native TLS access matches
+        # the original DLL. Runtime state begins after this capacity and stays zero.
+        img.write(anchor_start_rva, bytes(_STUB_TLS_PROTECTED_CAPACITY))
+        if source_template:
+            img.write(anchor_start_rva, source_template)
+        img.write(grafted_tls_rva + 36,
+                  struct.pack("<I", source_tls_characteristics))
+    stub_entry_rva, stub_guard_targets = _grafted_stub_guard_targets(
+        stub, img, graft_delta=graft_delta, image_base=out_base, is_dll=is_dll)
 
     # -- 5. code-hash key binding (over stub .text as laid in the OUTPUT) -----
     # .text is asserted reloc-free above, so its output bytes == the stub's raw
@@ -775,7 +1026,21 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
         raise AssembleError("payload exposed no protected sections")
 
     descs: List[container.SectionDesc] = [d for (_ct, d) in protected]
-    rsrc_rva, rsrc_bytes = _extract_rsrc(parsed)
+    (rsrc_rva, rsrc_bytes,
+     rsrc_directory_rva, rsrc_directory_size) = _extract_rsrc(parsed)
+    dll_export_snapshot = _dll_export_snapshot(parsed, orig) if is_dll else {}
+    dll_export_rva = int(orig.export_rva) if dll_export_snapshot else 0
+    dll_export_size = int(orig.export_size) if dll_export_snapshot else 0
+    dll_export_hash = bytes(16)
+    if dll_export_snapshot:
+        snapshot_owner_rva, snapshot_owner = next(
+            iter(dll_export_snapshot.items()))
+        snapshot_offset = dll_export_rva - snapshot_owner_rva
+        dll_export_span = snapshot_owner[
+            snapshot_offset:snapshot_offset + dll_export_size]
+        if len(dll_export_span) != dll_export_size:
+            raise AssembleError("DLL export snapshot span is truncated")
+        dll_export_hash = hashlib.sha256(dll_export_span).digest()[:16]
 
     # protected sections must fit their decrypted plaintext (uncompressed_size);
     # keyed by RVA so we can widen the matching original section's placeholder.
@@ -798,10 +1063,29 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
             if sname == ".rsrc" or (rsrc_bytes and srva == rsrc_rva):
                 continue                         # preserved separately, real bytes
             vsize = max(svsize, uncomp_by_rva.get(srva, 0), 1)
+            snapshot = dll_export_snapshot.get(srva)
+            source_chars = int(_get(s, "characteristics", default=0))
+            if (cfg_plan.source_guard_cf_enabled
+                    and source_chars & IMAGE_SCN_MEM_EXECUTE):
+                # The Windows image loader only applies GFID metadata to
+                # executable image pages. Keep protected code RX during image
+                # activation; the stub transiently switches it to RW while
+                # restoring bytes and later returns it to RX without changing
+                # the loader-created CFG bitmap.
+                placeholder_chars = (
+                    IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE |
+                    IMAGE_SCN_MEM_READ)
+            elif snapshot is not None:
+                placeholder_chars = (
+                    IMAGE_SCN_CNT_INITIALIZED_DATA |
+                    IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
+            else:
+                placeholder_chars = (
+                    IMAGE_SCN_CNT_UNINITIALIZED_DATA |
+                    IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
             out_sections.append(_OutSection(
                 sname, srva, vsize,
-                IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE,
-                None))
+                placeholder_chars, snapshot))
     else:
         _GENERIC_NAMES = [".text", ".rdata", ".data", ".bss",
                           ".tls", ".gfids", ".00cfg", ".idata"]
@@ -828,13 +1112,126 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
             sn, g_rva, s.vsize or len(s.content),
             s.characteristics, bytes(raw)))
 
-    # -- 8. payload section: per-section ciphertext + sealed meta envelope ---
+    # -- 8. loader-visible load config, merged relocations, then payload ------
+    # Windows consumes the output load config before our entry point. Keep its
+    # directory and target tables live in the outer image, while an authenticated
+    # inner recipe restores OS-populated guard slots after section decryption.
+    layout_cursor = _align_up(
+        max(g_rva + max(s.vsize, len(s.content)) for s, g_rva in grafted), SA)
+    outer_import_dir = (
+        (import_rva + graft_delta, import_size)
+        if import_rva else (0, 0))
+    if is_dll:
+        if ".limp" in used_names:
+            raise AssembleError("source PE uses reserved section name .limp")
+        try:
+            preload = dll_preload.build_dll_preload_image(
+                stub_import_descriptors,
+                _get(parsed, "imports", default=()) or (),
+                section_rva=layout_cursor,
+                image_size=orig_soi,
+            )
+        except (TypeError, ValueError, struct.error) as exc:
+            raise AssembleError(
+                f"could not emit DLL preload imports: {exc}") from exc
+        try:
+            artifacts.import_blob = container.bind_preload_iat_rvas(
+                bytes(artifacts.import_blob), list(preload.preload_iat_rvas))
+        except (AttributeError, TypeError, ValueError, struct.error) as exc:
+            raise AssembleError(
+                f"could not authenticate DLL preload IAT map: {exc}") from exc
+        used_names.add(".limp")
+        out_sections.append(_OutSection(
+            ".limp", layout_cursor, len(preload.data),
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+            IMAGE_SCN_MEM_WRITE,
+            preload.data,
+        ))
+        outer_import_dir = (layout_cursor, preload.descriptor_size)
+        layout_cursor = _align_up(layout_cursor + len(preload.data), SA)
+    live_load_config = None
+    load_config_dir = (0, 0)
+    outer_dll_characteristics = orig.dll_characteristics
+    if cfg_plan.source_guard_cf_enabled:
+        outer_dll_characteristics |= IMAGE_DLLCHARACTERISTICS_GUARD_CF
+    else:
+        outer_dll_characteristics &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF
+    if cfg_plan.source_load_config_present:
+        try:
+            live_load_config = cfg_preservation.build_live_load_config(
+                parsed, cfg_plan, section_rva=layout_cursor,
+                image_base=out_base,
+                outer_target_rvas=(stub_entry_rva, *stub_guard_targets))
+        except (TypeError, ValueError, struct.error) as exc:
+            raise AssembleError(
+                f"could not emit preserved load config: {exc}",
+                preservation_plan=cfg_plan,
+            ) from exc
+        if live_load_config is None:
+            raise AssembleError("load-config plan produced no live directory")
+        if ".lcfg" in used_names:
+            raise AssembleError("source PE uses reserved section name .lcfg")
+        used_names.add(".lcfg")
+        out_sections.append(_OutSection(
+            ".lcfg", live_load_config.section_rva,
+            len(live_load_config.data),
+            cfg_preservation.LIVE_SECTION_CHARACTERISTICS,
+            live_load_config.data,
+        ))
+        load_config_dir = (
+            live_load_config.directory_rva,
+            live_load_config.directory_size,
+        )
+        layout_cursor = _align_up(
+            live_load_config.section_rva + len(live_load_config.data), SA)
+        try:
+            artifacts.load_config_blob = cfg_preservation.build_runtime_slot_blob(
+                live_load_config.runtime_slot_copies,
+                cfg_plan.merged_declared_targets,
+                live_load_config=live_load_config,
+                dll_characteristics=outer_dll_characteristics,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AssembleError(
+                "payload artifacts cannot carry authenticated load-config metadata"
+            ) from exc
+    else:
+        try:
+            artifacts.load_config_blob = b""
+        except (AttributeError, TypeError) as exc:
+            raise AssembleError(
+                "payload artifacts cannot clear load-config metadata") from exc
+
+    stub_reloc_blob = (
+        img.read(reloc_rva + graft_delta, reloc_size)
+        if reloc_rva and reloc_size else b"")
+    extra_relocations = (
+        live_load_config.relocation_target_rvas if live_load_config else ())
+    merged_reloc_blob = _merge_dir64_relocations(
+        stub_reloc_blob, extra_relocations)
+    if extra_relocations:
+        if ".lrel2" in used_names:
+            raise AssembleError("source PE uses reserved section name .lrel2")
+        used_names.add(".lrel2")
+        reloc_output_rva = layout_cursor
+        out_sections.append(_OutSection(
+            ".lrel2", reloc_output_rva, len(merged_reloc_blob),
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+            IMAGE_SCN_MEM_DISCARDABLE,
+            merged_reloc_blob,
+        ))
+        reloc_output_dir = (reloc_output_rva, len(merged_reloc_blob))
+        layout_cursor = _align_up(
+            reloc_output_rva + len(merged_reloc_blob), SA)
+    else:
+        reloc_output_dir = (
+            (reloc_rva + graft_delta, reloc_size)
+            if reloc_rva else (0, 0))
+
     # The payload contains only data used by the runtime. We intentionally avoid
     # fake PackInfo records, fabricated application strings, and fingerprint
     # scrubbing: those mislead inspection tools without improving correctness.
-    payload_end = max(g_rva + max(s.vsize, len(s.content))
-                      for s, g_rva in grafted)
-    payload_rva = _align_up(payload_end, SA)
+    payload_rva = _align_up(layout_cursor, SA)
     payload = bytearray()
 
     def _emit(blob: bytes) -> int:
@@ -848,18 +1245,46 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     for (ct, d) in protected:
         d.stored_rva = _emit(ct)            # ASSIGN stored_rva into the LIVE desc
 
-    # finalize the envelope AFTER stored_rva assignment (payload.reseal_metadata
-    # reads those same live desc objects; see _finalize_metadata).
-    (meta_ct, meta_nonce, meta_tag, meta_stored_size,
-    meta_uncompressed_size, offsets) = _finalize_metadata(artifacts, descs, level)
-    meta_rva = _emit(meta_ct)
+    # The metadata RVA is determined by already-emitted section ciphertext and
+    # alignment, independent of metadata ciphertext length. Compute it before
+    # sealing so format-v2 AAD authenticates the final locator too.
+    meta_rva = payload_rva + _align_up(len(payload), 16)
+    aad_info = container.PackInfo(
+        original_image_base=out_base,
+        original_size_of_image=orig_soi,
+        oep_rva=oep_rva,
+        is_dll=1 if is_dll else 0,
+        flags=flags,
+        section_count=len(descs),
+        meta_rva=meta_rva,
+        pdata_rva=pdata_rva,
+        pdata_count=pdata_count,
+        stub_text_rva=stub_text_rva,
+        stub_text_size=stub_text_size,
+        dll_export_rva=dll_export_rva,
+        dll_export_size=dll_export_size,
+        dll_export_sha256_128=dll_export_hash,
+    )
+
+    # Finalize AFTER stored_rva assignment. payload.reseal_metadata reads those
+    # live descriptors and binds all critical PackInfo geometry into the AAD.
+    metadata = _finalize_metadata(artifacts, descs, level, aad_info)
+    meta_ct = metadata.meta_stored
+    meta_nonce = metadata.meta_nonce
+    meta_tag = metadata.meta_tag
+    meta_stored_size = metadata.meta_stored_size
+    meta_uncompressed_size = metadata.meta_uncompressed_size
+    offsets = metadata.offsets
+    emitted_meta_rva = _emit(meta_ct)
+    if emitted_meta_rva != meta_rva:
+        raise AssembleError("metadata RVA changed after AAD sealing")
 
     out_sections.append(_OutSection(
         ".rdata2", payload_rva, len(payload),
         IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ, bytes(payload)))
 
     # -- 9. build + patch PackInfo at g_packinfo's grafted RVA ---------------
-    g_packinfo_rva = stub.find_packinfo_rva() + graft_delta
+    g_packinfo_rva = stub_packinfo_rva + graft_delta
     # guard: nothing (e.g., a reloc target) should live inside the 192-byte slot
     pi = container.PackInfo(
         original_image_base=out_base,
@@ -885,6 +1310,9 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
         kdf_salt=bytes(kdf_salt),
         stub_text_rva=stub_text_rva,
         stub_text_size=stub_text_size,
+        dll_export_rva=dll_export_rva,
+        dll_export_size=dll_export_size,
+        dll_export_sha256_128=dll_export_hash,
     )
     packinfo_bytes = pi.pack()
     # Keep the real magic intact for deterministic post-pack validation.
@@ -894,15 +1322,21 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     out_sections.sort(key=lambda s: s.rva)
     _serialize(
         output_path, out_sections, out_base, SA, FA, orig, is_dll,
-        entry_rva=(stub.find_export_rva("StubDllMain" if is_dll else "StubExeEntry")
-                   or stub.entry_rva) + graft_delta,
+        entry_rva=stub_entry_rva,
         base_of_code=stub_text_rva,
-        import_dir=(import_rva + graft_delta, import_size) if import_rva else (0, 0),
-        reloc_dir=(reloc_rva + graft_delta, reloc_size) if reloc_rva else (0, 0),
-        tls_dir=(tls_rva + graft_delta, tls_size) if tls_rva else (0, 0),
+        import_dir=outer_import_dir,
+        reloc_dir=reloc_output_dir,
+        tls_dir=(tls_rva + graft_delta, tls_size)
+        if (tls_rva and (flags & container.FLAG_HAS_TLS)) else (0, 0),
         iat_dir=_grafted_dir(stub.dir(DIR_IAT), graft_delta),
-        rsrc_dir=(rsrc_rva, len(rsrc_bytes)) if rsrc_bytes else (0, 0),
+        rsrc_dir=(rsrc_directory_rva, rsrc_directory_size)
+        if rsrc_bytes else (0, 0),
+        delay_import_dir=(
+            int(_get(parsed, "delay_import_rva", default=0)),
+            int(_get(parsed, "delay_import_size", default=0))),
         export_dir=(orig.export_rva, orig.export_size) if (is_dll and orig.export_rva) else (0, 0),
+        load_config_dir=load_config_dir,
+        guard_cf_enabled=cfg_plan.source_guard_cf_enabled,
     )
 
     size_of_image = _align_up(
@@ -946,8 +1380,8 @@ def _iter_protected(artifacts) -> Iterable[Tuple[bytes, "container.SectionDesc"]
         yield bytes(ct), d
 
 
-def _extract_rsrc(parsed) -> Tuple[int, bytes]:
-    """Return (rsrc_rva, rsrc_bytes) or (0, b'') when the PE has no resources."""
+def _extract_rsrc(parsed) -> Tuple[int, bytes, int, int]:
+    """Return owner-section bytes plus exact RESOURCE directory geometry."""
     rva = _get(parsed, "rsrc_rva", default=None)
     data = _get(parsed, "rsrc_bytes", "rsrc_content", default=None)
     if rva is None or data is None:
@@ -956,8 +1390,104 @@ def _extract_rsrc(parsed) -> Tuple[int, bytes]:
             rva = _get(rsrc, "rva", "virtual_address", default=None)
             data = _get(rsrc, "bytes", "content", "data", default=None)
     if rva is None or not data:
-        return 0, b""
-    return int(rva), bytes(data)
+        return 0, b"", 0, 0
+    section_rva = int(rva)
+    section_bytes = bytes(data)
+    directory_rva = int(_get(
+        parsed, "rsrc_directory_rva", default=section_rva))
+    directory_size = int(_get(
+        parsed, "rsrc_directory_size", default=len(section_bytes)))
+    section_end = section_rva + len(section_bytes)
+    directory_end = directory_rva + directory_size
+    if (directory_rva < section_rva or directory_size <= 0 or
+            directory_end > section_end):
+        raise AssembleError(
+            "resource DataDirectory is outside its preserved owner section")
+    return (section_rva, section_bytes, directory_rva, directory_size)
+
+
+def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
+    """Build the minimal file-backed export bytes Windows needs before DllMain.
+
+    A dependent image resolves a DLL's static imports *before* the dependency's
+    entry point runs.  Protected sections are otherwise emitted as zero-backed
+    placeholders, which made the original export directory unreadable until
+    ``StubDllMain`` had already unpacked it.  Preserve only the authenticated
+    source export-directory span at its original RVA; the normal section
+    decrypt overwrites this sparse snapshot with the complete source bytes.
+
+    PE export tables are self-referential.  Reject layouts whose name/function/
+    ordinal arrays or strings escape the declared export directory instead of
+    emitting a partial table that happens to work with ``GetProcAddress`` but
+    fails when the Windows loader resolves a static consumer.
+    """
+    export_rva = int(orig.export_rva)
+    export_size = int(orig.export_size)
+    if export_rva == 0 and export_size == 0:
+        return {}
+    if export_rva <= 0 or export_size < 40:
+        raise AssembleError(
+            "DLL export directory must have a nonzero RVA and at least a "
+            "40-byte IMAGE_EXPORT_DIRECTORY")
+    export_end = export_rva + export_size
+    if export_end > int(_get(parsed, "size_of_image", "sizeof_image")):
+        raise AssembleError("DLL export directory escapes SizeOfImage")
+
+    owner = None
+    owner_raw = b""
+    owner_rva = 0
+    for section in _get(parsed, "sections", default=[]) or []:
+        section_rva = int(_get(section, "rva", "virtual_address"))
+        section_raw = bytes(_get(section, "raw", "content", "data", default=b""))
+        if (section_rva <= export_rva and
+                export_end <= section_rva + len(section_raw)):
+            owner = section
+            owner_raw = section_raw
+            owner_rva = section_rva
+            break
+    if owner is None:
+        raise AssembleError(
+            "DLL export directory is not wholly file-backed by one source section")
+
+    def export_slice(rva: int, size: int, what: str) -> bytes:
+        if size < 0 or rva < export_rva or rva + size > export_end:
+            raise AssembleError(
+                f"DLL export {what} escapes the declared export-directory span")
+        offset = rva - owner_rva
+        return owner_raw[offset:offset + size]
+
+    def export_cstr(rva: int, what: str) -> None:
+        data = export_slice(rva, export_end - rva, what)
+        if b"\x00" not in data:
+            raise AssembleError(f"DLL export {what} is not NUL-terminated")
+
+    directory = export_slice(export_rva, 40, "header")
+    (module_name_rva, _ordinal_base, function_count, name_count,
+     functions_rva, names_rva, ordinals_rva) = struct.unpack_from(
+        "<IIIIIII", directory, 12)
+    if function_count > export_size // 4 or name_count > export_size // 2:
+        raise AssembleError("DLL export table count exceeds its declared span")
+    export_cstr(module_name_rva, "module name")
+    functions = export_slice(
+        functions_rva, function_count * 4, "address table")
+    names = export_slice(names_rva, name_count * 4, "name-pointer table")
+    ordinals = export_slice(
+        ordinals_rva, name_count * 2, "name-ordinal table")
+    for index in range(name_count):
+        ordinal = struct.unpack_from("<H", ordinals, index * 2)[0]
+        if ordinal >= function_count:
+            raise AssembleError("DLL export name ordinal exceeds address table")
+        name_rva = struct.unpack_from("<I", names, index * 4)[0]
+        export_cstr(name_rva, f"name[{index}]")
+    for index in range(function_count):
+        target_rva = struct.unpack_from("<I", functions, index * 4)[0]
+        if export_rva <= target_rva < export_end:
+            export_cstr(target_rva, f"forwarder[{index}]")
+
+    sparse = bytearray(len(owner_raw))
+    start = export_rva - owner_rva
+    sparse[start:start + export_size] = owner_raw[start:start + export_size]
+    return {owner_rva: bytes(sparse)}
 
 
 def _patch_into_out_sections(out_sections: List[_OutSection], rva: int,
@@ -976,7 +1506,9 @@ def _patch_into_out_sections(out_sections: List[_OutSection], rva: int,
 def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
                FA: int, orig: _OrigHeader, is_dll: bool, *, entry_rva: int,
                base_of_code: int, import_dir, reloc_dir, iat_dir, rsrc_dir,
-               export_dir, tls_dir) -> None:
+               export_dir, tls_dir, load_config_dir=(0, 0),
+               guard_cf_enabled: bool = False,
+               delay_import_dir=(0, 0)) -> None:
     num_sections = len(sections)
     e_lfanew = 0x80
     headers_end = e_lfanew + 4 + 20 + IMAGE_SIZEOF_OPTIONAL_HEADER64 + num_sections * 40
@@ -1037,8 +1569,11 @@ def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
     struct.pack_into("<I", oh, 0x3C, size_of_headers)
     struct.pack_into("<I", oh, 0x40, 0)                 # CheckSum (computed last)
     struct.pack_into("<H", oh, 0x44, orig.subsystem)
-    # Preserve original DllCharacteristics with only GUARD_CF cleared (§6)
-    dll_chars = orig.dll_characteristics & ~IMAGE_DLLCHARACTERISTICS_GUARD_CF
+    dll_chars = orig.dll_characteristics
+    if guard_cf_enabled:
+        dll_chars |= IMAGE_DLLCHARACTERISTICS_GUARD_CF
+    else:
+        dll_chars &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF
     struct.pack_into("<H", oh, 0x46, dll_chars)
     struct.pack_into("<Q", oh, 0x48, orig.stack_reserve)
     struct.pack_into("<Q", oh, 0x50, orig.stack_commit)
@@ -1057,8 +1592,11 @@ def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
     _dir(DIR_RESOURCE, rsrc_dir)      # preserved resources
     _dir(DIR_BASERELOC, reloc_dir)    # stub relocs only (ASLR fixes the stub)
     _dir(DIR_TLS, tls_dir)            # OS-managed stub static-TLS anchor
+    _dir(DIR_LOAD_CONFIG, load_config_dir)
     _dir(DIR_IAT, iat_dir)            # stub IAT (informational)
-    # EXCEPTION(3) and LOAD_CONFIG(10) intentionally left zero.
+    _dir(DIR_DELAY_IMPORT, delay_import_dir)
+    # EXCEPTION is registered by the loader. LOAD_CONFIG is loader-visible and
+    # points at the immutable outer clone when the source carried one.
 
     # ---- section table ----
     sec_table = bytearray()

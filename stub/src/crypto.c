@@ -3,10 +3,11 @@
  *
  * SHA-256 (FIPS 180-4), HMAC-SHA256, HKDF-SHA256 (RFC 5869), AES-256 (FIPS 197),
  * and AES-256-GCM decrypt (NIST SP 800-38D) are implemented here from scratch so
- * the stub imports NO system crypto (bcrypt.dll) for its unpack path -- there is
- * no BCryptDecrypt / BCryptHash to inline-hook. The only entropy call
- * (crypto_csprng) resolves BCryptGenRandom dynamically at runtime; the name is
- * assembled on the stack so it is not a static import either.
+ * the stub uses no system crypto for its decrypt path -- there is no
+ * BCryptDecrypt / BCryptHash to inline-hook. Entropy is the one exception:
+ * BCryptGenRandom is a static import so the Windows loader resolves bcrypt.dll
+ * before a packed DLL enters StubDllMain. This avoids LoadLibrary under loader
+ * lock without moving any key operation into an unauthenticated implementation.
  *
  * Freestanding / no-CRT: byte loops, small fixed stack buffers, xzero/xcopy and
  * the SecureZeroMemory macro only. All key material is volatile-wiped after use.
@@ -27,6 +28,7 @@
 #include "crypto.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -448,39 +450,13 @@ int crypto_aes256gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
     return rc;
 }
 
-typedef LONG (WINAPI *LETHE_GenRandom_fn)(PVOID, PUCHAR, ULONG, ULONG);
-
-/* Red-team pass 2026-08-06 found that the previous stack-by-byte assembly of
- * "bcrypt.dll" / "BCryptGenRandom" was coalesced by MSVC's optimizer into a
- * memcpy from an .rdata constant -- the plaintext ended up visible in the
- * shipped stub. daedalus_strings.h's vstr_dec uses a `volatile uint8_t *` write,
- * which the optimizer can't hoist into an .rdata copy: only the XOR-encrypted
- * bytes appear in the shipped image, plaintext lives on the stack transiently
- * and is wiped before the function returns. */
-#include "daedalus_strings.h"
-#include "daedalus_str_data.h"
-
 int crypto_csprng(void *buf, size_t len)
 {
-    char dll[VSTR_BCRYPT_DLL_LEN + 1];
-    char fn[VSTR_BCRYPT_GENRANDOM_LEN + 1];
-
-    vstr_dec(_vs_bcrypt_dll, dll, VSTR_BCRYPT_DLL_LEN,
-             VSTR_BCRYPT_DLL_KEY, VSTR_BCRYPT_DLL_MUL);
-    vstr_dec(_vs_bcrypt_genrandom, fn, VSTR_BCRYPT_GENRANDOM_LEN,
-             VSTR_BCRYPT_GENRANDOM_KEY, VSTR_BCRYPT_GENRANDOM_MUL);
-
-    HMODULE h = LoadLibraryA(dll);
-    LETHE_GenRandom_fn gen = h ? (LETHE_GenRandom_fn)GetProcAddress(h, fn) : NULL;
-
-    /* Wipe the decrypted names off the stack before returning, so a live
-     * memory dump of the running stub after crypto_csprng finishes doesn't
-     * still expose them. */
-    vstr_zero(dll, sizeof(dll));
-    vstr_zero(fn,  sizeof(fn));
-
-    if (!gen) return 1;
-    LONG st = gen(NULL, (PUCHAR)buf, (ULONG)len, LETHE_RNG_SYSTEM_PREFERRED);
+    NTSTATUS st;
+    if ((!buf && len != 0) || len > 0xffffffffu)
+        return 1;
+    st = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     return (st >= 0) ? 0 : 1;
 }
 

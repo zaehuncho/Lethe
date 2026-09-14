@@ -64,13 +64,7 @@ def _assemble(vasm_path: Path, shuffled_map: dict, daedalus_asm,
         # assembly (proven semantics-preserving by tests/test_mba.py).
         import daedalus_mba
         source = daedalus_mba.rewrite_source(source)
-    # Swap the assembler's opcode table for the shuffled map, assemble, restore.
-    saved = daedalus_asm.OPCODES
-    daedalus_asm.OPCODES = shuffled_map
-    try:
-        blob = daedalus_asm.assemble(source)
-    finally:
-        daedalus_asm.OPCODES = saved
+    blob = daedalus_asm.assemble(source, opcodes=shuffled_map)
     return bytes(blob)
 
 

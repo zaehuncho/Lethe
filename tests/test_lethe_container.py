@@ -59,7 +59,7 @@ def test_magic_and_format_version():
     # 8 bytes incl. trailing NUL; the stub magic-scans its own image for this.
     assert container.MAGIC == b"LETHE01\x00"
     assert len(container.MAGIC) == 8
-    assert container.FORMAT_VERSION == 1
+    assert container.FORMAT_VERSION == 2
 
 
 def test_flag_bits_are_distinct_powers_of_two():
@@ -68,8 +68,12 @@ def test_flag_bits_are_distinct_powers_of_two():
         container.FLAG_HAS_EXCEPTIONS,
         container.FLAG_ANTIDEBUG,
         container.FLAG_MEMGUARD,
+        container.FLAG_PAGED_DVM,
+        container.FLAG_LOAD_CONFIG,
+        container.FLAG_DLL_PRELOAD_IAT,
+        container.FLAG_PROCESS_HARDENING,
     ]
-    assert bits == [1, 2, 4, 8]
+    assert bits == [1, 2, 4, 8, 16, 32, 64, 128]
     # no overlap, so flags OR/AND cleanly
     assert 0 == container.FLAG_HAS_TLS & container.FLAG_HAS_EXCEPTIONS
 
@@ -104,6 +108,9 @@ def _sample_packinfo():
         kdf_salt=b"\x44" * 16,
         stub_text_rva=0x8800,
         stub_text_size=0x600,
+        dll_export_rva=0x2800,
+        dll_export_size=0xA0,
+        dll_export_sha256_128=b"\x55" * 16,
     )
 
 
@@ -144,6 +151,13 @@ def test_packinfo_rejects_unsupported_version():
         container.PackInfo.from_bytes(bytes(blob))
 
 
+def test_packinfo_rejects_legacy_v1_format():
+    blob = bytearray(_sample_packinfo().pack())
+    struct.pack_into("<I", blob, 8, 1)
+    with pytest.raises(ValueError, match="format version 1"):
+        container.PackInfo.from_bytes(bytes(blob))
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
@@ -151,6 +165,7 @@ def test_packinfo_rejects_unsupported_version():
         ("meta_nonce", b"\x00" * 11),
         ("meta_tag", b"\x00" * 15),
         ("kdf_salt", b"\x00" * 17),
+        ("dll_export_sha256_128", b"\x00" * 15),
     ],
 )
 def test_packinfo_pack_validates_fixed_width_fields(field, value):
@@ -270,6 +285,7 @@ def test_import_blob_encodes_hint_or_ordinal_field():
         pos += 4           # skip iat_rva
         (h,) = struct.unpack_from("<H", blob, pos);  pos += 2
         pos += 4           # skip func_name_hash
+        pos += 4           # skip preload_iat_rva
         hints.append(h)
     # first two are by-hash (0xFFFF); third is ordinal 17
     assert hints[0] == container.IMPORT_HINT_BY_HASH
@@ -334,20 +350,22 @@ def test_build_tls_blob_layout_and_callbacks():
     blob = container.build_tls_blob(
         index_rva=0x3000, raw_start_rva=0x3100, raw_end_rva=0x3200,
         zero_fill=64, callback_rvas=[0x4000, 0x4008],
+        characteristics=0x00600000,
     )
-    index, raw_start, raw_end, zero_fill, count = struct.unpack_from("<IIIII", blob, 0)
-    assert (index, raw_start, raw_end, zero_fill, count) == (
-        0x3000, 0x3100, 0x3200, 64, 2)
-    callbacks = struct.unpack_from("<II", blob, 20)
+    index, raw_start, raw_end, zero_fill, characteristics, count = (
+        struct.unpack_from("<IIIIII", blob, 0))
+    assert (index, raw_start, raw_end, zero_fill, characteristics, count) == (
+        0x3000, 0x3100, 0x3200, 64, 0x00600000, 2)
+    callbacks = struct.unpack_from("<II", blob, 24)
     assert list(callbacks) == [0x4000, 0x4008]
-    assert len(blob) == 20 + 2 * 4
+    assert len(blob) == 24 + 2 * 4
 
 
 def test_build_tls_blob_no_callbacks():
     blob = container.build_tls_blob(0x1, 0x2, 0x3, 0, [])
-    (count,) = struct.unpack_from("<I", blob, 16)
+    (count,) = struct.unpack_from("<I", blob, 20)
     assert count == 0
-    assert len(blob) == 20
+    assert len(blob) == 24
 
 
 # ---------------------------------------------------------------------------

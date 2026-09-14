@@ -12,8 +12,8 @@ Design
 * A drop-enabled file table: add PEs with the button *or* by dragging them in
   (multi-select). Each row shows filename, detected type (EXE/DLL, read inline
   from the PE header), architecture, size and a live status cell.
-* A global options panel: output-folder picker, anti-debug toggle, memory-guard
-  toggle (opt-in; test against your AV first) and a deflate compression level.
+* A global options panel: output-folder picker, anti-debug, memory-guard and
+  EXE process-hardening toggles, plus a deflate compression level.
 * A Pack button that runs ``pack_file`` for every queued file on a background
   QThread (the UI never blocks), streams ``progress(str)`` lines into a log pane
   and updates each row's status in place.
@@ -342,7 +342,7 @@ class PackWorker(QThread):
     def __init__(self, jobs, opts, parent=None) -> None:
         super().__init__(parent)
         self._jobs = list(jobs)     # list[(row, input_path)]
-        self._opts = dict(opts)     # anti_debug, memory_guard, level, out_dir
+        self._opts = dict(opts)     # runtime flags, level, out_dir
         self._cancel = False
 
     def cancel(self) -> None:
@@ -372,6 +372,7 @@ class PackWorker(QThread):
             options = PackOptions(
                 anti_debug=self._opts["anti_debug"],
                 memory_guard=self._opts["memory_guard"],
+                process_hardening=self._opts["process_hardening"],
                 compression_level=self._opts["level"],
                 output_path=self._output_for(input_path),
                 is_dll=None,  # auto-detect authoritatively in the core
@@ -523,6 +524,11 @@ class MainWindow(QMainWindow):
         memguard_caption.setObjectName("caption")
         memguard_caption.setContentsMargins(24, 0, 0, 0)
         layout.addWidget(memguard_caption)
+
+        self.process_hardening_cb = QCheckBox(
+            "Process hardening (EXE only; irreversible policies)")
+        self.process_hardening_cb.setChecked(False)
+        layout.addWidget(self.process_hardening_cb)
         self._add_divider(layout)
 
         # compression
@@ -661,6 +667,7 @@ class MainWindow(QMainWindow):
         return {
             "anti_debug": self.anti_debug_cb.isChecked(),
             "memory_guard": self.memguard_cb.isChecked(),
+            "process_hardening": self.process_hardening_cb.isChecked(),
             "level": self.level_slider.value(),
             "out_dir": out_dir or None,
         }
@@ -686,7 +693,9 @@ class MainWindow(QMainWindow):
         opts = self._current_options()
         self.log_line(
             f"packing {len(jobs)} file(s)  ·  anti-debug={'on' if opts['anti_debug'] else 'off'}"
-            f"  memory-guard={'on' if opts['memory_guard'] else 'off'}  level={opts['level']}"
+            f"  memory-guard={'on' if opts['memory_guard'] else 'off'}"
+            f"  process-hardening={'on' if opts['process_hardening'] else 'off'}"
+            f"  level={opts['level']}"
             + (f"  out={opts['out_dir']}" if opts["out_dir"] else "  out=beside input")
         )
 
@@ -750,6 +759,7 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(not running and self.table.rowCount() > 0)
         self.anti_debug_cb.setEnabled(not running)
         self.memguard_cb.setEnabled(not running)
+        self.process_hardening_cb.setEnabled(not running)
         self.level_slider.setEnabled(not running)
         self.table.setEnabled(not running)
         if running:

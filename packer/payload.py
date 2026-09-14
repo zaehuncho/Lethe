@@ -53,9 +53,10 @@ envelope cannot be finalized until layout is done. The required sequence is:
         ss.desc.stored_rva = <rva you placed ss.data at>
 
     # 2. Re-seal the envelope now that stored_rva values are final:
-    env = art.reseal_metadata()   # -> art.metadata, fresh nonce/tag
+    aad_info = PackInfo(...)      # final critical geometry, including meta_rva
+    env = art.reseal_metadata(aad_info)  # -> metadata, fresh nonce/tag
 
-    # 3. Place env.meta_stored at meta_rva; fill PackInfo:
+    # 3. Place env.meta_stored at the AAD-bound meta_rva; fill PackInfo:
     #      meta_rva, meta_stored_size=env.meta_stored_size,
     #      meta_uncompressed_size=env.meta_uncompressed_size,
     #      meta_nonce=env.meta_nonce, meta_tag=env.meta_tag,
@@ -69,16 +70,16 @@ envelope cannot be finalized until layout is done. The required sequence is:
     #    pdata_rva/pdata_count come straight off ``art``. Preserve
     #    ``art.rsrc_bytes`` PLAINTEXT at ``art.rsrc_rva``.
 
-``build_payload`` already calls ``reseal_metadata`` once, so ``art.metadata`` is
-self-consistent with the placeholder (0) stored_rvas; it is only *correct* once
-you have assigned real stored_rvas and re-sealed.
+``build_payload`` creates one provisional v2 envelope using placeholder (0)
+stored RVAs and metadata RVA. It is only *correct* once the assembler assigns
+the final locations and re-seals with a matching PackInfo AAD context.
 """
 from __future__ import annotations
 
 import os
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -90,6 +91,8 @@ try:  # package import (normal case)
         SectionDesc, MetadataOffsets, build_import_blob, build_tls_blob,
         build_metadata, pack_section_descs,
         FLAG_HAS_TLS, FLAG_HAS_EXCEPTIONS, FLAG_ANTIDEBUG, FLAG_MEMGUARD,
+        FLAG_PAGED_DVM, FLAG_LOAD_CONFIG, FLAG_DLL_PRELOAD_IAT,
+        FLAG_PROCESS_HARDENING,
     )
     from .pe_analyze import ParsedPE
 except ImportError:  # pragma: no cover - allows standalone / importlib file loading
@@ -97,6 +100,8 @@ except ImportError:  # pragma: no cover - allows standalone / importlib file loa
         SectionDesc, MetadataOffsets, build_import_blob, build_tls_blob,
         build_metadata, pack_section_descs,
         FLAG_HAS_TLS, FLAG_HAS_EXCEPTIONS, FLAG_ANTIDEBUG, FLAG_MEMGUARD,
+        FLAG_PAGED_DVM, FLAG_LOAD_CONFIG, FLAG_DLL_PRELOAD_IAT,
+        FLAG_PROCESS_HARDENING,
     )
     from pe_analyze import ParsedPE  # type: ignore
 
@@ -144,6 +149,7 @@ class PayloadOptions:
 
     anti_debug: bool = False
     memory_guard: bool = False
+    process_hardening: bool = False
     compression_level: int = 9
 
 
@@ -213,15 +219,19 @@ class PayloadArtifacts:
     pdata_rva: int
     pdata_count: int
 
-    # .rsrc preserved PLAINTEXT by the assembler at rsrc_rva
+    # Resource owner section preserved PLAINTEXT by the assembler at rsrc_rva.
+    # The PE directory may begin at a nonzero offset inside that section.
     rsrc_rva: int
     rsrc_bytes: bytes
+    rsrc_directory_rva: int
+    rsrc_directory_size: int
 
     # raw metadata inputs + params retained so the envelope can be re-sealed
     import_blob: bytes
     reloc_blob: bytes
     tls_blob: bytes
     compression_level: int
+    load_config_blob: bytes = b""
 
     @property
     def section_count(self) -> int:
@@ -233,15 +243,17 @@ class PayloadArtifacts:
         mutate ``.stored_rva`` then call :meth:`reseal_metadata`)."""
         return [ss.desc for ss in self.stored_sections]
 
-    def reseal_metadata(self) -> MetadataEnvelope:
+    def reseal_metadata(self, aad_info: "_cnt.PackInfo") -> MetadataEnvelope:
         """Rebuild + re-encrypt the metadata envelope from the CURRENT
         ``stored_rva`` values (fresh nonce/tag). Call this after assigning every
-        section's ``stored_rva``. Updates and returns ``self.metadata``."""
+        section's ``stored_rva`` and final metadata RVA. ``aad_info`` supplies
+        the critical PackInfo geometry authenticated by format v2. Updates and
+        returns ``self.metadata``."""
         meta_key = _derive_meta_key(self.aes_key, self.kdf_salt)
         self.metadata = seal_metadata(
             meta_key, self.section_descs, self.import_blob,
             self.reloc_blob, self.tls_blob, self.compression_level,
-            flags=self.flags)
+            aad_info=aad_info, load_config_blob=self.load_config_blob)
         return self.metadata
 
 
@@ -310,30 +322,42 @@ def _derive_meta_key(master_key: bytes, salt: bytes) -> bytes:
 
 def seal_metadata(meta_key: bytes, section_descs: List[SectionDesc],
                   import_blob: bytes, reloc_blob: bytes, tls_blob: bytes,
-                  compression_level: int, flags: int = 0) -> MetadataEnvelope:
+                  compression_level: int, *,
+                  aad_info: "_cnt.PackInfo",
+                  load_config_blob: bytes = b"") -> MetadataEnvelope:
     """Serialize ``[SectionDesc[]][imports][relocs][tls]``, then zlib-compress +
     AES-256-GCM encrypt it as one unit. ``meta_key`` is the metadata SUBKEY
     (``_derive_meta_key(master_key, kdf_salt)``) -- NOT the master key; callers
     derive it first. The ``section_descs`` are read at call time, so their
     ``stored_rva`` values are baked in -- assign them first.
 
-    ``flags`` is the PackInfo flags word, bound as GCM AAD so that flipping
-    any flag (e.g. disabling anti-debug) invalidates the metadata tag."""
+    Format v2 authenticates the critical PackInfo geometry via the canonical
+    ``container.build_metadata_aad`` serialization. ``aad_info`` carries the
+    fields known before sealing; metadata sizes/offsets are filled from the
+    bytes built here so callers cannot accidentally authenticate stale values.
+    """
+    if aad_info.section_count != len(section_descs):
+        raise ValueError(
+            "metadata AAD section_count does not match SectionDesc count")
     sections_blob = pack_section_descs(section_descs)
     meta_buf, offsets = build_metadata(
-        sections_blob, import_blob, reloc_blob, tls_blob)
-    # The stub reads the AAD as a uint32_t (pe_loader.c: meta_aad = cpi->flags).
-    # If the flags word ever grows past 32 bits, the AAD width has to move with it
-    # -- otherwise the top bits are silently dropped on both sides and every
-    # packed binary still decrypts. Refuse the pack before that drift can ship.
-    if not 0 <= flags <= 0xFFFFFFFF:
-        raise ValueError(
-            f"flags 0x{flags:X} does not fit in the u32 AAD width; extend the "
-            f"AAD (and the stub's meta_aad type in pe_loader.c) before adding "
-            f"more flag bits")
-    meta_aad = struct.pack("<I", flags)
-    ciphertext, nonce, tag = _compress_encrypt(
-        meta_key, meta_buf, compression_level, aad=meta_aad)
+        sections_blob, import_blob, reloc_blob, tls_blob, load_config_blob)
+    compressed = zlib.compress(meta_buf, compression_level)
+    final_info = replace(
+        aad_info,
+        meta_stored_size=len(compressed),
+        meta_uncompressed_size=len(meta_buf),
+        sections_off=offsets.sections_off,
+        imports_off=offsets.imports_off,
+        imports_size=offsets.imports_size,
+        relocs_off=offsets.relocs_off,
+        relocs_size=offsets.relocs_size,
+        tls_off=offsets.tls_off,
+    )
+    meta_aad = _cnt.build_metadata_aad(final_info)
+    nonce = os.urandom(GCM_NONCE_LEN)
+    sealed = AESGCM(meta_key).encrypt(nonce, compressed, meta_aad)
+    ciphertext, tag = sealed[:-GCM_TAG_LEN], sealed[-GCM_TAG_LEN:]
     return MetadataEnvelope(
         meta_stored=ciphertext, meta_nonce=nonce, meta_tag=tag,
         meta_uncompressed_size=len(meta_buf), offsets=offsets)
@@ -353,19 +377,49 @@ def _is_protected(section) -> bool:
     return len(section.raw) > 0
 
 
-def build_payload(parsed: ParsedPE, options) -> PayloadArtifacts:
+def build_payload(
+    parsed: ParsedPE,
+    options,
+    *,
+    master_key: bytes | bytearray | memoryview | None = None,
+    paged_vm: bool = False,
+) -> PayloadArtifacts:
     """Compress + encrypt ``parsed`` into a :class:`PayloadArtifacts`.
 
-    ``options`` is any object exposing ``anti_debug`` (bool), ``memory_guard``
-    (bool) and ``compression_level`` (int) -- e.g. :class:`PayloadOptions` or the
-    orchestrator's ``PackOptions``. Absent attributes fall back to the
-    :class:`PayloadOptions` defaults.
+    ``options`` exposes ``anti_debug``, ``memory_guard``,
+    ``process_hardening`` and ``compression_level`` -- e.g.
+    :class:`PayloadOptions` or the orchestrator's ``PackOptions``. Absent
+    attributes fall back to the :class:`PayloadOptions` defaults.
     """
     anti_debug = bool(getattr(options, "anti_debug", False))
     memory_guard = bool(getattr(options, "memory_guard", False))
+    process_hardening = bool(getattr(options, "process_hardening", False))
     level = int(getattr(options, "compression_level", 9))
+    if not isinstance(paged_vm, bool):
+        raise TypeError("paged_vm must be a boolean")
+    requires_paged_vm = bool(getattr(parsed, "requires_paged_vm", False))
+    if parsed.is_dll and memory_guard:
+        raise ValueError(
+            "memory guard is unsupported for DLLs because loader-lock teardown "
+            "cannot safely establish vectored-handler rundown")
+    if parsed.is_dll and process_hardening:
+        raise ValueError(
+            "process hardening is EXE-only and must not mutate a DLL host")
+    if paged_vm != requires_paged_vm:
+        raise ValueError(
+            "paged_vm must match the materialized selected-function paging contract"
+        )
+    if paged_vm and master_key is None:
+        raise ValueError(
+            "paged VM payloads require the materializer's explicit master key"
+        )
 
-    master_key = os.urandom(AES_KEY_LEN)
+    if master_key is None:
+        checked_master_key = os.urandom(AES_KEY_LEN)
+    else:
+        checked_master_key = bytes(master_key)
+        if len(checked_master_key) != AES_KEY_LEN:
+            raise ValueError("injected payload master key must be exactly 32 bytes")
     salt = os.urandom(KDF_SALT_LEN)
 
     # --- protected sections (each under its own HKDF-derived subkey) ---
@@ -374,7 +428,7 @@ def build_payload(parsed: ParsedPE, options) -> PayloadArtifacts:
         if not _is_protected(sec):
             continue
         sec_aad = struct.pack("<I", sec.rva)
-        section_key = _derive_section_key(master_key, salt, sec.rva)
+        section_key = _derive_section_key(checked_master_key, salt, sec.rva)
         ciphertext, nonce, tag = _compress_encrypt(
             section_key, sec.raw, level, aad=sec_aad)
         desc = SectionDesc(
@@ -403,7 +457,7 @@ def build_payload(parsed: ParsedPE, options) -> PayloadArtifacts:
             )
         tls_blob = build_tls_blob(
             t.index_rva, t.raw_start_rva, t.raw_end_rva, t.zero_fill,
-            t.callback_rvas)
+            t.callback_rvas, characteristics=t.characteristics)
     else:
         tls_blob = b""
     reloc_blob = parsed.reloc_blob
@@ -418,15 +472,34 @@ def build_payload(parsed: ParsedPE, options) -> PayloadArtifacts:
         flags |= FLAG_ANTIDEBUG
     if memory_guard:
         flags |= FLAG_MEMGUARD
+    if process_hardening:
+        flags |= FLAG_PROCESS_HARDENING
+    if paged_vm:
+        flags |= FLAG_PAGED_DVM
+    if parsed.load_config is not None:
+        flags |= FLAG_LOAD_CONFIG
+    if parsed.is_dll:
+        flags |= FLAG_DLL_PRELOAD_IAT
 
     # --- provisional envelope (placeholder stored_rvas; assembler re-seals) ---
-    meta_key = _derive_meta_key(master_key, salt)
+    meta_key = _derive_meta_key(checked_master_key, salt)
+    provisional_info = _cnt.PackInfo(
+        original_image_base=parsed.image_base,
+        original_size_of_image=parsed.size_of_image,
+        oep_rva=parsed.oep_rva,
+        is_dll=1 if parsed.is_dll else 0,
+        flags=flags,
+        section_count=len(stored_sections),
+        meta_rva=0,
+        pdata_rva=parsed.pdata_rva,
+        pdata_count=parsed.pdata_count,
+    )
     metadata = seal_metadata(
         meta_key, [ss.desc for ss in stored_sections], import_blob, reloc_blob,
-        tls_blob, level, flags=flags)
+        tls_blob, level, aad_info=provisional_info)
 
     return PayloadArtifacts(
-        aes_key=master_key,
+        aes_key=checked_master_key,
         kdf_salt=salt,
         stored_sections=stored_sections,
         metadata=metadata,
@@ -439,6 +512,12 @@ def build_payload(parsed: ParsedPE, options) -> PayloadArtifacts:
         pdata_count=parsed.pdata_count,
         rsrc_rva=parsed.rsrc_rva,
         rsrc_bytes=parsed.rsrc_bytes,
+        rsrc_directory_rva=int(getattr(
+            parsed, "rsrc_directory_rva",
+            parsed.rsrc_rva if parsed.rsrc_bytes else 0)),
+        rsrc_directory_size=int(getattr(
+            parsed, "rsrc_directory_size",
+            len(parsed.rsrc_bytes) if parsed.rsrc_bytes else 0)),
         import_blob=import_blob,
         reloc_blob=reloc_blob,
         tls_blob=tls_blob,

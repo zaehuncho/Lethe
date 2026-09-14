@@ -306,6 +306,95 @@ def test_imul_32():
                  init=_init(rbx=0x40000000), flags=("CF", "OF"))
 
 
+@pytest.mark.parametrize(
+    ("source", "initial"),
+    [
+        ("mul al", _init(rax=0x11223344556677FF)),
+        ("imul al", _init(rax=0x1122334455667780)),
+        ("mul bl", _init(rax=0x11223344556677FF, rbx=2)),
+        ("imul cl", _init(rax=0x11223344556677F0, rcx=0xFE)),
+        ("mul bx", _init(rax=0x112233445566FFFF, rbx=0xFFFF,
+                         rdx=0xAABBCCDDEEFF0011)),
+        ("imul dx", _init(rax=0x1122334455668000, rdx=0xAABBCCDDEEEE0002)),
+        ("mul ebx", _init(rax=0xFFFFFFFF, rbx=0xFFFFFFFF,
+                          rdx=0xFFFFFFFFFFFFFFFF)),
+        ("imul edx", _init(rax=0x80000000, rdx=2)),
+        ("mul rbx", _init(rax=0xFFFFFFFFFFFFFFFF, rbx=0xFFFFFFFFFFFFFFFF,
+                          rdx=7)),
+        ("imul rdx", _init(rax=0x8000000000000000, rdx=2)),
+    ],
+)
+def test_one_operand_mul_imul_implicit_products(source, initial):
+    # PF/ZF/SF are architecturally undefined; CF/OF exactly report whether the
+    # upper half is zero (MUL) or a sign-extension of the lower half (IMUL).
+    oracle.check(asm(source), init=initial, flags=("CF", "OF"))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "mul byte ptr [rcx]",
+        "imul word ptr [rcx+2]",
+        "mul dword ptr [rcx+4]",
+        "imul qword ptr [rcx+8]",
+    ],
+)
+def test_one_operand_mul_imul_memory_sources(source):
+    memory = bytes.fromhex(
+        "fe00feff ffffffff feffffffffffffff 1122334455667788"
+    )
+    oracle.check(
+        asm(source),
+        init=_init(rax=0x80000000FFFFFFFF, rcx=oracle.MEM_BASE,
+                   rdx=0xAABBCCDDEEFF0011),
+        flags=("CF", "OF"),
+        mem=memory,
+    )
+
+
+def test_implicit_output_register_is_evaluated_as_memory_base_before_writeback():
+    memory = (0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+    oracle.check(
+        asm("mul qword ptr [rdx]"),
+        init=_init(rax=0xFFFFFFFFFFFFFFF0, rdx=oracle.MEM_BASE),
+        flags=("CF", "OF"),
+        mem=memory,
+    )
+
+
+def test_fuzz_one_operand_mul_imul():
+    rng = random.Random(0x4D554C31)
+    registers = {
+        8: ("bl", "cl", "dl", "sil", "r8b"),
+        16: ("bx", "cx", "dx", "si", "r8w"),
+        32: ("ebx", "ecx", "edx", "esi", "r8d"),
+        64: ("rbx", "rcx", "rdx", "rsi", "r8"),
+    }
+    for width, sources in registers.items():
+        for signed in (False, True):
+            mnemonic = "imul" if signed else "mul"
+            for _ in range(50):
+                initial = [rng.getrandbits(64) for _ in range(16)]
+                source = rng.choice(sources)
+                oracle.check(
+                    asm(f"{mnemonic} {source}"),
+                    init=initial,
+                    flags=("CF", "OF"),
+                )
+
+
+@pytest.mark.parametrize("source", ["div rcx", "idiv rcx"])
+def test_division_fault_contract_remains_explicitly_rejected(source):
+    with pytest.raises(L.LiftUnsupported, match="architectural #DE"):
+        L.lift_function(asm(source), base=oracle.BASE)
+
+
+@pytest.mark.parametrize("encoding", ["f048f7e3", "f048f7eb"])
+def test_lock_prefixed_one_operand_multiply_is_rejected(encoding):
+    with pytest.raises(L.LiftUnsupported):
+        L.lift_function(bytes.fromhex(encoding), base=oracle.BASE)
+
+
 def test_sar():
     # sign fill on a negative value; CF = last bit shifted out
     oracle.check(asm("sar rax, 4"), init=_init(rax=0x8000000000000001),
@@ -538,33 +627,20 @@ def test_fuzz_mem_ops():
 
 @pytest.mark.parametrize("src", [
     "call rax",             # call
+    "ret 8",                # callee stack cleanup cannot use the common thunk
     "movsb",                # string op
-    # 1-operand mul/div (implicit rdx:rax / 128-bit) stay out of scope
-    "imul rbx",             # 1-operand imul (128-bit rdx:rax)
-    "imul ebx",             # 1-operand imul (edx:eax)
-    "mul rbx",              # unsigned 1-operand multiply
-    "div rcx",              # unsigned division
-    "idiv rcx",             # signed division
+    # unsupported one-operand multiply encodings stay fail-closed
+    "mul qword ptr fs:[rbx]",  # segment-overridden source
     # lea forms outside the faithful subset
     "lea rax, [rip+0x10]",  # RIP-relative lea
     "lea eax, [rip+8]",     # RIP-relative lea (32-bit dest)
     "lea rax, [ebx+ecx]",   # 32-bit-addressed lea (mod-2^32, not modeled)
     "lea rax, fs:[rbx]",    # segment-overridden lea
-    # memory forms still outside cut 4's subset
-    "add [rbx], rax",       # ALU with a memory DEST (read-modify-write)
-    "cmp [rbx], rax",       # cmp with a memory dest
-    "mov qword ptr [rbx], 5",   # mov [mem], imm (needs the memory-operand size)
+    # memory forms still outside the faithful subset
     "mov rax, fs:[rbx]",    # segment-overridden load
-    # 8/16-bit sub-registers remain unsupported at any width
-    "mov al, 5",            # 8-bit sub-register
-    "mov ax, 5",            # 16-bit sub-register
-    "add al, bl",           # 8-bit ALU
-    "add ax, bx",           # 16-bit ALU
-    "sar al, 1",            # 8-bit arithmetic shift
-    "rol al, 1",            # 8-bit rotate
-    "ror bl, cl",           # 8-bit rotate by CL
-    "movzx rax, al",        # zero-extend move
-    "movsx eax, bl",        # sign-extend move
+    # Atomic memory exchange and LOCK-prefixed RMW are not synthesized.
+    "xchg [rbx], eax",
+    "lock add dword ptr [rbx], 1",
 ])
 def test_bailouts(src):
     with pytest.raises(L.LiftUnsupported):
