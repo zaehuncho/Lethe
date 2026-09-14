@@ -70,13 +70,14 @@ replay. It runs `test_native_runtime_hardening_stress.py`,
 requires all eleven cases without skips, and proves the selected leaf emits a
 paged-v1 program whose eager and memory-guard packed outputs match the original.
 The same rolling-capable candidate DLL must also preserve real MSVC XFG indirect
-call parity for the EXE fixture and thirteen DLL ABI shapes. Those DLL shapes
-include the prior seven GPR-class signatures plus scalar float transport, scalar
-double transport combined with a 64-bit GPR mask, mixed ordinal GPR/XMM
-arguments, six-register `__vectorcall` `__m128i` transport, one 16-byte by-value
-aggregate, and one 16-byte hidden-sret return. Distinct XFG call-site type hashes
-remain byte-exact through selected-function materialization. These cases prove
-the emitted legacy register move/XOR, scalar MOVD/MOVQ memory transfers,
+call parity for the EXE fixture and fourteen DLL ABI shapes. Those DLL shapes
+include the prior seven GPR-class signatures plus one pointer-to-pointer
+unaligned 16-byte memory copy, scalar float transport, scalar double transport
+combined with a 64-bit GPR mask, mixed ordinal GPR/XMM arguments, six-register
+`__vectorcall` `__m128i` transport, one 16-byte by-value aggregate, and one
+16-byte hidden-sret return. Distinct XFG call-site type hashes remain byte-exact
+through selected-function materialization. These cases prove the emitted legacy
+register move/XOR, one unaligned XMM copy body, scalar MOVD/MOVQ memory transfers,
 unaligned MOVUPS/MOVDQU transfers, and GPR load/store bodies; SIMD/FP
 arithmetic, aligned XMM memory forms, seventh-and-later vector arguments, HVA/HFA
 returns, VEX/AVX/YMM/ZMM, variadics, broader/C++ aggregates, cross-toolchain

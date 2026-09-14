@@ -239,7 +239,7 @@
       "required": true,
       "status": "partial",
       "native_checks": ["exe.delay.shape", "exe.delay.runtime"],
-      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and thirteen real DLL ABI shapes pass natively with XFG call-site type hashes preserved byte-exact through materialization; SIMD/FP arithmetic, XMM memory forms, extended vector/HVA/HFA and broader aggregate signatures, cross-toolchain compatibility, and clean-VM XFG enforcement remain incomplete.",
+      "blocker": "GuardCF, exact suppressed/export-suppressed GFIDs, one real EXE XFG signature, and fourteen real DLL ABI shapes pass natively with XFG call-site type hashes preserved byte-exact through materialization; SIMD/FP arithmetic, aligned XMM memory forms, extended vector/HVA/HFA and broader aggregate signatures, cross-toolchain compatibility, and clean-VM XFG enforcement remain incomplete.",
       "evidence": [
         {
           "type": "pytest",
@@ -254,7 +254,7 @@
         {
           "type": "pytest",
           "path": "tests/test_xfg_virtualization_preflight.py",
-          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and thirteen DLL ABI shapes: seven GPR-class signatures plus scalar float transport, mixed scalar-double/GPR transport, mixed ordinal GPR/XMM arguments, six-register __vectorcall __m128i transport, a 16-byte by-value aggregate, and a 16-byte hidden-sret return. Each distinct DLL caller XFG type hash is structurally paired with the XFG dispatch call and remains byte-exact through materialization; direct-only virtualized thunks retain internal and external-host packed parity without thunk GFIDs, while forged generated-GFID paths are rejected before output. Coverage is limited to the emitted legacy register move/XOR and GPR load/store bodies."
+          "claim": "Real MSVC /guard:cf /guard:xfg indirect calls retain the source GFID for one EXE signature and fourteen DLL ABI shapes: seven GPR-class signatures plus one unaligned XMM memory-copy body, scalar float transport, mixed scalar-double/GPR transport, mixed ordinal GPR/XMM arguments, six-register __vectorcall __m128i transport, a 16-byte by-value aggregate, and a 16-byte hidden-sret return. Each distinct DLL caller XFG type hash is structurally paired with the XFG dispatch call and remains byte-exact through materialization; direct-only virtualized thunks retain internal and external-host packed parity without thunk GFIDs, while forged generated-GFID paths are rejected before output. Coverage is limited to the emitted legacy register move/XOR, scalar MOVD/MOVQ memory transfers, unaligned MOVUPS/MOVDQU memory transfers, and GPR load/store bodies."
         }
       ]
     },
@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing and legacy register-only XMM moves/bitwise XOR are covered, while header/gap/executable/discardable/address-taken RIP targets, XMM memory forms, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing, legacy XMM register moves/bitwise XOR, scalar MOVD/MOVQ memory transfers, and unaligned MOVUPS/MOVDQU memory transfers are covered, while header/gap/executable/discardable/address-taken RIP targets, aligned XMM memory forms, XMM arithmetic memory sources, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -284,12 +284,17 @@
         {
           "type": "pytest",
           "path": "tests/test_lifter_xmm.py",
-          "claim": "Legacy register-only MOVD/MOVQ, 128-bit MOVAPS/MOVUPS/MOVDQA/MOVDQU, and PXOR/XORPS/XORPD match Unicorn across all XMM lanes and preserve requested GPR/flag state; memory, VEX/EVEX, and SIMD/FP arithmetic forms fail closed."
+          "claim": "Legacy MOVD/MOVQ scalar memory transfers, unaligned 128-bit MOVUPS/MOVDQU memory transfers, register MOVAPS/MOVUPS/MOVDQA/MOVDQU, and register PXOR/XORPS/XORPD match Unicorn across randomized memory, XMM, GPR, and flag state; aligned memory, XMM arithmetic memory sources, VEX/EVEX, and SIMD/FP arithmetic forms fail closed."
         },
         {
           "type": "pytest",
           "path": "tests/test_lifter_rip_relative.py",
-          "claim": "Mapped non-executable RIP-relative LEA and scalar 8/16/32/64-bit data accesses resolve as runtime image base plus decoded target RVA and match Unicorn after relocation; missing geometry, permissions, header/gap/cross-section/executable/discardable/selected-extent targets, segment overrides, indirect control, and XMM/VEX memory forms fail closed."
+          "claim": "Mapped non-executable RIP-relative LEA, scalar 8/16/32/64-bit data accesses, MOVD/MOVQ scalar transfers, and unaligned MOVUPS/MOVDQU transfers resolve as runtime image base plus decoded target RVA and match Unicorn after relocation; missing geometry, permissions, header/gap/cross-section/executable/discardable/selected-extent targets, segment overrides, indirect control, aligned XMM memory, and VEX memory forms fail closed."
+        },
+        {
+          "type": "native-pytest",
+          "path": "tests/test_xmm_store128_native.py",
+          "claim": "The dedicated STORE128 helper emits exactly one unaligned MOVDQU memory store; a cross-page PAGE_NOACCESS fault leaves the writable first lane unchanged."
         },
         {
           "type": "native-pytest",
@@ -299,7 +304,7 @@
         {
           "type": "native-pytest",
           "path": "tests/test_native_virtualization_runtime.py",
-          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative load/store/LEA bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata."
+          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative scalar and XMM memory-transfer bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata."
         }
       ]
     },
