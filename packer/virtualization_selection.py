@@ -394,6 +394,22 @@ def _current_padding_proof(
     }
 
 
+def _validate_pdata_inventory(parsed: Any) -> None:
+    """Bind a v3 runtime claim to the declared PDATA directory geometry."""
+    try:
+        from lifter import direct_control_flow
+    except ImportError as exc:
+        raise VirtualizationSelectionError(
+            f"cannot load the PDATA inventory verifier: {exc}") from exc
+    try:
+        runtime_ranges = direct_control_flow._normalize_runtime_functions(parsed)
+        direct_control_flow._validate_trimmed_pdata_inventory(
+            parsed, runtime_ranges)
+    except direct_control_flow.DirectControlFlowError as exc:
+        raise VirtualizationSelectionError(
+            f"selection manifest v3 PDATA binding failed: {exc}") from exc
+
+
 def verify_manifest_bytes(
     raw: bytes,
     *,
@@ -441,6 +457,8 @@ def verify_manifest_bytes(
     values = _list(root["selections"], "selection manifest selections")
     if not values:
         raise VirtualizationSelectionError("selection manifest selects no functions")
+    if version == VERSION:
+        _validate_pdata_inventory(parsed)
     functions: list[SelectedFunction] = []
     gaps: list[GapAcknowledgement] = []
     tails: list[TailExitApproval] = []

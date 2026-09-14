@@ -43,6 +43,8 @@ def _evidence():
         is_dll=False,
         image_base=0x140000000,
         size_of_image=0x3000,
+        pdata_rva=0x2800,
+        pdata_count=1,
         sections=(SimpleNamespace(
             name=".text",
             rva=0x1000,
@@ -141,6 +143,25 @@ def test_v3_rejects_stale_pdata_and_current_body_split():
         _verify(parsed, stale_report, manifest)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        (lambda parsed: delattr(parsed, "pdata_rva"), "requires PDATA"),
+        (lambda parsed: setattr(parsed, "pdata_count", 0), "nonempty PDATA"),
+        (lambda parsed: setattr(parsed, "pdata_count", 2), "count does not match"),
+        (lambda parsed: setattr(parsed, "pdata_rva", 0), "geometry is invalid"),
+        (lambda parsed: setattr(parsed, "pdata_rva", 0x2801),
+         "geometry is invalid"),
+    ),
+)
+def test_v3_rejects_free_floating_or_forged_pdata_inventory(mutation, match):
+    parsed, report, manifest = _evidence()
+    mutation(parsed)
+
+    with pytest.raises(selection.VirtualizationSelectionError, match=match):
+        _verify(parsed, report, manifest)
+
+
 def test_v3_recomputes_canonical_suffix_after_synchronized_hash_changes():
     parsed, report, manifest = _evidence()
     noncanonical = BODY + b"\x00\x00"
@@ -170,4 +191,3 @@ def test_v2_parser_remains_strictly_equal_extent_only():
 
     with pytest.raises(selection.VirtualizationSelectionError, match="version-2"):
         _verify(parsed, report, manifest)
-
