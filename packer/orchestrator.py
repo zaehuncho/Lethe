@@ -67,6 +67,7 @@ class VirtualizationSpec:
     name: str
     rva: int
     size: int
+    lifted_body_size: int | None = None
 
 
 @dataclass(frozen=True, order=True)
@@ -849,7 +850,9 @@ def pack_file(input_path: str, options: PackOptions,
                 import virtualize  # type: ignore
 
             function_specs = tuple(
-                virtualization_plan.FunctionSpec(spec.name, spec.rva, spec.size)
+                virtualization_plan.FunctionSpec(
+                    spec.name, spec.rva, spec.size, spec.lifted_body_size
+                )
                 for spec in virtualization_specs
             )
             proof = direct_control_flow.analyze_direct_control_flow(

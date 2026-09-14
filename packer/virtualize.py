@@ -181,6 +181,193 @@ def _planner_relocations(
     return tuple(plan.SourceDir64Relocation(item.target_rva) for item in records)
 
 
+def _overlaps(left_rva: int, left_size: int, right_rva: int, right_size: int) -> bool:
+    return left_rva < right_rva + right_size and right_rva < left_rva + left_size
+
+
+def _validate_padding_suffix_bindings(
+    parsed: pe_analyze.ParsedPE,
+    specs: Sequence[plan.FunctionSpec],
+) -> None:
+    """Reject known PE/code references into bytes proposed as padding."""
+    trimmed = tuple(
+        spec
+        for spec in specs
+        if (
+            isinstance(spec, plan.FunctionSpec)
+            and type(spec.body_size) is int
+            and type(spec.size) is int
+            and spec.body_size < spec.size
+        )
+    )
+    if not trimmed:
+        return
+
+    bindings: list[tuple[str, int, int]] = []
+    bindings.extend(
+        ("source DIR64 relocation", item.target_rva, 8)
+        for item in parsed.dir64_relocations
+    )
+    bindings.extend(
+        ("source unwind info", item.unwind_info_rva, 1)
+        for item in parsed.runtime_functions
+    )
+    if parsed.pdata_rva and parsed.pdata_count:
+        bindings.append(
+            ("source exception table", parsed.pdata_rva, parsed.pdata_count * 12)
+        )
+    if parsed.oep_rva:
+        bindings.append(("image entry point", parsed.oep_rva, 1))
+    if parsed.tls is not None:
+        bindings.extend(
+            ("TLS callback", rva, 1) for rva in parsed.tls.callback_rvas
+        )
+        bindings.append(("TLS index", parsed.tls.index_rva, 4))
+        if parsed.tls.raw_end_rva > parsed.tls.raw_start_rva:
+            bindings.append(
+                (
+                    "TLS raw-data range",
+                    parsed.tls.raw_start_rva,
+                    parsed.tls.raw_end_rva - parsed.tls.raw_start_rva,
+                )
+            )
+    for label, rva, size in (
+        ("resource directory", parsed.rsrc_directory_rva, parsed.rsrc_directory_size),
+        ("delay-import directory", parsed.delay_import_rva, parsed.delay_import_size),
+    ):
+        if rva and size:
+            bindings.append((label, rva, size))
+
+    load_config = parsed.load_config
+    if load_config is not None:
+        bindings.append(
+            (
+                "load-config directory",
+                load_config.directory_rva,
+                load_config.directory_size,
+            )
+        )
+        metadata_size = (load_config.guard_flags >> 28) & 0xF
+        stride = 4 + metadata_size
+        for label, table_rva, targets in (
+            (
+                "Guard CF function table",
+                load_config.guard_cf_function_table_rva,
+                load_config.guard_cf_targets,
+            ),
+            (
+                "Guard address-taken IAT table",
+                load_config.guard_address_taken_iat_entry_table_rva,
+                load_config.guard_address_taken_iat_entries,
+            ),
+            (
+                "Guard long-jump table",
+                load_config.guard_long_jump_target_table_rva,
+                load_config.guard_long_jump_targets,
+            ),
+            (
+                "Guard EH-continuation table",
+                load_config.guard_eh_continuation_table_rva,
+                load_config.guard_eh_continuation_targets,
+            ),
+        ):
+            if table_rva and targets:
+                bindings.append((label, table_rva, len(targets) * stride))
+            bindings.extend((f"{label} target", item.rva, 1) for item in targets)
+        bindings.extend(
+            ("XFG function hash", item.rva - 8, 8)
+            for item in load_config.guard_cf_targets
+            if item.rva >= 8 and item.metadata and item.metadata[0] & 0x08
+        )
+        for label in (
+            "security_cookie_rva",
+            "guard_cf_check_function_pointer_rva",
+            "guard_cf_dispatch_function_pointer_rva",
+            "guard_xfg_check_function_pointer_rva",
+            "guard_xfg_dispatch_function_pointer_rva",
+            "guard_xfg_table_dispatch_function_pointer_rva",
+            "cast_guard_os_determined_failure_mode_rva",
+            "guard_memcpy_function_pointer_rva",
+        ):
+            rva = getattr(load_config, label, 0)
+            if rva:
+                bindings.append((f"load-config {label}", rva, 1))
+        volatile = load_config.volatile_metadata
+        if volatile is not None:
+            bindings.append(("volatile metadata", volatile.rva, len(volatile.raw)))
+            bindings.extend(
+                ("volatile access target", rva, 1) for rva in volatile.access_rvas
+            )
+            bindings.extend(
+                ("volatile info range", rva, size)
+                for rva, size in volatile.info_ranges
+            )
+            if len(volatile.raw) >= 24:
+                access_rva, access_size, info_rva, info_size = struct.unpack_from(
+                    "<IIII", volatile.raw, 8
+                )
+                if access_rva and access_size:
+                    bindings.append(("volatile access table", access_rva, access_size))
+                if info_rva and info_size:
+                    bindings.append(("volatile info table", info_rva, info_size))
+
+    try:
+        from lifter import function_discovery
+
+        exports = function_discovery.parse_pe_exports(parsed)
+    except (OSError, ValueError) as exc:
+        raise _fail(
+            f"padding-aware virtualization requires strict export metadata: {exc}"
+        ) from exc
+    bindings.extend((f"export {item.name!r}", item.rva, 1) for item in exports)
+
+    try:
+        from iced_x86 import Decoder, FlowControl, OpKind
+
+        reader = plan.SectionImage.from_parsed_sections(parsed.sections)
+        near = {OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH64}
+        for record in parsed.runtime_functions:
+            code = reader.read_file_backed_executable(
+                record.begin_rva, record.end_rva - record.begin_rva
+            )
+            cursor = record.begin_rva
+            for instruction in Decoder(64, code, ip=record.begin_rva):
+                if instruction.ip != cursor or instruction.code == 0 or instruction.len <= 0:
+                    raise _fail(
+                        f"source direct-target scan failed at RVA 0x{cursor:X}"
+                    )
+                cursor += instruction.len
+                if instruction.flow_control not in {
+                    FlowControl.CALL,
+                    FlowControl.UNCONDITIONAL_BRANCH,
+                    FlowControl.CONDITIONAL_BRANCH,
+                }:
+                    continue
+                if instruction.op_count < 1 or instruction.op_kind(0) not in near:
+                    continue
+                bindings.append(
+                    ("decoded direct-control target", instruction.near_branch_target, 1)
+                )
+            if cursor != record.end_rva:
+                raise _fail(
+                    f"source direct-target scan did not consume runtime function "
+                    f"0x{record.begin_rva:X}"
+                )
+    except plan.VirtualizationPlanError as exc:
+        raise _fail(f"padding direct-target scan failed: {exc}") from exc
+
+    for spec in trimmed:
+        suffix_rva = spec.rva + spec.body_size
+        suffix_size = spec.size - spec.body_size
+        for label, rva, size in bindings:
+            if _overlaps(rva, size, suffix_rva, suffix_size):
+                raise _fail(
+                    f"function {spec.name!r} padding suffix "
+                    f"0x{suffix_rva:X}..0x{suffix_rva + suffix_size:X} contains "
+                    f"{label} at RVA 0x{rva:X}"
+                )
+
+
 def _planner_exceptions(
     parsed: pe_analyze.ParsedPE,
     records: Iterable[pe_analyze.ParsedRuntimeFunction],
@@ -298,6 +485,7 @@ def _compile_manifest(
     rolling_seed: bytes | None,
     page_master_key: bytes,
 ) -> tuple[plan.VirtualizationManifest, StubVirtualizationProvenance]:
+    _validate_padding_suffix_bindings(parsed, specs)
     text_rva, data_rva = _next_generated_rvas(parsed, len(specs))
     reader = plan.SectionImage.from_parsed_sections(parsed.sections)
     if len(page_master_key) != bytecode_pages.MASTER_KEY_SIZE:
@@ -321,7 +509,7 @@ def _compile_manifest(
         identity_input = (
             b"Lethe-selected-function-page-id-v1\0"
             + spec.name.encode("utf-8")
-            + struct.pack("<II", spec.rva, spec.size)
+            + struct.pack("<III", spec.rva, spec.size, spec.body_size)
             + hashlib.sha256(program).digest()
         )
         program_id = hashlib.sha256(identity_input).digest()[:16]
@@ -515,6 +703,14 @@ def _validate_function_artifacts(
         raise _fail(f"function {function.name!r} thunk hash is stale")
     if hashlib.sha256(function.program).hexdigest() != function.program_sha256:
         raise _fail(f"function {function.name!r} program hash is stale")
+    if (
+        type(function.lifted_body_size) is not int
+        or function.lifted_body_size < plan.TARGET_ENTRY_PATCH_SIZE
+        or function.lifted_body_size > function.target_size
+        or not _HASH_RE.fullmatch(function.original_sha256)
+        or not _HASH_RE.fullmatch(function.lifted_body_sha256)
+    ):
+        raise _fail(f"function {function.name!r} source/body extent contract is invalid")
     if function.program_format == "paged-v1":
         if len(function.descriptor_data) != 40:
             raise _fail(f"function {function.name!r} paged descriptor size is invalid")
@@ -571,6 +767,9 @@ def _validate_function_artifacts(
         or function.capabilities.get("direct_only_thunk") is not True
         or function.capabilities.get("cfg_target_declared") is not False
         or function.capabilities.get("xfg_function_hash_emitted") is not False
+        or function.capabilities.get("source_extent_fully_tombstoned") is not True
+        or function.capabilities.get("canonical_padding_suffix_trimmed")
+        is not (function.lifted_body_size < function.target_size)
         or function.cfg_target_rvas
     ):
         raise _fail(
@@ -768,6 +967,14 @@ def _patch_selected_functions(
         if hashlib.sha256(current).hexdigest() != function.original_sha256:
             raise _fail(
                 f"selected function {function.name!r} changed after manifest compilation"
+            )
+        if (
+            hashlib.sha256(current[:function.lifted_body_size]).hexdigest()
+            != function.lifted_body_sha256
+        ):
+            raise _fail(
+                f"selected function {function.name!r} lifted body changed after "
+                "manifest compilation"
             )
         owner = next(
             section

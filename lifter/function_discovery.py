@@ -29,7 +29,7 @@ except ImportError:  # standalone tests
 
 
 REPORT_SCHEMA = "lethe.virtualization-report"
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 SELECTION_SCHEMA = "lethe.virtualization-selection"
 SELECTION_VERSION = 1
 DEFAULT_LEAF_CAP = 64
@@ -109,6 +109,15 @@ class FunctionCandidate:
     internal_direct_call_count: int = 0
     max_internal_call_depth: int = 0
     rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...] = ()
+    lifted_body_size: int | None = None
+
+    @property
+    def source_extent_size(self) -> int:
+        return self.size
+
+    @property
+    def body_size(self) -> int:
+        return self.size if self.lifted_body_size is None else self.lifted_body_size
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +145,8 @@ class FunctionCandidate:
                 reference.to_dict() for reference in self.rip_relative_references
             ],
             "size": self.size,
+            "source_extent_size": self.size,
+            "lifted_body_size": self.body_size,
             "source": self.source,
             "unwind_flag_names": list(self.unwind_flag_names),
             "unwind_flags": self.unwind_flags,
@@ -182,6 +193,7 @@ class FunctionDiscoveryReport:
             for item in self.candidates
             if (
                 item.exact_extent
+                and item.body_size == item.size
                 and item.unwind_flags == 0
                 and item.liftable
                 and item.direct_control_proof_status == "passed"
@@ -208,6 +220,7 @@ class _Extent:
     source: str
     rva: int
     size: int
+    lifted_body_size: int
     extent_kind: str
     exact: bool
     heuristic: bool
@@ -596,7 +609,10 @@ def _traceback_instruction(exc: BaseException) -> UnsupportedInstruction | None:
 
 
 def _lift_status(
-    extent: _Extent, sections: Sequence[Any]
+    extent: _Extent,
+    sections: Sequence[Any],
+    *,
+    padding_rejection: str | None = None,
 ) -> tuple[
     bool,
     str | None,
@@ -605,6 +621,8 @@ def _lift_status(
 ]:
     if extent.unresolved_reason:
         return False, extent.unresolved_reason, None, ()
+    if padding_rejection is not None:
+        return False, padding_rejection, None, ()
     if extent.unwind_flags:
         return False, (
             "source runtime-function uses unsupported unwind flags "
@@ -618,9 +636,10 @@ def _lift_status(
             (),
         )
     try:
-        code = _read_executable(sections, extent.rva, extent.size, "candidate")
+        source = _read_executable(sections, extent.rva, extent.size, "candidate")
     except FunctionDiscoveryError as exc:
         return False, str(exc), None, ()
+    code = source[:extent.lifted_body_size]
     _instructions, decode_error, decode_instruction = _strict_decode(code, extent.rva)
     if decode_error:
         return False, decode_error, decode_instruction, ()
@@ -636,6 +655,7 @@ def _lift_status(
             base=extent.rva,
             image_sections=sections,
             selected_extents=((extent.rva, extent.size),),
+            source_extent_size=extent.size,
         )
         daedalus_asm.assemble(assembly)
     except (x64_lifter.LiftUnsupported, SyntaxError, ValueError) as exc:
@@ -664,6 +684,139 @@ def _lift_status(
                 reason += f" ({first.text})"
         return False, reason, first, ()
     return True, None, None, references
+
+
+def _ranges_overlap(left_rva: int, left_size: int, right_rva: int, right_size: int) -> bool:
+    return left_rva < right_rva + right_size and right_rva < left_rva + left_size
+
+
+def _padding_metadata_rejection(
+    parsed: Any,
+    extent: _Extent,
+    exports: Sequence[ExportSymbol],
+    runtime: Sequence[_RuntimeRange],
+    direct_transfers: Sequence[_DirectEdge],
+) -> str | None:
+    """Return the first source binding that makes suffix trimming unsafe."""
+    if extent.lifted_body_size == extent.size:
+        return None
+
+    suffix_rva = extent.rva + extent.lifted_body_size
+    suffix_size = extent.size - extent.lifted_body_size
+    points: list[tuple[str, int, int]] = []
+    ranges: list[tuple[str, int, int]] = []
+
+    points.extend((f"export {item.name!r}", item.rva, 1) for item in exports)
+    oep_rva = getattr(parsed, "oep_rva", 0)
+    if type(oep_rva) is int and oep_rva:
+        points.append(("image entry point", oep_rva, 1))
+    tls = getattr(parsed, "tls", None)
+    if tls is not None:
+        for callback_rva in tuple(getattr(tls, "callback_rvas", ())):
+            points.append(("TLS callback", callback_rva, 1))
+
+    runtime_records = tuple(getattr(parsed, "runtime_functions", ()))
+    for record in runtime:
+        unwind_rva = next(
+            (
+                item.unwind_info_rva
+                for item in runtime_records
+                if item.begin_rva == record.begin and item.end_rva == record.end
+            ),
+            0,
+        )
+        if unwind_rva:
+            points.append(("unwind info", unwind_rva, 1))
+
+    for relocation in tuple(getattr(parsed, "dir64_relocations", ())):
+        ranges.append(("DIR64 relocation", relocation.target_rva, 8))
+
+    for transfer in direct_transfers:
+        points.append((f"direct {transfer.kind} target", transfer.target_rva, 1))
+
+    load_config = getattr(parsed, "load_config", None)
+    if load_config is not None:
+        ranges.append(
+            (
+                "load-config directory",
+                load_config.directory_rva,
+                load_config.directory_size,
+            )
+        )
+        metadata_size = (load_config.guard_flags >> 28) & 0xF
+        stride = 4 + metadata_size
+        for label, table_rva, targets in (
+            (
+                "Guard CF function table",
+                load_config.guard_cf_function_table_rva,
+                load_config.guard_cf_targets,
+            ),
+            (
+                "Guard address-taken IAT table",
+                load_config.guard_address_taken_iat_entry_table_rva,
+                load_config.guard_address_taken_iat_entries,
+            ),
+            (
+                "Guard long-jump table",
+                load_config.guard_long_jump_target_table_rva,
+                load_config.guard_long_jump_targets,
+            ),
+            (
+                "Guard EH-continuation table",
+                load_config.guard_eh_continuation_table_rva,
+                load_config.guard_eh_continuation_targets,
+            ),
+        ):
+            if table_rva and targets:
+                ranges.append((label, table_rva, len(targets) * stride))
+            points.extend((f"{label} target", item.rva, 1) for item in targets)
+        ranges.extend(
+            ("XFG function hash", item.rva - 8, 8)
+            for item in load_config.guard_cf_targets
+            if item.rva >= 8 and item.metadata and item.metadata[0] & 0x08
+        )
+
+        for label in (
+            "security_cookie_rva",
+            "guard_cf_check_function_pointer_rva",
+            "guard_cf_dispatch_function_pointer_rva",
+            "guard_xfg_check_function_pointer_rva",
+            "guard_xfg_dispatch_function_pointer_rva",
+            "guard_xfg_table_dispatch_function_pointer_rva",
+            "cast_guard_os_determined_failure_mode_rva",
+            "guard_memcpy_function_pointer_rva",
+        ):
+            value = getattr(load_config, label, 0)
+            if value:
+                points.append((f"load-config {label}", value, 1))
+
+        volatile = getattr(load_config, "volatile_metadata", None)
+        if volatile is not None:
+            ranges.append(("volatile metadata", volatile.rva, len(volatile.raw)))
+            points.extend(
+                ("volatile access target", target, 1)
+                for target in volatile.access_rvas
+            )
+            ranges.extend(
+                ("volatile info range", start, size)
+                for start, size in volatile.info_ranges
+            )
+            if len(volatile.raw) >= 24:
+                access_rva, access_size, info_rva, info_size = struct.unpack_from(
+                    "<IIII", volatile.raw, 8
+                )
+                if access_rva and access_size:
+                    ranges.append(("volatile access table", access_rva, access_size))
+                if info_rva and info_size:
+                    ranges.append(("volatile info table", info_rva, info_size))
+
+    for label, rva, size in (*points, *ranges):
+        if _ranges_overlap(rva, size, suffix_rva, suffix_size):
+            return (
+                f"padding suffix 0x{suffix_rva:X}..0x{suffix_rva + suffix_size:X} "
+                f"contains {label} at RVA 0x{rva:X}"
+            )
+    return None
 
 
 def _coverage_gaps(
@@ -792,23 +945,39 @@ def _build_extents(
         if mapped:
             source_parts.append("map")
         source_parts.append("pdata")
+        size = record.end - record.begin
+        source = _read_executable(sections, record.begin, size, "runtime function")
+        try:
+            lifted_body_size = x64_lifter.canonical_lifted_body_size(
+                source, record.begin
+            )
+        except x64_lifter.LiftUnsupported:
+            lifted_body_size = size
         extents.append(_Extent(
-            name, "+".join(source_parts), record.begin, record.end - record.begin,
-            "runtime_function", True, False, record.unwind_flags,
+            name=name,
+            source="+".join(source_parts),
+            rva=record.begin,
+            size=size,
+            lifted_body_size=lifted_body_size,
+            extent_kind="runtime_function",
+            exact=True,
+            heuristic=False,
+            unwind_flags=record.unwind_flags,
         ))
 
     for symbol in exports_by_rva.values():
         size, reason = _heuristic_leaf_extent(sections, symbol.rva, leaf_cap)
         extents.append(_Extent(
-            symbol.name,
-            "export-heuristic" if size else "export-unresolved",
-            symbol.rva,
-            size,
-            "heuristic_plain_ret" if size else "unresolved",
-            False,
-            bool(size),
-            0,
-            None if size else (
+            name=symbol.name,
+            source="export-heuristic" if size else "export-unresolved",
+            rva=symbol.rva,
+            size=size,
+            lifted_body_size=size,
+            extent_kind="heuristic_plain_ret" if size else "unresolved",
+            exact=False,
+            heuristic=bool(size),
+            unwind_flags=0,
+            unresolved_reason=None if size else (
                 "export has no exact runtime range; conservative leaf extent "
                 f"rejected: {reason}"
             ),
@@ -865,12 +1034,22 @@ def discover_functions(
 
     candidates = []
     for extent in extents:
-        liftable, rejection, first, rip_references = _lift_status(extent, sections)
+        padding_rejection = _padding_metadata_rejection(
+            parsed, extent, export_records, runtime, direct_transfers
+        )
+        liftable, rejection, first, rip_references = _lift_status(
+            extent, sections, padding_rejection=padding_rejection
+        )
         internal_call_count = 0
         max_internal_call_depth = 0
         if liftable:
-            code = _read_executable(sections, extent.rva, extent.size, "candidate")
-            call_analysis = x64_lifter.analyze_internal_calls(code, base=extent.rva)
+            source = _read_executable(sections, extent.rva, extent.size, "candidate")
+            code = source[:extent.lifted_body_size]
+            call_analysis = x64_lifter.analyze_internal_calls(
+                code,
+                base=extent.rva,
+                source_extent_size=extent.size,
+            )
             internal_call_count = len(call_analysis.internal_call_rvas)
             max_internal_call_depth = call_analysis.max_call_depth
         candidate_gaps = global_gaps
@@ -885,6 +1064,16 @@ def discover_functions(
             control_reason = "global direct-control analysis rejected: " + direct_error
         elif extent.size:
             for transfer in direct_transfers:
+                if (
+                        extent.rva + extent.lifted_body_size
+                        <= transfer.target_rva < extent.rva + extent.size):
+                    control_status = "rejected"
+                    control_reason = (
+                        f"direct {transfer.kind} at RVA 0x{transfer.source_rva:X} "
+                        f"targets candidate padding suffix RVA "
+                        f"0x{transfer.target_rva:X}"
+                    )
+                    break
                 if (extent.rva < transfer.target_rva < extent.rva + extent.size
                         and not extent.rva <= transfer.source_rva < extent.rva + extent.size):
                     control_status = "rejected"
@@ -916,6 +1105,7 @@ def discover_functions(
             internal_direct_call_count=internal_call_count,
             max_internal_call_depth=max_internal_call_depth,
             rip_relative_references=rip_references,
+            lifted_body_size=extent.lifted_body_size,
         ))
 
     return FunctionDiscoveryReport(

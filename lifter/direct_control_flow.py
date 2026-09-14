@@ -17,7 +17,7 @@ from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
-PROOF_VERSION = 1
+PROOF_VERSION = 2
 _RVA_LIMIT = 0x1_0000_0000
 _NEAR_BRANCH_KINDS = {
     OpKind.NEAR_BRANCH16,
@@ -59,10 +59,23 @@ class SelectedFunctionRange:
     name: str
     rva: int
     size: int
+    lifted_body_size: int | None = None
 
     @property
     def end_rva(self) -> int:
         return self.rva + self.size
+
+    @property
+    def source_extent_size(self) -> int:
+        return self.size
+
+    @property
+    def body_size(self) -> int:
+        return self.size if self.lifted_body_size is None else self.lifted_body_size
+
+    @property
+    def body_end_rva(self) -> int:
+        return self.rva + self.body_size
 
 
 @dataclass(frozen=True, order=True)
@@ -162,6 +175,7 @@ class SelectedFunctionFlow:
     name: str
     rva: int
     size: int
+    lifted_body_size: int
     reachable_instruction_rvas: tuple[int, ...]
     approved_tail_exits: tuple[TailExitApproval, ...]
 
@@ -281,6 +295,7 @@ def _normalize_selected(specs: Sequence[Any]) -> tuple[SelectedFunctionRange, ..
             name = spec.name
             rva = spec.rva
             size = spec.size
+            lifted_body_size = getattr(spec, "lifted_body_size", None)
         except AttributeError as exc:
             raise DirectControlFlowError("invalid selected function record") from exc
         if (
@@ -294,6 +309,7 @@ def _normalize_selected(specs: Sequence[Any]) -> tuple[SelectedFunctionRange, ..
                 name=name,
                 rva=rva,
                 size=size,
+                lifted_body_size=lifted_body_size,
             )
         except (TypeError, ValueError) as exc:
             raise DirectControlFlowError("invalid selected function record") from exc
@@ -302,6 +318,15 @@ def _normalize_selected(specs: Sequence[Any]) -> tuple[SelectedFunctionRange, ..
                 "selected function name must be 1..128 non-NUL characters"
             )
         _validate_range(selected.rva, selected.size, f"function {selected.name!r}")
+        if (
+            type(selected.body_size) is not int
+            or selected.body_size <= 0
+            or selected.body_size > selected.size
+        ):
+            raise DirectControlFlowError(
+                f"selected function {selected.name!r} lifted body must be a "
+                "nonempty prefix of its source extent"
+            )
         normalized.append(selected)
     normalized.sort(key=lambda item: (item.rva, item.size, item.name))
     for previous, current in zip(normalized, normalized[1:]):
@@ -508,10 +533,10 @@ def _reachable_selected(
 
     def enqueue_fallthrough(instruction: Any) -> None:
         next_rva = instruction.ip + instruction.len
-        if next_rva >= spec.end_rva:
+        if next_rva >= spec.body_end_rva:
             raise DirectControlFlowError(
                 f"selected function {spec.name!r} has reachable fallthrough "
-                f"outside its extent at RVA 0x{instruction.ip:X}"
+                f"outside its lifted body at RVA 0x{instruction.ip:X}"
             )
         pending.append(next_rva)
 
@@ -529,14 +554,24 @@ def _reachable_selected(
         kind = _direct_kind(instruction)
         if kind == "call":
             target = _direct_target(instruction, kind)
-            if spec.rva <= target < spec.end_rva:
+            if spec.rva <= target < spec.body_end_rva:
                 pending.append(target)
+            elif spec.rva <= target < spec.end_rva:
+                raise DirectControlFlowError(
+                    f"selected function {spec.name!r} reaches padding suffix "
+                    f"RVA 0x{target:X}"
+                )
             enqueue_fallthrough(instruction)
         elif kind == "jump":
             target = _direct_target(instruction, kind)
-            if spec.rva <= target < spec.end_rva:
+            if spec.rva <= target < spec.body_end_rva:
                 pending.append(target)
                 continue
+            if spec.rva <= target < spec.end_rva:
+                raise DirectControlFlowError(
+                    f"selected function {spec.name!r} reaches padding suffix "
+                    f"RVA 0x{target:X}"
+                )
             approval = approval_by_edge.get((spec.rva, instruction.ip, target))
             if approval is None:
                 raise DirectControlFlowError(
@@ -551,7 +586,7 @@ def _reachable_selected(
             used_approvals.append(approval)
         elif kind in {"conditional_jump", "loop"}:
             target = _direct_target(instruction, kind)
-            if not spec.rva <= target < spec.end_rva:
+            if not spec.rva <= target < spec.body_end_rva:
                 raise DirectControlFlowError(
                     f"selected function {spec.name!r} has reachable {kind} exit "
                     f"at RVA 0x{instruction.ip:X} to RVA 0x{target:X}"
@@ -600,6 +635,14 @@ def _validate_direct_targets(
                 and target_selected is not None
                 and source_selected.rva == target_selected.rva
             )
+            if (
+                same_selected
+                and target >= source_selected.body_end_rva
+            ):
+                raise DirectControlFlowError(
+                    f"direct {kind} at RVA 0x{instruction.ip:X} targets "
+                    f"selected padding suffix RVA 0x{target:X}"
+                )
             if (
                 target_selected is not None
                 and target != target_selected.rva
@@ -690,6 +733,7 @@ def analyze_direct_control_flow(
                 spec.name,
                 spec.rva,
                 spec.size,
+                spec.body_size,
                 tuple(sorted(reachable)),
                 approvals,
             )

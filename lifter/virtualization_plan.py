@@ -32,7 +32,7 @@ except ImportError:  # standalone tests put daedalus/ directly on sys.path
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 DESCRIPTOR_VERSION_PLAIN = 3
 DESCRIPTOR_VERSION_PAGED = 4
 TARGET_ENTRY_PATCH_SIZE = 5
@@ -75,6 +75,15 @@ class FunctionSpec:
     name: str
     rva: int
     size: int
+    lifted_body_size: int | None = None
+
+    @property
+    def source_extent_size(self) -> int:
+        return self.size
+
+    @property
+    def body_size(self) -> int:
+        return self.size if self.lifted_body_size is None else self.lifted_body_size
 
 
 @dataclass(frozen=True)
@@ -452,7 +461,9 @@ class VirtualizedFunction:
     name: str
     target_rva: int
     target_size: int
+    lifted_body_size: int
     original_sha256: str
+    lifted_body_sha256: str
     target_entry_patch: TargetEntryPatch
     program_format: str
     program: bytes
@@ -480,7 +491,10 @@ class VirtualizedFunction:
             "name": self.name,
             "target_rva": self.target_rva,
             "target_size": self.target_size,
+            "source_extent_size": self.target_size,
+            "lifted_body_size": self.lifted_body_size,
             "original_sha256": self.original_sha256,
+            "lifted_body_sha256": self.lifted_body_sha256,
             "target_entry_patch": self.target_entry_patch.to_dict(),
             "program_format": self.program_format,
             "program_hex": self.program.hex(),
@@ -568,6 +582,7 @@ class VirtualizationManifest:
 class _Compiled:
     spec: FunctionSpec
     original: bytes
+    lifted_body: bytes
     program: bytes
     program_format: str
     thunk_symbol: str
@@ -597,7 +612,9 @@ def _symbol_stem(spec: FunctionSpec) -> str:
     if safe[0].isdigit():
         safe = "f_" + safe
     safe = safe[:40]
-    identity = f"{spec.name}\0{spec.rva:08X}\0{spec.size:X}".encode("utf-8")
+    identity = (
+        f"{spec.name}\0{spec.rva:08X}\0{spec.size:X}\0{spec.body_size:X}"
+    ).encode("utf-8")
     suffix = hashlib.sha256(identity).hexdigest()[:10]
     return f"lethe_vfn_{spec.rva:08X}_{safe}_{suffix}"
 
@@ -615,6 +632,15 @@ def _validate_specs(specs: Sequence[FunctionSpec]) -> tuple[FunctionSpec, ...]:
         if spec.size < TARGET_ENTRY_PATCH_SIZE:
             raise VirtualizationPlanError(
                 f"function {spec.name!r} is too small for a five-byte near-JMP entry patch"
+            )
+        if (
+            type(spec.body_size) is not int
+            or spec.body_size < TARGET_ENTRY_PATCH_SIZE
+            or spec.body_size > spec.size
+        ):
+            raise VirtualizationPlanError(
+                f"function {spec.name!r} lifted body must be a five-byte-or-larger "
+                "prefix of the source extent"
             )
         ordered.append(spec)
     ordered.sort(key=lambda item: (item.rva, item.size, item.name))
@@ -884,10 +910,10 @@ def _decode_exact(spec: FunctionSpec, code: bytes):
             raise FunctionRejected(spec, f"invalid instruction at RVA 0x{cursor:X}")
         starts.add(instruction.ip)
         cursor += instruction.len
-    if cursor != spec.rva + spec.size:
+    if cursor != spec.rva + len(code):
         raise FunctionRejected(
             spec,
-            f"decoder consumed 0x{cursor - spec.rva:X} bytes, expected 0x{spec.size:X}",
+            f"decoder consumed 0x{cursor - spec.rva:X} bytes, expected 0x{len(code):X}",
         )
     for instruction in instructions:
         if instruction.mnemonic == Mnemonic.JMP or instruction.mnemonic in x64_lifter._CC:
@@ -926,20 +952,41 @@ def _compile_one(
             spec,
             f"strict reader returned {len(original)} bytes, expected {spec.size}",
         )
-    _decode_exact(spec, original)
+    lifted_body = original[:spec.body_size]
+    if spec.body_size < spec.size:
+        try:
+            canonical_body_size = x64_lifter.canonical_lifted_body_size(
+                original, spec.rva
+            )
+        except x64_lifter.LiftUnsupported as exc:
+            raise FunctionRejected(
+                spec, f"source extent is not exactly decodable: {exc}"
+            ) from exc
+        if canonical_body_size != spec.body_size:
+            raise FunctionRejected(
+                spec,
+                "lifted body does not end before an entirely canonical "
+                "INT3/NOP padding suffix",
+            )
+    _decode_exact(spec, lifted_body)
     try:
-        call_analysis = x64_lifter.analyze_internal_calls(original, base=spec.rva)
+        call_analysis = x64_lifter.analyze_internal_calls(
+            lifted_body,
+            base=spec.rva,
+            source_extent_size=spec.size,
+        )
         rip_relative_references = x64_lifter.validate_rip_relative_references(
-            original,
+            lifted_body,
             base=spec.rva,
             image_sections=image_sections,
             selected_extents=selected_extents,
         )
         assembly = x64_lifter.lift_function(
-            original,
+            lifted_body,
             base=spec.rva,
             image_sections=image_sections,
             selected_extents=selected_extents,
+            source_extent_size=spec.size,
         )
         program = daedalus_asm.assemble(
             assembly, opcodes=opcode_table.assembler_mapping()
@@ -954,7 +1001,7 @@ def _compile_one(
             b"Lethe-virtual-function\0"
             + rolling_seed
             + spec.name.encode("utf-8")
-            + struct.pack("<II", spec.rva, spec.size)
+            + struct.pack("<III", spec.rva, spec.size, spec.body_size)
         ).digest()[:16]
         program = daedalus_rolling.pack_rolling_blob(
             program,
@@ -968,6 +1015,7 @@ def _compile_one(
     return _Compiled(
         spec=spec,
         original=original,
+        lifted_body=lifted_body,
         program=program,
         program_format=program_format,
         thunk_symbol=thunk_symbol,
@@ -1238,6 +1286,10 @@ def compile_virtualization_manifest(
             "simd_fp_arithmetic_supported": False,
             "return_address_shadow_validated": has_internal_calls,
             "rip_relative_data_addressing_supported": True,
+            "source_extent_fully_tombstoned": True,
+            "canonical_padding_suffix_trimmed": (
+                item.spec.body_size < item.spec.size
+            ),
         }
         if descriptor_version == DESCRIPTOR_VERSION_PAGED:
             capabilities["authenticated_bytecode_paging"] = True
@@ -1246,7 +1298,9 @@ def compile_virtualization_manifest(
                 name=item.spec.name,
                 target_rva=item.spec.rva,
                 target_size=item.spec.size,
+                lifted_body_size=item.spec.body_size,
                 original_sha256=hashlib.sha256(item.original).hexdigest(),
+                lifted_body_sha256=hashlib.sha256(item.lifted_body).hexdigest(),
                 target_entry_patch=target_entry_patch,
                 program_format=item.program_format,
                 program=item.program,

@@ -102,13 +102,18 @@ vm_sink DWORD 0
 vm_relocation_anchor QWORD OFFSET vm_value
 .code
 PUBLIC vm_leaf
-vm_leaf PROC
+vm_leaf PROC FRAME
+    sub rsp, 8
+    .allocstack 8
+    .endprolog
     mov eax, DWORD PTR vm_value
     add eax, 1
     mov DWORD PTR vm_sink, eax
     lea rdx, vm_sink
     mov eax, DWORD PTR [rdx]
+    add rsp, 8
     ret
+    DB 0CCh, 0CCh
 vm_leaf ENDP
 END
 """.lstrip(),
@@ -337,7 +342,14 @@ def test_packed_executable_calls_virtualized_leaf(
                 break
         assert decoded_leaf_list[-1].mnemonic == Mnemonic.RET
         decoded_leaf = tuple(decoded_leaf_list)
-        leaf_size = sum(instruction.len for instruction in decoded_leaf)
+        lifted_body_size = sum(instruction.len for instruction in decoded_leaf)
+        runtime_record = next(
+            record
+            for record in parsed_source.runtime_functions
+            if record.begin_rva == leaf_rva
+        )
+        source_extent_size = runtime_record.end_rva - runtime_record.begin_rva
+        assert source_extent_size == lifted_body_size + 2
         decoded_targets = tuple(
             instruction.ip_rel_memory_address
             for instruction in decoded_leaf
@@ -354,7 +366,7 @@ def test_packed_executable_calls_virtualized_leaf(
             for target in decoded_targets
         )
         function_spec = virtualization_plan.FunctionSpec(
-            "vm_leaf", leaf_rva, leaf_size
+            "vm_leaf", leaf_rva, source_extent_size, lifted_body_size
         )
         discovery = direct_control_flow.analyze_direct_control_flow(
             parsed_source, (function_spec,), production=False
@@ -405,7 +417,7 @@ def test_packed_executable_calls_virtualized_leaf(
                 memory_guard=memory_guard,
                 virtualization_specs=(
                     orchestrator.VirtualizationSpec(
-                        "vm_leaf", leaf_rva, leaf_size
+                        "vm_leaf", leaf_rva, source_extent_size, lifted_body_size
                     ),
                 ),
                 virtualization_gap_acknowledgements=gap_acknowledgements,
@@ -420,6 +432,8 @@ def test_packed_executable_calls_virtualized_leaf(
 
         materialized = captured["result"]
         function = materialized.manifest.functions[0]
+        assert function.target_size == source_extent_size
+        assert function.lifted_body_size == lifted_body_size
         assert function.program_format == "paged-v1"
         assert function.capabilities[
             "rip_relative_data_addressing_supported"
@@ -432,11 +446,11 @@ def test_packed_executable_calls_virtualized_leaf(
             reference.access for reference in function.rip_relative_references
         ) == ("read", "write", "address")
         generated = function.generated_executable_ranges[0]
-        entry = _slice(materialized.parsed, leaf_rva, leaf_size)
+        entry = _slice(materialized.parsed, leaf_rva, source_extent_size)
         assert entry[0] == 0xE9
         entry_displacement, = struct.unpack("<i", entry[1:5])
         assert leaf_rva + 5 + entry_displacement == generated.rva
-        assert entry[5:] == b"\xCC" * (leaf_size - 5)
+        assert entry[5:] == b"\xCC" * (source_extent_size - 5)
 
         thunk = _slice(
             materialized.parsed, generated.rva, win64_thunk.THUNK_CODE_SIZE

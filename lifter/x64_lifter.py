@@ -125,6 +125,21 @@ IMAGE_SCN_MEM_READ = 0x40000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 
+# Deliberately narrow linker-padding policy. These are the Intel-recommended
+# architectural NOP byte strings from one through nine bytes. Semantic NOPs
+# with arbitrary operands or prefixes are not extent padding.
+_CANONICAL_NOP_ENCODINGS = frozenset({
+    b"\x90",
+    b"\x66\x90",
+    b"\x0f\x1f\x00",
+    b"\x0f\x1f\x40\x00",
+    b"\x0f\x1f\x44\x00\x00",
+    b"\x66\x0f\x1f\x44\x00\x00",
+    b"\x0f\x1f\x80\x00\x00\x00\x00",
+    b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
+    b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
+})
+
 
 def _width_mask(width: int) -> int:
     try:
@@ -1691,6 +1706,62 @@ def _decode_exact(code: bytes, base: int):
     return instructions
 
 
+def canonical_lifted_body_size(code: bytes, base: int = 0x1000) -> int:
+    """Return a RET-terminated body length after canonical suffix trimming.
+
+    The complete byte range is decoded first. Trimming is allowed only when a
+    nonempty terminal sequence consists entirely of exact INT3 or enumerated
+    architectural NOP encodings and the preceding instruction is a plain RET.
+    The caller retains ownership of the complete source extent.
+    """
+    source = bytes(code)
+    instructions = _decode_exact(source, base)
+    padding_start = len(source)
+    for instruction in reversed(instructions):
+        offset = instruction.ip - base
+        encoded = source[offset:offset + instruction.len]
+        canonical = (
+            instruction.mnemonic == Mnemonic.INT3 and encoded == b"\xCC"
+        ) or (
+            instruction.mnemonic == Mnemonic.NOP
+            and encoded in _CANONICAL_NOP_ENCODINGS
+        )
+        if not canonical:
+            break
+        padding_start = offset
+    if padding_start == len(source):
+        return len(source)
+    body = tuple(
+        instruction for instruction in instructions
+        if instruction.ip < base + padding_start
+    )
+    if not body:
+        return len(source)
+    final = body[-1]
+    if final.mnemonic != Mnemonic.RET or final.op_count != 0:
+        return len(source)
+    return padding_start
+
+
+def validate_lifted_body_extent(
+    code: bytes,
+    base: int,
+    source_extent_size: int,
+) -> None:
+    """Bind lifted bytes to a containing, nonempty uint32 source extent."""
+    if (
+        type(source_extent_size) is not int
+        or source_extent_size < len(code)
+        or source_extent_size <= 0
+        or base <= 0
+        or base + source_extent_size > _RVA_LIMIT
+    ):
+        raise LiftUnsupported(
+            "lifted body is not a valid prefix of its source extent"
+        )
+    _decode_exact(bytes(code), base)
+
+
 def _rip_access(instruction, operand: int) -> tuple[str, bool]:
     access = InstructionInfoFactory().info(instruction).op_access(operand)
     if access in (OpAccess.READ, OpAccess.COND_READ):
@@ -1982,8 +2053,18 @@ def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAn
     )
 
 
-def analyze_internal_calls(code: bytes, base: int = 0x1000) -> InternalCallAnalysis:
+def analyze_internal_calls(
+    code: bytes,
+    base: int = 0x1000,
+    *,
+    source_extent_size: int | None = None,
+) -> InternalCallAnalysis:
     """Return the proven direct internal-call topology or raise LiftUnsupported."""
+    validate_lifted_body_extent(
+        code,
+        base,
+        len(code) if source_extent_size is None else source_extent_size,
+    )
     instructions = _decode_exact(code, base)
     return _analyze_internal_calls(instructions, base, base + len(code))
 
@@ -1994,12 +2075,18 @@ def lift_function(
     *,
     image_sections=None,
     selected_extents=(),
+    source_extent_size: int | None = None,
 ) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
     ``base`` is a source RVA. RIP-relative references require mapped section
     geometry and are emitted as ``runtime IMAGE_BASE + decoded target RVA``.
     """
+    validate_lifted_body_extent(
+        code,
+        base,
+        len(code) if source_extent_size is None else source_extent_size,
+    )
     validate_rip_relative_references(
         code,
         base,

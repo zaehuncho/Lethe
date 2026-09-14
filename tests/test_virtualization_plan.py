@@ -116,7 +116,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
     manifest = _compile(raw)
     function = manifest.functions[0]
 
-    assert manifest.version == plan.MANIFEST_VERSION == 2
+    assert manifest.version == plan.MANIFEST_VERSION == 3
     assert function.target_rva == 0x1000
     assert function.target_size == len(raw)
     assert function.original_sha256 == hashlib.sha256(raw).hexdigest()
@@ -212,6 +212,8 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         "simd_fp_arithmetic_supported": False,
         "return_address_shadow_validated": False,
         "rip_relative_data_addressing_supported": True,
+        "source_extent_fully_tombstoned": True,
+        "canonical_padding_suffix_trimmed": False,
     }
     assert function.internal_call_rvas == ()
     assert function.max_internal_call_depth == 0

@@ -210,6 +210,18 @@ records; preserve every declared source CFG target; then apply each deterministi
 so the original tail is scrubbed and an interior entry faults. A selected extent
 under five bytes, a target-to-thunk displacement outside signed rel32 reach, or any
 source DIR64 relocation target overlapping a selected extent is a hard bailout.
+
+Virtualization manifest version 3 separates the exact source extent from its
+semantic lifted body. `FunctionSpec(name, rva, source_extent_size,
+lifted_body_size)` accepts a shorter body only when the full PDATA range decodes
+and the body ends in plain `RET` followed entirely by exact one-byte `INT3` or
+enumerated architectural NOP encodings. Bytecode covers only that body; source
+hashing, overlap checks, exception-record removal, stale-source validation, and
+the `E9`/`INT3` patch cover the complete source extent. Export/OEP/TLS/direct
+targets, DIR64 spans, unwind records, GFIDs, XFG hashes, Guard tables, and other
+loader metadata in the suffix reject the transform. Discovery report version 2
+publishes both lengths. The starter selection manifest stays version 1 and emits
+only equal-length entries, so this does not silently widen its existing schema.
 An explicit empty DIR64 metadata set is distinct from missing metadata. Rolling
 containers and nonempty VM data regions are rejected for production-selected
 functions; the raw program is never materialized beside its paged envelope.
