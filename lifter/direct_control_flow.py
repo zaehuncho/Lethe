@@ -199,6 +199,7 @@ class DirectControlFlowProof:
     direct_reference_gate_passed: bool
     indirect_target_closure_proven: bool
     limitations: tuple[str, ...]
+    isolated_runtime_functions: tuple[IsolatedRuntimeFunction, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -437,9 +438,20 @@ def _read_executable(
     return result
 
 
-def _decode_runtime(
+def _ranges_intersect(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _decode_extent(
     sections: Sequence[_Section], begin: int, end: int
 ) -> _RuntimeDecode:
+    """Decode one contiguous executable extent, excising proven jump tables.
+
+    Raises the raw :mod:`jump_table` exceptions so a caller can distinguish an
+    *isolatable* unprovable data-in-code fault (:class:`JumpTableUnresolved`)
+    from a hard malformed-image fault (:class:`JumpTableError`). Empty
+    instruction streams are rejected.
+    """
     code = _read_executable(
         sections, begin, end - begin, f"runtime function 0x{begin:X}"
     )
@@ -449,19 +461,190 @@ def _decode_runtime(
     # instructions and no control edges). This gate stays STRICT: a decode
     # fault that cannot be proven to be a jump table is rejected, so the
     # differential-oracle contract is never relaxed.
+    body = jump_table.decode_function_body(code, begin, end)
+    if not body.instructions:
+        raise DirectControlFlowError(
+            f"runtime function 0x{begin:X} contains no instructions"
+        )
+    return _RuntimeDecode(begin, end, body.instructions, body.instruction_starts)
+
+
+def _decode_runtime(
+    sections: Sequence[_Section], begin: int, end: int
+) -> _RuntimeDecode:
     try:
-        body = jump_table.decode_function_body(code, begin, end)
+        return _decode_extent(sections, begin, end)
     except jump_table.JumpTableUnresolved as exc:
         raise DirectControlFlowError(
             f"undecodable runtime function at 0x{begin:X}: {exc}"
         ) from exc
     except jump_table.JumpTableError as exc:
         raise DirectControlFlowError(str(exc)) from exc
-    if not body.instructions:
-        raise DirectControlFlowError(
-            f"runtime function 0x{begin:X} contains no instructions"
+
+
+@dataclass(frozen=True, order=True)
+class IsolatedRuntimeFunction:
+    """One un-decodable chain-info function isolated (quarantined) whole.
+
+    A compiler split a switch/dispatch function into a primary pdata record
+    plus contiguous ``UNW_FLAG_CHAININFO`` fragments; the jump table lands in a
+    later fragment while its indexing instruction sits in the primary, so the
+    fragment does not decode in isolation (no in-extent table reference). The
+    strict pass decodes the WHOLE contiguous chain group as one extent -- the
+    same trusted :mod:`jump_table` machinery then resolves the table from the
+    in-group dispatch reference and proves every dword entry is a real in-group
+    instruction start. The whole group is left native (never patched, never
+    selected); its fully decoded real edges still participate in the image-wide
+    proof, so nothing that IS selected can be entered interior by it.
+    """
+
+    begin_rva: int
+    end_rva: int
+    chain_primary_rva: int
+    fragment_count: int
+
+
+def _chain_primary_map(
+    parsed: Any, runtime_ranges: Sequence[tuple[int, int]]
+) -> dict[tuple[int, int], int]:
+    """Map each runtime range to its chain-primary begin RVA.
+
+    Reads ``ParsedRuntimeFunction.chain_primary_rva`` (0 == primary /
+    non-chained). Returns an empty map when the metadata is unavailable, which
+    disables chain-group isolation so the pass fails closed on an unprovable
+    extent exactly as before.
+    """
+    records = getattr(parsed, "runtime_functions", None)
+    if not records:
+        return {}
+    range_set = set(runtime_ranges)
+    mapping: dict[tuple[int, int], int] = {}
+    for record in records:
+        try:
+            key = (record.begin_rva, record.end_rva)
+        except AttributeError:
+            return {}
+        if key not in range_set:
+            continue
+        primary = getattr(record, "chain_primary_rva", 0)
+        if type(primary) is not int or primary < 0:
+            primary = 0
+        mapping[key] = primary
+    return mapping
+
+
+def _chain_group(
+    range_key: tuple[int, int],
+    runtime_set: frozenset[tuple[int, int]],
+    chain_primary: dict[tuple[int, int], int],
+) -> list[tuple[int, int]] | None:
+    """Return the sorted contiguous chain group containing ``range_key``.
+
+    A group is the primary record plus every record whose ``chain_primary_rva``
+    equals that primary, and it must be a contiguous tiling of at least two
+    whole ranges starting at the primary. Returns ``None`` for anything else,
+    so a lone unprovable extent (not a compiler chain fragment) is never
+    isolated.
+    """
+    primary = chain_primary.get(range_key, 0) or range_key[0]
+    members = sorted(
+        key
+        for key in runtime_set
+        if chain_primary.get(key, 0) == primary
+        or (key[0] == primary and chain_primary.get(key, 0) == 0)
+    )
+    if len(members) < 2 or members[0][0] != primary:
+        return None
+    for left, right in zip(members, members[1:]):
+        if left[1] != right[0]:
+            return None
+    return members
+
+
+def _decode_runtime_inventory(
+    sections: Sequence[_Section],
+    runtime_ranges: Sequence[tuple[int, int]],
+    subsumed_ranges: set[tuple[int, int]],
+    selected: Sequence[SelectedFunctionRange],
+    chain_primary: dict[tuple[int, int], int],
+) -> tuple[
+    dict[tuple[int, int], _RuntimeDecode], tuple[IsolatedRuntimeFunction, ...]
+]:
+    """Decode every non-subsumed runtime range, isolating provable chain groups.
+
+    An unprovable extent that IS a decodable contiguous chain group (its whole
+    span resolves through :func:`_decode_extent`) is isolated: the group is
+    decoded once as a single span, its member standalone decodes are dropped,
+    and the group is recorded un-selectable. Anything else -- a lone unprovable
+    extent, or a chain group that intersects a selected extent, or a group span
+    that is itself unprovable -- still raises, leaving the image strict-blocked
+    (correctness over coverage; an isolated function is never virtualized).
+    """
+    runtime_set = frozenset(runtime_ranges)
+    selected_extents = tuple((spec.rva, spec.end_rva) for spec in selected)
+    decoded: dict[tuple[int, int], _RuntimeDecode] = {}
+    failures: dict[tuple[int, int], jump_table.JumpTableUnresolved] = {}
+    for rng in runtime_ranges:
+        if rng in subsumed_ranges:
+            continue
+        try:
+            decoded[rng] = _decode_extent(sections, rng[0], rng[1])
+        except jump_table.JumpTableUnresolved as exc:
+            failures[rng] = exc
+        except jump_table.JumpTableError as exc:
+            raise DirectControlFlowError(str(exc)) from exc
+
+    isolated: list[IsolatedRuntimeFunction] = []
+    handled: set[tuple[int, int]] = set()
+    for rng in sorted(failures):
+        if rng in handled:
+            continue
+        exc = failures[rng]
+        group = _chain_group(rng, runtime_set, chain_primary)
+        reason: str | None = None
+        span: tuple[int, int] | None = None
+        if group is None:
+            reason = "extent is not part of a contiguous chain-info group"
+        else:
+            span = (group[0][0], group[-1][1])
+            member_set = set(group)
+            for member in group:
+                if member in subsumed_ranges or any(
+                    _ranges_intersect(member, extent) for extent in selected_extents
+                ):
+                    reason = "chain group intersects a selected extent"
+                    break
+            if reason is None and any(
+                other not in member_set and _ranges_intersect(other, span)
+                for other in runtime_set
+            ):
+                reason = "chain group span overlaps a non-member runtime range"
+        group_decode: _RuntimeDecode | None = None
+        if reason is None:
+            assert span is not None
+            try:
+                group_decode = _decode_extent(sections, span[0], span[1])
+            except jump_table.JumpTableError as gexc:
+                reason = f"chain-group span is itself unprovable ({gexc})"
+        if reason is not None:
+            raise DirectControlFlowError(
+                f"undecodable runtime function at 0x{rng[0]:X}: {exc}; "
+                f"cannot isolate ({reason})"
+            ) from exc
+        assert group is not None and span is not None and group_decode is not None
+        for member in group:
+            decoded.pop(member, None)
+            handled.add(member)
+        decoded[span] = group_decode
+        isolated.append(
+            IsolatedRuntimeFunction(
+                begin_rva=span[0],
+                end_rva=span[1],
+                chain_primary_rva=chain_primary.get(rng, 0) or rng[0],
+                fragment_count=len(group),
+            )
         )
-    return _RuntimeDecode(begin, end, body.instructions, body.instruction_starts)
+    return decoded, tuple(sorted(isolated))
 
 
 def _selected_owner(
@@ -776,10 +959,13 @@ def analyze_direct_control_flow(
             )
         subsumed_ranges.update(covering)
 
-    runtime_decodes = tuple(
-        _decode_runtime(sections, begin, end)
-        for begin, end in runtime_ranges
-        if (begin, end) not in subsumed_ranges
+    chain_primary = _chain_primary_map(parsed, runtime_ranges)
+    runtime_decode_map, isolated_runtime = _decode_runtime_inventory(
+        sections, runtime_ranges, subsumed_ranges, selected, chain_primary
+    )
+    runtime_decodes = tuple(runtime_decode_map.values())
+    isolated_spans = frozenset(
+        (item.begin_rva, item.end_rva) for item in isolated_runtime
     )
     extra_selected_ranges = tuple(
         (spec.rva, spec.end_rva)
@@ -825,7 +1011,9 @@ def analyze_direct_control_flow(
 
     direct = []
     indirect = []
-    runtime_range_set = set(runtime_ranges)
+    # An isolated chain group's span is backed by its member runtime functions,
+    # so its instructions are correctly flagged as runtime-backed.
+    runtime_range_set = set(runtime_ranges) | set(isolated_spans)
     for decoded in decodes:
         for instruction in decoded.instructions:
             source_selected = _selected_owner(selected, instruction.ip)
@@ -923,6 +1111,7 @@ def analyze_direct_control_flow(
         direct_reference_gate_passed=not unacknowledged,
         indirect_target_closure_proven=False,
         limitations=tuple(limitations),
+        isolated_runtime_functions=isolated_runtime,
     )
 
 
@@ -935,6 +1124,7 @@ __all__ = [
     "DirectControlFlowProof",
     "DirectControlTransfer",
     "IndirectControlTransfer",
+    "IsolatedRuntimeFunction",
     "SelectedFunctionFlow",
     "SelectedFunctionRange",
     "TailExitApproval",

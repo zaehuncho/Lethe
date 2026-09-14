@@ -257,3 +257,106 @@ def test_strict_gate_still_rejects_unprovable_extent() -> None:
         flow.analyze_direct_control_flow(
             parsed, [_spec("clean", clean_rva, clean)], production=False,
         )
+
+
+# --------------------------------------------------------------------------- #
+# lifter.direct_control_flow -- chain-group isolation (strict-gate unblock)
+#
+# A compiler split a switch/dispatch into a primary pdata record (the indexing
+# instruction) plus a contiguous CHAININFO fragment carrying the jump table.
+# The fragment does NOT decode in isolation (no in-extent table reference), so
+# it used to poison the whole-image strict proof and block the DLL. The pass
+# now isolates the whole contiguous chain group (decoded and proven as one
+# extent) instead, while never allowing an isolated function to be selected.
+# --------------------------------------------------------------------------- #
+_DISPATCH_LEN = 28  # cmp+ja+lea+mov+add+jmp = 3+6+7+7+3+2
+
+
+def _split_switch(base: int = 0x2000):
+    """A PIC MSVC switch split at the dispatch/table boundary.
+
+    Returns ``(primary_code, fragment_code, base, end, split)`` where the
+    primary holds the ``cmp/ja/lea/mov[*4+TBL]/jmp`` dispatch and the fragment
+    holds the case bodies plus the trailing dword table. The fragment alone has
+    no in-extent scaled-index reference (that lives in the primary), so it does
+    not decode standalone -- exactly like the real SecurityCore/AutomationCore/
+    RemotePlayCore cold-fragment jump tables.
+    """
+    blob, sbase, send, _tbl, _cases, _default = _build_switch(base=base)
+    split = base + _DISPATCH_LEN
+    return blob[:_DISPATCH_LEN], blob[_DISPATCH_LEN:], base, send, split
+
+
+def _dcf_parsed_chained(functions):
+    """A minimal ParsedPE whose records carry unwind flags + chain primaries.
+
+    ``functions`` items are ``(rva, code, unwind_flags, chain_primary_rva)``.
+    """
+    ordered = sorted(functions, key=lambda item: item[0])
+    start = ordered[0][0]
+    end = max(rva + len(code) for rva, code, _f, _c in ordered)
+    raw = bytearray(b"\xCC" * (end - start))
+    records = []
+    for rva, code, unwind_flags, chain_primary in ordered:
+        raw[rva - start:rva - start + len(code)] = code
+        records.append(SimpleNamespace(
+            begin_rva=rva, end_rva=rva + len(code),
+            unwind_info_rva=0x30000, unwind_flags=unwind_flags,
+            chain_primary_rva=chain_primary,
+        ))
+    return SimpleNamespace(
+        sections=[_section(start, bytes(raw))],
+        runtime_functions=tuple(records),
+    )
+
+
+def test_split_chain_fragment_is_unresolvable_alone_but_group_decodes() -> None:
+    primary, fragment, base, end, split = _split_switch()
+    # The fragment alone cannot be proven (no in-extent table reference).
+    with pytest.raises(jt.JumpTableUnresolved):
+        jt.decode_function_body(fragment, split, end)
+    # The whole contiguous chain group resolves the table from the primary's
+    # in-group dispatch reference (the same trusted machinery).
+    body = jt.decode_function_body(primary + fragment, base, end)
+    assert body.has_data_in_code and body.has_indirect_dispatch
+
+
+def test_strict_gate_isolates_split_chain_group() -> None:
+    primary, fragment, base, end, split = _split_switch(base=0x2000)
+    clean_rva = 0x1000
+    clean = _clean(clean_rva)
+    parsed = _dcf_parsed_chained([
+        (clean_rva, clean, 0, 0),
+        (base, primary, 0, 0),            # primary dispatch record
+        (split, fragment, 0x4, base),     # CHAININFO fragment carrying the table
+    ])
+    # Selecting the clean leaf now SUCCEEDS: the split chain group no longer
+    # poisons the whole-image proof -- it is isolated whole.
+    proof = flow.analyze_direct_control_flow(
+        parsed, [_spec("clean", clean_rva, clean)], production=False,
+    )
+    assert any(f.rva == clean_rva for f in proof.selected_functions)
+    assert len(proof.isolated_runtime_functions) == 1
+    isolated = proof.isolated_runtime_functions[0]
+    assert isolated.begin_rva == base
+    assert isolated.end_rva == end
+    assert isolated.chain_primary_rva == base
+    assert isolated.fragment_count == 2
+
+
+def test_strict_gate_refuses_to_select_an_isolated_fragment() -> None:
+    # The differential-oracle contract: an isolated (un-decodable) function must
+    # be provably EXCLUDED from selection, never silently quarantined. Selecting
+    # the table-bearing fragment therefore hard-fails rather than isolating it.
+    primary, fragment, base, end, split = _split_switch(base=0x2000)
+    clean_rva = 0x1000
+    clean = _clean(clean_rva)
+    parsed = _dcf_parsed_chained([
+        (clean_rva, clean, 0, 0),
+        (base, primary, 0, 0),
+        (split, fragment, 0x4, base),
+    ])
+    with pytest.raises(flow.DirectControlFlowError, match="cannot isolate"):
+        flow.analyze_direct_control_flow(
+            parsed, [_spec("frag", split, fragment)], production=False,
+        )
