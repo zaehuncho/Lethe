@@ -41,6 +41,22 @@ if(BUILD_TESTING)
         target_compile_options(LetheMetadataAADTest PRIVATE /W4 /WX /O2)
     endif()
     add_test(NAME LetheMetadataAADVector COMMAND LetheMetadataAADTest)
+
+    add_executable(LetheForwarderResolutionTest
+        tests/forwarder_resolution_test.c
+        src/pe_loader.c
+    )
+    target_include_directories(LetheForwarderResolutionTest PRIVATE src)
+    target_compile_definitions(LetheForwarderResolutionTest PRIVATE
+        LETHE_FORWARDER_TEST_API LETHE_FORWARDER_TEST_ONLY)
+    target_link_libraries(LetheForwarderResolutionTest PRIVATE kernel32)
+    if(MSVC)
+        target_compile_options(LetheForwarderResolutionTest PRIVATE
+            /W4 /WX /O2 /Gy)
+        target_link_options(LetheForwarderResolutionTest PRIVATE
+            /OPT:REF /INCREMENTAL:NO)
+    endif()
+    add_test(NAME LetheForwarderResolution COMMAND LetheForwarderResolutionTest)
 endif()
 
 # Freestanding: no CRT, no default libs, no DLL entry point.

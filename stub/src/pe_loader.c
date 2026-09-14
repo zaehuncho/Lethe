@@ -55,6 +55,7 @@
 
 /* ---- helpers (no CRT) --------------------------------------------------- */
 
+#if !defined(LETHE_FORWARDER_TEST_ONLY)
 static void pl_zero(void *p, size_t n)
 {
     volatile uint8_t *d = (volatile uint8_t *)p;
@@ -249,6 +250,7 @@ static int wipe_stored(uint8_t *base, const SectionDesc *sd)
     __stosb(p, 0, sd->stored_size);
     return PL_WIPE_RESTORE(p, sd->stored_size, old, &tmp) ? 0 : 1;
 }
+#endif
 
 /* ---- hash-based import resolution --------------------------------------- */
 
@@ -319,31 +321,74 @@ static void *find_module_by_hash(uint32_t target_hash)
     return NULL;
 }
 
-/* Forward declaration: resolve_export and resolve_forwarder are mutually
-   recursive (a named export may forward to another DLL). */
+#if !defined(LETHE_FORWARDER_TEST_ONLY)
+/* Forward declaration: the custom export walk enters resolve_forwarder once;
+   the Windows loader owns any API-set redirection or subsequent forwarding. */
 static FARPROC resolve_export(void *mod_base, uint32_t func_hash,
                                uint16_t ordinal, int by_hash, int depth);
+#endif
 
 /* Resolve a PE export forwarder string ("DLL.FuncName" or "DLL.#ordinal"). */
-static FARPROC resolve_forwarder(const char *fwd, int depth)
+static FARPROC resolve_forwarder(const char *fwd, uint32_t fwd_size, int depth)
 {
     char dll_lower[260];
-    const char *dot;
-    int dll_len, i;
+    const char *dot = NULL;
+    const char *func;
+    uint32_t dll_len = 0;
+    uint32_t func_len;
+    uint32_t scan_limit;
+    uint32_t terminator;
+    uint32_t i;
     uint32_t dll_hash;
+    uint16_t ordinal = 0;
+    int by_ordinal = 0;
     void *mod;
     FARPROC result = NULL;
 
-    if (depth > 5 || !fwd)
+    if (depth > 5 || !fwd || fwd_size < 3u)
         return NULL;
 
-    /* Locate the '.' separator */
-    dot = fwd;
-    while (*dot && *dot != '.') dot++;
-    if (!*dot) return NULL;
+    /* The string lives in the trusted OS module's export directory, but keep a
+       fixed local ceiling so even damaged metadata cannot trigger an unbounded
+       scan. A terminator must occur before both boundaries. */
+    scan_limit = fwd_size < 512u ? fwd_size : 512u;
+    for (terminator = 0; terminator < scan_limit; ++terminator) {
+        if (fwd[terminator] == '\0')
+            break;
+        if (!dot && fwd[terminator] == '.') {
+            dot = fwd + terminator;
+            dll_len = terminator;
+        }
+    }
+    if (terminator == scan_limit || !dot || dll_len == 0u ||
+        dll_len > sizeof(dll_lower) - 5u)
+        return NULL;
 
-    dll_len = (int)(dot - fwd);
-    if (dll_len <= 0 || dll_len >= 250) return NULL;
+    func = dot + 1;
+    func_len = terminator - dll_len - 1u;
+    if (func_len == 0u)
+        return NULL;
+
+    /* Validate the complete target before loading anything. Ordinals use the
+       MAKEINTRESOURCEA range and must be canonical decimal text. */
+    if (func[0] == '#') {
+        uint32_t parsed = 0;
+        if (func_len == 1u)
+            return NULL;
+        for (i = 1u; i < func_len; ++i) {
+            uint32_t digit;
+            if (func[i] < '0' || func[i] > '9')
+                return NULL;
+            digit = (uint32_t)(func[i] - '0');
+            if (parsed > (65535u - digit) / 10u)
+                return NULL;
+            parsed = parsed * 10u + digit;
+        }
+        if (parsed == 0u)
+            return NULL;
+        ordinal = (uint16_t)parsed;
+        by_ordinal = 1;
+    }
 
     /* Lowercase DLL name + append ".dll" for PEB matching */
     for (i = 0; i < dll_len; i++) {
@@ -382,24 +427,24 @@ static FARPROC resolve_forwarder(const char *fwd, int depth)
     __stosb((uint8_t *)dll_lower, 0, sizeof(dll_lower));   /* wipe */
     if (!mod) return NULL;
 
-    /* Parse the function part after the dot */
-    {
-        const char *func = dot + 1;
-        if (*func == '#') {
-            uint16_t ord = 0;
-            func++;
-            while (*func >= '0' && *func <= '9') {
-                ord = (uint16_t)(ord * 10 + (*func - '0'));
-                func++;
-            }
-            result = resolve_export(mod, 0, ord, 0, depth);
-        } else {
-            result = resolve_export(mod, import_hash(func), 0, 1, depth);
-        }
-    }
+    /* fwd is an OS export string, not protected-image import plaintext. Let the
+       Windows loader resolve API-set contracts and chained forwarders instead
+       of recursively re-walking the same custom export path. */
+    if (by_ordinal)
+        result = GetProcAddress((HMODULE)mod, (LPCSTR)(uintptr_t)ordinal);
+    else
+        result = GetProcAddress((HMODULE)mod, func);
     return result;
 }
 
+#if defined(LETHE_FORWARDER_TEST_API)
+FARPROC lethe_test_resolve_forwarder(const char *fwd, uint32_t fwd_size)
+{
+    return resolve_forwarder(fwd, fwd_size, 0);
+}
+#endif
+
+#if !defined(LETHE_FORWARDER_TEST_ONLY)
 /* Walk a module's export directory to resolve a function by name hash or by
    ordinal.  Handles forwarder exports (recursion capped at depth 5). */
 static FARPROC resolve_export(void *mod_base, uint32_t func_hash,
@@ -457,8 +502,13 @@ static FARPROC resolve_export(void *mod_base, uint32_t func_hash,
         return NULL;
 
     /* Forwarder: the function RVA falls inside the export directory itself */
-    if (func_rva >= export_rva && func_rva < export_rva + export_size)
-        return resolve_forwarder((const char *)(base + func_rva), depth + 1);
+    if (func_rva >= export_rva &&
+        (uint64_t)func_rva < (uint64_t)export_rva + export_size) {
+        uint32_t forwarder_bound =
+            (uint32_t)((uint64_t)export_rva + export_size - func_rva);
+        return resolve_forwarder((const char *)(base + func_rva),
+                                 forwarder_bound, depth + 1);
+    }
 
     return (FARPROC)(base + func_rva);
 }
@@ -1876,3 +1926,4 @@ void pe_loader_tls_dll_detach(DWORD reason, void *reserved)
     else if (reason == DLL_PROCESS_DETACH)
         tls_process_detach();
 }
+#endif
