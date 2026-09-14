@@ -23,6 +23,11 @@ except ImportError:  # standalone tools/tests
     import x64_lifter  # type: ignore
 
 try:
+    from . import jump_table
+except ImportError:  # standalone tools/tests
+    import jump_table  # type: ignore
+
+try:
     from daedalus import daedalus_asm
 except ImportError:  # standalone tests
     import daedalus_asm  # type: ignore
@@ -847,30 +852,53 @@ def _coverage_gaps(
     return tuple(gaps)
 
 
+def _linear_prefix(code: bytes, begin: int, end: int) -> tuple[Any, ...]:
+    """Decode instructions from ``begin`` until the first fault or ``end``."""
+    instructions = []
+    cursor = begin
+    for instruction in Decoder(64, code, ip=begin):
+        if instruction.ip != cursor or instruction.code == 0 or instruction.len <= 0:
+            break
+        instructions.append(instruction)
+        cursor += instruction.len
+        if cursor >= end:
+            break
+    return tuple(instructions)
+
+
 def _scan_direct_control(
         sections: Sequence[Any], runtime: Sequence[_RuntimeRange]
-) -> tuple[_DirectEdge, ...]:
-    """Decode the runtime inventory once and record all near direct edges."""
+) -> tuple[tuple[_DirectEdge, ...], tuple[tuple[int, int], ...]]:
+    """Decode the runtime inventory once and record all near direct edges.
+
+    Compiler ``switch`` jump tables sit as data-in-code inside a function's
+    extent. They are recognized and their bytes excised as data so they neither
+    fabricate edges nor fault the sweep. A function whose data-in-code cannot be
+    proven is *isolated* (quarantined): its cleanly decoded prefix still
+    contributes its edges, but the function itself becomes unselectable -- it
+    no longer poisons the whole-image analysis. Returns
+    ``(edges, quarantined_ranges)``.
+    """
     decoded = []
     instruction_starts = set()
+    quarantined: list[tuple[int, int]] = []
     for record in runtime:
         code = _read_executable(
             sections, record.begin, record.end - record.begin, "runtime function"
         )
-        instructions = tuple(Decoder(64, code, ip=record.begin))
-        cursor = record.begin
+        try:
+            body = jump_table.decode_function_body(code, record.begin, record.end)
+            instructions = body.instructions
+        except jump_table.JumpTableUnresolved:
+            # Data-in-code we cannot prove: bail this one function to native.
+            instructions = _linear_prefix(code, record.begin, record.end)
+            quarantined.append((record.begin, record.end))
         for instruction in instructions:
-            if instruction.ip != cursor or instruction.code == 0 or instruction.len <= 0:
-                raise FunctionDiscoveryError(
-                    f"undecodable runtime function at RVA 0x{cursor:X}"
-                )
             instruction_starts.add(instruction.ip)
-            cursor += instruction.len
-        if cursor != record.end:
-            raise FunctionDiscoveryError(
-                f"runtime function 0x{record.begin:X} decode did not consume its extent"
-            )
         decoded.extend(instructions)
+
+    def _in_quarantine(rva: int) -> bool:
+        return any(begin <= rva < end for begin, end in quarantined)
 
     edges = []
     near_kinds = {OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH64}
@@ -896,13 +924,14 @@ def _scan_direct_control(
         owner = next(
             (record for record in runtime if record.begin <= target < record.end), None
         )
-        if owner is not None and target not in instruction_starts:
+        if (owner is not None and target not in instruction_starts
+                and not _in_quarantine(target)):
             raise FunctionDiscoveryError(
                 f"direct {kind} at RVA 0x{instruction.ip:X} targets "
                 f"non-instruction RVA 0x{target:X}"
             )
         edges.append(_DirectEdge(instruction.ip, target, kind))
-    return tuple(edges)
+    return tuple(edges), tuple(quarantined)
 
 
 def _build_extents(
@@ -1030,8 +1059,11 @@ def discover_functions(
     global_gaps = _coverage_gaps(sections, runtime_pairs)
     direct_error = None
     direct_transfers = ()
+    quarantined_ranges: tuple[tuple[int, int], ...] = ()
     try:
-        direct_transfers = _scan_direct_control(sections, runtime)
+        direct_transfers, quarantined_ranges = _scan_direct_control(
+            sections, runtime
+        )
         direct_status = "passed"
     except FunctionDiscoveryError as exc:
         direct_status = "rejected"
@@ -1064,9 +1096,19 @@ def discover_functions(
             )
         control_reason = None
         control_status = "not_run" if extent.size == 0 else "passed"
+        extent_quarantined = any(
+            begin < extent.rva + extent.size and extent.rva < end
+            for begin, end in quarantined_ranges
+        )
         if extent.size and direct_error is not None:
             control_status = "rejected"
             control_reason = "global direct-control analysis rejected: " + direct_error
+        elif extent.size and extent_quarantined:
+            control_status = "rejected"
+            control_reason = (
+                "function contains unresolved data-in-code; bailed to native "
+                "so the rest of the image stays analyzable"
+            )
         elif extent.size:
             for transfer in direct_transfers:
                 if (

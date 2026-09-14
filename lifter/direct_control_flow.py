@@ -15,6 +15,11 @@ from typing import Any, Sequence
 
 from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
+try:
+    from . import jump_table
+except ImportError:  # standalone tools/tests
+    import jump_table  # type: ignore
+
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 PROOF_VERSION = 2
@@ -438,26 +443,25 @@ def _decode_runtime(
     code = _read_executable(
         sections, begin, end - begin, f"runtime function 0x{begin:X}"
     )
-    instructions = tuple(Decoder(64, code, ip=begin))
-    if not instructions:
+    # A compiler ``switch`` places its jump table as data-in-code inside the
+    # function extent. Recognize it and excise the table bytes as data; the
+    # returned instruction stream is real code only (table bytes carry no
+    # instructions and no control edges). This gate stays STRICT: a decode
+    # fault that cannot be proven to be a jump table is rejected, so the
+    # differential-oracle contract is never relaxed.
+    try:
+        body = jump_table.decode_function_body(code, begin, end)
+    except jump_table.JumpTableUnresolved as exc:
+        raise DirectControlFlowError(
+            f"undecodable runtime function at 0x{begin:X}: {exc}"
+        ) from exc
+    except jump_table.JumpTableError as exc:
+        raise DirectControlFlowError(str(exc)) from exc
+    if not body.instructions:
         raise DirectControlFlowError(
             f"runtime function 0x{begin:X} contains no instructions"
         )
-    cursor = begin
-    starts = set()
-    for instruction in instructions:
-        if instruction.ip != cursor or instruction.code == 0 or instruction.len <= 0:
-            raise DirectControlFlowError(
-                f"undecodable runtime function at RVA 0x{cursor:X}"
-            )
-        starts.add(instruction.ip)
-        cursor += instruction.len
-    if cursor != end:
-        raise DirectControlFlowError(
-            f"runtime function 0x{begin:X} decoder consumed 0x{cursor - begin:X} "
-            f"bytes, expected 0x{end - begin:X}"
-        )
-    return _RuntimeDecode(begin, end, instructions, frozenset(starts))
+    return _RuntimeDecode(begin, end, body.instructions, body.instruction_starts)
 
 
 def _selected_owner(
