@@ -124,7 +124,10 @@ def _candidate(tmp_path: Path) -> tuple[Path, Path, dict]:
                   *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS])
     command("roundtrip-fixture-build", "roundtrip-fixture-build.json", bound=True)
     command("exe-dll-roundtrip", "roundtrip.json", bound=True,
-            stdout="11/11 passed -- PASS\n")
+            stdout=(
+                f"{promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT}/"
+                f"{promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT} "
+                "passed -- PASS\n"))
     command("production-corpus-build", "production-corpus-build.json", bound=True)
     command("production-corpus", "production-corpus.json", bound=True)
     command("all-scope-production-gate", "production-gate.json", bound=True,
@@ -153,7 +156,10 @@ def _candidate(tmp_path: Path) -> tuple[Path, Path, dict]:
                         "dvm_native_map_sha256": "5" * 64,
                         "dvm_rolling": True, "dvm_roll_poison": False,
                         "dvm_paged_runtime": True},
-        roundtrip_counts=(11, 11), ctest_count=4,
+        roundtrip_counts=(
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+        ), ctest_count=4,
         evidence_paths=evidence_paths, stage_dir=candidate, gate_payload=gate,
     )
     manifest_path = candidate / "lethe_stub_x64.manifest.json"

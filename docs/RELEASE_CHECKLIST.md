@@ -71,8 +71,9 @@ The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
 frozen fourteen-node native hardening, selected-function, STORE128, and XFG
-replay, complete EXE/DLL round trip, and native production corpus against one immutable stub
-SHA-256 before evaluating the `all` production matrix. The native replay
+replay, the complete nineteen-check EXE/DLL round trip, and native production
+corpus against one immutable stub SHA-256 before evaluating the `all` production
+matrix. The native replay
 inherits the normal process environment, overrides
 `LETHE_RUN_NATIVE_RUNTIME_STRESS=1`, `LETHE_RUN_NATIVE_VM_E2E=1`, and
 `LETHE_NATIVE_RUNTIME_STUB_PATH=<fresh-stub>`, and never serializes the inherited
@@ -255,6 +256,9 @@ with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.
 Release replay repeats that same command against the byte-identical rebuilt stub.
+The separate EXE/DLL round-trip record must contain exactly one terminal
+`19/19 passed -- PASS` summary; reduced, duplicated, nested, or contradictory
+summaries reject both candidate promotion and release replay.
 The candidate promoter, compatibility matrix, and dependency-lock hashes are read
 back from that tracked Git commit rather than trusted from candidate snapshots.
 The rebuilt bytes then rerun CTest, candidate-bound native runtime hardening,
