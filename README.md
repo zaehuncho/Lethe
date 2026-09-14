@@ -145,7 +145,9 @@ manifest cannot waive a stale byte, a new edge, or any failed current proof.
 When both report and manifest files are requested, the tool constructs and
 source-revalidates both before a transactional sibling-file publication. Path
 identity aliases, hardlinks between the three roles, and reparse-based output
-paths reject without changing either prior output.
+paths reject without changing either prior output. A failed multi-output commit
+restores each original filesystem object, retaining its identity and metadata,
+instead of reconstructing it from copied bytes.
 
 ### Server shard mode
 

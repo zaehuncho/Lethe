@@ -131,6 +131,17 @@ def _snapshot_identity(value) -> tuple[object, ...]:
     )
 
 
+def _relocated_snapshot_identity(value) -> tuple[object, ...]:
+    return (
+        value.sha256,
+        value.size,
+        value.device,
+        value.inode,
+        value.link_count,
+        value.mtime_ns,
+    )
+
+
 def _assert_source_current(path: str, expected) -> None:
     current = snapshot_file(path, what="inspected PE")
     if _snapshot_identity(current) != _snapshot_identity(expected):
@@ -145,7 +156,10 @@ class _Publication:
     data: bytes
     previous: object | None = None
     staged: Path | None = None
+    staged_snapshot: object | None = None
     backup: Path | None = None
+    backup_reservation: object | None = None
+    keep_backup: bool = False
 
 
 def _write_exclusive_sibling(target: Path, data: bytes, purpose: str) -> Path:
@@ -183,9 +197,13 @@ def _prepare_publications(
             publications.append(publication)
             publication.staged = _write_exclusive_sibling(
                 target, data, f"{label.replace(' ', '-')}-new")
+            publication.staged_snapshot = snapshot_file(
+                publication.staged, what=f"staged {label}")
             if previous is not None:
                 publication.backup = _write_exclusive_sibling(
-                    target, previous.data, f"{label.replace(' ', '-')}-backup")
+                    target, b"", f"{label.replace(' ', '-')}-backup")
+                publication.backup_reservation = snapshot_file(
+                    publication.backup, what=f"reserved {label} backup")
         return publications
     except BaseException:
         _cleanup_publications(publications)
@@ -203,10 +221,53 @@ def _assert_target_current(publication: _Publication) -> None:
         raise ValueError(f"{publication.label} changed before publication")
 
 
+def _assert_snapshot_current(path: Path | None, expected, label: str) -> None:
+    if path is None or expected is None:
+        raise ValueError(f"{label} is unavailable")
+    current = snapshot_file(path, what=label)
+    if _snapshot_identity(current) != _snapshot_identity(expected):
+        raise ValueError(f"{label} changed before publication")
+
+
+def _matches_snapshot(path: Path, expected) -> bool:
+    try:
+        current = snapshot_file(path, what="publication rollback file")
+    except (OSError, ValueError):
+        return False
+    return _snapshot_identity(current) == _snapshot_identity(expected)
+
+
+def _matches_relocated_snapshot(path: Path, expected) -> bool:
+    try:
+        current = snapshot_file(path, what="relocated publication file")
+    except (OSError, ValueError):
+        return False
+    return _relocated_snapshot_identity(current) == \
+        _relocated_snapshot_identity(expected)
+
+
+def _assert_relocated_snapshot_current(
+        path: Path | None, expected, label: str) -> None:
+    if path is None or expected is None:
+        raise ValueError(f"{label} is unavailable")
+    current = snapshot_file(path, what=label)
+    if (_relocated_snapshot_identity(current)
+            != _relocated_snapshot_identity(expected)):
+        raise ValueError(f"{label} changed before publication")
+
+
+def _assert_target_absent(publication: _Publication) -> None:
+    _validate_output_path(str(publication.target), publication.label)
+    if os.path.lexists(publication.target):
+        raise ValueError(f"{publication.label} appeared before publication")
+
+
 def _cleanup_publications(publications: list[_Publication]) -> None:
     for publication in publications:
         for path in (publication.staged, publication.backup):
             if path is not None:
+                if path == publication.backup and publication.keep_backup:
+                    continue
                 try:
                     path.unlink()
                 except OSError:
@@ -214,25 +275,88 @@ def _cleanup_publications(publications: list[_Publication]) -> None:
 
 
 def _commit_publications(publications: list[_Publication]) -> None:
-    for publication in publications:
-        _assert_target_current(publication)
-    published: list[_Publication] = []
+    touched: list[_Publication] = []
     try:
         for publication in publications:
+            touched.append(publication)
+            _assert_snapshot_current(
+                publication.staged,
+                publication.staged_snapshot,
+                f"staged {publication.label}",
+            )
+            if publication.previous is not None:
+                _assert_snapshot_current(
+                    publication.backup,
+                    publication.backup_reservation,
+                    f"reserved {publication.label} backup",
+                )
+                _assert_target_current(publication)
+                assert publication.backup is not None
+                os.replace(publication.target, publication.backup)
+                _assert_relocated_snapshot_current(
+                    publication.backup,
+                    publication.previous,
+                    f"original {publication.label} backup",
+                )
+                _assert_snapshot_current(
+                    publication.staged,
+                    publication.staged_snapshot,
+                    f"staged {publication.label}",
+                )
+                _assert_target_absent(publication)
+            else:
+                _assert_target_current(publication)
             assert publication.staged is not None
             os.replace(publication.staged, publication.target)
             publication.staged = None
-            published.append(publication)
     except BaseException as publish_error:
         rollback_errors = []
-        for publication in reversed(published):
+        for publication in reversed(touched):
             try:
+                target_exists = os.path.lexists(publication.target)
+                target_is_staged = bool(
+                    target_exists
+                    and publication.staged_snapshot is not None
+                    and _matches_relocated_snapshot(
+                        publication.target, publication.staged_snapshot))
                 if publication.previous is None:
-                    publication.target.unlink()
-                else:
-                    assert publication.backup is not None
+                    if target_is_staged:
+                        publication.target.unlink()
+                    elif target_exists:
+                        raise RuntimeError(
+                            f"{publication.label} changed during rollback")
+                    continue
+
+                assert publication.backup is not None
+                backup_is_original = _matches_relocated_snapshot(
+                    publication.backup, publication.previous)
+                target_is_original = bool(
+                    target_exists
+                    and _matches_relocated_snapshot(
+                        publication.target, publication.previous))
+                if backup_is_original:
+                    if target_exists and not target_is_staged:
+                        publication.keep_backup = True
+                        raise RuntimeError(
+                            f"{publication.label} changed during rollback; "
+                            f"original retained at {publication.backup}")
+                    publication.keep_backup = True
+                    _assert_relocated_snapshot_current(
+                        publication.backup,
+                        publication.previous,
+                        f"original {publication.label} backup",
+                    )
                     os.replace(publication.backup, publication.target)
+                    publication.keep_backup = False
                     publication.backup = None
+                elif not target_is_original:
+                    if (os.path.lexists(publication.backup)
+                            and not _matches_snapshot(
+                                publication.backup,
+                                publication.backup_reservation)):
+                        publication.keep_backup = True
+                    raise RuntimeError(
+                        f"original {publication.label} is unavailable during rollback")
             except BaseException as rollback_error:
                 rollback_errors.append(
                     f"{publication.label}: {rollback_error}")

@@ -39,6 +39,11 @@ def _temporary_publications(path):
     return tuple(path.glob(".lethe-*.tmp"))
 
 
+def _file_identity(path):
+    metadata = path.stat()
+    return metadata.st_dev, metadata.st_ino
+
+
 def test_tool_writes_report_and_safe_starter_manifest(monkeypatch, tmp_path):
     input_path = tmp_path / "input.exe"
     input_path.write_bytes(b"input remains unchanged")
@@ -293,6 +298,10 @@ def test_second_replace_failure_rolls_back_both_outputs(
     if preexisting:
         report_path.write_bytes(b"old report")
         manifest_path.write_bytes(b"old manifest")
+        original_identities = {
+            path: _file_identity(path)
+            for path in (report_path, manifest_path)
+        }
     real_replace = virtualization_report.os.replace
     failed = False
 
@@ -318,7 +327,166 @@ def test_second_replace_failure_rolls_back_both_outputs(
     if preexisting:
         assert report_path.read_bytes() == b"old report"
         assert manifest_path.read_bytes() == b"old manifest"
+        assert {
+            path: _file_identity(path)
+            for path in (report_path, manifest_path)
+        } == original_identities
     else:
         assert not report_path.exists()
         assert not manifest_path.exists()
+    assert not _temporary_publications(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS alternate streams are Windows-only")
+def test_second_replace_failure_preserves_original_alternate_streams(
+        monkeypatch, tmp_path, capsys):
+    _patch_empty_success(monkeypatch)
+    input_path = tmp_path / "input.exe"
+    report_path = tmp_path / "report.json"
+    manifest_path = tmp_path / "selection.json"
+    input_path.write_bytes(b"input")
+    report_path.write_bytes(b"old report")
+    manifest_path.write_bytes(b"old manifest")
+    streams = {
+        report_path: b"report metadata",
+        manifest_path: b"manifest metadata",
+    }
+    try:
+        for path, content in streams.items():
+            with open(str(path) + ":lethe-audit", "wb") as stream:
+                stream.write(content)
+    except OSError as exc:
+        pytest.skip(f"alternate streams unavailable: {exc}")
+    real_replace = virtualization_report.os.replace
+    failed = False
+
+    def fail_manifest_install(source, destination):
+        nonlocal failed
+        if (not failed
+                and os.path.normcase(os.path.abspath(destination))
+                == os.path.normcase(os.path.abspath(manifest_path))):
+            failed = True
+            raise OSError("injected manifest install failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        virtualization_report.os, "replace", fail_manifest_install)
+
+    rc = virtualization_report.main([
+        str(input_path), "--output", str(report_path),
+        "--emit-selection-manifest", str(manifest_path),
+    ])
+
+    assert rc == 1
+    assert "injected manifest install failure" in capsys.readouterr().err
+    assert report_path.read_bytes() == b"old report"
+    assert manifest_path.read_bytes() == b"old manifest"
+    for path, content in streams.items():
+        with open(str(path) + ":lethe-audit", "rb") as stream:
+            assert stream.read() == content
+    assert not _temporary_publications(tmp_path)
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_post_replace_exception_rolls_back_current_and_prior_outputs(
+        preexisting, monkeypatch, tmp_path, capsys):
+    _patch_empty_success(monkeypatch)
+    input_path = tmp_path / "input.exe"
+    report_path = tmp_path / "report.json"
+    manifest_path = tmp_path / "selection.json"
+    input_path.write_bytes(b"input")
+    if preexisting:
+        report_path.write_bytes(b"old report")
+        manifest_path.write_bytes(b"old manifest")
+        original_identities = {
+            path: _file_identity(path)
+            for path in (report_path, manifest_path)
+        }
+    real_replace = virtualization_report.os.replace
+    injected = False
+
+    def replace_then_fail(source, destination):
+        nonlocal injected
+        result = real_replace(source, destination)
+        if (not injected
+                and os.path.normcase(os.path.abspath(destination))
+                == os.path.normcase(os.path.abspath(manifest_path))):
+            injected = True
+            raise OSError("injected post-replace failure")
+        return result
+
+    monkeypatch.setattr(
+        virtualization_report.os, "replace", replace_then_fail)
+
+    rc = virtualization_report.main([
+        str(input_path), "--output", str(report_path),
+        "--emit-selection-manifest", str(manifest_path),
+    ])
+
+    assert rc == 1
+    assert injected
+    assert "injected post-replace failure" in capsys.readouterr().err
+    if preexisting:
+        assert report_path.read_bytes() == b"old report"
+        assert manifest_path.read_bytes() == b"old manifest"
+        assert {
+            path: _file_identity(path)
+            for path in (report_path, manifest_path)
+        } == original_identities
+    else:
+        assert not report_path.exists()
+        assert not manifest_path.exists()
+    assert not _temporary_publications(tmp_path)
+
+
+def test_output_change_before_commit_is_preserved_and_rejected(
+        monkeypatch, tmp_path, capsys):
+    _patch_empty_success(monkeypatch)
+    input_path = tmp_path / "input.exe"
+    report_path = tmp_path / "report.json"
+    manifest_path = tmp_path / "selection.json"
+    input_path.write_bytes(b"input")
+    report_path.write_bytes(b"old report")
+    manifest_path.write_bytes(b"old manifest")
+    real_assert_source = virtualization_report._assert_source_current
+
+    def mutate_after_source_revalidation(path, expected):
+        real_assert_source(path, expected)
+        report_path.write_bytes(b"external report update")
+
+    monkeypatch.setattr(
+        virtualization_report, "_assert_source_current",
+        mutate_after_source_revalidation,
+    )
+
+    rc = virtualization_report.main([
+        str(input_path), "--output", str(report_path),
+        "--emit-selection-manifest", str(manifest_path),
+    ])
+
+    assert rc == 1
+    assert "changed before publication" in capsys.readouterr().err
+    assert report_path.read_bytes() == b"external report update"
+    assert manifest_path.read_bytes() == b"old manifest"
+    assert not _temporary_publications(tmp_path)
+
+
+def test_successful_transaction_removes_original_object_backups(
+        monkeypatch, tmp_path):
+    _patch_empty_success(monkeypatch)
+    input_path = tmp_path / "input.exe"
+    report_path = tmp_path / "report.json"
+    manifest_path = tmp_path / "selection.json"
+    input_path.write_bytes(b"input")
+    report_path.write_bytes(b"old report")
+    manifest_path.write_bytes(b"old manifest")
+
+    rc = virtualization_report.main([
+        str(input_path), "--output", str(report_path),
+        "--emit-selection-manifest", str(manifest_path),
+    ])
+
+    assert rc == 0
+    assert report_path.read_bytes() != b"old report"
+    assert manifest_path.read_bytes() != b"old manifest"
     assert not _temporary_publications(tmp_path)
