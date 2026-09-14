@@ -23,8 +23,10 @@ else + a **differential oracle** that proves every lift correct.
   heuristic, capped, labelled, and never selected for production automatically.
 - `../tools/virtualization_report.py` — CLI renderer for that report; it does
   not invoke the packer or mutate the inspected image. Its optional canonical
-  version-2 selection manifest binds the exact PE and runtime-function evidence;
-  human gap and indirect-closure acknowledgements default to fail-closed.
+  source-bound selection manifest binds the exact PE and runtime-function
+  evidence; version 2 remains equal-extent only, while version 3 additionally
+  binds unequal source/body extents and both hashes. Human gap and
+  indirect-closure acknowledgements default to fail-closed.
 
 ## Fixed model (do NOT change without updating both sides)
 - 16 GPRs → VM locals at offsets `0,8,…,120` (`REG_OFF`, order = `GPR_NAMES`).
@@ -220,11 +222,13 @@ hashing, overlap checks, exception-record removal, stale-source validation, and
 the `E9`/`INT3` patch cover the complete source extent. Export/OEP/TLS/direct
 targets, DIR64 spans, unwind records, GFIDs, XFG hashes, Guard tables, and other
 loader metadata in the suffix reject the transform. Discovery report version 2
-publishes both lengths. The starter selection manifest stays version 1 and emits
-only equal-length entries, so this does not silently widen its existing schema.
-The source-bound selection schema v2 also requires equal extents; integrating
-padding-aware selection remains blocked until a separate schema v3 carries both
-lengths and both source/body hashes while retaining v2 equal-extent verification.
+publishes both lengths. Its legacy starter selection manifest stays version 1
+and equal-extent-only. The source-bound report tool emits schema v2 when every
+selected body equals its source extent and promotes the complete manifest to v3
+when any canonical suffix is trimmed. Schema v3 binds source and body extents,
+full-extent and body SHA-256 values, the exact PDATA record, and a recomputed
+canonical-padding proof. The packer continues to accept schema v2 strictly as
+equal extents.
 An explicit empty DIR64 metadata set is distinct from missing metadata. Rolling
 containers and nonempty VM data regions are rejected for production-selected
 functions; the raw program is never materialized beside its paged envelope.

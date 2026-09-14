@@ -18,7 +18,11 @@ from pathlib import Path
 import pytest
 
 from lifter import direct_control_flow, virtualization_plan, win64_thunk
-from packer import assemble, bytecode_pages, orchestrator, pe_analyze, virtualize
+from packer import (
+    assemble, bytecode_pages, orchestrator, pe_analyze, virtualize,
+    virtualization_selection,
+)
+from tools import virtualization_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,6 +248,111 @@ def _build_stub(work: Path) -> Path:
     return stub
 
 
+def _build_dll_fixture(work: Path) -> tuple[Path, Path]:
+    source = work / "dll_fixture_source"
+    build = work / "dll_fixture_build"
+    source.mkdir()
+    (source / "dllmain.c").write_text(
+        r"""
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
+{
+    (void)instance;
+    (void)reason;
+    (void)reserved;
+    return TRUE;
+}
+""".lstrip(),
+        encoding="ascii",
+    )
+    (source / "leaf.asm").write_text(
+        r"""
+OPTION CASEMAP:NONE
+.data
+ALIGN 8
+PUBLIC vm_dll_anchor
+vm_dll_anchor QWORD OFFSET vm_dll_leaf
+.code
+PUBLIC vm_dll_leaf
+vm_dll_leaf PROC FRAME
+    sub rsp, 8
+    .allocstack 8
+    .endprolog
+    mov eax, 41
+    add eax, 1
+    add rsp, 8
+    ret
+    DB 0CCh, 0CCh
+vm_dll_leaf ENDP
+END
+""".lstrip(),
+        encoding="ascii",
+    )
+    (source / "host.cpp").write_text(
+        r"""
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <cstdio>
+
+using VmLeaf = int (__cdecl *)(void);
+
+int wmain(int argc, wchar_t **argv)
+{
+    if (argc != 2)
+        return 90;
+    HMODULE module = LoadLibraryW(argv[1]);
+    if (!module)
+        return 91;
+    FARPROC address = GetProcAddress(module, "vm_dll_leaf");
+    if (!address) {
+        FreeLibrary(module);
+        return 92;
+    }
+    VmLeaf leaf = reinterpret_cast<VmLeaf>(address);
+    int answer = leaf();
+    std::printf("dll-answer=%d\n", answer);
+    if (!FreeLibrary(module))
+        return 93;
+    return answer == 42 ? 0 : 94;
+}
+""".lstrip(),
+        encoding="ascii",
+    )
+    (source / "CMakeLists.txt").write_text(
+        """
+cmake_minimum_required(VERSION 3.20)
+project(lethe_native_vm_dll_fixture C CXX ASM_MASM)
+add_library(vm_dll_fixture SHARED dllmain.c leaf.asm)
+add_executable(vm_dll_host host.cpp)
+target_compile_options(vm_dll_fixture PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2;/GS-;/guard:cf->)
+target_compile_options(vm_dll_host PRIVATE /W4 /WX /O2)
+target_link_options(vm_dll_fixture PRIVATE
+    /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT /CETCOMPAT:NO /GUARD:NO
+    /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_dll_leaf
+    /EXPORT:vm_dll_anchor,DATA)
+""".lstrip(),
+        encoding="ascii",
+    )
+    _run_checked(
+        [
+            "cmake", "-S", str(source), "-B", str(build),
+            "-G", "Visual Studio 17 2022", "-A", "x64",
+        ],
+        cwd=work,
+    )
+    _run_checked(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        cwd=work,
+    )
+    dll = build / "Release" / "vm_dll_fixture.dll"
+    host = build / "Release" / "vm_dll_host.exe"
+    assert dll.is_file() and host.is_file()
+    return dll, host
+
+
 def _candidate_stub_or_build(work: Path) -> Path:
     configured = os.environ.get(_STUB_PATH_ENV)
     if not configured:
@@ -376,14 +485,35 @@ def test_packed_executable_calls_virtualized_leaf(
             and transfer.target_is_selected_entry
             for transfer in discovery.direct_transfers
         )
-        gap_acknowledgements = tuple(
-            orchestrator.VirtualizationGapAcknowledgement(
-                gap.rva,
-                gap.size,
-                "exact native fixture linker/compiler executable gap",
-            )
-            for gap in discovery.coverage_gaps
-        )
+        selection_path = work / "vm_fixture.selection.json"
+        assert virtualization_report.main([
+            str(source),
+            "--format", "json",
+            "--output", str(work / "vm_fixture.report.json"),
+            "--emit-selection-manifest", str(selection_path),
+        ]) == 0
+        selection_manifest = json.loads(
+            selection_path.read_text(encoding="ascii"))
+        selection_manifest["selections"] = [
+            item for item in selection_manifest["selections"]
+            if item["source_extent"]["rva"] == leaf_rva
+        ]
+        assert len(selection_manifest["selections"]) == 1
+        selection_item = selection_manifest["selections"][0]
+        assert selection_manifest["version"] == 3
+        assert selection_item["source_extent"] == {
+            "rva": leaf_rva, "size": source_extent_size,
+        }
+        assert selection_item["lifted_body_extent"] == {
+            "rva": leaf_rva, "size": lifted_body_size,
+        }
+        selection_item["indirect_target_closure"]["acknowledged"] = True
+        for gap in selection_item["coverage_gaps"]:
+            gap["acknowledged"] = True
+            gap["rationale"] = (
+                "exact native fixture linker/compiler executable gap")
+        selection_path.write_bytes(
+            virtualization_selection.canonical_json(selection_manifest))
 
         stub = _candidate_stub_or_build(work)
         _stub_bytes, _stub_hash, opcode_table, _handler_hash, rolling = (
@@ -415,13 +545,7 @@ def test_packed_executable_calls_virtualized_leaf(
                 is_dll=False,
                 stub_path=str(stub),
                 memory_guard=memory_guard,
-                virtualization_specs=(
-                    orchestrator.VirtualizationSpec(
-                        "vm_leaf", leaf_rva, source_extent_size, lifted_body_size
-                    ),
-                ),
-                virtualization_gap_acknowledgements=gap_acknowledgements,
-                acknowledge_unproven_indirect_targets=True,
+                virtualization_selection_manifest=str(selection_path),
                 _allow_unverified_stub_for_tests=True,
             ),
             progress.append,
@@ -510,5 +634,118 @@ def test_packed_executable_calls_virtualized_leaf(
         assert packed_run.stderr == original_run.stderr
     finally:
         if (work.parent == root and work.name.startswith(".native_vm_e2e_")
+                and work.exists()):
+            shutil.rmtree(work)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
+def test_packed_dll_calls_source_bound_virtualized_padded_leaf(
+    monkeypatch,
+) -> None:
+    if os.environ.get(_RUN_GATE) != "1":
+        pytest.skip(f"set {_RUN_GATE}=1 to run the native virtualization proof")
+    pytest.importorskip("lief")
+    pytest.importorskip("iced_x86")
+    if not shutil.which("cmake") or not _visual_studio_available():
+        pytest.skip("CMake + the Visual Studio x64 toolchain are required")
+
+    root = ROOT.resolve()
+    work = Path(tempfile.mkdtemp(prefix=".native_vm_dll_", dir=root)).resolve()
+    if work.parent != root or not work.name.startswith(".native_vm_dll_"):
+        pytest.fail(f"native test directory escaped repository root: {work}")
+    try:
+        source, host = _build_dll_fixture(work)
+        source_image = assemble._StubImage(source.read_bytes())
+        leaf_rva = source_image.find_export_rva("vm_dll_leaf")
+        assert leaf_rva is not None
+        parsed_source = pe_analyze.analyze_pe(str(source))
+        runtime_record = next(
+            record for record in parsed_source.runtime_functions
+            if record.begin_rva == leaf_rva
+        )
+        source_extent_size = runtime_record.end_rva - runtime_record.begin_rva
+        source_extent = _slice(parsed_source, leaf_rva, source_extent_size)
+        from iced_x86 import Decoder, Mnemonic
+        decoded = []
+        for instruction in Decoder(64, source_extent, ip=leaf_rva):
+            decoded.append(instruction)
+            if instruction.mnemonic == Mnemonic.RET:
+                break
+        lifted_body_size = sum(instruction.len for instruction in decoded)
+        assert source_extent_size == lifted_body_size + 2
+
+        report_path = work / "vm_dll.report.json"
+        selection_path = work / "vm_dll.selection.json"
+        assert virtualization_report.main([
+            str(source),
+            "--format", "json",
+            "--output", str(report_path),
+            "--emit-selection-manifest", str(selection_path),
+        ]) == 0
+        manifest = json.loads(selection_path.read_text(encoding="ascii"))
+        manifest["selections"] = [
+            item for item in manifest["selections"]
+            if item["source_extent"]["rva"] == leaf_rva
+        ]
+        assert len(manifest["selections"]) == 1
+        item = manifest["selections"][0]
+        assert manifest["version"] == 3
+        assert item["source_extent"]["size"] == source_extent_size
+        assert item["lifted_body_extent"]["size"] == lifted_body_size
+        item["indirect_target_closure"]["acknowledged"] = True
+        for gap in item["coverage_gaps"]:
+            gap["acknowledged"] = True
+            gap["rationale"] = "exact native DLL compiler/linker executable gap"
+        selection_path.write_bytes(
+            virtualization_selection.canonical_json(manifest))
+
+        stub = _candidate_stub_or_build(work)
+        captured = {}
+        materialize = virtualize.materialize_selected_functions
+
+        def capture_materialization(*args, **kwargs):
+            result = materialize(*args, **kwargs)
+            captured["result"] = result
+            return result
+
+        monkeypatch.setattr(
+            virtualize, "materialize_selected_functions", capture_materialization)
+        monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+        monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+        packed = work / "vm_dll_fixture.packed.dll"
+        result = orchestrator.pack_file(
+            str(source),
+            orchestrator.PackOptions(
+                output_path=str(packed),
+                is_dll=True,
+                stub_path=str(stub),
+                virtualization_selection_manifest=str(selection_path),
+                _allow_unverified_stub_for_tests=True,
+            ),
+        )
+        assert result.ok, result.error
+
+        function = captured["result"].manifest.functions[0]
+        assert function.target_size == source_extent_size
+        assert function.lifted_body_size == lifted_body_size
+        assert function.original_sha256 == hashlib.sha256(source_extent).hexdigest()
+        assert function.lifted_body_sha256 == hashlib.sha256(
+            source_extent[:lifted_body_size]).hexdigest()
+        entry = _slice(captured["result"].parsed, leaf_rva, source_extent_size)
+        assert entry[0] == 0xE9
+        assert entry[5:] == b"\xCC" * (source_extent_size - 5)
+
+        original_run = subprocess.run(
+            [str(host), str(source)], capture_output=True, check=False, timeout=30)
+        packed_run = subprocess.run(
+            [str(host), str(packed)], capture_output=True, check=False, timeout=30)
+        assert original_run.returncode == 0
+        assert original_run.stdout == b"dll-answer=42\r\n"
+        assert original_run.stderr == b""
+        assert packed_run.returncode == original_run.returncode
+        assert packed_run.stdout == original_run.stdout
+        assert packed_run.stderr == original_run.stderr
+    finally:
+        if (work.parent == root and work.name.startswith(".native_vm_dll_")
                 and work.exists()):
             shutil.rmtree(work)

@@ -124,6 +124,60 @@ def test_tool_writes_report_and_safe_starter_manifest(monkeypatch, tmp_path):
     }
 
 
+def test_tool_emits_v3_for_canonical_padding_split(monkeypatch, tmp_path):
+    input_path = tmp_path / "padded.exe"
+    input_path.write_bytes(b"input remains unchanged")
+    selection_path = tmp_path / "selection.json"
+    body = b"\xB8\x2A\x00\x00\x00\xC3"
+    source = body + b"\xCC\xCC"
+    candidate = function_discovery.FunctionCandidate(
+        name="padded", source="pdata", rva=0x1000, size=len(source),
+        extent_kind="runtime_function", exact_extent=True, heuristic=False,
+        unwind_flags=0, unwind_flag_names=(), liftable=True,
+        rejection_reason=None, first_unsupported_instruction=None,
+        direct_control_proof_status="passed",
+        direct_control_rejection_reason=None,
+        direct_reference_gate_passed=True,
+        executable_coverage_gaps=(), indirect_target_closure_proven=False,
+        lifted_body_size=len(body),
+    )
+    report = function_discovery.FunctionDiscoveryReport(
+        image_path=str(input_path), image_base=0x140000000,
+        size_of_image=0x3000, candidates=(candidate,),
+        executable_coverage_gaps=(), direct_control_analysis_status="passed",
+        direct_control_analysis_error=None,
+    )
+    parsed = SimpleNamespace(
+        path="snapshot.exe", is_dll=False, image_base=0x140000000,
+        size_of_image=0x3000,
+        sections=(SimpleNamespace(
+            rva=0x1000, raw=source, characteristics=0x60000020),),
+        runtime_functions=(SimpleNamespace(
+            begin_rva=0x1000, end_rva=0x1000 + len(source),
+            unwind_info_rva=0x2000, unwind_flags=0),),
+    )
+    monkeypatch.setattr(
+        virtualization_report.pe_analyze, "analyze_pe", lambda _path: parsed)
+    monkeypatch.setattr(
+        virtualization_report, "pe_content_id", lambda _path: "b" * 64)
+    monkeypatch.setattr(
+        virtualization_report.function_discovery, "discover_functions",
+        lambda _parsed, **_kwargs: report)
+
+    rc = virtualization_report.main([
+        str(input_path), "--emit-selection-manifest", str(selection_path),
+    ])
+
+    assert rc == 0
+    manifest = json.loads(selection_path.read_text(encoding="ascii"))
+    item = manifest["selections"][0]
+    assert manifest["version"] == 3
+    assert item["source_extent"]["size"] == len(source)
+    assert item["lifted_body_extent"]["size"] == len(body)
+    assert item["source_extent_sha256"] == hashlib.sha256(source).hexdigest()
+    assert item["lifted_body_sha256"] == hashlib.sha256(body).hexdigest()
+
+
 def test_tool_reports_map_read_failure_cleanly(tmp_path, capsys):
     input_path = tmp_path / "input.exe"
     input_path.write_bytes(b"fixture")

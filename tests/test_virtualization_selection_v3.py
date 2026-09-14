@@ -1,0 +1,173 @@
+"""Version-3 source/body extent bindings and fail-closed compatibility."""
+from __future__ import annotations
+
+import copy
+import hashlib
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from lifter.function_discovery import FunctionCandidate
+from packer import virtualization_selection as selection
+
+
+SOURCE_SHA256 = "a" * 64
+CONTENT_ID = "b" * 64
+BODY = b"\xB8\x2A\x00\x00\x00\xC3"
+SOURCE = BODY + b"\xCC\xCC"
+
+
+def _evidence():
+    candidate = FunctionCandidate(
+        name="PaddedLeaf",
+        source="pdata",
+        rva=0x1000,
+        size=len(SOURCE),
+        extent_kind="runtime_function",
+        exact_extent=True,
+        heuristic=False,
+        unwind_flags=0,
+        unwind_flag_names=(),
+        liftable=True,
+        rejection_reason=None,
+        first_unsupported_instruction=None,
+        direct_control_proof_status="passed",
+        direct_control_rejection_reason=None,
+        direct_reference_gate_passed=True,
+        executable_coverage_gaps=(),
+        indirect_target_closure_proven=False,
+        lifted_body_size=len(BODY),
+    )
+    parsed = SimpleNamespace(
+        is_dll=False,
+        image_base=0x140000000,
+        size_of_image=0x3000,
+        sections=(SimpleNamespace(
+            name=".text",
+            rva=0x1000,
+            raw=SOURCE,
+            characteristics=0x60000020,
+        ),),
+        runtime_functions=(SimpleNamespace(
+            begin_rva=0x1000,
+            end_rva=0x1000 + len(SOURCE),
+            unwind_info_rva=0x2000,
+            unwind_flags=0,
+        ),),
+    )
+    report = SimpleNamespace(candidates=(candidate,))
+    manifest = selection.build_manifest(
+        report,
+        parsed,
+        source_sha256=SOURCE_SHA256,
+        source_pe_content_id=CONTENT_ID,
+    )
+    manifest["selections"][0]["indirect_target_closure"]["acknowledged"] = True
+    return parsed, report, manifest
+
+
+def _verify(parsed, report, manifest):
+    return selection.verify_manifest_bytes(
+        selection.canonical_json(manifest),
+        parsed=parsed,
+        report=report,
+        source_sha256=SOURCE_SHA256,
+        source_pe_content_id=CONTENT_ID,
+    )
+
+
+def test_v3_binds_unequal_source_and_lifted_body_extents():
+    parsed, report, manifest = _evidence()
+    item = manifest["selections"][0]
+
+    assert manifest["version"] == 3
+    assert item["source_extent"] == {"rva": 0x1000, "size": len(SOURCE)}
+    assert item["lifted_body_extent"] == {"rva": 0x1000, "size": len(BODY)}
+    assert item["source_extent_sha256"] == hashlib.sha256(SOURCE).hexdigest()
+    assert item["lifted_body_sha256"] == hashlib.sha256(BODY).hexdigest()
+    assert item["padding_proof"] == {
+        "canonical_body_size": len(BODY),
+        "source_extent_runtime_bound": True,
+        "status": "passed",
+        "suffix_rva": 0x1000 + len(BODY),
+        "suffix_size": len(SOURCE) - len(BODY),
+    }
+    assert _verify(parsed, report, manifest).functions == (
+        selection.SelectedFunction(
+            "PaddedLeaf", 0x1000, len(SOURCE), len(BODY)),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    (
+        (lambda item: item.__setitem__("source_extent_sha256", "c" * 64),
+         "source extent changed"),
+        (lambda item: item.__setitem__("lifted_body_sha256", "c" * 64),
+         "lifted body changed"),
+        (lambda item: item["lifted_body_extent"].__setitem__("size", 5),
+         "currently liftable"),
+        (lambda item: item["padding_proof"].__setitem__("suffix_size", 1),
+         "padding proof"),
+        (lambda item: item["padding_proof"].__setitem__(
+            "source_extent_runtime_bound", False), "padding proof"),
+    ),
+)
+def test_v3_rejects_hash_extent_and_padding_proof_tampering(mutation, match):
+    parsed, report, manifest = _evidence()
+    mutation(manifest["selections"][0])
+    with pytest.raises(selection.VirtualizationSelectionError, match=match):
+        _verify(parsed, report, manifest)
+
+
+def test_v3_rejects_stale_pdata_and_current_body_split():
+    parsed, report, manifest = _evidence()
+    stale_pdata = SimpleNamespace(**{
+        **parsed.__dict__,
+        "runtime_functions": (SimpleNamespace(
+            begin_rva=0x1000,
+            end_rva=0x1000 + len(SOURCE) + 1,
+            unwind_info_rva=0x2000,
+            unwind_flags=0,
+        ),),
+    })
+    with pytest.raises(selection.VirtualizationSelectionError, match="exact runtime"):
+        _verify(stale_pdata, report, manifest)
+
+    stale_report = SimpleNamespace(candidates=(replace(
+        report.candidates[0], lifted_body_size=len(SOURCE)),))
+    with pytest.raises(selection.VirtualizationSelectionError, match="currently liftable"):
+        _verify(parsed, stale_report, manifest)
+
+
+def test_v3_recomputes_canonical_suffix_after_synchronized_hash_changes():
+    parsed, report, manifest = _evidence()
+    noncanonical = BODY + b"\x00\x00"
+    changed = SimpleNamespace(**{
+        **parsed.__dict__,
+        "sections": (SimpleNamespace(
+            **{**parsed.sections[0].__dict__, "raw": noncanonical}),),
+    })
+    item = manifest["selections"][0]
+    item["source_extent_sha256"] = hashlib.sha256(noncanonical).hexdigest()
+    item["lifted_body_sha256"] = hashlib.sha256(BODY).hexdigest()
+
+    with pytest.raises(
+            selection.VirtualizationSelectionError,
+            match="padding proof|canonical padding"):
+        _verify(changed, report, manifest)
+
+
+def test_v2_parser_remains_strictly_equal_extent_only():
+    parsed, report, manifest = _evidence()
+    item = manifest["selections"][0]
+    item.pop("source_extent_sha256")
+    item.pop("lifted_body_sha256")
+    item.pop("padding_proof")
+    item["original_bytes_sha256"] = hashlib.sha256(SOURCE).hexdigest()
+    manifest["version"] = 2
+
+    with pytest.raises(selection.VirtualizationSelectionError, match="version-2"):
+        _verify(parsed, report, manifest)
+

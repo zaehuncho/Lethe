@@ -66,8 +66,13 @@ class VirtualizationSpec:
 
     name: str
     rva: int
-    size: int
+    source_extent_size: int
     lifted_body_size: int | None = None
+
+    @property
+    def size(self) -> int:
+        """Compatibility alias for callers written before extent schema v3."""
+        return self.source_extent_size
 
 
 @dataclass(frozen=True, order=True)
@@ -410,12 +415,20 @@ def _validate_virtualization_specs(
                 or len(spec.name) > 128 or "\0" in spec.name):
             raise ValueError("virtualization function names must be 1..128 characters")
         if (not isinstance(spec.rva, int) or isinstance(spec.rva, bool)
-                or not isinstance(spec.size, int) or isinstance(spec.size, bool)
+                or not isinstance(spec.source_extent_size, int)
+                or isinstance(spec.source_extent_size, bool)
                 or spec.rva < 0 or spec.size < 5
                 or spec.rva + spec.size > 0x1_0000_0000):
             raise ValueError(
                 f"invalid virtualization range for {spec.name!r}: "
                 f"RVA 0x{spec.rva:X}, size {spec.size}")
+        if (spec.lifted_body_size is not None
+                and (not isinstance(spec.lifted_body_size, int)
+                     or isinstance(spec.lifted_body_size, bool)
+                     or not 5 <= spec.lifted_body_size <= spec.size)):
+            raise ValueError(
+                f"invalid lifted body size for {spec.name!r}: "
+                f"{spec.lifted_body_size!r}")
         if spec.name in names or spec.rva in starts:
             raise ValueError(
                 f"duplicate virtualization function {spec.name!r} or entry RVA")
@@ -806,7 +819,12 @@ def pack_file(input_path: str, options: PackOptions,
                 source_snapshot_path=source_snapshot_path,
             )
             virtualization_specs = tuple(
-                VirtualizationSpec(item.name, item.rva, item.size)
+                VirtualizationSpec(
+                    item.name,
+                    item.rva,
+                    item.source_extent_size,
+                    item.lifted_body_size,
+                )
                 for item in verified.functions
             )
             eff = replace(

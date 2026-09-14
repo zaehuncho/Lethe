@@ -18,7 +18,8 @@ from .pe_content_id import pe_content_id, snapshot_file
 
 
 SCHEMA = "lethe.virtualization-selection"
-VERSION = 2
+LEGACY_VERSION = 2
+VERSION = 3
 MAX_MANIFEST_BYTES = 1024 * 1024
 AMD64_MACHINE = 0x8664
 _HEX = frozenset("0123456789abcdef")
@@ -32,7 +33,21 @@ class VirtualizationSelectionError(ValueError):
 class SelectedFunction:
     name: str
     rva: int
-    size: int
+    source_extent_size: int
+    lifted_body_size: int | None = None
+
+    @property
+    def size(self) -> int:
+        """Compatibility alias for version-2 callers."""
+        return self.source_extent_size
+
+    @property
+    def body_size(self) -> int:
+        return (
+            self.source_extent_size
+            if self.lifted_body_size is None
+            else self.lifted_body_size
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -210,7 +225,7 @@ def build_manifest(
     source_sha256 = _digest(source_sha256, "source SHA-256")
     source_pe_content_id = _digest(
         source_pe_content_id, "source PE content identity")
-    selections = []
+    selected = []
     for item in report.candidates:
         if not (
             item.exact_extent
@@ -220,7 +235,21 @@ def build_manifest(
             and item.direct_control_proof_status == "passed"
         ):
             continue
-        original = _extent_bytes(parsed, item.rva, item.size)
+        source_extent_size = item.size
+        lifted_body_size = item.body_size
+        original = _extent_bytes(parsed, item.rva, source_extent_size)
+        selected.append((item, original, source_extent_size, lifted_body_size))
+
+    # Version 2 remains the byte-for-byte equal-extent format.  A report that
+    # contains any canonical padding trim is promoted as a unit to version 3,
+    # avoiding mixed per-entry interpretation.
+    version = (
+        VERSION if any(body_size != source_size for _, _, source_size, body_size
+                       in selected)
+        else LEGACY_VERSION
+    )
+    selections = []
+    for item, original, source_extent_size, lifted_body_size in selected:
         gaps = [{
             "acknowledged": False,
             "rationale": "",
@@ -228,7 +257,7 @@ def build_manifest(
             "section": gap.section_name,
             "size": gap.size,
         } for gap in item.executable_coverage_gaps]
-        selections.append({
+        selection = {
             "coverage_gaps": gaps,
             "direct_reference_verdict": {
                 "gate_passed": item.direct_reference_gate_passed,
@@ -238,13 +267,37 @@ def build_manifest(
                 "acknowledged": False,
                 "proven": item.indirect_target_closure_proven,
             },
-            "lifted_body_extent": {"rva": item.rva, "size": item.size},
+            "lifted_body_extent": {
+                "rva": item.rva,
+                "size": lifted_body_size,
+            },
             "name": item.name,
-            "original_bytes_sha256": hashlib.sha256(original).hexdigest(),
-            "runtime_function": _runtime_identity(parsed, item.rva, item.size),
-            "source_extent": {"rva": item.rva, "size": item.size},
+            "runtime_function": _runtime_identity(
+                parsed, item.rva, source_extent_size),
+            "source_extent": {
+                "rva": item.rva,
+                "size": source_extent_size,
+            },
             "tail_exit_approvals": [],
-        })
+        }
+        if version == LEGACY_VERSION:
+            selection["original_bytes_sha256"] = hashlib.sha256(
+                original).hexdigest()
+        else:
+            suffix_size = source_extent_size - lifted_body_size
+            selection.update({
+                "lifted_body_sha256": hashlib.sha256(
+                    original[:lifted_body_size]).hexdigest(),
+                "padding_proof": {
+                    "canonical_body_size": lifted_body_size,
+                    "source_extent_runtime_bound": True,
+                    "status": "passed" if suffix_size else "not_applicable",
+                    "suffix_rva": item.rva + lifted_body_size,
+                    "suffix_size": suffix_size,
+                },
+                "source_extent_sha256": hashlib.sha256(original).hexdigest(),
+            })
+        selections.append(selection)
     selections.sort(key=lambda item: item["source_extent"]["rva"])
     return {
         "schema": SCHEMA,
@@ -257,7 +310,7 @@ def build_manifest(
             "sha256": source_sha256,
             "size_of_image": parsed.size_of_image,
         },
-        "version": VERSION,
+        "version": version,
     }
 
 
@@ -309,6 +362,38 @@ def _verify_tail(value: Any, function_rva: int, label: str) -> TailExitApproval:
     )
 
 
+def _current_padding_proof(
+    *, rva: int, source_extent_size: int, lifted_body_size: int,
+    source_bytes: bytes,
+) -> dict[str, Any]:
+    """Recompute the canonical padding split; never trust report JSON alone."""
+    if not 5 <= lifted_body_size <= source_extent_size:
+        raise VirtualizationSelectionError(
+            "selected lifted body is outside its source extent")
+    try:
+        from lifter import x64_lifter
+    except ImportError as exc:
+        raise VirtualizationSelectionError(
+            f"cannot load the canonical padding verifier: {exc}") from exc
+    try:
+        current_body_size = x64_lifter.canonical_lifted_body_size(
+            source_bytes, base=rva)
+    except (ValueError, x64_lifter.LiftUnsupported) as exc:
+        raise VirtualizationSelectionError(
+            f"cannot reproduce selected padding proof: {exc}") from exc
+    if current_body_size != lifted_body_size:
+        raise VirtualizationSelectionError(
+            "selected lifted body or canonical padding suffix changed")
+    suffix_size = source_extent_size - lifted_body_size
+    return {
+        "canonical_body_size": lifted_body_size,
+        "source_extent_runtime_bound": True,
+        "status": "passed" if suffix_size else "not_applicable",
+        "suffix_rva": rva + lifted_body_size,
+        "suffix_size": suffix_size,
+    }
+
+
 def verify_manifest_bytes(
     raw: bytes,
     *,
@@ -321,9 +406,10 @@ def verify_manifest_bytes(
         "schema", "selections", "source", "version",
     }, "selection manifest")
     _string(root["schema"], "selection manifest schema", maximum=64)
-    _integer(root["version"], "selection manifest version",
-             minimum=VERSION, maximum=VERSION)
-    if root["schema"] != SCHEMA or root["version"] != VERSION:
+    version = _integer(
+        root["version"], "selection manifest version",
+        minimum=LEGACY_VERSION, maximum=VERSION)
+    if root["schema"] != SCHEMA or version not in (LEGACY_VERSION, VERSION):
         raise VirtualizationSelectionError(
             "selection manifest schema/version is unsupported")
     source = _exact(root["source"], {
@@ -362,12 +448,20 @@ def verify_manifest_bytes(
     previous_rva = -1
     for index, value in enumerate(values):
         label = f"selection[{index}]"
-        item = _exact(value, {
+        common_fields = {
             "coverage_gaps", "direct_reference_verdict",
             "indirect_target_closure", "lifted_body_extent", "name",
-            "original_bytes_sha256", "runtime_function", "source_extent",
-            "tail_exit_approvals",
-        }, label)
+            "runtime_function", "source_extent", "tail_exit_approvals",
+        }
+        version_fields = (
+            {"original_bytes_sha256"}
+            if version == LEGACY_VERSION
+            else {
+                "lifted_body_sha256", "padding_proof",
+                "source_extent_sha256",
+            }
+        )
+        item = _exact(value, common_fields | version_fields, label)
         name = _string(item["name"], f"{label}.name", maximum=128)
         source_extent = _exact(
             item["source_extent"], {"rva", "size"}, f"{label}.source_extent")
@@ -383,16 +477,22 @@ def verify_manifest_bytes(
         body = _exact(
             item["lifted_body_extent"], {"rva", "size"},
             f"{label}.lifted_body_extent")
-        _integer(body["rva"], f"{label}.lifted_body_extent.rva", minimum=1)
-        _integer(body["size"], f"{label}.lifted_body_extent.size", minimum=5)
-        if body != source_extent:
+        body_rva = _integer(
+            body["rva"], f"{label}.lifted_body_extent.rva", minimum=1)
+        body_size = _integer(
+            body["size"], f"{label}.lifted_body_extent.size", minimum=5)
+        if body_rva != rva or body_size > size:
             raise VirtualizationSelectionError(
-                f"{label} lifted body must equal the full source extent")
+                f"{label} lifted body must be a prefix of the source extent")
+        if version == LEGACY_VERSION and body != source_extent:
+            raise VirtualizationSelectionError(
+                f"{label} version-2 lifted body must equal the source extent")
 
         candidate = candidates.get(rva)
         if (candidate is None or not candidate.exact_extent
                 or candidate.extent_kind != "runtime_function"
-                or candidate.size != size or not candidate.liftable
+                or candidate.size != size or candidate.body_size != body_size
+                or not candidate.liftable
                 or candidate.unwind_flags != 0):
             raise VirtualizationSelectionError(
                 f"{label} is not a currently liftable exact non-handler function")
@@ -439,10 +539,55 @@ def verify_manifest_bytes(
         if runtime != _runtime_identity(parsed, rva, size):
             raise VirtualizationSelectionError(
                 f"{label} runtime-function identity changed")
-        actual_hash = hashlib.sha256(_extent_bytes(parsed, rva, size)).hexdigest()
-        if _digest(item["original_bytes_sha256"], f"{label}.original_bytes_sha256") \
-                != actual_hash:
-            raise VirtualizationSelectionError(f"{label} original bytes changed")
+        source_bytes = _extent_bytes(parsed, rva, size)
+        actual_source_hash = hashlib.sha256(source_bytes).hexdigest()
+        if version == LEGACY_VERSION:
+            if _digest(
+                    item["original_bytes_sha256"],
+                    f"{label}.original_bytes_sha256") != actual_source_hash:
+                raise VirtualizationSelectionError(
+                    f"{label} original bytes changed")
+        else:
+            if _digest(
+                    item["source_extent_sha256"],
+                    f"{label}.source_extent_sha256") != actual_source_hash:
+                raise VirtualizationSelectionError(
+                    f"{label} source extent changed")
+            actual_body_hash = hashlib.sha256(
+                source_bytes[:body_size]).hexdigest()
+            if _digest(
+                    item["lifted_body_sha256"],
+                    f"{label}.lifted_body_sha256") != actual_body_hash:
+                raise VirtualizationSelectionError(
+                    f"{label} lifted body changed")
+            padding = _exact(item["padding_proof"], {
+                "canonical_body_size", "source_extent_runtime_bound", "status",
+                "suffix_rva", "suffix_size",
+            }, f"{label}.padding_proof")
+            _integer(
+                padding["canonical_body_size"],
+                f"{label}.padding_proof.canonical_body_size", minimum=5)
+            _boolean(
+                padding["source_extent_runtime_bound"],
+                f"{label}.padding_proof.source_extent_runtime_bound")
+            _string(
+                padding["status"], f"{label}.padding_proof.status",
+                maximum=32)
+            _integer(
+                padding["suffix_rva"],
+                f"{label}.padding_proof.suffix_rva", minimum=1)
+            _integer(
+                padding["suffix_size"],
+                f"{label}.padding_proof.suffix_size")
+            current_padding = _current_padding_proof(
+                rva=rva,
+                source_extent_size=size,
+                lifted_body_size=body_size,
+                source_bytes=source_bytes,
+            )
+            if padding != current_padding:
+                raise VirtualizationSelectionError(
+                    f"{label} padding proof does not match the current audit")
 
         gap_values = _list(item["coverage_gaps"], f"{label}.coverage_gaps")
         if len(gap_values) != len(candidate.executable_coverage_gaps):
@@ -457,7 +602,12 @@ def verify_manifest_bytes(
         for tail_index, tail_value in enumerate(tail_values):
             tails.append(_verify_tail(
                 tail_value, rva, f"{label}.tail_exit_approvals[{tail_index}]"))
-        functions.append(SelectedFunction(name, rva, size))
+        functions.append(SelectedFunction(
+            name,
+            rva,
+            size,
+            body_size if version == VERSION else None,
+        ))
 
     # Candidate gap inventories are commonly identical.  Require any repeated
     # acknowledgement to be byte-for-byte semantically consistent, then dedupe.

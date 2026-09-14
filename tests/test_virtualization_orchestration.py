@@ -254,7 +254,7 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
         captures["source_sha256"] = kwargs["source_sha256"]
         return virtualization_selection.VerifiedSelection(
             functions=(virtualization_selection.SelectedFunction(
-                "Init", 0x1000, 16),),
+                "Init", 0x1000, 16, 12),),
             gaps=(virtualization_selection.GapAcknowledgement(
                 0x2000, 16, "reviewed linker padding"),),
             tail_exits=(virtualization_selection.TailExitApproval(
@@ -301,7 +301,7 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
     assert captures["manifest_report"] is current_report
     assert captures["source_sha256"] == hashlib.sha256(b"source").hexdigest()
     assert captures["proof_specs"] == (
-        virtualization_plan.FunctionSpec("Init", 0x1000, 16),
+        virtualization_plan.FunctionSpec("Init", 0x1000, 16, 12),
     )
     assert captures["proof_gaps"] == (
         direct_control_flow.CoverageGapAcknowledgement(
