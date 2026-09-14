@@ -194,6 +194,11 @@ class ParsedRuntimeFunction:
     end_rva: int
     unwind_info_rva: int
     unwind_flags: int = 0
+    # For a UNW_FLAG_CHAININFO fragment, the begin RVA of the primary (ultimate
+    # non-chained ancestor) it belongs to; 0 for a non-chained record. This lets
+    # a selected function soundly subsume its own cold/continuation fragments
+    # (and reject a fragment claimed by another function's pdata).
+    chain_primary_rva: int = 0
 
 
 @dataclass(frozen=True, order=True)
@@ -937,12 +942,13 @@ def _validate_runtime_function(begin: int, end: int, unwind_rva: int,
             _validate_v3_payload(payload, header, end - begin)
             tail_rva = (unwind_rva + 4 + payload_size + 3) & ~3
 
+        primary_begin = begin
         if flags & _UNW_FLAG_CHAININFO:
             chain = _unwind_bytes(
                 sections, tail_rva, _RUNTIME_FUNCTION_SIZE, image_size,
                 "chained RUNTIME_FUNCTION")
             chain_begin, chain_end, chain_unwind = struct.unpack("<III", chain)
-            _validate_runtime_function(
+            _chain_flags, primary_begin = _validate_runtime_function(
                 chain_begin, chain_end, chain_unwind, image_size,
                 sections, active_unwind)
         elif flags & (_UNW_FLAG_EHANDLER | _UNW_FLAG_UHANDLER):
@@ -953,7 +959,7 @@ def _validate_runtime_function(begin: int, end: int, unwind_rva: int,
                 sections, handler_rva, 1, image_size, "unwind handler target")
     finally:
         active_unwind.remove(unwind_rva)
-    return flags
+    return flags, primary_begin
 
 
 def _parse_pdata(blob: bytes, pdata_rva: int, image_size: int,
@@ -979,14 +985,20 @@ def _parse_pdata(blob: bytes, pdata_rva: int, image_size: int,
             raise ValueError(
                 f"malformed RUNTIME_FUNCTION at RVA 0x{pdata_rva + offset:X}: "
                 "unaligned unwind RVA")
-        unwind_flags = (_validate_runtime_function(
-            begin, end, unwind, image_size, sections, set())
-            if sections is not None else 0)
+        if sections is not None:
+            unwind_flags, primary_begin = _validate_runtime_function(
+                begin, end, unwind, image_size, sections, set())
+        else:
+            unwind_flags, primary_begin = 0, begin
+        chain_primary_rva = (
+            primary_begin if unwind_flags & _UNW_FLAG_CHAININFO else 0
+        )
         runtime_functions.append(ParsedRuntimeFunction(
             begin_rva=begin,
             end_rva=end,
             unwind_info_rva=unwind,
             unwind_flags=unwind_flags,
+            chain_primary_rva=chain_primary_rva,
         ))
         previous_end = end
     return tuple(runtime_functions)

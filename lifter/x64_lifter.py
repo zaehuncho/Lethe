@@ -206,6 +206,41 @@ def _is_rip_import_call(instruction) -> bool:
         return False
 
 
+def _direct_near_call_target(instruction) -> int | None:
+    """Return the target RVA of a direct near ``call rel32``/``rel8``, else None.
+
+    A direct near call encodes its destination as a signed displacement from the
+    following instruction, so the target is a fixed image RVA knowable at lift
+    time (unlike register/memory-indirect calls)."""
+    if instruction.mnemonic != Mnemonic.CALL:
+        return None
+    if instruction.op_count < 1 or instruction.op_kind(0) != OpKind.NEAR_BRANCH64:
+        return None
+    return instruction.near_branch_target
+
+
+def _is_cfg_dispatch_call(instruction, guard_cf_dispatch_rva: int | None) -> bool:
+    """True for ``call qword ptr [rip+disp]`` through GuardCFDispatchFunctionPointer.
+
+    MSVC emits guarded indirect calls as ``mov rax, <target>; call qword ptr
+    [__guard_dispatch_icall_fptr]``: the slot points at a tiny dispatch thunk
+    (``jmp rax`` on this image) that transfers to the target held in RAX after a
+    Control-Flow-Guard bitmap check. Structurally this matches the plain import
+    form, so it MUST be distinguished by the slot RVA before Cut 16 treats it as
+    an import -- otherwise the bridge would call the dispatch thunk with RAX
+    unmarshalled and jump to garbage. The real target is RAX, resolved at
+    runtime; the bridge forwards RAX to the Win64 trampoline (the CFG bitmap
+    check is a hardening step, not part of the callee's result)."""
+    if guard_cf_dispatch_rva is None:
+        return False
+    if not _is_rip_import_call(instruction):
+        return False
+    try:
+        return int(instruction.ip_rel_memory_address) == guard_cf_dispatch_rva
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class RipRelativeReference:
     """One decoded RIP-relative reference expressed entirely in RVAs."""
@@ -261,12 +296,23 @@ def _lbl(addr: int) -> str:
 
 
 class _Lifter:
-    def __init__(self, code: bytes, base: int) -> None:
+    def __init__(
+        self,
+        code: bytes,
+        base: int,
+        *,
+        native_call_targets=frozenset(),
+        guard_cf_dispatch_rva: int | None = None,
+    ) -> None:
         self.code = code
         self.base = base
         self.end = base + len(code)
         self.a = _Asm()
         self._lblctr = 0
+        self.native_call_targets = frozenset(int(t) for t in native_call_targets)
+        self.guard_cf_dispatch_rva = (
+            None if guard_cf_dispatch_rva is None else int(guard_cf_dispatch_rva)
+        )
 
     def _new_label(self) -> str:
         """A unique intra-instruction label (for CL-shift zero-count guards).
@@ -1595,12 +1641,28 @@ class _Lifter:
         and by the trampoline, and any output-parameter memory is written by the
         real callee through the caller-supplied pointers."""
         slot_rva = int(instr.ip_rel_memory_address)
-        # argv is popped in reverse by n_call_ptr, so push argument 0 first
-        # (deepest) and the trampoline func_ptr last (TOS). argc is fixed at the
-        # trampoline's maximum (8): the four register arguments followed by the
-        # first four outgoing stack slots at [RSP+0x20/0x28/0x30/0x38]. A callee
-        # taking fewer arguments ignores the surplus; the reads stay inside the
-        # mapped caller stack frame, so they never fault.
+        self._marshal_win64_argv()
+        # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
+        # RIP-relative so ASLR never bakes a preferred VA into the bytecode.
+        self.rd_local(IMAGE_BASE)
+        self.push_imm(slot_rva)
+        self.a("add")
+        self.a("load64")
+        self.a("n_call_ptr")                      # -> trampoline RAX on TOS
+        self.wr_reg(Register.RAX)                 # commit the scalar return
+
+    def _marshal_win64_argv(self) -> None:
+        """Push the fixed Win64 pass-through argv the ``n_call_ptr`` trampoline
+        consumes: the four register arguments then the first four outgoing stack
+        slots at ``[RSP+0x20/0x28/0x30/0x38]``, followed by a fixed argc of 8.
+
+        argv is popped in reverse by ``n_call_ptr``, so argument 0 is pushed
+        first (deepest) and the ``func_ptr`` is pushed last (TOS) by the caller.
+        A callee taking fewer arguments ignores the surplus; the stack reads stay
+        inside the mapped caller frame, so they never fault. This is the exact
+        marshalling Cut 16 proved against a real Win64 callee -- every external
+        call bridge (import, GuardCF dispatch, direct first-party) reuses it, so
+        only the ``func_ptr`` computation differs between them."""
         self.rd_reg(Register.RCX)
         self.rd_reg(Register.RDX)
         self.rd_reg(Register.R8)
@@ -1611,19 +1673,57 @@ class _Lifter:
             self.a("add")
             self.a("load64")
         self.push_imm(8)                          # argc
-        # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
-        # RIP-relative so ASLR never bakes a preferred VA into the bytecode.
+
+    def _cfg_dispatch_call(self, instr) -> None:
+        """Bridge a Control-Flow-Guard dispatched indirect call (``call qword ptr
+        [__guard_dispatch_icall_fptr]``) through the Win64 trampoline.
+
+        The guarded idiom loads the real target into RAX, then calls the dispatch
+        slot; the slot's thunk validates RAX against the CFG bitmap and transfers
+        to it. Functionally the callee is the value in RAX, so the bridge forwards
+        the current VM RAX as ``func_ptr`` (identical marshalling to Cut 16) and
+        commits the returned RAX. RAX is read as the target BEFORE it is
+        overwritten by the return; the four argument reads do not touch it. The
+        native CFG bitmap check is a hardening step, not part of the callee's
+        result, and is intentionally not reproduced -- the virtualized body's
+        control flow is already interpreter-mediated rather than x86-CFG-guarded.
+        Volatile registers/RFLAGS are ABI-scratch and are not reproduced."""
+        self._marshal_win64_argv()
+        self.rd_reg(Register.RAX)                 # func_ptr = CFG dispatch target
+        self.a("n_call_ptr")
+        self.wr_reg(Register.RAX)                 # commit the scalar return
+
+    def _direct_native_call(self, instr, target_rva: int) -> None:
+        """Bridge a direct near ``call`` to a first-party callee left native.
+
+        The callee lives OUTSIDE every selected extent (it is not scrubbed) at a
+        fixed image RVA, so ``func_ptr = runtime image base + target RVA`` -- a
+        direct-address variant of Cut 16 that skips the slot dereference. The
+        caller's Win64 argument setup is already lifted, so the marshalling is
+        identical; the callee runs natively and its RAX return is committed."""
+        self._marshal_win64_argv()
         self.rd_local(IMAGE_BASE)
-        self.push_imm(slot_rva)
+        self.push_imm(int(target_rva))
         self.a("add")
-        self.a("load64")
-        self.a("n_call_ptr")                      # -> trampoline RAX on TOS
+        self.a("n_call_ptr")
         self.wr_reg(Register.RAX)                 # commit the scalar return
 
     def _call(self, instr) -> None:
         """Emit a direct in-extent x64 CALL plus Daedalus control transfer."""
         if _is_rip_import_call(instr):
-            self._import_call(instr)
+            if _is_cfg_dispatch_call(instr, self.guard_cf_dispatch_rva):
+                self._cfg_dispatch_call(instr)
+            else:
+                self._import_call(instr)
+            return
+        direct_target = _direct_near_call_target(instr)
+        if direct_target is not None and direct_target in self.native_call_targets:
+            if self.base <= direct_target < self.end:
+                raise LiftUnsupported(
+                    f"direct native-bridge target 0x{direct_target:X} lies inside "
+                    "the lifted body"
+                )
+            self._direct_native_call(instr, direct_target)
             return
         target = self._branch_target(instr)
         return_ip = instr.ip + instr.len
@@ -1690,7 +1790,13 @@ class _Lifter:
     # -- top-level -------------------------------------------------------
     def lift(self) -> str:
         instructions = _decode_exact(self.code, self.base)
-        call_analysis = _analyze_internal_calls(instructions, self.base, self.end)
+        call_analysis = _analyze_internal_calls(
+            instructions,
+            self.base,
+            self.end,
+            native_call_targets=self.native_call_targets,
+            guard_cf_dispatch_rva=self.guard_cf_dispatch_rva,
+        )
         internal_returns = frozenset(call_analysis.internal_return_rvas)
         top_level_returns = frozenset(call_analysis.top_level_return_rvas)
         for instr in instructions:
@@ -2107,11 +2213,32 @@ def validate_rip_relative_references(
     return references
 
 
-def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAnalysis:
-    """Prove finite in-extent CALL/RET contexts and classify every RET."""
+def _analyze_internal_calls(
+    instructions,
+    base: int,
+    end: int,
+    *,
+    native_call_targets=frozenset(),
+    guard_cf_dispatch_rva: int | None = None,
+) -> InternalCallAnalysis:
+    """Prove finite in-extent CALL/RET contexts and classify every RET.
+
+    ``native_call_targets`` are proven first-party callee entry RVAs outside the
+    lifted body that a direct near ``call`` may bridge to the native trampoline;
+    a ``call qword ptr [guard_cf_dispatch_rva]`` is the CFG dispatch idiom. Both,
+    like a RIP-relative import call, transfer out and return to the next
+    instruction, so they never enter the in-extent CALL/RET graph."""
     instruction_by_ip = {instruction.ip: instruction for instruction in instructions}
     starts = frozenset(instruction_by_ip)
+    native_call_targets = frozenset(int(t) for t in native_call_targets)
     calls = []
+
+    def is_external_call(instruction) -> bool:
+        # Import (incl. GuardCF dispatch) or a proven direct first-party call.
+        if _is_rip_import_call(instruction):
+            return True
+        target = _direct_near_call_target(instruction)
+        return target is not None and target in native_call_targets
 
     def direct_target(instruction, kind: str) -> int:
         if instruction.op_kind(0) != OpKind.NEAR_BRANCH64:
@@ -2126,11 +2253,12 @@ def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAn
         return target
 
     # Reject unsupported call shapes even when their bytes are unreachable.
-    # A direct RIP-relative import call transfers to an external routine and
-    # returns to the following instruction, so it never enters the in-extent
-    # CALL/RET graph and is not recorded as an internal call.
+    # An external call (RIP-relative import, GuardCF dispatch, or a proven direct
+    # first-party call) transfers to a routine outside the body and returns to
+    # the following instruction, so it never enters the in-extent CALL/RET graph
+    # and is not recorded as an internal call.
     for instruction in instructions:
-        if instruction.mnemonic == Mnemonic.CALL and not _is_rip_import_call(
+        if instruction.mnemonic == Mnemonic.CALL and not is_external_call(
             instruction
         ):
             direct_target(instruction, "call")
@@ -2160,7 +2288,7 @@ def _analyze_internal_calls(instructions, base: int, end: int) -> InternalCallAn
         next_ip = instruction.ip + instruction.len
         mnemonic = instruction.mnemonic
 
-        if mnemonic == Mnemonic.CALL and _is_rip_import_call(instruction):
+        if mnemonic == Mnemonic.CALL and is_external_call(instruction):
             # External call: control returns to the next instruction without
             # touching the in-extent return context.
             pending.append((next_ip, return_stack, call_entries))
@@ -2222,6 +2350,8 @@ def analyze_internal_calls(
     base: int = 0x1000,
     *,
     source_extent_size: int | None = None,
+    native_call_targets=frozenset(),
+    guard_cf_dispatch_rva: int | None = None,
 ) -> InternalCallAnalysis:
     """Return the proven direct internal-call topology or raise LiftUnsupported."""
     validate_lifted_body_extent(
@@ -2230,7 +2360,13 @@ def analyze_internal_calls(
         len(code) if source_extent_size is None else source_extent_size,
     )
     instructions = _decode_exact(code, base)
-    return _analyze_internal_calls(instructions, base, base + len(code))
+    return _analyze_internal_calls(
+        instructions,
+        base,
+        base + len(code),
+        native_call_targets=native_call_targets,
+        guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+    )
 
 
 def lift_function(
@@ -2240,11 +2376,19 @@ def lift_function(
     image_sections=None,
     selected_extents=(),
     source_extent_size: int | None = None,
+    native_call_targets=frozenset(),
+    guard_cf_dispatch_rva: int | None = None,
 ) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
     ``base`` is a source RVA. RIP-relative references require mapped section
     geometry and are emitted as ``runtime IMAGE_BASE + decoded target RVA``.
+
+    ``native_call_targets`` are proven first-party callee entry RVAs (outside
+    every selected extent) that a direct near ``call`` may bridge to the native
+    trampoline; ``guard_cf_dispatch_rva`` names the GuardCFDispatchFunctionPointer
+    slot so its guarded indirect calls are bridged (target in RAX) rather than
+    mis-read as a plain import. Both must lie outside every selected extent.
     """
     validate_lifted_body_extent(
         code,
@@ -2257,4 +2401,39 @@ def lift_function(
         image_sections=image_sections,
         selected_extents=selected_extents,
     )
-    return _Lifter(code, base).lift()
+    native_call_targets = frozenset(int(t) for t in native_call_targets)
+    _validate_native_bridge_targets(
+        native_call_targets, guard_cf_dispatch_rva, selected_extents
+    )
+    return _Lifter(
+        code,
+        base,
+        native_call_targets=native_call_targets,
+        guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+    ).lift()
+
+
+def _validate_native_bridge_targets(
+    native_call_targets, guard_cf_dispatch_rva, selected_extents
+) -> None:
+    """A bridged callee/slot must live outside every selected (scrubbed) extent
+    and be a valid image RVA, or the bridge would call scrubbed bytes."""
+    extents = []
+    for extent in selected_extents:
+        try:
+            extent_rva, extent_size = int(extent[0]), int(extent[1])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise LiftUnsupported("invalid selected-function extent geometry") from exc
+        extents.append((extent_rva, extent_rva + extent_size))
+    probes = list(native_call_targets)
+    if guard_cf_dispatch_rva is not None:
+        probes.append(int(guard_cf_dispatch_rva))
+    for rva in probes:
+        if not (0 < rva < _RVA_LIMIT):
+            raise LiftUnsupported(f"native-bridge target 0x{rva:X} is not a valid RVA")
+        for begin, end in extents:
+            if begin <= rva < end:
+                raise LiftUnsupported(
+                    f"native-bridge target 0x{rva:X} lies inside selected extent "
+                    f"0x{begin:X}..0x{end:X}"
+                )

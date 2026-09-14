@@ -352,6 +352,10 @@ class SourceRuntimeFunction:
     end_rva: int
     unwind_info_rva: int
     unwind_flags: int = 0
+    # For a UNW_FLAG_CHAININFO fragment, the begin RVA of the primary it belongs
+    # to (0 for a non-chained record); used to prove a subsumed fragment is this
+    # function's own cold/continuation block, not another function's.
+    chain_primary_rva: int = 0
 
 
 @dataclass(frozen=True)
@@ -378,6 +382,9 @@ class PlannedRuntimeFunction:
     record_rva: int | None
     source_record_rva: int | None = None
     function_name: str | None = None
+    # Mirror of ParsedRuntimeFunction.chain_primary_rva so a round-trip re-parse
+    # of the emitted pdata matches the planned inventory exactly.
+    chain_primary_rva: int = 0
 
     @property
     def packed(self) -> bytes:
@@ -746,8 +753,10 @@ def _validate_source_exceptions(
             "an empty source exception table must use RVA zero"
         )
 
-    retained = []
-    removed = []
+    # Pass 1: validate every source record's structure and build its planned
+    # form. Spec matching (below) may subsume several contiguous records into
+    # one selected function, so it is done as a second pass.
+    planned_records: list[PlannedRuntimeFunction] = []
     previous: SourceRuntimeFunction | None = None
     for index, record in enumerate(metadata.records):
         if not isinstance(record, SourceRuntimeFunction):
@@ -785,52 +794,120 @@ def _validate_source_exceptions(
                     "source runtime-function ranges overlap"
                 )
         previous = record
-
-        source_record_rva = (
-            metadata.table_rva + index * _RUNTIME_FUNCTION_SIZE
-        )
-        planned = PlannedRuntimeFunction(
+        planned_records.append(PlannedRuntimeFunction(
             origin="source",
             begin_rva=record.begin_rva,
             end_rva=record.end_rva,
             unwind_info_rva=record.unwind_info_rva,
             unwind_flags=record.unwind_flags,
             record_rva=None,
-            source_record_rva=source_record_rva,
-        )
-        selected = None
-        for spec in specs:
-            if record.begin_rva < spec.rva + spec.size and spec.rva < record.end_rva:
-                selected = spec
-                break
-        if selected is None:
-            retained.append(planned)
+            source_record_rva=metadata.table_rva + index * _RUNTIME_FUNCTION_SIZE,
+            chain_primary_rva=record.chain_primary_rva,
+        ))
+
+    # Pass 2: match each selected function to the source record(s) it covers.
+    # A single exactly-matching EH-free record is the ordinary case; a function
+    # the linker split into a primary plus contiguous chained (cold/continuation)
+    # fragments is subsumed as one, but only when every fragment provably chains
+    # to this function's primary and none carries a real EH/UH handler.
+    removed_indices: set[int] = set()
+    removed: list[PlannedRuntimeFunction] = []
+    for spec in specs:
+        covering = [
+            i for i, record in enumerate(metadata.records)
+            if record.begin_rva < spec.rva + spec.size
+            and spec.rva < record.end_rva
+        ]
+        if not covering:
             continue
-        if (
-            record.begin_rva != selected.rva
-            or record.end_rva != selected.rva + selected.size
-        ):
-            raise FunctionRejected(
-                selected,
-                "source runtime-function only partially matches the selected extent",
-            )
-        if record.unwind_flags:
-            raise FunctionRejected(
-                selected,
-                "source runtime-function uses unsupported unwind flags "
-                + _unwind_flag_names(record.unwind_flags),
-            )
-        removed.append(replace(planned, function_name=selected.name))
-    removed_by_range = {
-        (record.begin_rva, record.end_rva): record for record in removed
-    }
+        recs = [metadata.records[i] for i in covering]
+        eh_mask = UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER
+        exact_single = (
+            len(recs) == 1
+            and recs[0].begin_rva == spec.rva
+            and recs[0].end_rva == spec.rva + spec.size
+        )
+        if exact_single:
+            if recs[0].unwind_flags:
+                raise FunctionRejected(
+                    spec,
+                    "source runtime-function uses unsupported unwind flags "
+                    + _unwind_flag_names(recs[0].unwind_flags),
+                )
+        else:
+            # Multi-record subsumption is not offered for padding-aware extents.
+            if spec.body_size < spec.size:
+                raise FunctionRejected(
+                    spec,
+                    "padding-aware source extent must exactly match one "
+                    "runtime-function record",
+                )
+            # The covered records must tile the selected extent exactly and
+            # contiguously (records are already sorted and non-overlapping).
+            if (
+                recs[0].begin_rva != spec.rva
+                or recs[-1].end_rva != spec.rva + spec.size
+                or any(a.end_rva != b.begin_rva for a, b in zip(recs, recs[1:]))
+            ):
+                raise FunctionRejected(
+                    spec,
+                    "source runtime-function only partially matches the "
+                    "selected extent",
+                )
+            for position, record in enumerate(recs):
+                if record.unwind_flags & eh_mask:
+                    raise FunctionRejected(
+                        spec,
+                        "source runtime-function uses unsupported unwind flags "
+                        + _unwind_flag_names(record.unwind_flags),
+                    )
+                if position == 0:
+                    # The primary owns the selected extent's entry; it cannot
+                    # itself be a chained fragment of some earlier function.
+                    if record.unwind_flags & UNW_FLAG_CHAININFO:
+                        raise FunctionRejected(
+                            spec,
+                            "selected extent begins at a chained fragment whose "
+                            f"primary is 0x{record.chain_primary_rva:X}, "
+                            "not the selected extent",
+                        )
+                else:
+                    # Every continuation fragment must provably belong to this
+                    # function's primary (its chain root == the selected entry).
+                    if not (record.unwind_flags & UNW_FLAG_CHAININFO):
+                        raise FunctionRejected(
+                            spec,
+                            "source runtime-function only partially matches the "
+                            "selected extent",
+                        )
+                    if record.chain_primary_rva != spec.rva:
+                        raise FunctionRejected(
+                            spec,
+                            f"chained fragment 0x{record.begin_rva:X} belongs to "
+                            f"function 0x{record.chain_primary_rva:X}, not the "
+                            f"selected function 0x{spec.rva:X}",
+                        )
+        for i in covering:
+            removed_indices.add(i)
+            removed.append(replace(planned_records[i], function_name=spec.name))
+
+    # A padding-aware extent with no covering record at all is still rejected:
+    # it must bind to exactly one source runtime-function record.
+    removed_ranges = {(record.begin_rva, record.end_rva) for record in removed}
     for spec in trimmed:
-        if (spec.rva, spec.rva + spec.size) not in removed_by_range:
+        if (spec.rva, spec.rva + spec.size) not in removed_ranges:
             raise FunctionRejected(
                 spec,
                 "padding-aware source extent must exactly match one "
                 "runtime-function record",
             )
+
+    retained = [
+        planned_records[i]
+        for i in range(len(planned_records))
+        if i not in removed_indices
+    ]
+    removed.sort(key=lambda record: record.begin_rva)
     return tuple(retained), tuple(removed)
 
 
@@ -957,6 +1034,8 @@ def _compile_one(
     opcode_table: OpcodeTable,
     image_sections: Sequence[Any] | None,
     selected_extents: Sequence[tuple[int, int]],
+    native_call_targets=frozenset(),
+    guard_cf_dispatch_rva: int | None = None,
 ) -> _Compiled:
     try:
         original = bytes(reader.read_file_backed_executable(spec.rva, spec.size))
@@ -991,6 +1070,8 @@ def _compile_one(
             lifted_body,
             base=spec.rva,
             source_extent_size=spec.size,
+            native_call_targets=native_call_targets,
+            guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         )
         rip_relative_references = x64_lifter.validate_rip_relative_references(
             lifted_body,
@@ -1004,6 +1085,8 @@ def _compile_one(
             image_sections=image_sections,
             selected_extents=selected_extents,
             source_extent_size=spec.size,
+            native_call_targets=native_call_targets,
+            guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         )
         program = daedalus_asm.assemble(
             assembly, opcodes=opcode_table.assembler_mapping()
@@ -1059,6 +1142,7 @@ def compile_virtualization_manifest(
     runtime_common_rva: int | None = None,
     source_exception_metadata: SourceExceptionMetadata | None = None,
     require_source_exception_metadata: bool = False,
+    guard_cf_dispatch_rva: int | None = None,
     program_sealer: Callable[[FunctionSpec, bytes], tuple[bytes, bytes]] | None = None,
 ) -> VirtualizationManifest:
     """Compile an all-or-nothing selected-function virtualization manifest.
@@ -1137,6 +1221,25 @@ def compile_virtualization_manifest(
 
     image_sections = getattr(reader, "sections", None)
     selected_extents = tuple((spec.rva, spec.size) for spec in ordered)
+
+    # A direct near call may be bridged to a first-party callee left native only
+    # when its target is a proven function entry outside every selected extent.
+    # Source pdata BeginAddresses are exactly such proven entries; the ones not
+    # being virtualized here stay native and are the sound direct-call targets.
+    native_call_targets: frozenset[int] = frozenset()
+    if source_exception_metadata is not None:
+        native_call_targets = frozenset(
+            record.begin_rva
+            for record in source_exception_metadata.records
+            if not any(
+                rva <= record.begin_rva < rva + size
+                for rva, size in selected_extents
+            )
+        )
+    if guard_cf_dispatch_rva is not None:
+        guard_cf_dispatch_rva = int(guard_cf_dispatch_rva)
+        _validate_rva_range(guard_cf_dispatch_rva, 1, "GuardCF dispatch pointer")
+
     compiled = tuple(
         _compile_one(
             spec,
@@ -1146,6 +1249,8 @@ def compile_virtualization_manifest(
             opcode_table=opcode_table,
             image_sections=image_sections,
             selected_extents=selected_extents,
+            native_call_targets=native_call_targets,
+            guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         )
         for spec in ordered
     )

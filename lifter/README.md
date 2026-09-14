@@ -149,6 +149,32 @@ else + a **differential oracle** that proves every lift correct.
   Register-indirect (`call reg`), base/index-indirect (`call [reg]`,
   `call [reg+idx*s+disp]`), far, and segment-overridden calls stay native, and a
   callee taking more than eight arguments is out of the trampoline's envelope.
+- **Cut 17** — the extent/call-graph capabilities a real MSVC verifier needs
+  (proven end-to-end on SecurityCore's `ed25519Verify`, a 5-fragment function).
+  (a) **Multi-range (multi-fragment) extent**: a function the linker split into
+  a primary pdata record plus contiguous `UNW_FLAG_CHAININFO` cold/continuation
+  fragments (the cold return-false epilogue among them) is selected and lifted
+  as one body, with cross-fragment `jcc`s resolved. The planner subsumes the
+  fragment group only when the records tile the selected extent exactly and each
+  fragment's chain root (surfaced by `pe_analyze` as
+  `ParsedRuntimeFunction.chain_primary_rva`) provably equals the primary; any
+  fragment claimed by another function's pdata, or any real EH/UH handler on the
+  group, bails. The whole extent is scrubbed and one merged unwind record is
+  emitted. (b) **Direct near-call bridged to a native first-party callee**: a
+  `call rel32` to a proven function entry (a pdata BeginAddress) outside every
+  selected extent is bridged to `image_base + target_rva` through the Cut 16
+  trampoline (callee left native), a direct-address variant that skips the slot
+  load. Any out-of-extent direct call to a non-proven target still bails.
+  (c) **Control-Flow-Guard dispatched indirect call**: the MSVC
+  `mov rax,<t>; call qword ptr [__guard_dispatch_icall_fptr]` idiom is
+  recognized by the load-config dispatch-pointer RVA and bridged with the target
+  taken from RAX (the native CFG bitmap check — a hardening step, not part of the
+  callee's result — is not reproduced), instead of being mis-read as a plain
+  import that would jump to the dispatch thunk with RAX unmarshalled. All three
+  are differential-checked (Unicorn vs the reference VM) and proven on the real
+  DLL: the lifted `ed25519Verify` returns byte-identical results to native for a
+  valid RFC 8032 signature (true), a tampered signature (false), and a
+  wrong-length key (false, via the out-of-extent cold epilogue).
 
 Still **bails** (left native — correctness over coverage): register-indirect
 (`call reg`) and base/index-indirect (`call [reg…]`), far, and

@@ -400,6 +400,7 @@ def _planner_exceptions(
                 end_rva=item.end_rva,
                 unwind_info_rva=item.unwind_info_rva,
                 unwind_flags=item.unwind_flags,
+                chain_primary_rva=item.chain_primary_rva,
             )
             for item in records
         ),
@@ -547,6 +548,12 @@ def _compile_manifest(
         )
         return envelope, program_id
 
+    guard_cf_dispatch_rva = None
+    if parsed.load_config is not None:
+        dispatch = parsed.load_config.guard_cf_dispatch_function_pointer_rva
+        if dispatch:
+            guard_cf_dispatch_rva = dispatch
+
     common_args = dict(
         rolling=rolling,
         rolling_seed=rolling_seed,
@@ -557,6 +564,7 @@ def _compile_manifest(
         require_source_relocation_metadata=True,
         source_exception_metadata=source_exceptions,
         require_source_exception_metadata=True,
+        guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         program_sealer=seal_program,
     )
     try:
@@ -1141,6 +1149,7 @@ def _commit_manifest(
             end_rva=item.end_rva,
             unwind_info_rva=item.unwind_info_rva,
             unwind_flags=item.unwind_flags,
+            chain_primary_rva=item.chain_primary_rva,
         )
         for item in exception.merged
     )

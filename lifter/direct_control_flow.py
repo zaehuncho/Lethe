@@ -735,6 +735,9 @@ def analyze_direct_control_flow(
     exact_runtime = set(runtime_ranges)
     if any(spec.body_size < spec.size for spec in selected):
         _validate_trimmed_pdata_inventory(parsed, runtime_ranges)
+    # Runtime ranges a multi-fragment selected function wholly subsumes; these
+    # are decoded as part of the selected extent, not standalone.
+    subsumed_ranges: set[tuple[int, int]] = set()
     for spec in selected:
         selected_range = (spec.rva, spec.end_rva)
         if selected_range in exact_runtime:
@@ -744,15 +747,39 @@ def analyze_direct_control_flow(
                 f"padding-aware selected function {spec.name!r} must exactly "
                 "match one runtime-function range"
             )
-        for begin, end in runtime_ranges:
-            if begin < spec.end_rva and spec.rva < end:
-                raise DirectControlFlowError(
-                    f"selected function {spec.name!r} partially overlaps runtime "
-                    f"function 0x{begin:X}..0x{end:X}"
-                )
+        # A function the linker split into a primary plus contiguous cold/
+        # continuation fragments: the selected extent must fully contain a
+        # contiguous tiling of whole runtime-function ranges. Any range that
+        # crosses the extent boundary is a genuine partial overlap and rejected.
+        covering = sorted(
+            (begin, end)
+            for begin, end in runtime_ranges
+            if begin < spec.end_rva and spec.rva < end
+        )
+        if not covering:
+            # A selected leaf with no runtime-function record at all: decoded
+            # standalone below, exactly as before.
+            continue
+        contiguous_tiling = (
+            covering[0][0] == spec.rva
+            and covering[-1][1] == spec.end_rva
+            and all(
+                covering[i][1] == covering[i + 1][0]
+                for i in range(len(covering) - 1)
+            )
+        )
+        if not contiguous_tiling:
+            begin, end = covering[0]
+            raise DirectControlFlowError(
+                f"selected function {spec.name!r} partially overlaps runtime "
+                f"function 0x{begin:X}..0x{end:X}"
+            )
+        subsumed_ranges.update(covering)
 
     runtime_decodes = tuple(
-        _decode_runtime(sections, begin, end) for begin, end in runtime_ranges
+        _decode_runtime(sections, begin, end)
+        for begin, end in runtime_ranges
+        if (begin, end) not in subsumed_ranges
     )
     extra_selected_ranges = tuple(
         (spec.rva, spec.end_rva)
