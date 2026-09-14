@@ -289,6 +289,8 @@ class ParsedPE:
     rsrc_directory_size: int = 0          # exact RESOURCE DataDirectory size
     delay_import_rva: int = 0              # exact delay-import directory RVA
     delay_import_size: int = 0             # exact delay-import directory size
+    export_directory_rva: int = 0           # exact EXPORT DataDirectory RVA
+    export_directory_size: int = 0          # exact EXPORT DataDirectory size
     dir64_relocations: tuple[ParsedDir64Relocation, ...] = ()
     runtime_functions: tuple[ParsedRuntimeFunction, ...] = ()
     load_config: Optional[ParsedLoadConfig] = None
@@ -1751,6 +1753,11 @@ def analyze_pe(path: str) -> ParsedPE:
         ))
     _validate_sections(sections, image_size, section_alignment)
 
+    export_directory_rva, export_directory_size = _data_dir(
+        binary, "EXPORT_TABLE")
+    _validate_directory_range(
+        "export", export_directory_rva, export_directory_size, image_size)
+
     imports = _extract_imports(binary, image_base)
 
     delay_import_rva, delay_import_size = _data_dir(
@@ -1897,6 +1904,8 @@ def analyze_pe(path: str) -> ParsedPE:
             rsrc_directory_size if rsrc_bytes else 0),
         delay_import_rva=delay_import_rva,
         delay_import_size=delay_import_size,
+        export_directory_rva=export_directory_rva,
+        export_directory_size=export_directory_size,
         dir64_relocations=dir64_relocations,
         runtime_functions=runtime_functions,
         load_config=load_config,

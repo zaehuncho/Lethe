@@ -140,6 +140,14 @@ def test_inventory_empty_cases_and_parsed_pe_defaults_are_immutable() -> None:
 def test_real_fixture_inventories_match_preserved_blobs() -> None:
     parsed = pe_analyze.analyze_pe(str(STUB))
 
+    export_directory = pe_analyze._data_dir(
+        pe_analyze.lief.parse(str(STUB)), "EXPORT_TABLE"
+    )
+    assert (
+        parsed.export_directory_rva,
+        parsed.export_directory_size,
+    ) == export_directory
+
     assert tuple(item.target_rva for item in parsed.dir64_relocations) == (
         _manual_dir64_targets(parsed.reloc_blob))
 

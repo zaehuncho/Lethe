@@ -694,6 +694,11 @@ def analyze_direct_control_flow(
         selected_range = (spec.rva, spec.end_rva)
         if selected_range in exact_runtime:
             continue
+        if spec.body_size < spec.size:
+            raise DirectControlFlowError(
+                f"padding-aware selected function {spec.name!r} must exactly "
+                "match one runtime-function range"
+            )
         for begin, end in runtime_ranges:
             if begin < spec.end_rva and spec.rva < end:
                 raise DirectControlFlowError(

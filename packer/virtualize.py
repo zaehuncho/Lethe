@@ -203,6 +203,21 @@ def _validate_padding_suffix_bindings(
     if not trimmed:
         return
 
+    runtime_ranges = tuple(
+        (item.begin_rva, item.end_rva) for item in parsed.runtime_functions
+    )
+    for spec in trimmed:
+        exact_matches = sum(
+            1
+            for begin_rva, end_rva in runtime_ranges
+            if begin_rva == spec.rva and end_rva == spec.rva + spec.size
+        )
+        if exact_matches != 1:
+            raise _fail(
+                f"function {spec.name!r} padding-aware source extent must "
+                "exactly match one runtime-function record"
+            )
+
     bindings: list[tuple[str, int, int]] = []
     bindings.extend(
         ("source DIR64 relocation", item.target_rva, 8)
@@ -232,6 +247,11 @@ def _validate_padding_suffix_bindings(
                 )
             )
     for label, rva, size in (
+        (
+            "source export directory",
+            getattr(parsed, "export_directory_rva", 0),
+            getattr(parsed, "export_directory_size", 0),
+        ),
         ("resource directory", parsed.rsrc_directory_rva, parsed.rsrc_directory_size),
         ("delay-import directory", parsed.delay_import_rva, parsed.delay_import_size),
     ):

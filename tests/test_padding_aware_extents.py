@@ -60,6 +60,12 @@ def _parsed(
         dir64_relocations=tuple(
             SimpleNamespace(target_rva=target) for target in relocations
         ),
+        export_directory_rva=0,
+        export_directory_size=0,
+        rsrc_directory_rva=0,
+        rsrc_directory_size=0,
+        delay_import_rva=0,
+        delay_import_size=0,
         load_config=load_config,
     )
 
@@ -149,6 +155,135 @@ def test_discovery_rejects_export_entry_in_padding_suffix() -> None:
                 ),
             ),
         )
+
+
+def test_padding_requires_one_exact_pdata_owner_at_every_gate() -> None:
+    body = _asm("mov eax, 42; ret")
+    source = body + b"\xCC"
+    spec = virtualization_plan.FunctionSpec(
+        "no_pdata_owner", 0x1000, len(source), len(body)
+    )
+    parsed = _parsed(source)
+    parsed.runtime_functions = ()
+    parsed.pdata_count = 0
+    parsed.pdata_rva = 0
+
+    with pytest.raises(
+        direct_control_flow.DirectControlFlowError,
+        match="must exactly match one runtime-function range",
+    ):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False
+        )
+
+    reader = virtualization_plan.SectionImage.from_parsed_sections(parsed.sections)
+    with pytest.raises(
+        virtualization_plan.FunctionRejected,
+        match="requires complete source exception metadata",
+    ):
+        virtualization_plan.compile_virtualization_manifest(
+            (spec,),
+            reader,
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
+        )
+
+    with pytest.raises(
+        virtualization_plan.FunctionRejected,
+        match="exactly match one runtime-function record",
+    ):
+        virtualization_plan.compile_virtualization_manifest(
+            (spec,),
+            reader,
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
+            source_exception_metadata=virtualization_plan.SourceExceptionMetadata(
+                0, ()
+            ),
+            require_source_exception_metadata=True,
+        )
+
+    mismatched = virtualization_plan.SourceExceptionMetadata(
+        0x3000,
+        (
+            virtualization_plan.SourceRuntimeFunction(
+                0x1100, 0x1100 + len(source), 0x4000, 0
+            ),
+        ),
+    )
+    with pytest.raises(
+        virtualization_plan.FunctionRejected,
+        match="exactly match one runtime-function record",
+    ):
+        virtualization_plan.compile_virtualization_manifest(
+            (spec,),
+            reader,
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
+            source_exception_metadata=mismatched,
+        )
+
+    duplicate = virtualization_plan.SourceRuntimeFunction(
+        0x1000, 0x1000 + len(source), 0x4000, 0
+    )
+    with pytest.raises(
+        virtualization_plan.VirtualizationPlanError,
+        match="ranges overlap",
+    ):
+        virtualization_plan.compile_virtualization_manifest(
+            (spec,),
+            reader,
+            generated_text_rva=0x5000,
+            generated_data_rva=0x7000,
+            source_exception_metadata=virtualization_plan.SourceExceptionMetadata(
+                0x3000, (duplicate, duplicate)
+            ),
+        )
+
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="exactly match one runtime-function record",
+    ):
+        virtualize._validate_padding_suffix_bindings(parsed, (spec,))
+
+    record = SimpleNamespace(
+        begin_rva=0x1000,
+        end_rva=0x1000 + len(source),
+        unwind_info_rva=0x3000,
+        unwind_flags=0,
+    )
+    parsed.runtime_functions = (record, record)
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="exactly match one runtime-function record",
+    ):
+        virtualize._validate_padding_suffix_bindings(parsed, (spec,))
+
+
+def test_exact_export_directory_range_rejects_padding_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _asm("mov eax, 42; ret")
+    source = body + b"\xCC" * 40
+    suffix_rva = 0x1000 + len(body)
+    parsed = _parsed(source)
+    parsed.export_directory_rva = suffix_rva
+    parsed.export_directory_size = 40
+    candidate = function_discovery.discover_functions(
+        parsed, exports=()
+    ).candidates[0]
+    assert candidate.liftable is False
+    assert "export directory" in candidate.rejection_reason
+
+    monkeypatch.setattr(function_discovery, "parse_pe_exports", lambda _parsed: ())
+    spec = virtualization_plan.FunctionSpec(
+        "export_overlap", 0x1000, len(source), len(body)
+    )
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="source export directory",
+    ):
+        virtualize._validate_padding_suffix_bindings(parsed, (spec,))
 
 
 def test_direct_control_flow_rejects_branch_into_padding_suffix() -> None:

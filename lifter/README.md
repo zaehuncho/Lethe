@@ -222,6 +222,9 @@ targets, DIR64 spans, unwind records, GFIDs, XFG hashes, Guard tables, and other
 loader metadata in the suffix reject the transform. Discovery report version 2
 publishes both lengths. The starter selection manifest stays version 1 and emits
 only equal-length entries, so this does not silently widen its existing schema.
+The source-bound selection schema v2 also requires equal extents; integrating
+padding-aware selection remains blocked until a separate schema v3 carries both
+lengths and both source/body hashes while retaining v2 equal-extent verification.
 An explicit empty DIR64 metadata set is distinct from missing metadata. Rolling
 containers and nonempty VM data regions are rejected for production-selected
 functions; the raw program is never materialized beside its paged envelope.

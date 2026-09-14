@@ -714,7 +714,14 @@ def _validate_source_exceptions(
     tuple[PlannedRuntimeFunction, ...],
     tuple[PlannedRuntimeFunction, ...],
 ]:
+    trimmed = tuple(spec for spec in specs if spec.body_size < spec.size)
     if metadata is None:
+        if trimmed:
+            raise FunctionRejected(
+                trimmed[0],
+                "padding-aware virtualization requires complete source "
+                "exception metadata and one exact runtime-function record",
+            )
         if required:
             raise VirtualizationPlanError(
                 "production planning requires complete source exception metadata"
@@ -814,6 +821,16 @@ def _validate_source_exceptions(
                 + _unwind_flag_names(record.unwind_flags),
             )
         removed.append(replace(planned, function_name=selected.name))
+    removed_by_range = {
+        (record.begin_rva, record.end_rva): record for record in removed
+    }
+    for spec in trimmed:
+        if (spec.rva, spec.rva + spec.size) not in removed_by_range:
+            raise FunctionRejected(
+                spec,
+                "padding-aware source extent must exactly match one "
+                "runtime-function record",
+            )
     return tuple(retained), tuple(removed)
 
 

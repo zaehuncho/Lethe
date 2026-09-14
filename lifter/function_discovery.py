@@ -731,6 +731,11 @@ def _padding_metadata_rejection(
     for relocation in tuple(getattr(parsed, "dir64_relocations", ())):
         ranges.append(("DIR64 relocation", relocation.target_rva, 8))
 
+    export_rva = getattr(parsed, "export_directory_rva", 0)
+    export_size = getattr(parsed, "export_directory_size", 0)
+    if export_rva and export_size:
+        ranges.append(("export directory", export_rva, export_size))
+
     for transfer in direct_transfers:
         points.append((f"direct {transfer.kind} target", transfer.target_rva, 1))
 
