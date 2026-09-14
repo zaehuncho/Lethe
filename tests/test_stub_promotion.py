@@ -159,21 +159,21 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
         promote_stub.validate_runtime_hardening_record(skipped, digest)
 
     incomplete_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "4 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "11 passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             incomplete_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     oversized_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "8 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "13 passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             oversized_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     xfailed_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "11 passed, 1 xfailed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "12 passed, 1 xfailed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
@@ -181,7 +181,7 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     nested_summary = promote_stub.CommandRecord(
         **{**passing.__dict__,
-           "stdout": "11 passed in 1.00s\n12 passed in 2.00s\n"}
+           "stdout": "12 passed in 1.00s\n13 passed in 2.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
@@ -195,8 +195,12 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_virtualization_runtime.py",
         "test_xfg_virtualization_preflight.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 11
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 11
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 12
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 12
+    assert (
+        "tests/test_native_virtualization_runtime.py::"
+        "test_packed_dll_calls_source_bound_virtualized_padded_leaf"
+    ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
 
 
 def test_corpus_evidence_is_bound_to_commit_and_artifact(tmp_path: Path) -> None:
@@ -325,7 +329,7 @@ def test_candidate_gate_rejects_unknown_evidence_and_malformed_blockers(
         promote_stub.validate_candidate_gate_payload(payload)
 
 
-def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
+def test_manifest_keeps_schema_2_field_but_derives_actual_count_label(
     tmp_path: Path,
 ) -> None:
     staged_stub = tmp_path / "lethe_stub_x64.dll"
@@ -377,7 +381,7 @@ def test_manifest_keeps_legacy_field_but_records_actual_hashed_evidence(
     assert manifest["production_ready"] is False
     assert manifest["candidate_scope"] == "all"
     assert "production_scope" not in manifest
-    assert manifest["native_roundtrip"] == "passed-9-of-9"
+    assert manifest["native_roundtrip"] == "passed-11-of-11"
     assert manifest["native_roundtrip_actual"] == {"passed": 11, "total": 11}
     assert manifest["dvm_handler_variant_sha256"] == "3" * 64
     assert manifest["dvm_roll_poison"] is False
@@ -488,6 +492,13 @@ def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_statu
     manifest["production_ready"] = True
     promote_stub.atomic_write_json(manifest_path, manifest)
     with pytest.raises(promote_stub.PromotionError, match="candidate-verified"):
+        promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
+
+    manifest["artifact_status"] = "candidate-verified"
+    manifest["production_ready"] = False
+    manifest["native_roundtrip"] = "passed-10-of-11"
+    promote_stub.atomic_write_json(manifest_path, manifest)
+    with pytest.raises(promote_stub.PromotionError, match="full native round-trip"):
         promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
 
 

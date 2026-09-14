@@ -63,6 +63,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_packed_executable_calls_virtualized_leaf[eager]",
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_executable_calls_virtualized_leaf[memguard]",
+    "tests/test_native_virtualization_runtime.py::"
+    "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
     "tests/test_xfg_virtualization_preflight.py::"
     "test_real_xfg_direct_only_plan_preserves_source_gfid_identity",
     "tests/test_xfg_virtualization_preflight.py::"
@@ -750,7 +752,7 @@ def build_manifest(
         "ctest_version": host["ctest_version"],
         "dependency_locks": source["locked_files"],
         **dvm_provenance,
-        "native_roundtrip": "passed-9-of-9",
+        "native_roundtrip": f"passed-{passed}-of-{total}",
         "native_roundtrip_actual": {"passed": passed, "total": total},
         "ctest": {"passed": ctest_count, "total": ctest_count},
         "provenance_status": "clean",
@@ -858,12 +860,13 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         raise PromotionError("candidate manifest release blockers disagree with its gate")
 
     actual = manifest.get("native_roundtrip_actual")
-    if (manifest.get("native_roundtrip") != "passed-9-of-9"
-            or not isinstance(actual, dict)
+    if (not isinstance(actual, dict)
             or type(actual.get("passed")) is not int
             or type(actual.get("total")) is not int
             or actual["total"] < 1
-            or actual["passed"] != actual["total"]):
+            or actual["passed"] != actual["total"]
+            or manifest.get("native_roundtrip") != (
+                f"passed-{actual['passed']}-of-{actual['total']}")):
         raise PromotionError("candidate manifest has no full native round-trip result")
     ctest = manifest.get("ctest")
     if (not isinstance(ctest, dict)

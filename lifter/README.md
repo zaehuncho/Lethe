@@ -24,7 +24,7 @@ else + a **differential oracle** that proves every lift correct.
 - `../tools/virtualization_report.py` — CLI renderer for that report; it does
   not invoke the packer or mutate the inspected image. Its optional canonical
   source-bound selection manifest binds the exact PE and runtime-function
-  evidence; version 2 remains equal-extent only, while version 3 additionally
+  evidence; schema v2 remains equal-extent only, while schema v3 additionally
   binds unequal source/body extents and both hashes. Human gap and
   indirect-closure acknowledgements default to fail-closed.
 
@@ -225,7 +225,7 @@ so the original tail is scrubbed and an interior entry faults. A selected extent
 under five bytes, a target-to-thunk displacement outside signed rel32 reach, or any
 source DIR64 relocation target overlapping a selected extent is a hard bailout.
 
-Virtualization manifest version 3 separates the exact source extent from its
+The virtualization function plan separates the exact source extent from its
 semantic lifted body. `FunctionSpec(name, rva, source_extent_size,
 lifted_body_size)` accepts a shorter body only when the full PDATA range decodes
 and the body ends in plain `RET` followed entirely by exact one-byte `INT3` or
@@ -233,11 +233,13 @@ enumerated architectural NOP encodings. Bytecode covers only that body; source
 hashing, overlap checks, exception-record removal, stale-source validation, and
 the `E9`/`INT3` patch cover the complete source extent. Export/OEP/TLS/direct
 targets, DIR64 spans, unwind records, GFIDs, XFG hashes, Guard tables, and other
-loader metadata in the suffix reject the transform. Discovery report version 2
-publishes both lengths. Its legacy starter selection manifest stays version 1
-and equal-extent-only. The source-bound report tool emits schema v2 when every
-selected body equals its source extent and promotes the complete manifest to v3
-when any canonical suffix is trimmed. Schema v3 binds source and body extents,
+loader metadata in the suffix reject the transform. Discovery JSON report
+schema v2 publishes both lengths. Its `starter_selection_manifest()` output is
+legacy authoring schema v1: it emits only equal-extent `(name, RVA, size)`
+candidates and is not the canonical source-bound packer manifest. The report
+CLI independently emits canonical source-bound selection schema v2 when every
+selected body equals its source extent and emits schema v3 when any canonical
+suffix is trimmed. Schema v3 binds source and body extents,
 full-extent and body SHA-256 values, the exact PDATA record, and a recomputed
 canonical-padding proof. The packer continues to accept schema v2 strictly as
 equal extents.
