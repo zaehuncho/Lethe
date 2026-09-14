@@ -456,6 +456,88 @@ def test_apply_is_atomic_and_rejects_stale_source_or_missing_acknowledgement(
         )
 
 
+def test_apply_rechecks_direct_targets_into_padding_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed, lifted_body = _parsed()
+    source = lifted_body + b"\xCC"
+    caller_rva = 0x1020
+    suffix_rva = 0x1000 + len(lifted_body)
+    displacement = suffix_rva - (caller_rva + 5)
+
+    text = bytearray(parsed.sections[0].raw)
+    text.extend(b"\xCC" * max(0, caller_rva + 5 - 0x1000 - len(text)))
+    text[: len(source)] = source
+    text[caller_rva - 0x1000 : caller_rva - 0x1000 + 5] = (
+        b"\xE9" + struct.pack("<i", displacement)
+    )
+    parsed.sections[0].raw = bytes(text)
+    parsed.sections[0].virtual_size = len(text)
+    selected_record = pe_analyze.ParsedRuntimeFunction(
+        0x1000, 0x1000 + len(source), 0x3000, 0
+    )
+    caller_record = pe_analyze.ParsedRuntimeFunction(
+        caller_rva, caller_rva + 5, 0x3010, 0
+    )
+    parsed.runtime_functions = (selected_record, caller_record)
+    parsed.pdata_count = 2
+    parsed.sections[1].raw = b"".join(
+        struct.pack(
+            "<III", record.begin_rva, record.end_rva, record.unwind_info_rva
+        )
+        for record in parsed.runtime_functions
+    )
+    parsed.sections[1].virtual_size = len(parsed.sections[1].raw)
+
+    spec = plan.FunctionSpec(
+        "padded", 0x1000, len(source), len(lifted_body)
+    )
+    generated_text_rva, generated_data_rva = virtualize._next_generated_rvas(
+        parsed, 1
+    )
+    source_exceptions = plan.SourceExceptionMetadata(
+        parsed.pdata_rva,
+        tuple(
+            plan.SourceRuntimeFunction(
+                record.begin_rva,
+                record.end_rva,
+                record.unwind_info_rva,
+                record.unwind_flags,
+            )
+            for record in parsed.runtime_functions
+        ),
+    )
+    manifest = plan.compile_virtualization_manifest(
+        (spec,),
+        plan.SectionImage.from_parsed_sections(parsed.sections),
+        generated_text_rva=generated_text_rva,
+        generated_data_rva=generated_data_rva,
+        runtime_common_rva=generated_text_rva,
+        source_dir64_relocations=tuple(
+            plan.SourceDir64Relocation(record.target_rva)
+            for record in parsed.dir64_relocations
+        ),
+        require_source_relocation_metadata=True,
+        source_exception_metadata=source_exceptions,
+        require_source_exception_metadata=True,
+    )
+    monkeypatch.setattr(
+        "lifter.function_discovery.parse_pe_exports", lambda _parsed: ()
+    )
+    before = copy.deepcopy(parsed)
+
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="decoded direct-control target",
+    ):
+        virtualize.apply_virtualization_manifest(
+            parsed,
+            manifest,
+            acknowledge_no_interior_entries=True,
+        )
+    assert parsed == before
+
+
 def test_materializer_rejects_unsupported_selected_exception_record(fresh_stub) -> None:
     _rolling, _stub_path, stub_bytes, table, handler_hash = fresh_stub
     parsed, selected = _parsed(selected_unwind_flags=plan.UNW_FLAG_EHANDLER)

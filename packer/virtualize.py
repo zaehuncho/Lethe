@@ -1042,6 +1042,18 @@ def _commit_manifest(
         raise _fail(
             f"unsupported virtualization manifest version {manifest.version}"
         )
+    _validate_padding_suffix_bindings(
+        parsed,
+        tuple(
+            plan.FunctionSpec(
+                function.name,
+                function.target_rva,
+                function.target_size,
+                function.lifted_body_size,
+            )
+            for function in manifest.functions
+        ),
+    )
     _validate_direct_only_references(parsed, manifest)
     cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed, manifest)
     if not cfg_plan.preservation_supported:

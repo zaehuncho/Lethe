@@ -362,6 +362,45 @@ def _normalize_runtime_functions(parsed: Any) -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
+def _validate_trimmed_pdata_inventory(
+    parsed: Any,
+    runtime_ranges: Sequence[tuple[int, int]],
+) -> None:
+    """Bind padding-aware selections to a nonempty PDATA directory inventory."""
+    try:
+        pdata_rva = parsed.pdata_rva
+        pdata_count = parsed.pdata_count
+    except AttributeError as exc:
+        raise DirectControlFlowError(
+            "padding-aware selection requires PDATA directory metadata"
+        ) from exc
+    if type(pdata_count) is not int or pdata_count <= 0:
+        raise DirectControlFlowError(
+            "padding-aware selection requires a nonempty PDATA directory"
+        )
+    if pdata_count != len(runtime_ranges):
+        raise DirectControlFlowError(
+            "PDATA count does not match the runtime-function inventory"
+        )
+    pdata_size = pdata_count * 12
+    if (
+        type(pdata_rva) is not int
+        or pdata_rva <= 0
+        or pdata_rva & 3
+        or pdata_rva + pdata_size > _RVA_LIMIT
+    ):
+        raise DirectControlFlowError("PDATA directory geometry is invalid")
+    size_of_image = getattr(parsed, "size_of_image", None)
+    if size_of_image is not None and (
+        type(size_of_image) is not int
+        or size_of_image <= 0
+        or pdata_rva + pdata_size > size_of_image
+    ):
+        raise DirectControlFlowError(
+            "PDATA directory exceeds the declared image geometry"
+        )
+
+
 def _read_executable(
     sections: Sequence[_Section], rva: int, size: int, label: str
 ) -> bytes:
@@ -690,6 +729,8 @@ def analyze_direct_control_flow(
     runtime_ranges = _normalize_runtime_functions(parsed)
 
     exact_runtime = set(runtime_ranges)
+    if any(spec.body_size < spec.size for spec in selected):
+        _validate_trimmed_pdata_inventory(parsed, runtime_ranges)
     for spec in selected:
         selected_range = (spec.rva, spec.end_rva)
         if selected_range in exact_runtime:

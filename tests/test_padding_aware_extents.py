@@ -170,7 +170,7 @@ def test_padding_requires_one_exact_pdata_owner_at_every_gate() -> None:
 
     with pytest.raises(
         direct_control_flow.DirectControlFlowError,
-        match="must exactly match one runtime-function range",
+        match="requires a nonempty PDATA directory",
     ):
         direct_control_flow.analyze_direct_control_flow(
             parsed, (spec,), production=False
@@ -246,13 +246,81 @@ def test_padding_requires_one_exact_pdata_owner_at_every_gate() -> None:
     ):
         virtualize._validate_padding_suffix_bindings(parsed, (spec,))
 
-    record = SimpleNamespace(
-        begin_rva=0x1000,
-        end_rva=0x1000 + len(source),
-        unwind_info_rva=0x3000,
-        unwind_flags=0,
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("absent", "requires PDATA directory metadata"),
+        ("empty", "requires a nonempty PDATA directory"),
+        ("count_mismatch", "PDATA count does not match"),
+        ("zero_rva", "PDATA directory geometry is invalid"),
+        ("misaligned_rva", "PDATA directory geometry is invalid"),
+    ),
+)
+def test_direct_control_flow_binds_trimmed_specs_to_pdata_directory(
+    mutation: str,
+    reason: str,
+) -> None:
+    body = _asm("mov eax, 42; ret")
+    source = body + b"\xCC"
+    parsed = _parsed(source)
+    spec = virtualization_plan.FunctionSpec(
+        "pdata_bound", 0x1000, len(source), len(body)
     )
+
+    if mutation == "absent":
+        del parsed.pdata_count
+        del parsed.pdata_rva
+    elif mutation == "empty":
+        parsed.pdata_count = 0
+        parsed.pdata_rva = 0
+    elif mutation == "count_mismatch":
+        parsed.pdata_count = 2
+    elif mutation == "zero_rva":
+        parsed.pdata_rva = 0
+    elif mutation == "misaligned_rva":
+        parsed.pdata_rva += 1
+    else:  # pragma: no cover - parametrization is closed above
+        raise AssertionError(mutation)
+
+    with pytest.raises(direct_control_flow.DirectControlFlowError, match=reason):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False
+        )
+
+
+def test_direct_control_flow_rejects_duplicate_trimmed_pdata_records() -> None:
+    body = _asm("mov eax, 42; ret")
+    source = body + b"\xCC"
+    parsed = _parsed(source)
+    record = parsed.runtime_functions[0]
     parsed.runtime_functions = (record, record)
+    parsed.pdata_count = 2
+    spec = virtualization_plan.FunctionSpec(
+        "duplicate_pdata", 0x1000, len(source), len(body)
+    )
+
+    with pytest.raises(
+        direct_control_flow.DirectControlFlowError,
+        match="runtime-function ranges overlap",
+    ):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False
+        )
+
+
+
+def test_materializer_rejects_duplicate_trimmed_pdata_records() -> None:
+    body = _asm("mov eax, 42; ret")
+    source = body + b"\xCC"
+    parsed = _parsed(source)
+    record = parsed.runtime_functions[0]
+    parsed.runtime_functions = (record, record)
+    parsed.pdata_count = 2
+    spec = virtualization_plan.FunctionSpec(
+        "duplicate_pdata", 0x1000, len(source), len(body)
+    )
+
     with pytest.raises(
         virtualize.VirtualizationMaterializationError,
         match="exactly match one runtime-function record",
