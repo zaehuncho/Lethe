@@ -89,8 +89,10 @@ else + a **differential oracle** that proves every lift correct.
   fuzz cases compare the full XMM/GPR/flags state against Unicorn. Native-frame
   and entry-thunk tests exercise plain and rolling bytecode drawn from this
   bounded subset; the real XFG DLL pack exercises XMM-shaped Win64 ABI values
-  in eager mode. The memory-guard selected-function proof remains scalar. XMM
-  memory operands and VEX/EVEX encodings remain fail-closed.
+  in eager mode. Cut 15 extends the eager and memory-guard selected-function
+  proof with scalar and unaligned 128-bit XMM memory transfers. Aligned XMM
+  memory operands, XMM arithmetic memory sources, and VEX/EVEX encodings remain
+  fail-closed.
 - **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
   source at its 32-bit RVA; the lift computes each effective address as runtime
   image base local `504` plus the decoded target RVA, so ASLR never bakes a
