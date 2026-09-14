@@ -618,12 +618,18 @@ def _lift_status(
     sections: Sequence[Any],
     *,
     padding_rejection: str | None = None,
+    native_call_targets: frozenset[int] = frozenset(),
 ) -> tuple[
     bool,
     str | None,
     UnsupportedInstruction | None,
     tuple[x64_lifter.RipRelativeReference, ...],
 ]:
+    # ``native_call_targets`` are proven first-party pdata BeginAddress RVAs that
+    # lie OUTSIDE this candidate's own extent. A direct near ``call`` to such a
+    # target is a direct-call-to-native the lifter bridges to the untouched
+    # callee (Cut 17); a ``call`` INTO this extent stays a Cut 9 internal call,
+    # and a ``call`` to anything not a proven pdata entry still fails closed.
     if extent.unresolved_reason:
         return False, extent.unresolved_reason, None, ()
     if padding_rejection is not None:
@@ -661,6 +667,7 @@ def _lift_status(
             image_sections=sections,
             selected_extents=((extent.rva, extent.size),),
             source_extent_size=extent.size,
+            native_call_targets=native_call_targets,
         )
         daedalus_asm.assemble(assembly)
     except (x64_lifter.LiftUnsupported, SyntaxError, ValueError) as exc:
@@ -1056,6 +1063,12 @@ def discover_functions(
     )
 
     runtime_pairs = tuple((item.begin, item.end) for item in runtime)
+    # Proven first-party function entries. A direct near ``call`` to any of these
+    # that lies outside a candidate's own extent is a direct-call-to-native the
+    # lifter bridges to the untouched callee, so the caller becomes liftable
+    # instead of bailing on an out-of-extent call. pdata ranges never overlap, so
+    # the only begin inside a candidate is the candidate's own entry.
+    pdata_begins = frozenset(item.begin for item in runtime)
     global_gaps = _coverage_gaps(sections, runtime_pairs)
     direct_error = None
     direct_transfers = ()
@@ -1074,8 +1087,18 @@ def discover_functions(
         padding_rejection = _padding_metadata_rejection(
             parsed, extent, export_records, runtime, direct_transfers
         )
+        # Assess this candidate as a lone selection: every proven first-party
+        # entry outside its own extent may be bridged as a native call.
+        native_call_targets = frozenset(
+            begin
+            for begin in pdata_begins
+            if not (extent.rva <= begin < extent.rva + extent.size)
+        )
         liftable, rejection, first, rip_references = _lift_status(
-            extent, sections, padding_rejection=padding_rejection
+            extent,
+            sections,
+            padding_rejection=padding_rejection,
+            native_call_targets=native_call_targets,
         )
         internal_call_count = 0
         max_internal_call_depth = 0
@@ -1086,6 +1109,7 @@ def discover_functions(
                 code,
                 base=extent.rva,
                 source_extent_size=extent.size,
+                native_call_targets=native_call_targets,
             )
             internal_call_count = len(call_analysis.internal_call_rvas)
             max_internal_call_depth = call_analysis.max_call_depth
