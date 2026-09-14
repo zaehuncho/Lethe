@@ -297,6 +297,9 @@ class ParsedPE:
     requires_paged_vm: bool = False
     generated_cfg_targets: tuple[ParsedGuardTarget, ...] = ()
     section_alignment: int = _OUTPUT_SECTION_ALIGNMENT
+    # Supported IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS bits to re-declare on the
+    # packed output (e.g. CET Shadow Stack). 0 when the source declared none.
+    extended_dll_characteristics: int = 0
 
     @property
     def has_tls(self) -> bool:
@@ -310,6 +313,18 @@ class ParsedPE:
 _IMAGE_DEBUG_DIRECTORY = struct.Struct("<IIHHIIII")
 _IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS = 20
 
+# Extended DLL characteristics payload bits (the DWORD an
+# IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS entry points at).
+IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT = 0x0001          # hardware shadow stack
+IMAGE_DLLCHARACTERISTICS_EX_FORWARD_CFI_COMPAT = 0x0040  # forward-edge CFI / IBT
+# Bits Lethe can faithfully carry onto the packed output. CET Shadow Stack is a
+# return-edge protection: the freestanding stub keeps strict CALL/RET pairing
+# and is linked /CETCOMPAT, so the resident stub code is shadow-stack-safe and
+# the declaration is honest. Forward-edge CFI (IBT) needs endbr64 landing pads
+# the stub does not emit, so it stays unsupported and must fail closed rather
+# than be silently stripped from a source binary.
+SUPPORTED_EXTENDED_DLL_CHARACTERISTICS = IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT
+
 
 def _parse_extended_dll_characteristics(
     debug_blob: bytes,
@@ -319,9 +334,11 @@ def _parse_extended_dll_characteristics(
 ) -> int:
     """Inventory loader-visible extended DLL characteristics.
 
-    Lethe does not yet emit an outer debug directory. Any nonzero extended
-    characteristic must therefore reject before mutation instead of silently
-    stripping CET Shadow Stack or future mitigation declarations.
+    Returns the OR of every IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS bit declared
+    by the source module. The caller preserves the bits Lethe can honour
+    (``SUPPORTED_EXTENDED_DLL_CHARACTERISTICS``) by re-emitting an outer debug
+    directory, and fails closed on any unsupported bit rather than silently
+    stripping a mitigation.
     """
     if not debug_blob:
         return 0
@@ -1821,19 +1838,22 @@ def analyze_pe(path: str) -> ParsedPE:
         sections, debug_rva, debug_size, what="debug directory")
     extended_dll_characteristics = _parse_extended_dll_characteristics(
         debug_blob, image_size=image_size, sections=sections)
-    if extended_dll_characteristics:
+    unsupported = (
+        extended_dll_characteristics & ~SUPPORTED_EXTENDED_DLL_CHARACTERISTICS)
+    if unsupported:
         labels = []
-        if extended_dll_characteristics & 0x0001:
-            labels.append("CET Shadow Stack")
-        if extended_dll_characteristics & 0x0040:
+        if unsupported & IMAGE_DLLCHARACTERISTICS_EX_FORWARD_CFI_COMPAT:
             labels.append("forward-edge CFI")
-        known = 0x0001 | 0x0040
-        if extended_dll_characteristics & ~known:
-            labels.append(
-                f"unknown bits 0x{extended_dll_characteristics & ~known:X}")
+        residual = unsupported & ~IMAGE_DLLCHARACTERISTICS_EX_FORWARD_CFI_COMPAT
+        if residual:
+            labels.append(f"unknown bits 0x{residual:X}")
         raise ValueError(
             "unsupported extended DLL characteristics would be stripped: "
             + ", ".join(labels))
+    # Bits we can carry onto the packed output (re-emitted as an outer debug
+    # directory in assemble._serialize). Currently CET Shadow Stack.
+    preserved_extended_dll_characteristics = (
+        extended_dll_characteristics & SUPPORTED_EXTENDED_DLL_CHARACTERISTICS)
 
     tls_rva, tls_size = _data_dir(binary, "TLS_TABLE")
     _validate_directory_range("TLS", tls_rva, tls_size, image_size)
@@ -1910,4 +1930,5 @@ def analyze_pe(path: str) -> ParsedPE:
         runtime_functions=runtime_functions,
         load_config=load_config,
         section_alignment=section_alignment,
+        extended_dll_characteristics=preserved_extended_dll_characteristics,
     )

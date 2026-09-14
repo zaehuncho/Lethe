@@ -75,6 +75,16 @@ if(BUILD_TESTING)
 endif()
 
 # Freestanding: no CRT, no default libs, no DLL entry point.
+#
+# /CETCOMPAT declares the stub compatible with the hardware shadow stack (CET
+# return-edge protection). The stub's hand-written ASM keeps strict CALL/RET
+# pairing, so the resident stub code is shadow-stack-safe. Unlike /guard:cf it
+# adds no .text relocations and does not alter .text content -- it only emits
+# the IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (type 20) entry with the CET
+# Shadow Stack bit -- so the .text key-binding hash and reloc-free invariant
+# hold. This lets the packer preserve a source binary's CET Shadow Stack
+# declaration instead of failing closed. (Forward-edge CFI / IBT, bit 0x40, is
+# NOT declared: it needs endbr64 landing pads the freestanding stub omits.)
 target_link_options(lethe_stub_x64 PRIVATE
     /NODEFAULTLIB
     /NOENTRY
@@ -82,6 +92,7 @@ target_link_options(lethe_stub_x64 PRIVATE
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
+    /CETCOMPAT
     /EXPORT:StubExeEntry
     /EXPORT:StubDllMain
     /EXPORT:daedalus_x64_enter_common

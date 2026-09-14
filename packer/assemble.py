@@ -1318,6 +1318,23 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     # Keep the real magic intact for deterministic post-pack validation.
     _patch_into_out_sections(out_sections, g_packinfo_rva, packinfo_bytes)
 
+    # Preserve the source module's supported extended DLL characteristics
+    # (e.g. CET Shadow Stack) by re-declaring them on the packed output. The
+    # output *is* the stub image, so refuse to declare a bit the resident stub
+    # cannot actually back -- rebuild the stub with the matching mitigation
+    # (/CETCOMPAT) rather than emit a false, faulting declaration.
+    ext_dll_characteristics = int(
+        _get(parsed, "extended_dll_characteristics", default=0))
+    if ext_dll_characteristics:
+        stub_ext = _stub_extended_dll_characteristics(stub)
+        missing = ext_dll_characteristics & ~stub_ext
+        if missing:
+            raise AssembleError(
+                "cannot preserve source extended DLL characteristics "
+                f"0x{ext_dll_characteristics:X}: the stub does not declare "
+                f"0x{missing:X}. Rebuild the stub with the matching mitigation "
+                "(e.g. /CETCOMPAT).")
+
     # -- 10. serialize the PE to disk ----------------------------------------
     out_sections.sort(key=lambda s: s.rva)
     _serialize(
@@ -1337,6 +1354,7 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
         export_dir=(orig.export_rva, orig.export_size) if (is_dll and orig.export_rva) else (0, 0),
         load_config_dir=load_config_dir,
         guard_cf_enabled=cfg_plan.source_guard_cf_enabled,
+        ext_dll_characteristics=ext_dll_characteristics,
     )
 
     size_of_image = _align_up(
@@ -1352,6 +1370,39 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
 def _grafted_dir(d: Tuple[int, int], delta: int) -> Tuple[int, int]:
     rva, size = d
     return (rva + delta, size) if rva else (0, 0)
+
+
+_IMAGE_DEBUG_DIRECTORY = struct.Struct("<IIHHIIII")  # 28 bytes
+_IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS = 20
+
+
+def _stub_extended_dll_characteristics(stub: "_StubImage") -> int:
+    """OR of the extended DLL characteristics the stub image itself declares.
+
+    The packed output is the stub image, so it may only declare a mitigation
+    (e.g. CET Shadow Stack) that the resident stub code actually supports. This
+    reads the stub's own IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS entries, built
+    from its link options (``/CETCOMPAT``).
+    """
+    rva, size = stub.dir(DIR_DEBUG)
+    if not rva or size < _IMAGE_DEBUG_DIRECTORY.size:
+        return 0
+    entry_count = size // _IMAGE_DEBUG_DIRECTORY.size
+    found = 0
+    try:
+        blob = stub.read_at_rva(rva, entry_count * _IMAGE_DEBUG_DIRECTORY.size)
+    except Exception:
+        return 0
+    for i in range(entry_count):
+        (_ch, _ts, _maj, _min, dtype, dsize, drva, _dptr) = \
+            _IMAGE_DEBUG_DIRECTORY.unpack_from(blob, i * _IMAGE_DEBUG_DIRECTORY.size)
+        if dtype != _IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS or dsize != 4 or not drva:
+            continue
+        try:
+            found |= struct.unpack("<I", stub.read_at_rva(drva, 4))[0]
+        except Exception:
+            continue
+    return found
 
 
 def _sec_name(name) -> str:
@@ -1508,7 +1559,24 @@ def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
                base_of_code: int, import_dir, reloc_dir, iat_dir, rsrc_dir,
                export_dir, tls_dir, load_config_dir=(0, 0),
                guard_cf_enabled: bool = False,
-               delay_import_dir=(0, 0)) -> None:
+               delay_import_dir=(0, 0),
+               ext_dll_characteristics: int = 0) -> None:
+    # Synthesize an outer debug directory that re-declares the source module's
+    # supported extended DLL characteristics (CET Shadow Stack). It is one
+    # IMAGE_DEBUG_DIRECTORY (type 20) entry plus the 4-byte DWORD it points at,
+    # in a dedicated read-only section appended after every other section. The
+    # RVA/offset fields are backfilled once file layout is known.
+    debug_section = None
+    if ext_dll_characteristics:
+        dbg_rva = _align_up(max(s.rva + s.vsize for s in sections), SA)
+        debug_section = _OutSection(
+            name=".ldbg",
+            rva=dbg_rva,
+            vsize=_IMAGE_DEBUG_DIRECTORY.size + 4,
+            characteristics=IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+            raw=b"\x00" * (_IMAGE_DEBUG_DIRECTORY.size + 4),
+        )
+        sections = list(sections) + [debug_section]
     num_sections = len(sections)
     e_lfanew = 0x80
     headers_end = e_lfanew + 4 + 20 + IMAGE_SIZEOF_OPTIONAL_HEADER64 + num_sections * 40
@@ -1533,6 +1601,26 @@ def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
             raw_sizes[id(s)] = 0
             raw_ptrs[id(s)] = 0
     size_of_image = _align_up(max(s.rva + s.vsize for s in sections), SA)
+
+    # Backfill the synthesized debug directory now that its RVA and file offset
+    # are fixed: a type-20 entry pointing at the trailing 4-byte characteristics
+    # DWORD within the same section.
+    debug_dir = (0, 0)
+    if debug_section is not None:
+        entry_off = raw_ptrs[id(debug_section)]
+        dword_rva = debug_section.rva + _IMAGE_DEBUG_DIRECTORY.size
+        dword_off = entry_off + _IMAGE_DEBUG_DIRECTORY.size
+        entry = _IMAGE_DEBUG_DIRECTORY.pack(
+            0,                              # Characteristics (must be 0)
+            orig.timestamp & 0xFFFFFFFF,    # TimeDateStamp
+            0, 0,                           # MajorVersion, MinorVersion
+            _IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS,
+            4,                              # SizeOfData
+            dword_rva,                      # AddressOfRawData
+            dword_off,                      # PointerToRawData
+        )
+        debug_section.raw = entry + struct.pack("<I", ext_dll_characteristics)
+        debug_dir = (debug_section.rva, _IMAGE_DEBUG_DIRECTORY.size)
 
     size_of_code = sum(raw_sizes[id(s)] for s in sections
                        if s.characteristics & IMAGE_SCN_CNT_CODE)
@@ -1595,6 +1683,7 @@ def _serialize(path, sections: List[_OutSection], image_base: int, SA: int,
     _dir(DIR_LOAD_CONFIG, load_config_dir)
     _dir(DIR_IAT, iat_dir)            # stub IAT (informational)
     _dir(DIR_DELAY_IMPORT, delay_import_dir)
+    _dir(DIR_DEBUG, debug_dir)        # synthesized CET Shadow Stack declaration
     # EXCEPTION is registered by the loader. LOAD_CONFIG is loader-visible and
     # points at the immutable outer clone when the source carried one.
 
