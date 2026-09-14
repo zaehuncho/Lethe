@@ -94,6 +94,34 @@ def test_exact_runtime_candidates_report_lift_rejection_and_handler_flags():
     assert all(item.indirect_target_closure_proven is False for item in report.candidates)
 
 
+def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
+    supported = (
+        _asm("movd xmm0, dword ptr [rcx]; movd eax, xmm0; ret", 0x1300),
+        _asm("movq xmm1, qword ptr [rcx]; movq rax, xmm1; ret", 0x1400),
+        _asm("movups xmm2, xmmword ptr [rcx]; movups xmmword ptr [rdx], xmm2; ret", 0x1500),
+        _asm("movdqu xmm3, xmmword ptr [rcx]; movdqu xmmword ptr [rdx], xmm3; ret", 0x1600),
+    )
+    aligned = _asm("movaps xmm0, xmmword ptr [rcx]; nop; ret", 0x1700)
+    parsed = _parsed([
+        (0x1300, supported[0], 0),
+        (0x1400, supported[1], 0),
+        (0x1500, supported[2], 0),
+        (0x1600, supported[3], 0),
+        (0x1700, aligned, 0),
+    ])
+
+    report = discovery.discover_functions(parsed, exports=())
+
+    assert [candidate.liftable for candidate in report.candidates] == [
+        True, True, True, True, False
+    ]
+    assert all(
+        candidate.rejection_reason is None
+        for candidate in report.candidates[:4]
+    )
+    assert "alignment/fault parity" in report.candidates[4].rejection_reason
+
+
 def test_export_without_pdata_is_bounded_plain_ret_heuristic():
     code = _asm("mov eax, 3; ret", 0x1000)
     parsed = _parsed([(0x1000, code, 0)])

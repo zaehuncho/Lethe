@@ -74,6 +74,7 @@ OPCODE_TABLE = {
     0x35: ('store16',        0, 'none'),
     0x36: ('rot3',           0, 'none'),
     0x37: ('pick',           1, 'imm'),
+    0x38: ('store128',       0, 'none'),
 }
 
 

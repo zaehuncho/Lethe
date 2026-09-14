@@ -322,16 +322,18 @@ int main(void)
 """
     (tmp_path / "harness.c").write_text(harness, encoding="utf-8")
     vm_source = (ROOT / "stub/src/daedalus_vm.c").as_posix()
+    store128_source = (ROOT / "stub/src/daedalus_store128.asm").as_posix()
     rolling_source = (ROOT / "stub/src/daedalus_rolling.c").as_posix()
     vm_include = (ROOT / "stub/src").as_posix()
     (tmp_path / "CMakeLists.txt").write_text(
         f"""
 cmake_minimum_required(VERSION 3.20)
-project(lethe_internal_call_native C)
-add_executable(internal_call harness.c "{vm_source}" "{rolling_source}")
+project(lethe_internal_call_native C ASM_MASM)
+add_executable(internal_call harness.c "{vm_source}" "{rolling_source}" "{store128_source}")
 target_include_directories(internal_call PRIVATE "{vm_include}")
 target_compile_definitions(internal_call PRIVATE DVM_ROLLING WIN32_LEAN_AND_MEAN NOMINMAX)
-target_compile_options(internal_call PRIVATE /W4 /WX)
+target_compile_options(internal_call PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:/W4;/WX>)
 target_link_libraries(internal_call PRIVATE bcrypt)
 """.lstrip(),
         encoding="utf-8",

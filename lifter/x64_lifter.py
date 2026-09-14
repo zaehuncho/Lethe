@@ -22,12 +22,13 @@ MOVSXD, SETcc/CMOVcc, register XCHG, BSWAP, ADC, and SBB. High-8 aliases,
 scalar memory destinations, immediate stores, parity conditions, and balanced
 PUSH/POP/LEAVE stack frames are covered. Direct non-recursive calls to proven
 instruction boundaries inside the same selected extent preserve architectural
-stack effects and use shadow-validated VM returns. Legacy register-only XMM
-moves and bitwise XOR operate on a captured 16-register, two-lane state.
+stack effects and use shadow-validated VM returns. Legacy XMM moves and bitwise
+XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar memory
+transfers and unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported.
 Register-target BT/BTS/BTR/BTC are supported; memory bit strings remain closed.
-Floating-point arithmetic, XMM memory operands, VEX/EVEX encodings, atomic
-XCHG/LOCK forms, external/indirect/recursive calls, and unmodeled widths remain
-explicit whole-function bailouts.
+Floating-point/SIMD arithmetic, aligned XMM memory forms, VEX/EVEX encodings,
+atomic XCHG/LOCK forms, external/indirect/recursive calls, and unmodeled widths
+remain explicit whole-function bailouts.
 """
 from __future__ import annotations
 
@@ -384,12 +385,60 @@ class _Lifter:
         self.rd_local(T0); self.wr_local(offset)
         self.rd_local(T1); self.wr_local(offset + 8)
 
+    def _require_legacy_binary(self, instr, mnemonic: str) -> None:
+        if instr.encoding != EncodingKind.LEGACY:
+            raise LiftUnsupported(f"{mnemonic} VEX/EVEX encoding is not supported")
+        if instr.op_count != 2:
+            raise LiftUnsupported(f"{mnemonic} requires exactly two operands")
+
+    def _require_xmm_memory_size(self, instr, mnemonic: str) -> None:
+        try:
+            size = int(MemorySizeExt.size(instr.memory_size))
+        except (TypeError, ValueError) as exc:
+            raise LiftUnsupported(
+                f"{mnemonic} memory operand has no width"
+            ) from exc
+        if size != 16:
+            raise LiftUnsupported(f"{mnemonic} memory operand must be 128 bits")
+
     def _xmm_move(self, instr, mnemonic: str) -> None:
-        destination, source = self._require_legacy_registers(instr, mnemonic)
-        self._xmm_offset(destination)
-        self._xmm_offset(source)
-        self._read_xmm(source)
-        self._write_xmm_from_temps(destination)
+        self._require_legacy_binary(instr, mnemonic)
+        destination_kind = instr.op_kind(0)
+        source_kind = instr.op_kind(1)
+        if destination_kind == OpKind.REGISTER and source_kind == OpKind.REGISTER:
+            destination = instr.op_register(0)
+            source = instr.op_register(1)
+            self._xmm_offset(destination)
+            self._xmm_offset(source)
+            self._read_xmm(source)
+            self._write_xmm_from_temps(destination)
+            return
+        if mnemonic not in ("movups", "movdqu"):
+            raise LiftUnsupported(
+                f"{mnemonic} memory operands require unproven alignment/fault parity"
+            )
+        if destination_kind == OpKind.REGISTER and source_kind == OpKind.MEMORY:
+            destination = instr.op_register(0)
+            self._xmm_offset(destination)
+            self._require_xmm_memory_size(instr, mnemonic)
+            self._emit_effective_address(instr); self.wr_local(T5)
+            self.rd_local(T5); self.a("load64"); self.wr_local(T0)
+            self.rd_local(T5); self.push_imm(8); self.a("add")
+            self.a("load64"); self.wr_local(T1)
+            self._write_xmm_from_temps(destination)
+            return
+        if destination_kind == OpKind.MEMORY and source_kind == OpKind.REGISTER:
+            source = instr.op_register(1)
+            self._xmm_offset(source)
+            self._require_xmm_memory_size(instr, mnemonic)
+            self._emit_effective_address(instr); self.wr_local(T5)
+            self._read_xmm(source)
+            self.rd_local(T5); self.rd_local(T0); self.rd_local(T1)
+            self.a("store128")
+            return
+        raise LiftUnsupported(
+            f"{mnemonic} requires XMM/XMM or one XMM and one memory operand"
+        )
 
     def _xmm_logical(self, instr, mnemonic: str) -> None:
         destination, source = self._require_legacy_registers(instr, mnemonic)
@@ -403,24 +452,50 @@ class _Lifter:
 
     def _movd_movq(self, instr, *, width: int) -> None:
         mnemonic = "movd" if width == 32 else "movq"
-        destination, source = self._require_legacy_registers(instr, mnemonic)
-        destination_is_xmm = destination in XMM_OFF
-        source_is_xmm = source in XMM_OFF
+        self._require_legacy_binary(instr, mnemonic)
+        destination_kind = instr.op_kind(0)
+        source_kind = instr.op_kind(1)
+        destination = (
+            instr.op_register(0) if destination_kind == OpKind.REGISTER else None
+        )
+        source = instr.op_register(1) if source_kind == OpKind.REGISTER else None
+        destination_is_xmm = (
+            destination in XMM_OFF if destination is not None else False
+        )
+        source_is_xmm = source in XMM_OFF if source is not None else False
         if destination_is_xmm:
-            if source_is_xmm:
+            if source_kind == OpKind.MEMORY:
+                if self._memory_width(instr) != width:
+                    raise LiftUnsupported(f"{mnemonic} memory source width mismatch")
+                self._emit_effective_address(instr); self.a(f"load{width}")
+                self.wr_local(T0)
+            elif source_is_xmm:
                 if width != 64:
                     raise LiftUnsupported("movd does not support an XMM register source")
                 self.rd_local(self._xmm_offset(source)); self.wr_local(T0)
-            else:
+            elif source_kind == OpKind.REGISTER:
                 _source_offset, source_width = self._reg_info(source)
                 if source_width != width:
                     raise LiftUnsupported(f"{mnemonic} GPR source width mismatch")
                 self.rd_reg(source); self.wr_local(T0)
+            else:
+                raise LiftUnsupported(f"{mnemonic} source must be GPR, XMM, or memory")
             self.push_imm(0); self.wr_local(T1)
             self._write_xmm_from_temps(destination)
             return
+        if destination_kind == OpKind.MEMORY:
+            if not source_is_xmm:
+                raise LiftUnsupported(f"{mnemonic} memory store requires an XMM source")
+            if self._memory_width(instr) != width:
+                raise LiftUnsupported(f"{mnemonic} memory destination width mismatch")
+            self._emit_effective_address(instr)
+            self.rd_local(self._xmm_offset(source))
+            self.a(f"store{width}")
+            return
         if not source_is_xmm:
             raise LiftUnsupported(f"{mnemonic} requires one XMM register operand")
+        if destination_kind != OpKind.REGISTER:
+            raise LiftUnsupported(f"{mnemonic} destination must be a GPR or memory")
         _destination_offset, destination_width = self._reg_info(destination)
         if destination_width != width:
             raise LiftUnsupported(f"{mnemonic} GPR destination width mismatch")

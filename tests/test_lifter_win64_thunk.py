@@ -684,6 +684,7 @@ END
         "virtual_zero_base.asm",
         "verifier.asm",
         f'"{(ROOT / "stub/src/daedalus_vm.c").as_posix()}"',
+        f'"{(ROOT / "stub/src/daedalus_store128.asm").as_posix()}"',
         f'"{(ROOT / "stub/src/daedalus_x64_thunk.asm").as_posix()}"',
     ]
     definitions = ""

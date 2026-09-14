@@ -259,6 +259,8 @@ typedef unsigned __int64 (__cdecl *xfg_pair_fold_fn)(
     xfg_pair16, unsigned __int64);
 typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
     unsigned __int64, unsigned __int64);
+typedef unsigned __int64 (__cdecl *xfg_xmm_copy_fn)(
+    const unsigned char *, unsigned char *);
 """.lstrip(),
         encoding="utf-8",
     )
@@ -315,6 +317,15 @@ __declspec(dllexport) __declspec(noinline) void __cdecl xfg_ptr_write(
     unsigned __int64 value)
 {
     *destination = value ^ 0x0F1E2D3C4B5A6978ui64;
+}
+
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_xmm_copy(
+    const unsigned char *source,
+    unsigned char *destination)
+{
+    __m128i value = _mm_loadu_si128((const __m128i *)source);
+    _mm_storeu_si128((__m128i *)destination, value);
+    return (unsigned __int64)_mm_cvtsi128_si64(value);
 }
 
 __declspec(dllexport) __declspec(noinline) float __cdecl xfg_f32_bits(
@@ -401,6 +412,7 @@ __declspec(dllexport) xfg_noargs_fn volatile selected_xfg_noargs = xfg_noargs;
 __declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = xfg_u64x6;
 __declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = xfg_ptr_read;
 __declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = xfg_ptr_write;
+__declspec(dllexport) xfg_xmm_copy_fn volatile selected_xfg_xmm_copy = xfg_xmm_copy;
 __declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = xfg_f32_bits;
 __declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = xfg_f64_bits;
 __declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_mixed_bits;
@@ -412,6 +424,11 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
 {
     const unsigned int input[2] = { 13u, 29u };
     unsigned __int64 written = 0;
+    const unsigned char xmm_input[18] = {
+        0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0
+    };
+    unsigned char xmm_output[18] = {0};
     xfg_f32_word f32_first;
     xfg_f32_word f32_second;
     xfg_f32_word f32_third;
@@ -459,6 +476,9 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     selected_xfg_ptr_write(&written, 0x8877665544332211ui64);
     ok = ok && written
         == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
+    ok = ok && selected_xfg_xmm_copy(xmm_input + 1, xmm_output + 1)
+        == 0x1122334455667788ui64;
+    ok = ok && xmm_output[1] == 0x88 && xmm_output[16] == 0x80;
     f32_result.value = selected_xfg_f32_bits(
         f32_first.value, f32_second.value, f32_third.value);
     ok = ok && f32_result.bits == 0xBF000000u;
@@ -995,6 +1015,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_u64x6",
         "xfg_ptr_read",
         "xfg_ptr_write",
+        "xfg_xmm_copy",
         "xfg_f32_bits",
         "xfg_f64_bits",
         "xfg_mixed_bits",
@@ -1017,6 +1038,21 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         specs.append(
             virtualization_plan.FunctionSpec(name, target_rva, target_size)
         )
+    from iced_x86 import Decoder, Mnemonic, OpKind
+    xmm_copy = next(spec for spec in specs if spec.name == "xfg_xmm_copy")
+    xmm_copy_instructions = tuple(Decoder(
+        64,
+        source_image.read_at_rva(xmm_copy.rva, xmm_copy.size),
+        ip=source_image.image_base + xmm_copy.rva,
+    ))
+    assert any(
+        instruction.mnemonic in (Mnemonic.MOVDQU, Mnemonic.MOVUPS)
+        and any(
+            instruction.op_kind(index) == OpKind.MEMORY
+            for index in range(instruction.op_count)
+        )
+        for instruction in xmm_copy_instructions
+    )
     parsed = pe_analyze.analyze_pe(str(dll))
     assert parsed.is_dll is True
     assert parsed.load_config is not None
@@ -1135,6 +1171,10 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["stack_arguments_supported"] is True
         assert function.capabilities["xmm_register_state_captured"] is True
         assert function.capabilities["xmm_register_moves_and_xor_supported"] is True
+        assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
+        assert function.capabilities[
+            "xmm_unaligned_128bit_memory_transfers_supported"
+        ] is True
         assert function.capabilities["simd_fp_arithmetic_supported"] is False
         thunk_rva = function.generated_executable_ranges[0].rva
         thunk_rvas.add(thunk_rva)

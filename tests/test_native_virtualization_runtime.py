@@ -100,9 +100,14 @@ __declspec(noreturn) void fixture_entry(void)
         r"""
 OPTION CASEMAP:NONE
 .data
-ALIGN 8
+ALIGN 16
 vm_value DWORD 41
 vm_sink DWORD 0
+vm_qword QWORD 0123456789ABCDEFh
+vm_qword_sink QWORD 0
+vm_vector BYTE 00h, 11h, 22h, 33h, 44h, 55h, 66h, 77h
+          BYTE 88h, 99h, 0AAh, 0BBh, 0CCh, 0DDh, 0EEh, 0FFh
+vm_vector_sink BYTE 16 DUP (0)
 vm_relocation_anchor QWORD OFFSET vm_value
 .code
 PUBLIC vm_leaf
@@ -110,9 +115,15 @@ vm_leaf PROC FRAME
     sub rsp, 8
     .allocstack 8
     .endprolog
-    mov eax, DWORD PTR vm_value
+    movd xmm0, DWORD PTR vm_value
+    movd eax, xmm0
     add eax, 1
-    mov DWORD PTR vm_sink, eax
+    movd xmm1, eax
+    movd DWORD PTR vm_sink, xmm1
+    movq xmm2, QWORD PTR vm_qword
+    movq QWORD PTR vm_qword_sink, xmm2
+    movdqu xmm3, XMMWORD PTR vm_vector
+    movups XMMWORD PTR vm_vector_sink, xmm3
     lea rdx, vm_sink
     mov eax, DWORD PTR [rdx]
     add rsp, 8
@@ -438,7 +449,7 @@ def test_packed_executable_calls_virtualized_leaf(
         source_image = assemble._StubImage(source.read_bytes())
         leaf_rva = source_image.find_export_rva("vm_leaf")
         assert leaf_rva is not None
-        leaf_window = source_image.read_at_rva(leaf_rva, 64)
+        leaf_window = source_image.read_at_rva(leaf_rva, 128)
         parsed_source = pe_analyze.analyze_pe(str(source))
         assert parsed_source.image_base == 0x7FFE0000
         assert parsed_source.dir64_relocations
@@ -464,7 +475,7 @@ def test_packed_executable_calls_virtualized_leaf(
             for instruction in decoded_leaf
             if instruction.is_ip_rel_memory_operand
         )
-        assert len(decoded_targets) == 3
+        assert len(decoded_targets) == 7
         assert all(
             any(
                 section.rva <= target
@@ -562,13 +573,17 @@ def test_packed_executable_calls_virtualized_leaf(
         assert function.capabilities[
             "rip_relative_data_addressing_supported"
         ] is True
+        assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
+        assert function.capabilities[
+            "xmm_unaligned_128bit_memory_transfers_supported"
+        ] is True
         assert tuple(
             reference.target_rva
             for reference in function.rip_relative_references
         ) == decoded_targets
         assert tuple(
             reference.access for reference in function.rip_relative_references
-        ) == ("read", "write", "address")
+        ) == ("read", "write", "read", "write", "read", "write", "address")
         generated = function.generated_executable_ranges[0]
         entry = _slice(materialized.parsed, leaf_rva, source_extent_size)
         assert entry[0] == 0xE9

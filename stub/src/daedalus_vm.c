@@ -24,7 +24,7 @@
 #include "daedalus_opcodes_shuffled.h"
 #else
 #define DVM_OPCODE_MAPPING_SHA256 \
-    "d7279c7aa1c36515a0cc03f935fbf8f83c07648547ffb46b3541e07899fac5ff"
+    "e6beba7d0f8e4eb3b192331678705ceb3c474b4be1526dd62364501c79abc5f1"
 #define DVM_HANDLER_VARIANT_SHA256 \
     "41b31ad73ed541bd478cc97567fdee815d4154666608703b7e1ac2ebcc8b873d"
 #define DVM_HANDLER_VARIANT_ADD    0
@@ -52,6 +52,7 @@ __declspec(dllexport) const char daedalus_handler_variant_sha256[] =
 
 /* Forward-declare the MASM trampoline for N_CALL_PTR (daedalus_trampoline.asm). */
 extern uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv);
+extern void dvm_store128_unaligned(void *destination, uint64_t low, uint64_t high);
 
 /* ---- tiny local helpers (no CRT) ---------------------------------------- */
 
@@ -396,6 +397,14 @@ static int dvm_run(DaedalusVM *vm)
             uint64_t addr, val;
             if (dvm_pop(vm, &val) || dvm_pop(vm, &addr)) return -1;
             *(uint64_t *)(uintptr_t)addr = val;
+            vm->pc += 1;
+            break;
+        }
+        case DVM_STORE128: {
+            uint64_t addr, low, high;
+            if (dvm_pop(vm, &high) || dvm_pop(vm, &low) || dvm_pop(vm, &addr))
+                return -1;
+            dvm_store128_unaligned((void *)(uintptr_t)addr, low, high);
             vm->pc += 1;
             break;
         }

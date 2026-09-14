@@ -110,6 +110,16 @@ else + a **differential oracle** that proves every lift correct.
   destinations with the architectural five-/six-bit count mask, rotate-width
   reduction, zero-count behavior, and defined flag results. Dead-flag
   elimination is not enabled by the default lift path.
+- **Cut 15** - legacy scalar `movd`/`movq` memory loads and stores plus
+  unaligned 128-bit `movups`/`movdqu` memory loads and stores. Scalar loads
+  clear the upper XMM bits, scalar stores write only the low lane, and 128-bit
+  transfers preserve both 64-bit lanes. Base/index/scale/displacement,
+  RIP-relative rebasing, segment rejection, and full memory/register state are
+  differential-checked against Unicorn. A dedicated `store128` VM opcode calls
+  one MASM `movdqu` memory store; a native guard-page test proves a cross-page
+  fault leaves the first lane unchanged. Aligned `movaps`/`movdqa` memory forms
+  remain closed until their alignment-fault behavior is modeled; this cut does
+  not add floating-point/SIMD arithmetic or VEX/AVX encodings.
 
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
@@ -118,7 +128,7 @@ ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
 RIP targets in headers/gaps/discardable sections/code/selected extents,
 segment memory, 16-bit `shld`/`shrd`, memory-target `bt/bts/btr/btc` bit strings,
-XMM memory forms,
+aligned XMM memory forms and XMM arithmetic memory sources,
 SIMD/FP arithmetic, VEX/EVEX encodings, YMM/ZMM state, string ops, and
 indirect/external branches.
 

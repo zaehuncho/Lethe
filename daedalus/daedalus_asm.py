@@ -90,6 +90,7 @@ OPCODES = {
     'store16':        (0x35, 0, 'none'),
     'rot3':           (0x36, 0, 'none'),
     'pick':           (0x37, 1, 'imm'),
+    'store128':       (0x38, 0, 'none'),
 }
 
 

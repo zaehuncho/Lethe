@@ -108,9 +108,10 @@ CANONICAL_OPCODES = OrderedDict([
     ('store16',        (0x35, 0, 'none')),
     ('rot3',           (0x36, 0, 'none')),
     ('pick',           (0x37, 1, 'imm')),
+    ('store128',       (0x38, 0, 'none')),
 ])
 
-NUM_REAL = len(CANONICAL_OPCODES)       # 56
+NUM_REAL = len(CANONICAL_OPCODES)       # 57
 NUM_DECOYS = 17                         # ~30% of real count
 DECOY_CANONICAL_BASE = 0x80             # canonical IDs 0x80..0x90
 TRAP_CANONICAL = 0xFF                   # unmap value for trap slots
@@ -417,7 +418,7 @@ def emit_c_header(result):
     lines.append(
         "/* Maps wire byte -> canonical byte for dispatch.                     */")
     lines.append(
-        "/*   0x00..0x37 = real opcode  |  0x80..0x90 = decoy  |  0xFF = trap */")
+        "/*   0x00..0x38 = real opcode  |  0x80..0x90 = decoy  |  0xFF = trap */")
     lines.append("")
     lines.append("static const uint8_t DVM_OPCODE_UNMAP[256] = {")
     for row in range(16):
@@ -523,7 +524,7 @@ def verify_shuffle(result):
                 handler_variants):
             errors.append("FAIL: handler variant profile hash mismatch")
 
-    # 1. All 56 real opcodes must have unique wire bytes.
+    # 1. All 57 real opcodes must have unique wire bytes.
     real_wires = list(real_map.values())
     if len(real_wires) != len(set(real_wires)):
         dups = [w for w in real_wires if real_wires.count(w) > 1]

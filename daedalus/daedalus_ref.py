@@ -263,6 +263,13 @@ class RefVM:
                 if not isinstance(buf, bytearray):
                     raise DaedalusError("store into read-only data")
                 buf[idx:idx + size] = (val & ((1 << (8 * size)) - 1)).to_bytes(size, 'little')
+            elif m == 'store128':
+                high = self._pop(); low = self._pop(); addr = self._pop()
+                buf, idx = self._mem_ref(addr, 16)
+                if not isinstance(buf, bytearray):
+                    raise DaedalusError("store into read-only data")
+                value = low.to_bytes(8, 'little') + high.to_bytes(8, 'little')
+                buf[idx:idx + 16] = value
             elif m == 'push_arg':
                 if operand >= len(self.args):
                     raise DaedalusError("arg index OOB")

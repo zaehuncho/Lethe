@@ -76,8 +76,9 @@ double transport combined with a 64-bit GPR mask, mixed ordinal GPR/XMM
 arguments, six-register `__vectorcall` `__m128i` transport, one 16-byte by-value
 aggregate, and one 16-byte hidden-sret return. Distinct XFG call-site type hashes
 remain byte-exact through selected-function materialization. These cases prove
-only the emitted legacy register move/XOR and GPR load/store bodies; SIMD/FP
-arithmetic, XMM memory forms, seventh-and-later vector arguments, HVA/HFA
+the emitted legacy register move/XOR, scalar MOVD/MOVQ memory transfers,
+unaligned MOVUPS/MOVDQU transfers, and GPR load/store bodies; SIMD/FP
+arithmetic, aligned XMM memory forms, seventh-and-later vector arguments, HVA/HFA
 returns, VEX/AVX/YMM/ZMM, variadics, broader/C++ aggregates, cross-toolchain
 compatibility, and clean-VM XFG enforcement remain outside coverage. External
 host calls establish packed runtime parity, not structurally decoded host-side

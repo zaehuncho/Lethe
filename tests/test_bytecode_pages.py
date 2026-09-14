@@ -248,19 +248,21 @@ def test_native_runtime_matches_python_and_rejects_tamper(tmp_path: Path) -> Non
     harness = ROOT / "stub/tests/bytecode_pages_test.c"
     cmake_source = f"""
 cmake_minimum_required(VERSION 3.20)
-project(lethe_bytecode_pages_native C)
+project(lethe_bytecode_pages_native C ASM_MASM)
 set(CMAKE_C_STANDARD 11)
 add_executable(bytecode_pages_test
     "{harness.as_posix()}"
     "{(source_dir / 'bytecode_pages.c').as_posix()}"
     "{(source_dir / 'crypto.c').as_posix()}"
     "{(source_dir / 'daedalus_vm.c').as_posix()}"
+    "{(source_dir / 'daedalus_store128.asm').as_posix()}"
 )
 target_include_directories(bytecode_pages_test PRIVATE "{source_dir.as_posix()}")
 target_compile_definitions(bytecode_pages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(bytecode_pages_test PRIVATE bcrypt)
 if(MSVC)
-    target_compile_options(bytecode_pages_test PRIVATE /W4 /WX /O2)
+        target_compile_options(bytecode_pages_test PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2>)
 endif()
 """
     (tmp_path / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")
@@ -326,13 +328,14 @@ def test_native_paged_vm_cross_page_execution_and_tamper(tmp_path: Path) -> None
     harness = ROOT / "stub/tests/daedalus_paged_vm_test.c"
     cmake_source = f"""
 cmake_minimum_required(VERSION 3.20)
-project(lethe_paged_vm_native C)
+project(lethe_paged_vm_native C ASM_MASM)
 set(CMAKE_C_STANDARD 11)
 add_executable(daedalus_paged_vm_test
     "{harness.as_posix()}"
     "{(source_dir / 'bytecode_pages.c').as_posix()}"
     "{(source_dir / 'crypto.c').as_posix()}"
     "{(source_dir / 'daedalus_vm.c').as_posix()}"
+    "{(source_dir / 'daedalus_store128.asm').as_posix()}"
     "{(source_dir / 'key_scatter.c').as_posix()}"
 )
 target_include_directories(daedalus_paged_vm_test PRIVATE "{source_dir.as_posix()}")
@@ -340,7 +343,8 @@ target_compile_definitions(daedalus_paged_vm_test PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX DVM_PAGED_RUNTIME)
 target_link_libraries(daedalus_paged_vm_test PRIVATE bcrypt)
 if(MSVC)
-    target_compile_options(daedalus_paged_vm_test PRIVATE /W4 /WX /O2)
+        target_compile_options(daedalus_paged_vm_test PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2>)
 endif()
 """
     (tmp_path / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")

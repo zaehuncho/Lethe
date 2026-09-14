@@ -129,12 +129,18 @@ def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
 
 
 def run_daedalus_xmm(code: bytes, init=None, xmm_init=None, mem=None,
-                     mem_base=MEM_BASE, lift_base=BASE, image_base=0):
+                     mem_base=MEM_BASE, lift_base=BASE, image_base=0, *,
+                     image_sections=None, selected_extents=()):
     init = list(init) if init is not None else _default_init()
     initial_xmm = list(xmm_init) if xmm_init is not None else [0] * 16
     if len(initial_xmm) != 16:
         raise ValueError("xmm_init must contain exactly 16 register values")
-    blob = daedalus_asm.assemble(L.lift_function(code, base=lift_base))
+    blob = daedalus_asm.assemble(L.lift_function(
+        code,
+        base=lift_base,
+        image_sections=image_sections,
+        selected_extents=selected_extents,
+    ))
     ds = struct.unpack_from("<H", blob, 0)[0]
     data, prog = blob[2:2 + ds], blob[2 + ds:]
     vm = RefVM(prog, data, args=[],
@@ -186,11 +192,25 @@ def check(code: bytes, init=None, flags=("CF", "PF", "ZF", "SF", "OF"), mem=None
 
 
 def check_xmm(code: bytes, init=None, xmm_init=None,
-              flags=("CF", "PF", "ZF", "SF", "OF")):
+              flags=("CF", "PF", "ZF", "SF", "OF"), *, mem=None,
+              mem_base=MEM_BASE, lift_base=BASE, image_base=0,
+              code_base=BASE, image_sections=None, selected_extents=()):
     init = list(init) if init is not None else _default_init()
     initial_xmm = list(xmm_init) if xmm_init is not None else [0] * 16
-    ur, uf, um, ux = run_unicorn_xmm(code, init, initial_xmm)
-    dr, df, dm, dx = run_daedalus_xmm(code, init, initial_xmm)
+    ur, uf, um, ux = run_unicorn_xmm(
+        code, init, initial_xmm, mem, mem_base, code_base
+    )
+    dr, df, dm, dx = run_daedalus_xmm(
+        code,
+        init,
+        initial_xmm,
+        mem,
+        mem_base,
+        lift_base,
+        image_base,
+        image_sections=image_sections,
+        selected_extents=selected_extents,
+    )
     assert um == dm
     for index, (native, lifted) in enumerate(zip(ur, dr)):
         assert native == lifted, (

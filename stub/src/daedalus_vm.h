@@ -210,7 +210,8 @@ typedef enum VvmOpcode {
     DVM_LOAD16      = 0x34, /* pop addr -> push *(uint16_t *)addr (zero-ext) */
     DVM_STORE16     = 0x35, /* pop val, pop addr -> *(uint16_t *)addr = val  */
     DVM_ROT3        = 0x36, /* rotate top 3: [c b a] -> [a c b] (top=b)     */
-    DVM_PICK        = 0x37  /* 1 byte n: copy stack[sp-1-n] to top (0=DUP)  */
+    DVM_PICK        = 0x37, /* 1 byte n: copy stack[sp-1-n] to top (0=DUP)  */
+    DVM_STORE128    = 0x38  /* pop hi,lo,addr -> one unaligned 16-byte store */
 } VvmOpcode;
 
 /* ---- VM state ----------------------------------------------------------- */

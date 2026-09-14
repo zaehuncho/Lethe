@@ -286,6 +286,10 @@ def test_rip_push_and_pop_data_forms_lift_with_bounded_geometry() -> None:
         "imul rax, qword ptr {mem}, 7",
         "shld qword ptr {mem}, rax, 3",
         "shrd qword ptr {mem}, rax, cl",
+        "movd xmm0, dword ptr {mem}",
+        "movq xmm1, qword ptr {mem}",
+        "movups xmm2, xmmword ptr {mem}",
+        "movdqu xmm3, xmmword ptr {mem}",
     ],
 )
 def test_existing_scalar_rip_memory_routes_compile(source: str) -> None:
@@ -304,11 +308,12 @@ def test_existing_scalar_rip_memory_routes_compile(source: str) -> None:
     [
         ("call qword ptr {mem}", "indirect / non-near call"),
         ("jmp qword ptr {mem}", "indirect / non-near branch"),
-        ("movdqu xmm0, xmmword ptr {mem}", "register-only operands"),
         ("vmovdqu xmm0, xmmword ptr {mem}", "mnemonic"),
     ],
 )
-def test_indirect_control_and_xmm_memory_remain_rejected(source: str, reason: str) -> None:
+def test_indirect_control_and_vex_xmm_memory_remain_rejected(
+    source: str, reason: str
+) -> None:
     code = _program([(source, 0x4000)], code_rva=0x1000)
     with pytest.raises(lifter.LiftUnsupported, match=reason):
         lifter.lift_function(
