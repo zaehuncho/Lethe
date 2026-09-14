@@ -46,6 +46,7 @@ REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
 REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_runtime_hardening_stress.py",
     "test_native_virtualization_runtime.py",
+    "test_xmm_store128_native.py",
     "test_xfg_virtualization_preflight.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
@@ -65,6 +66,10 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_packed_executable_calls_virtualized_leaf[memguard]",
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
+    "tests/test_xmm_store128_native.py::"
+    "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic",
+    "tests/test_xmm_store128_native.py::"
+    "test_shuffled_rolling_store128_dispatch_and_guard_fault_are_atomic",
     "tests/test_xfg_virtualization_preflight.py::"
     "test_real_xfg_direct_only_plan_preserves_source_gfid_identity",
     "tests/test_xfg_virtualization_preflight.py::"

@@ -70,8 +70,8 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-frozen twelve-node native hardening, selected-function, and XFG replay, complete
-EXE/DLL round trip, and native production corpus against one immutable stub
+frozen fourteen-node native hardening, selected-function, STORE128, and XFG
+replay, complete EXE/DLL round trip, and native production corpus against one immutable stub
 SHA-256 before evaluating the `all` production matrix. The native replay
 inherits the normal process environment, overrides
 `LETHE_RUN_NATIVE_RUNTIME_STRESS=1`, `LETHE_RUN_NATIVE_VM_E2E=1`, and
@@ -247,9 +247,10 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of twelve
-node IDs spanning hardening stress, selected-function virtualization E2E, and
-XFG preflight. Its terminal pytest summary must report exactly twelve passes
+The candidate-bound native runtime record must name the frozen list of fourteen
+node IDs spanning hardening stress, selected-function virtualization E2E,
+plain and shuffled-rolling STORE128 atomic-fault checks, and XFG preflight. Its
+terminal pytest summary must report exactly fourteen passes
 with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.

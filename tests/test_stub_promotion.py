@@ -193,13 +193,22 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
     assert promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS == (
         "test_native_runtime_hardening_stress.py",
         "test_native_virtualization_runtime.py",
+        "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 12
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 12
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 14
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 14
     assert (
         "tests/test_native_virtualization_runtime.py::"
         "test_packed_dll_calls_source_bound_virtualized_padded_leaf"
+    ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    assert (
+        "tests/test_xmm_store128_native.py::"
+        "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic"
+    ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    assert (
+        "tests/test_xmm_store128_native.py::"
+        "test_shuffled_rolling_store128_dispatch_and_guard_fault_are_atomic"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
 
 
