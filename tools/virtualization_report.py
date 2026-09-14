@@ -102,10 +102,15 @@ def _validate_output_path(path: str, label: str) -> Path:
     return target
 
 
-def _validate_identity_aliases(input_path: str, report_path: str | None,
-                               manifest_path: str | None) -> None:
+def _validate_identity_aliases(
+    input_path: str,
+    map_path: str | None,
+    report_path: str | None,
+    manifest_path: str | None,
+) -> None:
     paths = [
         ("input", input_path),
+        ("linker MAP", map_path),
         ("report", report_path),
         ("selection manifest", manifest_path),
     ]
@@ -142,11 +147,11 @@ def _relocated_snapshot_identity(value) -> tuple[object, ...]:
     )
 
 
-def _assert_source_current(path: str, expected) -> None:
-    current = snapshot_file(path, what="inspected PE")
+def _assert_source_current(path: str, expected, label: str = "inspected PE") -> None:
+    current = snapshot_file(path, what=label)
     if _snapshot_identity(current) != _snapshot_identity(expected):
         raise ValueError(
-            "inspected PE path or content changed while the report was generated")
+            f"{label} path or content changed while the report was generated")
 
 
 @dataclass
@@ -159,6 +164,8 @@ class _Publication:
     staged_snapshot: object | None = None
     backup: Path | None = None
     backup_reservation: object | None = None
+    backup_snapshot: object | None = None
+    installed_snapshot: object | None = None
     keep_backup: bool = False
 
 
@@ -246,6 +253,19 @@ def _matches_relocated_snapshot(path: Path, expected) -> bool:
         _relocated_snapshot_identity(expected)
 
 
+def _matches_filesystem_object(path: Path, expected) -> bool:
+    try:
+        current = snapshot_file(path, what="publication filesystem object")
+    except (OSError, ValueError):
+        return False
+    return bool(
+        expected is not None
+        and current.inode
+        and expected.inode
+        and (current.device, current.inode) == (expected.device, expected.inode)
+    )
+
+
 def _assert_relocated_snapshot_current(
         path: Path | None, expected, label: str) -> None:
     if path is None or expected is None:
@@ -254,6 +274,16 @@ def _assert_relocated_snapshot_current(
     if (_relocated_snapshot_identity(current)
             != _relocated_snapshot_identity(expected)):
         raise ValueError(f"{label} changed before publication")
+
+
+def _capture_relocated_snapshot(path: Path | None, expected, label: str):
+    if path is None or expected is None:
+        raise ValueError(f"{label} is unavailable")
+    current = snapshot_file(path, what=label)
+    if (_relocated_snapshot_identity(current)
+            != _relocated_snapshot_identity(expected)):
+        raise ValueError(f"{label} changed before publication")
+    return current
 
 
 def _assert_target_absent(publication: _Publication) -> None:
@@ -293,7 +323,7 @@ def _commit_publications(publications: list[_Publication]) -> None:
                 _assert_target_current(publication)
                 assert publication.backup is not None
                 os.replace(publication.target, publication.backup)
-                _assert_relocated_snapshot_current(
+                publication.backup_snapshot = _capture_relocated_snapshot(
                     publication.backup,
                     publication.previous,
                     f"original {publication.label} backup",
@@ -308,7 +338,18 @@ def _commit_publications(publications: list[_Publication]) -> None:
                 _assert_target_current(publication)
             assert publication.staged is not None
             os.replace(publication.staged, publication.target)
+            publication.installed_snapshot = _capture_relocated_snapshot(
+                publication.target,
+                publication.staged_snapshot,
+                f"installed {publication.label}",
+            )
             publication.staged = None
+        for publication in publications:
+            _assert_snapshot_current(
+                publication.target,
+                publication.installed_snapshot,
+                f"installed {publication.label}",
+            )
     except BaseException as publish_error:
         rollback_errors = []
         for publication in reversed(touched):
@@ -317,7 +358,7 @@ def _commit_publications(publications: list[_Publication]) -> None:
                 target_is_staged = bool(
                     target_exists
                     and publication.staged_snapshot is not None
-                    and _matches_relocated_snapshot(
+                    and _matches_filesystem_object(
                         publication.target, publication.staged_snapshot))
                 if publication.previous is None:
                     if target_is_staged:
@@ -328,11 +369,13 @@ def _commit_publications(publications: list[_Publication]) -> None:
                     continue
 
                 assert publication.backup is not None
-                backup_is_original = _matches_relocated_snapshot(
-                    publication.backup, publication.previous)
+                backup_is_original = bool(
+                    publication.backup_snapshot is not None
+                    and _matches_snapshot(
+                        publication.backup, publication.backup_snapshot))
                 target_is_original = bool(
                     target_exists
-                    and _matches_relocated_snapshot(
+                    and _matches_filesystem_object(
                         publication.target, publication.previous))
                 if backup_is_original:
                     if target_exists and not target_is_staged:
@@ -341,12 +384,17 @@ def _commit_publications(publications: list[_Publication]) -> None:
                             f"{publication.label} changed during rollback; "
                             f"original retained at {publication.backup}")
                     publication.keep_backup = True
-                    _assert_relocated_snapshot_current(
+                    _assert_snapshot_current(
                         publication.backup,
-                        publication.previous,
+                        publication.backup_snapshot,
                         f"original {publication.label} backup",
                     )
                     os.replace(publication.backup, publication.target)
+                    _assert_relocated_snapshot_current(
+                        publication.target,
+                        publication.backup_snapshot,
+                        f"restored {publication.label}",
+                    )
                     publication.keep_backup = False
                     publication.backup = None
                 elif not target_is_original:
@@ -355,8 +403,13 @@ def _commit_publications(publications: list[_Publication]) -> None:
                                 publication.backup,
                                 publication.backup_reservation)):
                         publication.keep_backup = True
+                    recovery = (
+                        f"; recoverable object retained at {publication.backup}"
+                        if publication.keep_backup else ""
+                    )
                     raise RuntimeError(
-                        f"original {publication.label} is unavailable during rollback")
+                        f"original {publication.label} is unavailable during "
+                        f"rollback{recovery}")
             except BaseException as rollback_error:
                 rollback_errors.append(
                     f"{publication.label}: {rollback_error}")
@@ -374,13 +427,18 @@ def main(argv: list[str] | None = None) -> int:
     snapshot_path = None
     try:
         _validate_identity_aliases(
-            args.input, args.output, args.emit_selection_manifest)
+            args.input, args.map_path, args.output,
+            args.emit_selection_manifest)
         if args.output:
             _validate_output_path(args.output, "report output")
         if args.emit_selection_manifest:
             _validate_output_path(
                 args.emit_selection_manifest, "selection manifest output")
         source = snapshot_file(args.input, what="inspected PE")
+        map_source = (
+            snapshot_file(args.map_path, what="linker MAP")
+            if args.map_path else None
+        )
         suffix = os.path.splitext(args.input)[1]
         descriptor, snapshot_path = tempfile.mkstemp(
             prefix=".lethe-virtualization-report-", suffix=suffix)
@@ -389,10 +447,10 @@ def main(argv: list[str] | None = None) -> int:
             stream.flush()
             os.fsync(stream.fileno())
         parsed = pe_analyze.analyze_pe(snapshot_path)
-        map_text = None
-        if args.map_path:
-            with open(args.map_path, "r", encoding="utf-8-sig") as stream:
-                map_text = stream.read()
+        map_text = (
+            map_source.data.decode("utf-8-sig") if map_source is not None
+            else None
+        )
         report = function_discovery.discover_functions(
             parsed, map_text=map_text, leaf_cap=args.leaf_cap
         )
@@ -404,8 +462,13 @@ def main(argv: list[str] | None = None) -> int:
         rendered_bytes = rendered.encode("utf-8")
         selection = None
         if args.emit_selection_manifest:
+            selection_report = (
+                function_discovery.discover_functions(
+                    parsed, leaf_cap=args.leaf_cap)
+                if map_source is not None else report
+            )
             selection = canonical_json(build_manifest(
-                report,
+                selection_report,
                 parsed,
                 source_sha256=source.sha256,
                 source_pe_content_id=pe_content_id(snapshot_path),
@@ -423,8 +486,12 @@ def main(argv: list[str] | None = None) -> int:
         publications = _prepare_publications(pending)
         try:
             _assert_source_current(args.input, source)
+            if map_source is not None:
+                _assert_source_current(
+                    args.map_path, map_source, "linker MAP")
             _validate_identity_aliases(
-                args.input, args.output, args.emit_selection_manifest)
+                args.input, args.map_path, args.output,
+                args.emit_selection_manifest)
             _commit_publications(publications)
         finally:
             _cleanup_publications(publications)

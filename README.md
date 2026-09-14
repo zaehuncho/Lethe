@@ -144,10 +144,17 @@ snapshot and then runs the existing production direct-control-flow audit; the
 manifest cannot waive a stale byte, a new edge, or any failed current proof.
 When both report and manifest files are requested, the tool constructs and
 source-revalidates both before a transactional sibling-file publication. Path
-identity aliases, hardlinks between the three roles, and reparse-based output
-paths reject without changing either prior output. A failed multi-output commit
-restores each original filesystem object, retaining its identity and metadata,
-instead of reconstructing it from copied bytes.
+identity aliases and hardlinks between the PE, optional linker MAP, report, and
+manifest roles, plus reparse-based output paths, reject without changing prior
+outputs. A MAP is read from one private snapshot and revalidated before
+publication. It may enrich the human report, but a simultaneously emitted
+selection is built from a second deterministic PE-only discovery view because
+the packer deliberately recomputes discovery without external symbols. A failed
+multi-output commit restores each original filesystem object, retaining its
+identity and metadata, instead of reconstructing it from copied bytes. Staged
+and installed objects are identity-verified through final commit; if an original
+backup changes concurrently, publication fails and reports the retained recovery
+path rather than overwriting either the changed target or recovery object.
 
 ### Server shard mode
 
