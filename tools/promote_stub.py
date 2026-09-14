@@ -37,7 +37,17 @@ PRODUCTION_MATRIX = ROOT / "docs" / "production_compatibility.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SEED_RE = re.compile(r"[0-9a-f]+\Z")
-ROUNDTRIP_RE = re.compile(r"(?m)^\s*(\d+)/(\d+) passed -- PASS\s*$")
+ROUNDTRIP_SUMMARY_RE = re.compile(
+    r"^\s*(\d+)/(\d+) passed(?: \((\d+) failed\))? -- (PASS|FAIL)\s*$"
+)
+ROUNDTRIP_SUMMARY_SENTINEL_RE = re.compile(
+    r"^\s*\d+/\d+\s+passed\b.*--\s*(?:PASS|FAIL)\s*$"
+)
+PYTEST_SUMMARY_RE = re.compile(
+    r"^\s*\d+\s+(?:passed|failed|skipped|xfailed|xpassed|errors?|warnings?)"
+    r"(?:,\s*\d+\s+(?:passed|failed|skipped|xfailed|xpassed|errors?|warnings?))*"
+    r"\s+in\s+[^\r\n]+$"
+)
 SUPPORTED_PYTHON = (3, 12)
 SUPPORTED_UV = "0.11.29"
 SUPPORTED_GENERATOR = "Visual Studio 17 2022"
@@ -80,6 +90,7 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity",
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT = 19
 CANDIDATE_POLICY_ID = "lethe-native-candidate-v1"
 CANDIDATE_ALLOWED_BLOCKERS = {
     "mitigation.load_config_cfg_xfg": "partial",
@@ -591,12 +602,27 @@ def validate_roundtrip_record(record: CommandRecord, expected_hash: str) -> tupl
         raise PromotionError("round-trip evidence names a different artifact SHA-256")
     if record.exit_code != 0:
         raise PromotionError(f"EXE/DLL round-trip gate failed with exit {record.exit_code}")
-    match = ROUNDTRIP_RE.search(record.stdout)
+    lines = record.stdout.rstrip().splitlines()
+    summaries = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if ROUNDTRIP_SUMMARY_SENTINEL_RE.fullmatch(line) is not None
+    ]
+    if len(summaries) != 1 or summaries[0][0] != len(lines) - 1:
+        raise PromotionError(
+            "round-trip output must contain exactly one terminal summary")
+    _index, terminal = summaries[0]
+    match = ROUNDTRIP_SUMMARY_RE.fullmatch(terminal)
     if match is None:
-        raise PromotionError("round-trip output has no authoritative N/N PASS summary")
-    passed, total = map(int, match.groups())
-    if total < 1 or passed != total:
-        raise PromotionError("round-trip summary is not fully passing")
+        raise PromotionError("round-trip terminal summary is malformed")
+    passed, total = map(int, match.group(1, 2))
+    if (match.group(3) is not None or match.group(4) != "PASS"
+            or passed != REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT
+            or total != REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT):
+        raise PromotionError(
+            "round-trip summary is not the complete "
+            f"{REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT}/"
+            f"{REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT} PASS contract")
     return passed, total
 
 
@@ -613,10 +639,16 @@ def validate_runtime_hardening_record(
         raise PromotionError(
             f"candidate-bound native runtime hardening failed with exit {record.exit_code}")
     summary = record.stdout.rstrip().splitlines()
-    match = (
-        re.fullmatch(r"(\d+) passed in [^\r\n]+", summary[-1].strip())
-        if summary else None
-    )
+    summaries = [
+        (index, line.strip())
+        for index, line in enumerate(summary)
+        if PYTEST_SUMMARY_RE.fullmatch(line) is not None
+    ]
+    if len(summaries) != 1 or summaries[0][0] != len(summary) - 1:
+        raise PromotionError(
+            "candidate-bound native runtime hardening must contain exactly "
+            "one terminal pytest summary")
+    match = re.fullmatch(r"(\d+) passed in [^\r\n]+", summaries[0][1])
     if match is None or int(match.group(1)) != expected_tests:
         raise PromotionError(
             "candidate-bound native runtime hardening has no exact pass summary")
@@ -722,6 +754,12 @@ def build_manifest(
 ) -> dict[str, Any]:
     artifact_hash = sha256_file(staged_stub)
     passed, total = roundtrip_counts
+    if (passed, total) != (
+        REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+        REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+    ):
+        raise PromotionError(
+            "candidate manifest requires the complete native round-trip contract")
     release_blockers = validate_candidate_gate_payload(gate_payload)
     evidence = []
     for path in evidence_paths:
@@ -868,8 +906,8 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
     if (not isinstance(actual, dict)
             or type(actual.get("passed")) is not int
             or type(actual.get("total")) is not int
-            or actual["total"] < 1
-            or actual["passed"] != actual["total"]
+            or actual["passed"] != REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT
+            or actual["total"] != REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT
             or manifest.get("native_roundtrip") != (
                 f"passed-{actual['passed']}-of-{actual['total']}")):
         raise PromotionError("candidate manifest has no full native round-trip result")

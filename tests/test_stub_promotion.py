@@ -86,17 +86,19 @@ def test_atomic_manifest_write_never_replaces_target_on_swap_failure(
 
 def test_roundtrip_evidence_requires_same_hash_and_full_summary() -> None:
     digest = "a" * 64
+    required = promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT
     passing = promote_stub.CommandRecord(
         name="roundtrip",
         argv=["roundtrip.ps1"],
         exit_code=0,
-        stdout="  11/11 passed -- PASS\n",
+        stdout=f"  {required}/{required} passed -- PASS\n",
         stderr="",
         source_commit="b" * 40,
         artifact_sha256=digest,
     )
 
-    assert promote_stub.validate_roundtrip_record(passing, digest) == (11, 11)
+    assert promote_stub.validate_roundtrip_record(passing, digest) == (
+        required, required)
 
     with pytest.raises(promote_stub.PromotionError, match="different artifact"):
         promote_stub.validate_roundtrip_record(passing, "c" * 64)
@@ -105,6 +107,23 @@ def test_roundtrip_evidence_requires_same_hash_and_full_summary() -> None:
     )
     with pytest.raises(promote_stub.PromotionError, match="gate failed"):
         promote_stub.validate_roundtrip_record(red, digest)
+
+    for malformed in (
+        "1/1 passed -- PASS\n",
+        f"{required}/{required} passed -- PASS\n"
+        f"{required}/{required} passed -- PASS\n",
+        f"{required}/{required} passed -- PASS\n"
+        f"{required - 1}/{required} passed (1 failed) -- FAIL\n",
+        f"{required - 1}/{required} passed; one failed -- FAIL\n"
+        f"{required}/{required} passed -- PASS\n",
+        f"{required - 1}/{required - 1} passed -- PASS\n"
+        f"{required}/{required} passed -- PASS\n",
+    ):
+        forged = promote_stub.CommandRecord(
+            **{**passing.__dict__, "stdout": malformed}
+        )
+        with pytest.raises(promote_stub.PromotionError):
+            promote_stub.validate_roundtrip_record(forged, digest)
 
 
 def test_command_environment_overrides_inherit_without_recording_secrets(
@@ -159,21 +178,21 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
         promote_stub.validate_runtime_hardening_record(skipped, digest)
 
     incomplete_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "11 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "13 passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             incomplete_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     oversized_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "13 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "15 passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             oversized_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     xfailed_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "12 passed, 1 xfailed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": "14 passed, 1 xfailed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
@@ -181,9 +200,9 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     nested_summary = promote_stub.CommandRecord(
         **{**passing.__dict__,
-           "stdout": "12 passed in 1.00s\n13 passed in 2.00s\n"}
+           "stdout": "14 passed in 1.00s\n14 passed in 2.00s\n"}
     )
-    with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
+    with pytest.raises(promote_stub.PromotionError, match="exactly one terminal"):
         promote_stub.validate_runtime_hardening_record(
             nested_summary, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
@@ -197,6 +216,7 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_xfg_virtualization_preflight.py",
     )
     assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 14
+    assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 14
     assert (
         "tests/test_native_virtualization_runtime.py::"
@@ -378,7 +398,10 @@ def test_manifest_keeps_schema_2_field_but_derives_actual_count_label(
             "dvm_roll_poison": False,
             "dvm_paged_runtime": True,
         },
-        roundtrip_counts=(11, 11),
+        roundtrip_counts=(
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+        ),
         ctest_count=4,
         evidence_paths=[evidence],
         stage_dir=tmp_path,
@@ -390,8 +413,8 @@ def test_manifest_keeps_schema_2_field_but_derives_actual_count_label(
     assert manifest["production_ready"] is False
     assert manifest["candidate_scope"] == "all"
     assert "production_scope" not in manifest
-    assert manifest["native_roundtrip"] == "passed-11-of-11"
-    assert manifest["native_roundtrip_actual"] == {"passed": 11, "total": 11}
+    assert manifest["native_roundtrip"] == "passed-19-of-19"
+    assert manifest["native_roundtrip_actual"] == {"passed": 19, "total": 19}
     assert manifest["dvm_handler_variant_sha256"] == "3" * 64
     assert manifest["dvm_roll_poison"] is False
     assert manifest["evidence"] == [{
@@ -477,7 +500,10 @@ def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_statu
             "dvm_roll_poison": False,
             "dvm_paged_runtime": True,
         },
-        roundtrip_counts=(11, 11),
+        roundtrip_counts=(
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+            promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT,
+        ),
         ctest_count=4,
         evidence_paths=evidence_paths,
         stage_dir=tmp_path,
@@ -505,7 +531,7 @@ def test_candidate_bundle_validation_rejects_tampered_evidence_and_release_statu
 
     manifest["artifact_status"] = "candidate-verified"
     manifest["production_ready"] = False
-    manifest["native_roundtrip"] = "passed-10-of-11"
+    manifest["native_roundtrip"] = "passed-18-of-19"
     promote_stub.atomic_write_json(manifest_path, manifest)
     with pytest.raises(promote_stub.PromotionError, match="full native round-trip"):
         promote_stub.validate_candidate_bundle(staged_stub, manifest_path)
