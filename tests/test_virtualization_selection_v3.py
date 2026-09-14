@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import struct
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ SOURCE_SHA256 = "a" * 64
 CONTENT_ID = "b" * 64
 BODY = b"\xB8\x2A\x00\x00\x00\xC3"
 SOURCE = BODY + b"\xCC\xCC"
+PDATA = struct.pack("<III", 0x1000, 0x1000 + len(SOURCE), 0x2000)
 
 
 def _evidence():
@@ -45,12 +47,26 @@ def _evidence():
         size_of_image=0x3000,
         pdata_rva=0x2800,
         pdata_count=1,
-        sections=(SimpleNamespace(
-            name=".text",
-            rva=0x1000,
-            raw=SOURCE,
-            characteristics=0x60000020,
-        ),),
+        sections=(
+            SimpleNamespace(
+                name=".text",
+                rva=0x1000,
+                raw=SOURCE,
+                characteristics=0x60000020,
+            ),
+            SimpleNamespace(
+                name=".xdata",
+                rva=0x2000,
+                raw=b"\x01\x00\x00\x00",
+                characteristics=0x40000040,
+            ),
+            SimpleNamespace(
+                name=".pdata",
+                rva=0x2800,
+                raw=PDATA,
+                characteristics=0x40000040,
+            ),
+        ),
         runtime_functions=(SimpleNamespace(
             begin_rva=0x1000,
             end_rva=0x1000 + len(SOURCE),
@@ -101,6 +117,22 @@ def test_v3_binds_unequal_source_and_lifted_body_extents():
     )
 
 
+def test_v3_emitter_rejects_unbacked_pdata_claim():
+    parsed, report, _manifest = _evidence()
+    changed = SimpleNamespace(**{
+        **parsed.__dict__,
+        "sections": parsed.sections[:2],
+    })
+
+    with pytest.raises(selection.VirtualizationSelectionError, match="not file-backed"):
+        selection.build_manifest(
+            report,
+            changed,
+            source_sha256=SOURCE_SHA256,
+            source_pe_content_id=CONTENT_ID,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     (
@@ -134,7 +166,7 @@ def test_v3_rejects_stale_pdata_and_current_body_split():
             unwind_flags=0,
         ),),
     })
-    with pytest.raises(selection.VirtualizationSelectionError, match="exact runtime"):
+    with pytest.raises(selection.VirtualizationSelectionError, match="PDATA bytes"):
         _verify(stale_pdata, report, manifest)
 
     stale_report = SimpleNamespace(candidates=(replace(
@@ -162,13 +194,42 @@ def test_v3_rejects_free_floating_or_forged_pdata_inventory(mutation, match):
         _verify(parsed, report, manifest)
 
 
+@pytest.mark.parametrize(
+    ("pdata_raw", "match"),
+    (
+        (b"", "not file-backed"),
+        (PDATA[:-1], "not file-backed"),
+        (struct.pack("<III", 0x1000, 0x1000 + len(SOURCE) - 1, 0x2000),
+         "do not match"),
+        (struct.pack("<III", 0x1000, 0x1000 + len(SOURCE), 0x2004),
+         "UNWIND_INFO|do not match"),
+    ),
+)
+def test_v3_rejects_missing_truncated_or_forged_pdata_bytes(pdata_raw, match):
+    parsed, report, manifest = _evidence()
+    pdata = SimpleNamespace(**{
+        **parsed.sections[2].__dict__,
+        "raw": pdata_raw,
+    })
+    changed = SimpleNamespace(**{
+        **parsed.__dict__,
+        "sections": (*parsed.sections[:2], pdata),
+    })
+
+    with pytest.raises(selection.VirtualizationSelectionError, match=match):
+        _verify(changed, report, manifest)
+
+
 def test_v3_recomputes_canonical_suffix_after_synchronized_hash_changes():
     parsed, report, manifest = _evidence()
     noncanonical = BODY + b"\x00\x00"
     changed = SimpleNamespace(**{
         **parsed.__dict__,
-        "sections": (SimpleNamespace(
-            **{**parsed.sections[0].__dict__, "raw": noncanonical}),),
+        "sections": (
+            SimpleNamespace(
+                **{**parsed.sections[0].__dict__, "raw": noncanonical}),
+            *parsed.sections[1:],
+        ),
     })
     item = manifest["selections"][0]
     item["source_extent_sha256"] = hashlib.sha256(noncanonical).hexdigest()

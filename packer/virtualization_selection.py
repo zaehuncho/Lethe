@@ -248,6 +248,8 @@ def build_manifest(
                        in selected)
         else LEGACY_VERSION
     )
+    if version == VERSION:
+        _validate_pdata_inventory(parsed)
     selections = []
     for item, original, source_extent_size, lifted_body_size in selected:
         gaps = [{
@@ -395,9 +397,10 @@ def _current_padding_proof(
 
 
 def _validate_pdata_inventory(parsed: Any) -> None:
-    """Bind a v3 runtime claim to the declared PDATA directory geometry."""
+    """Bind a v3 runtime claim to the exact file-backed PDATA inventory."""
     try:
         from lifter import direct_control_flow
+        from . import pe_analyze
     except ImportError as exc:
         raise VirtualizationSelectionError(
             f"cannot load the PDATA inventory verifier: {exc}") from exc
@@ -405,7 +408,46 @@ def _validate_pdata_inventory(parsed: Any) -> None:
         runtime_ranges = direct_control_flow._normalize_runtime_functions(parsed)
         direct_control_flow._validate_trimmed_pdata_inventory(
             parsed, runtime_ranges)
+        pdata_size = parsed.pdata_count * 12
+        pdata = pe_analyze._slice_at_rva(
+            parsed.sections,
+            parsed.pdata_rva,
+            pdata_size,
+            what="selection manifest v3 PDATA directory",
+        )
+        validated = pe_analyze._parse_pdata(
+            pdata,
+            parsed.pdata_rva,
+            parsed.size_of_image,
+            parsed.sections,
+        )
+        current_inventory = tuple(
+            (
+                item.begin_rva,
+                item.end_rva,
+                item.unwind_info_rva,
+                item.unwind_flags,
+            )
+            for item in parsed.runtime_functions
+        )
+        validated_inventory = tuple(
+            (
+                item.begin_rva,
+                item.end_rva,
+                item.unwind_info_rva,
+                item.unwind_flags,
+            )
+            for item in validated
+        )
+        if validated_inventory != current_inventory:
+            raise VirtualizationSelectionError(
+                "selection manifest v3 PDATA bytes do not match the "
+                "runtime-function inventory"
+            )
     except direct_control_flow.DirectControlFlowError as exc:
+        raise VirtualizationSelectionError(
+            f"selection manifest v3 PDATA binding failed: {exc}") from exc
+    except (AttributeError, TypeError, ValueError) as exc:
         raise VirtualizationSelectionError(
             f"selection manifest v3 PDATA binding failed: {exc}") from exc
 

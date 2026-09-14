@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -150,8 +151,19 @@ def test_tool_emits_v3_for_canonical_padding_split(monkeypatch, tmp_path):
     parsed = SimpleNamespace(
         path="snapshot.exe", is_dll=False, image_base=0x140000000,
         size_of_image=0x3000,
-        sections=(SimpleNamespace(
-            rva=0x1000, raw=source, characteristics=0x60000020),),
+        pdata_rva=0x2800, pdata_count=1,
+        sections=(
+            SimpleNamespace(
+                rva=0x1000, raw=source, characteristics=0x60000020),
+            SimpleNamespace(
+                rva=0x2000, raw=b"\x01\x00\x00\x00",
+                characteristics=0x40000040),
+            SimpleNamespace(
+                rva=0x2800,
+                raw=struct.pack(
+                    "<III", 0x1000, 0x1000 + len(source), 0x2000),
+                characteristics=0x40000040),
+        ),
         runtime_functions=(SimpleNamespace(
             begin_rva=0x1000, end_rva=0x1000 + len(source),
             unwind_info_rva=0x2000, unwind_flags=0),),
