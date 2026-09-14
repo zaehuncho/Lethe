@@ -49,6 +49,11 @@ int main(void)
     uint32_t i;
     uint32_t api_set_count = 0;
     uint32_t ordinal_count = 0;
+    HMODULE dotted_forwarder_module;
+    FARPROC dotted_expected;
+    FARPROC dotted_os_result;
+    FARPROC dotted_lethe_result;
+    FARPROC dotted_upper_result;
     char ordinal_forwarder[64];
     char unterminated[] = {
         'k','e','r','n','e','l','3','2','.','S','l','e','e','p'
@@ -117,6 +122,22 @@ int main(void)
     if (api_set_count == 0u)
         return 21;
 
+    dotted_forwarder_module = LoadLibraryW(L"LetheForwarderDotModule.dll");
+    if (dotted_forwarder_module == NULL)
+        return 22;
+    dotted_expected = GetProcAddress(kernel32, "Sleep");
+    dotted_os_result = GetProcAddress(
+        dotted_forwarder_module, "LetheDottedForward");
+    dotted_lethe_result = lethe_test_resolve_forwarder(
+        "kernel32.dll.Sleep", (uint32_t)sizeof("kernel32.dll.Sleep"));
+    dotted_upper_result = lethe_test_resolve_forwarder(
+        "KERNEL32.DLL.Sleep", (uint32_t)sizeof("KERNEL32.DLL.Sleep"));
+    if (dotted_expected == NULL || dotted_os_result != dotted_expected ||
+        dotted_lethe_result != dotted_expected ||
+        dotted_upper_result != dotted_expected)
+        return 23;
+    printf("dotted module resolved: kernel32.dll.Sleep\n");
+
     for (i = 0; i < exports->NumberOfNames; ++i) {
         uint32_t function_index = name_ordinals[i];
         uint32_t exported_ordinal;
@@ -140,6 +161,14 @@ int main(void)
             ordinal_forwarder, (uint32_t)sizeof(ordinal_forwarder));
         if (actual != expected)
             continue;
+        if (sprintf_s(ordinal_forwarder, sizeof(ordinal_forwarder),
+                      "kernel32.dll.#%lu",
+                      (unsigned long)exported_ordinal) < 0)
+            return 32;
+        actual = lethe_test_resolve_forwarder(
+            ordinal_forwarder, (uint32_t)sizeof(ordinal_forwarder));
+        if (actual != expected)
+            return 33;
         printf("ordinal resolved: %s -> #%lu\n",
                name, (unsigned long)exported_ordinal);
         ++ordinal_count;
@@ -155,6 +184,8 @@ int main(void)
         !expect_rejected("kernel32.#65536",
                          (uint32_t)sizeof("kernel32.#65536")) ||
         !expect_rejected("kernel32.#1x", (uint32_t)sizeof("kernel32.#1x")) ||
+        !expect_rejected("kernel32.dll.#1x",
+                         (uint32_t)sizeof("kernel32.dll.#1x")) ||
         !expect_rejected(unterminated, (uint32_t)sizeof(unterminated)))
         return 40;
 

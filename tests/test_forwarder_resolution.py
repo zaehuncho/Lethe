@@ -19,10 +19,14 @@ def test_forwarder_resolution_delegates_only_after_bounded_validation() -> None:
     assert "uint32_t fwd_size" in resolver
     assert "scan_limit = fwd_size < 512u ? fwd_size : 512u" in resolver
     assert "terminator == scan_limit" in resolver
+    assert "if (fwd[terminator] == '.')" in resolver
+    assert "if (!dot && fwd[terminator] == '.')" not in resolver
     assert "func_len == 0u" in resolver
     assert "func[i] < '0' || func[i] > '9'" in resolver
     assert "parsed > (65535u - digit) / 10u" in resolver
     assert "parsed == 0u" in resolver
+    assert "has_dll_suffix" in resolver
+    assert "if (!mod && !has_dll_suffix)" in resolver
     assert resolver.index("if (!mod) return NULL") < resolver.index(
         "GetProcAddress((HMODULE)mod"
     )
@@ -44,6 +48,11 @@ def test_native_contract_covers_api_set_ordinal_and_negative_inputs() -> None:
     cmake = CMAKE.read_text(encoding="utf-8")
     assert "api-set resolved:" in native
     assert '"kernel32.#%lu"' in native
+    assert '"kernel32.dll.Sleep"' in native
+    assert '"KERNEL32.DLL.Sleep"' in native
+    assert '"kernel32.dll.#%lu"' in native
+    assert "LetheForwarderDotModule.dll" in native
+    assert "forwarder_dot_module.def" in cmake
     for malformed in (
         '"kernel32."',
         '".Sleep"',
@@ -51,6 +60,7 @@ def test_native_contract_covers_api_set_ordinal_and_negative_inputs() -> None:
         '"kernel32.#0"',
         '"kernel32.#65536"',
         '"kernel32.#1x"',
+        '"kernel32.dll.#1x"',
     ):
         assert malformed in native
     assert "LetheForwarderResolutionTest" in cmake

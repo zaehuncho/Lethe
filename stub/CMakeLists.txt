@@ -50,6 +50,20 @@ if(BUILD_TESTING)
     target_compile_definitions(LetheForwarderResolutionTest PRIVATE
         LETHE_FORWARDER_TEST_API LETHE_FORWARDER_TEST_ONLY)
     target_link_libraries(LetheForwarderResolutionTest PRIVATE kernel32)
+    set(_forwarder_dot_module
+        "${CMAKE_CURRENT_BINARY_DIR}/LetheForwarderDotModule.dll")
+    add_custom_command(
+        OUTPUT "${_forwarder_dot_module}"
+        COMMAND "${CMAKE_LINKER}" /NOLOGO /DLL /NOENTRY /MACHINE:X64
+            /IGNORE:4001
+            "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/tests/forwarder_dot_module.def"
+            "/OUT:${_forwarder_dot_module}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/forwarder_dot_module.def"
+        VERBATIM
+    )
+    add_custom_target(LetheForwarderDotModule ALL
+        DEPENDS "${_forwarder_dot_module}")
+    add_dependencies(LetheForwarderResolutionTest LetheForwarderDotModule)
     if(MSVC)
         target_compile_options(LetheForwarderResolutionTest PRIVATE
             /W4 /WX /O2 /Gy)

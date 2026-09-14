@@ -341,6 +341,7 @@ static FARPROC resolve_forwarder(const char *fwd, uint32_t fwd_size, int depth)
     uint32_t i;
     uint32_t dll_hash;
     uint16_t ordinal = 0;
+    int has_dll_suffix = 0;
     int by_ordinal = 0;
     void *mod;
     FARPROC result = NULL;
@@ -355,7 +356,7 @@ static FARPROC resolve_forwarder(const char *fwd, uint32_t fwd_size, int depth)
     for (terminator = 0; terminator < scan_limit; ++terminator) {
         if (fwd[terminator] == '\0')
             break;
-        if (!dot && fwd[terminator] == '.') {
+        if (fwd[terminator] == '.') {
             dot = fwd + terminator;
             dll_len = terminator;
         }
@@ -396,17 +397,27 @@ static FARPROC resolve_forwarder(const char *fwd, uint32_t fwd_size, int depth)
         if (c >= 'A' && c <= 'Z') c += 32;
         dll_lower[i] = c;
     }
-    dll_lower[dll_len]   = '.';
-    dll_lower[dll_len+1] = 'd';
-    dll_lower[dll_len+2] = 'l';
-    dll_lower[dll_len+3] = 'l';
-    dll_lower[dll_len+4] = '\0';
+    has_dll_suffix =
+        dll_len >= 4u &&
+        dll_lower[dll_len - 4u] == '.' &&
+        dll_lower[dll_len - 3u] == 'd' &&
+        dll_lower[dll_len - 2u] == 'l' &&
+        dll_lower[dll_len - 1u] == 'l';
+    if (has_dll_suffix) {
+        dll_lower[dll_len] = '\0';
+    } else {
+        dll_lower[dll_len]   = '.';
+        dll_lower[dll_len+1] = 'd';
+        dll_lower[dll_len+2] = 'l';
+        dll_lower[dll_len+3] = 'l';
+        dll_lower[dll_len+4] = '\0';
+    }
 
     dll_hash = import_hash(dll_lower);
     if (dll_hash == 0) dll_hash = 1;
     mod = find_module_by_hash(dll_hash);
 
-    if (!mod) {
+    if (!mod && !has_dll_suffix) {
         /* Try without .dll extension */
         dll_lower[dll_len] = '\0';
         dll_hash = import_hash(dll_lower);
@@ -416,11 +427,13 @@ static FARPROC resolve_forwarder(const char *fwd, uint32_t fwd_size, int depth)
 
     if (!mod) {
         /* Last resort: LoadLibraryA (handles API-set redirection) */
-        dll_lower[dll_len]   = '.';
-        dll_lower[dll_len+1] = 'd';
-        dll_lower[dll_len+2] = 'l';
-        dll_lower[dll_len+3] = 'l';
-        dll_lower[dll_len+4] = '\0';
+        if (!has_dll_suffix) {
+            dll_lower[dll_len]   = '.';
+            dll_lower[dll_len+1] = 'd';
+            dll_lower[dll_len+2] = 'l';
+            dll_lower[dll_len+3] = 'l';
+            dll_lower[dll_len+4] = '\0';
+        }
         mod = (void *)LoadLibraryA(dll_lower);
     }
 
