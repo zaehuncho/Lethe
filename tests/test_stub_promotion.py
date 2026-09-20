@@ -177,22 +177,24 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(skipped, digest)
 
+    expected = promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT
     incomplete_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "13 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": f"{expected - 1} passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             incomplete_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     oversized_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "15 passed in 1.00s\n"}
+        **{**passing.__dict__, "stdout": f"{expected + 1} passed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
             oversized_release_gate, digest,
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     xfailed_release_gate = promote_stub.CommandRecord(
-        **{**passing.__dict__, "stdout": "14 passed, 1 xfailed in 1.00s\n"}
+        **{**passing.__dict__,
+           "stdout": f"{expected} passed, 1 xfailed in 1.00s\n"}
     )
     with pytest.raises(promote_stub.PromotionError, match="exact pass summary"):
         promote_stub.validate_runtime_hardening_record(
@@ -200,7 +202,8 @@ def test_runtime_hardening_evidence_is_artifact_bound_and_cannot_skip() -> None:
             expected_tests=promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
     nested_summary = promote_stub.CommandRecord(
         **{**passing.__dict__,
-           "stdout": "14 passed in 1.00s\n14 passed in 2.00s\n"}
+           "stdout": (f"{expected} passed in 1.00s\n"
+                      f"{expected} passed in 2.00s\n")}
     )
     with pytest.raises(promote_stub.PromotionError, match="exactly one terminal"):
         promote_stub.validate_runtime_hardening_record(
@@ -215,9 +218,13 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 14
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 15
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 14
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 15
+    assert (
+        "tests/test_native_virtualization_runtime.py::"
+        "test_packed_executable_calls_virtualized_native_callee"
+    ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert (
         "tests/test_native_virtualization_runtime.py::"
         "test_packed_dll_calls_source_bound_virtualized_padded_leaf"
@@ -622,7 +629,8 @@ def test_native_runtime_promotion_uses_short_isolated_basetemp(tmp_path: Path) -
             name="candidate-bound-native-runtime-hardening",
             argv=argv,
             exit_code=0,
-            stdout="14 passed in 1.00s\n",
+            stdout=(f"{promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT} "
+                    "passed in 1.00s\n"),
             stderr="",
             source_commit="f" * 40,
             artifact_sha256="a" * 64,
@@ -632,6 +640,23 @@ def test_native_runtime_promotion_uses_short_isolated_basetemp(tmp_path: Path) -
     assert (
         f"--basetemp=external://{basetemp.name}" in recorded["argv"]
     )
+    promote_stub._validate_recorded_runtime_hardening_argv(recorded["argv"])
+
+    # A verified bundle may be copied into the release signer's immutable
+    # snapshot. The portable token stays valid there, but malformed or
+    # machine-local replacements do not.
+    relocated = list(recorded["argv"])
+    relocated[6] = "--basetemp=external://0123456789ab"
+    promote_stub._validate_recorded_runtime_hardening_argv(relocated)
+    for bad in (
+        "--basetemp=C:/machine/local",
+        "--basetemp=external://too-short",
+        "--basetemp=external://0123456789AB",
+    ):
+        tampered = list(recorded["argv"])
+        tampered[6] = bad
+        with pytest.raises(promote_stub.PromotionError, match="unexpected command"):
+            promote_stub._validate_recorded_runtime_hardening_argv(tampered)
 
 
 def test_production_corpus_hashing_has_no_cmdlet_autoload_dependency() -> None:

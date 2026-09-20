@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing, legacy XMM register moves/bitwise XOR, scalar MOVD/MOVQ memory transfers, and unaligned MOVUPS/MOVDQU memory transfers are covered, while header/gap/executable/discardable/address-taken RIP targets, aligned XMM memory forms, XMM arithmetic memory sources, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, native calls, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing, legacy XMM register moves/bitwise XOR, scalar MOVD/MOVQ memory transfers, unaligned MOVUPS/MOVDQU memory transfers, RIP-relative import calls, proven direct calls to first-party PDATA entries left native, and the MSVC CFG-dispatch idiom are covered, while header/gap/executable/discardable/address-taken RIP targets, aligned XMM memory forms, XMM arithmetic memory sources, SIMD/FP arithmetic, AVX-family state, DIV/IDIV fault delivery, other indirect/native call shapes, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -304,7 +304,7 @@
         {
           "type": "native-pytest",
           "path": "tests/test_native_virtualization_runtime.py",
-          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative scalar and XMM memory-transfer bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata."
+          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative scalar and XMM memory-transfer bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata. A candidate-bound packed EXE also virtualizes a direct caller while its PDATA-proven callee remains native and preserves forced-ASLR output and exit parity."
         }
       ]
     },

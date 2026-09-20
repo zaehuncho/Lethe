@@ -36,7 +36,7 @@ turn on debugger-sensitive poison behavior.
 Candidate promotion and release replay run the exact rolling-capable DLL through
 the native selected-function paged-v1 E2E gate in both eager and memory-guard
 modes and through the source-bound schema-v3 padded-DLL E2E gate. Any skip,
-output mismatch, non-paged program, or test count other than fourteen rejects the
+output mismatch, non-paged program, or test count other than fifteen rejects the
 candidate/release replay.
 The separate EXE/DLL round-trip gate is frozen at nineteen checks and rejects
 reduced or ambiguous terminal summaries.
@@ -237,9 +237,11 @@ Concrete, honest limitations of the offline layer:
   PE compatibility. The LLVM obfuscation layer is a **drafted, uncompiled** first
   cut. Selected scalar functions have a native Win64 thunk and VM entry path;
   direct non-recursive calls within one selected extent preserve ASLR-correct
-  stack return addresses and use shadow-validated VM returns. Native/external or
-  indirect calls, SIMD/FP, exception-bearing selected bodies, and indirect target
-  closure remain unsupported.
+  stack return addresses and use shadow-validated VM returns. Bounded
+  RIP-relative import calls, proven direct calls to first-party PDATA entries
+  left native, and the MSVC CFG-dispatch idiom cross the Win64 native-call
+  bridge; other indirect calls, SIMD/FP arithmetic, exception-bearing selected
+  bodies, and general indirect-target closure remain unsupported.
 
 ## AV / Authenticode
 

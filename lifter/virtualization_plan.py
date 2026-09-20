@@ -1392,7 +1392,14 @@ def compile_virtualization_manifest(
             "cfg_target_declared": False,
             "direct_only_thunk": True,
             "exception_handlers_supported": False,
-            "external_calls_supported": False,
+            # The Cut 16 bridge covers three bounded call shapes: a
+            # RIP-relative import slot, a proven direct first-party function
+            # entry left native, and the MSVC CFG dispatch idiom. Other
+            # indirect call shapes still fail closed in x64_lifter.
+            "external_calls_supported": True,
+            "direct_native_calls_supported": True,
+            "rip_relative_import_calls_supported": True,
+            "guard_cf_dispatch_calls_supported": True,
             "external_interior_entries_supported": False,
             "direct_internal_calls_supported": True,
             "leaf_only": not has_internal_calls,

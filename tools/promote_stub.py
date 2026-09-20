@@ -75,6 +75,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_executable_calls_virtualized_leaf[memguard]",
     "tests/test_native_virtualization_runtime.py::"
+    "test_packed_executable_calls_virtualized_native_callee",
+    "tests/test_native_virtualization_runtime.py::"
     "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
     "tests/test_xmm_store128_native.py::"
     "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic",
@@ -188,6 +190,25 @@ def _runtime_hardening_argv(
         f"--basetemp={_runtime_hardening_basetemp(stage_dir)}",
         *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
     ]
+
+
+def _validate_recorded_runtime_hardening_argv(argv: list[str]) -> None:
+    """Validate the portable form without rebinding it to a local stage path.
+
+    Candidate directories are intentionally relocatable and the release signer
+    snapshots one under a different parent before validation. The external
+    basetemp token therefore authenticates the recorded isolated run without
+    being recomputed from the verifier's current directory.
+    """
+    prefix = ["-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    if (len(argv) != 7 + len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+            or argv[1:6] != prefix
+            or re.fullmatch(
+                r"--basetemp=external://[0-9a-f]{12}", argv[6]
+            ) is None
+            or argv[7:] != list(REQUIRED_NATIVE_RUNTIME_NODE_IDS)):
+        raise PromotionError(
+            "runtime-hardening evidence names an unexpected command")
 
 
 def sha256_file(path: Path) -> str:
@@ -1112,13 +1133,7 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
             "schema", "name", "argv", "exit_code", "stdout", "stderr",
             "source_commit", "artifact_sha256"}:
         raise PromotionError("runtime-hardening evidence has unexpected fields")
-    expected_runtime_argv = [
-        "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        f"--basetemp=external://{_runtime_hardening_basetemp(stage_dir).name}",
-        *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
-    ]
-    if runtime_payload["argv"][1:] != expected_runtime_argv:
-        raise PromotionError("runtime-hardening evidence names an unexpected command")
+    _validate_recorded_runtime_hardening_argv(runtime_payload["argv"])
     runtime_record = CommandRecord(
         name=runtime_payload["name"],
         argv=runtime_payload["argv"],
