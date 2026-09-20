@@ -32,6 +32,7 @@ _XMM_ORS = ("por", "orps", "orpd")
 _XMM_LOGICAL = _XMM_XORS + _XMM_ANDS + _XMM_AND_NOTS + _XMM_ORS
 _XMM_HALF_MEMORY = ("movlps", "movlpd", "movhps", "movhpd")
 _XMM_HALF_REGISTER = ("movhlps", "movlhps")
+_XMM_BYTE_SHIFTS = ("pslldq", "psrldq")
 
 
 def _asm(source: str) -> bytes:
@@ -326,6 +327,38 @@ def test_randomized_half_lane_memory_moves_match_unicorn(
             ),
             xmm_init=xmms,
             mem=memory,
+        )
+
+
+@pytest.mark.parametrize("mnemonic", _XMM_BYTE_SHIFTS)
+@pytest.mark.parametrize("count", [0, 1, 7, 8, 9, 15, 16, 17, 255])
+def test_legacy_xmm_byte_shift_boundaries_match_unicorn(
+    mnemonic: str,
+    count: int,
+) -> None:
+    oracle.check_xmm(
+        _asm(f"cmp r10, r11; {mnemonic} xmm15, {count}"),
+        init=_gprs(r10=1, r11=2),
+        xmm_init=_xmms(xmm15=0xFFEEDDCCBBAA99887766554433221100),
+    )
+
+
+@pytest.mark.parametrize("mnemonic", _XMM_BYTE_SHIFTS)
+def test_randomized_legacy_xmm_byte_shifts_match_unicorn(
+    mnemonic: str,
+) -> None:
+    rng = random.Random(0x584D4D1780 + _XMM_BYTE_SHIFTS.index(mnemonic))
+    for _ in range(128):
+        destination = rng.randrange(16)
+        count = rng.randrange(256)
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        oracle.check_xmm(
+            _asm(f"cmp r10, r11; {mnemonic} xmm{destination}, {count}"),
+            init=_gprs(
+                r10=rng.getrandbits(64),
+                r11=rng.getrandbits(64),
+            ),
+            xmm_init=xmms,
         )
 
 
@@ -876,6 +909,8 @@ def test_rip_relative_half_lane_transfer_rebases_through_image_base(
         "vmovhps xmm0, xmm1, qword ptr [rax]",
         "vmovlpd xmm0, xmm1, qword ptr [rax]",
         "vmovhpd xmm0, xmm1, qword ptr [rax]",
+        "vpslldq xmm0, xmm1, 4",
+        "vpsrldq xmm0, xmm1, 4",
         "vmovaps ymm0, ymm1",
     ],
 )

@@ -90,8 +90,9 @@ register move, XOR/AND/AND-NOT/OR bitwise families with aligned memory sources,
 one mixed aligned/unaligned XMM copy body, scalar MOVD/MOVQ memory transfers,
 scalar MOVSS/MOVSD transfers, aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU
 transfers, low/high MOVLPS/MOVLPD/MOVHPS/MOVHPD memory transfers, and GPR
-load/store bodies. MOVHLPS/MOVLHPS register-lane shuffles are covered by the
-differential oracle. Other SIMD/FP arithmetic, wider vector/HVA/HFA signatures
+load/store bodies. MOVHLPS/MOVLHPS register-lane shuffles and immediate
+PSLLDQ/PSRLDQ byte shifts are covered by the differential oracle; the byte
+shifts also execute inside the packed XFG vector body. Other SIMD/FP arithmetic, wider vector/HVA/HFA signatures
 and returns, VEX/AVX/YMM/ZMM, variadics, broader/C++ aggregates, cross-toolchain
 compatibility, and clean-VM XFG enforcement remain outside coverage. External
 host calls establish packed runtime parity, not structurally decoded host-side

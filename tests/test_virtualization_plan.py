@@ -216,6 +216,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         "xmm_logical_memory_sources_supported": True,
         "xmm_scalar_float_moves_supported": True,
         "xmm_half_lane_moves_supported": True,
+        "xmm_byte_shifts_supported": True,
         "xmm_scalar_memory_transfers_supported": True,
         "xmm_aligned_128bit_memory_transfers_supported": True,
         "xmm_unaligned_128bit_memory_transfers_supported": True,

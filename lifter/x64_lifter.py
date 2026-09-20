@@ -31,7 +31,8 @@ and legacy MOVSS/MOVSD scalar transfers plus aligned MOVAPS/MOVDQA and
 unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported. Legacy
 MOVLPS/MOVLPD and MOVHPS/MOVHPD memory transfers preserve the untouched
 64-bit lane, while MOVHLPS/MOVLHPS cover the corresponding register-lane
-shuffles. Legacy
+shuffles. Legacy PSLLDQ/PSRLDQ byte shifts cover constant 128-bit lane
+realignment. Legacy
 PXOR/XORPS/XORPD,
 PAND/ANDPS/ANDPD, PANDN/ANDNPS/ANDNPD, and POR/ORPS/ORPD accept register
 sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
@@ -129,6 +130,10 @@ _XMM_HALF_MEMORY_MOVES = {
 _XMM_HALF_REGISTER_MOVES = {
     Mnemonic.MOVHLPS: ("movhlps", 8, 0),
     Mnemonic.MOVLHPS: ("movlhps", 0, 8),
+}
+_XMM_BYTE_SHIFTS = {
+    Mnemonic.PSLLDQ: ("pslldq", True),
+    Mnemonic.PSRLDQ: ("psrldq", False),
 }
 _XMM_LOGICAL = {
     Mnemonic.PXOR: ("pxor", "xor", False),
@@ -746,6 +751,63 @@ class _Lifter:
         preserved_lane_offset = 8 if destination_lane_offset == 0 else 0
         self.rd_local(destination_offset + preserved_lane_offset)
         self.wr_local(T1 if destination_lane_offset == 0 else T0)
+        self._write_xmm_from_temps(destination)
+
+    def _xmm_byte_shift(self, instr, mnemonic: str, left: bool) -> None:
+        """Lift legacy PSLLDQ/PSRLDQ immediate byte shifts over 128 bits."""
+        self._require_legacy_binary(instr, mnemonic)
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported(f"{mnemonic} destination must be an XMM register")
+        if instr.op_kind(1) != OpKind.IMMEDIATE8:
+            raise LiftUnsupported(f"{mnemonic} count must be an 8-bit immediate")
+        destination = instr.op_register(0)
+        destination_offset = self._xmm_offset(destination)
+        byte_count = instr.immediate(1) & 0xFF
+        if byte_count == 0:
+            return
+        if byte_count >= 16:
+            self.push_imm(0); self.wr_local(T0)
+            self.push_imm(0); self.wr_local(T1)
+            self._write_xmm_from_temps(destination)
+            return
+        if byte_count == 8:
+            if left:
+                self.rd_local(destination_offset); self.wr_local(T1)
+                self.push_imm(0); self.wr_local(T0)
+            else:
+                self.rd_local(destination_offset + 8); self.wr_local(T0)
+                self.push_imm(0); self.wr_local(T1)
+            self._write_xmm_from_temps(destination)
+            return
+        if byte_count < 8:
+            bit_count = byte_count * 8
+            if left:
+                self.rd_local(destination_offset)
+                self.push_imm(bit_count); self.a("shl"); self.wr_local(T0)
+                self.rd_local(destination_offset + 8)
+                self.push_imm(bit_count); self.a("shl"); self.wr_local(T1)
+                self.rd_local(destination_offset)
+                self.push_imm(64 - bit_count); self.a("shr")
+                self.rd_local(T1); self.a("or"); self.wr_local(T1)
+            else:
+                self.rd_local(destination_offset)
+                self.push_imm(bit_count); self.a("shr"); self.wr_local(T0)
+                self.rd_local(destination_offset + 8)
+                self.push_imm(64 - bit_count); self.a("shl")
+                self.rd_local(T0); self.a("or"); self.wr_local(T0)
+                self.rd_local(destination_offset + 8)
+                self.push_imm(bit_count); self.a("shr"); self.wr_local(T1)
+            self._write_xmm_from_temps(destination)
+            return
+        bit_count = (byte_count - 8) * 8
+        if left:
+            self.rd_local(destination_offset)
+            self.push_imm(bit_count); self.a("shl"); self.wr_local(T1)
+            self.push_imm(0); self.wr_local(T0)
+        else:
+            self.rd_local(destination_offset + 8)
+            self.push_imm(bit_count); self.a("shr"); self.wr_local(T0)
+            self.push_imm(0); self.wr_local(T1)
         self._write_xmm_from_temps(destination)
 
     def _read_rmw_destination(self, instr):
@@ -2018,6 +2080,9 @@ class _Lifter:
                     source_lane_offset,
                     destination_lane_offset,
                 )
+            elif m in _XMM_BYTE_SHIFTS:
+                mnemonic, left = _XMM_BYTE_SHIFTS[m]
+                self._xmm_byte_shift(instr, mnemonic, left)
             elif m in _XMM_LOGICAL:
                 mnemonic, operation, invert_destination = _XMM_LOGICAL[m]
                 self._xmm_logical(

@@ -442,6 +442,8 @@ __declspec(noinline) __m128i __vectorcall xfg_v128x7(
     result = _mm_or_si128(result, second);
     result = _mm_andnot_si128(third, result);
     result = _mm_xor_si128(result, fourth);
+    result = _mm_slli_si128(result, 3);
+    result = _mm_srli_si128(result, 1);
     result = _mm_xor_si128(result, fifth);
     return _mm_xor_si128(result, sixth);
 }
@@ -584,6 +586,8 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     vector_expected_seven = _mm_andnot_si128(
         vector_third, vector_expected_seven);
     vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_fourth);
+    vector_expected_seven = _mm_slli_si128(vector_expected_seven, 3);
+    vector_expected_seven = _mm_srli_si128(vector_expected_seven, 1);
     vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_fifth);
     vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_sixth);
     hva_value.first = vector_first;
@@ -1309,6 +1313,8 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         Mnemonic.ANDNPD,
     }
     assert vector7_mnemonics & {Mnemonic.POR, Mnemonic.ORPS, Mnemonic.ORPD}
+    assert Mnemonic.PSLLDQ in vector7_mnemonics
+    assert Mnemonic.PSRLDQ in vector7_mnemonics
     assert any(
         instruction.mnemonic in (
             Mnemonic.PAND,
@@ -1471,6 +1477,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["xmm_logical_memory_sources_supported"] is True
         assert function.capabilities["xmm_scalar_float_moves_supported"] is True
         assert function.capabilities["xmm_half_lane_moves_supported"] is True
+        assert function.capabilities["xmm_byte_shifts_supported"] is True
         assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
         assert function.capabilities[
             "xmm_aligned_128bit_memory_transfers_supported"

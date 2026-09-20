@@ -241,9 +241,9 @@ Concrete, honest limitations of the offline layer:
   RIP-relative import calls, proven direct calls to first-party PDATA entries
   left native, and the MSVC CFG-dispatch idiom cross the Win64 native-call
   bridge. The bounded legacy XMM transport subset includes whole-register,
-  scalar MOVSS/MOVSD, and low/high 64-bit lane moves; other indirect calls,
-  SIMD/FP arithmetic, exception-bearing selected bodies, and general
-  indirect-target closure remain unsupported.
+  scalar MOVSS/MOVSD, low/high 64-bit lane moves, and immediate whole-register
+  byte shifts; other indirect calls, SIMD/FP arithmetic, exception-bearing
+  selected bodies, and general indirect-target closure remain unsupported.
 
 ## AV / Authenticode
 

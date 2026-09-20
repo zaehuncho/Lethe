@@ -96,7 +96,9 @@ else + a **differential oracle** that proves every lift correct.
   Cut 18 adds
   aligned XMM transfers. All twelve legacy bitwise forms additionally accept
   aligned 128-bit memory sources while preserving architectural alignment
-  faults. Other SIMD/FP arithmetic and VEX/EVEX encodings remain fail-closed.
+  faults. Low/high 64-bit lane transfers and register shuffles plus immediate
+  `pslldq`/`psrldq` byte shifts extend compiler-generated transport coverage.
+  Other SIMD/FP arithmetic and VEX/EVEX encodings remain fail-closed.
 - **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
   source at its 32-bit RVA; the lift computes each effective address as runtime
   image base local `504` plus the decoded target RVA, so ASLR never bakes a
