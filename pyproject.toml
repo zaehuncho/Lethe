@@ -20,6 +20,7 @@ dev = [
     "pytest>=9.1,<10",
     "pyside6>=6.11,<6.12",
     "unicorn>=2.1.4,<3",
+    "pefile>=2024.8.26",
 ]
 gui-build = [
     "nuitka>=4.1.3,<5",
