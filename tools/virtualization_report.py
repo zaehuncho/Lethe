@@ -411,8 +411,17 @@ def _commit_publications(publications: list[_Publication]) -> None:
                         f"original {publication.label} is unavailable during "
                         f"rollback{recovery}")
             except BaseException as rollback_error:
+                recovery = ""
+                rollback_text = str(rollback_error)
+                if (publication.keep_backup
+                        and publication.backup is not None
+                        and os.path.lexists(publication.backup)
+                        and "retained at" not in rollback_text):
+                    recovery = (
+                        f"; recoverable object retained at "
+                        f"{publication.backup}")
                 rollback_errors.append(
-                    f"{publication.label}: {rollback_error}")
+                    f"{publication.label}: {rollback_text}{recovery}")
         if rollback_errors:
             raise RuntimeError(
                 f"publication failed ({publish_error}); rollback failed "
