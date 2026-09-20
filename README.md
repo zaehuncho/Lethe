@@ -68,6 +68,12 @@ reduced or ambiguous terminal summaries.
 # pack a supported unmanaged x64 EXE
 python lethe.py yourapp.exe yourapp.packed.exe
 
+# transactionally pack an EXE + DLL with the constrained first-release profile
+uv run python tools/pack_limited_release.py `
+  --stub-path C:\path\to\candidate\lethe_stub_x64.dll `
+  --exe C:\path\to\yourapp.exe --dll C:\path\to\yourlib.dll `
+  --output-dir C:\path\to\new-dist-directory
+
 # inventory exact function candidates and lift blockers without modifying input
 python tools/virtualization_report.py yourapp.exe --format table
 
@@ -89,6 +95,12 @@ uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
   tests/test_lifter_native_runtime.py tests/test_lifter_scalar_batch.py `
   -q -p no:cacheprovider -p no:faulthandler
 ```
+
+The constrained `lethe-limited-v1` path deliberately disables experimental
+hardening and selected-function virtualization, publishes both files only after
+structural validation, and writes exact source/output hashes. It still requires
+product-specific EXE and DLL-host runtime testing, scanning, and Authenticode
+signing before distribution. See [`docs/LIMITED_RELEASE.md`](docs/LIMITED_RELEASE.md).
 
 The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packing
 itself needs **no compiler**. Ordinary native builds stay under `stub/build` and
