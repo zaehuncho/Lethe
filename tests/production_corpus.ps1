@@ -444,7 +444,24 @@ finally {
     }
 }
 
-$stubHash = (Get-FileHash -LiteralPath $StubPath -Algorithm SHA256).Hash.ToLowerInvariant()
+# Avoid depending on PowerShell module auto-loading during candidate promotion.
+# Some locked-down build shells expose the .NET runtime but do not auto-import
+# Microsoft.PowerShell.Utility, which made an otherwise green native corpus fail
+# while trying to hash the already-verified stub.
+$stubStream = [System.IO.File]::OpenRead($StubPath)
+try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stubHash = ([System.BitConverter]::ToString(
+            $sha256.ComputeHash($stubStream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+finally {
+    $stubStream.Dispose()
+}
 Write-Host 'Collecting source provenance...'
 if ($SourceCommit) {
     if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {

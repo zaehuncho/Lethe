@@ -164,6 +164,32 @@ def _promotion_configure_argv(
     ]
 
 
+def _runtime_hardening_basetemp(stage_dir: Path) -> Path:
+    identity = hashlib.sha256(
+        str(stage_dir.resolve()).encode("utf-8")
+    ).hexdigest()[:12]
+    return Path.home() / ".lethe-pytest" / identity
+
+
+def _runtime_hardening_argv(
+    host: Mapping[str, str], stage_dir: Path,
+) -> list[str | os.PathLike[str]]:
+    """Build the candidate-bound pytest command with isolated temp state.
+
+    A machine-wide pytest base directory can be left unreadable by another
+    account or an interrupted elevated run. Candidate evidence must not depend
+    on that shared directory. A short user-profile path also avoids MSVC's
+    legacy path-length failures in the nested CMake fault-injection builds.
+    Key the directory to the fresh stage path so concurrent promotions remain
+    isolated.
+    """
+    return [
+        host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        f"--basetemp={_runtime_hardening_basetemp(stage_dir)}",
+        *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
+    ]
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1225,11 +1251,10 @@ def execute(args: argparse.Namespace) -> Path | None:
         failures.append(f"CTest failed with exit {ctest.exit_code}")
     _require_unchanged_artifact(built_stub, artifact_hash, "CTest")
 
+    runtime_basetemp = _runtime_hardening_basetemp(stage_dir)
+    runtime_basetemp.parent.mkdir(parents=True, exist_ok=True)
     runtime_hardening = run_recorded(
-        [
-            host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
-        ],
+        _runtime_hardening_argv(host, stage_dir),
         name="candidate-bound-native-runtime-hardening",
         path_name="runtime-hardening.json",
         artifact_hash=artifact_hash,

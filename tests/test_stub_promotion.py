@@ -604,6 +604,27 @@ def test_promotion_configure_enables_rolling_without_debug_poison(tmp_path: Path
     assert not any(str(argument).startswith("-DDVM_ROLL_POISON=ON") for argument in argv)
 
 
+def test_native_runtime_promotion_uses_short_isolated_basetemp(tmp_path: Path) -> None:
+    stage_dir = tmp_path / "candidate"
+    basetemp = promote_stub._runtime_hardening_basetemp(stage_dir)
+    argv = promote_stub._runtime_hardening_argv({"python": "python"}, stage_dir)
+
+    assert basetemp.parent == Path.home() / ".lethe-pytest"
+    assert len(basetemp.name) == 12
+    assert f"--basetemp={basetemp}" in argv
+    assert argv[-len(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS):] == list(
+        promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+
+
+def test_production_corpus_hashing_has_no_cmdlet_autoload_dependency() -> None:
+    source = (
+        promote_stub.ROOT / "tests" / "production_corpus.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "[System.Security.Cryptography.SHA256]::Create()" in source
+    assert "Get-FileHash" not in source
+
+
 def test_legacy_build_script_cannot_update_tracked_prebuilt() -> None:
     source = (promote_stub.ROOT / "stub" / "build_stub.ps1").read_text(encoding="utf-8")
 
