@@ -1114,6 +1114,7 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         raise PromotionError("runtime-hardening evidence has unexpected fields")
     expected_runtime_argv = [
         "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        f"--basetemp=external://{_runtime_hardening_basetemp(stage_dir).name}",
         *REQUIRED_NATIVE_RUNTIME_NODE_IDS,
     ]
     if runtime_payload["argv"][1:] != expected_runtime_argv:

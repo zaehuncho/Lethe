@@ -615,6 +615,24 @@ def test_native_runtime_promotion_uses_short_isolated_basetemp(tmp_path: Path) -
     assert argv[-len(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS):] == list(
         promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
 
+    evidence = stage_dir / "evidence" / "runtime-hardening.json"
+    promote_stub._record(
+        evidence,
+        promote_stub.CommandRecord(
+            name="candidate-bound-native-runtime-hardening",
+            argv=argv,
+            exit_code=0,
+            stdout="14 passed in 1.00s\n",
+            stderr="",
+            source_commit="f" * 40,
+            artifact_sha256="a" * 64,
+        ),
+    )
+    recorded = json.loads(evidence.read_text(encoding="utf-8"))
+    assert (
+        f"--basetemp=external://{basetemp.name}" in recorded["argv"]
+    )
+
 
 def test_production_corpus_hashing_has_no_cmdlet_autoload_dependency() -> None:
     source = (
