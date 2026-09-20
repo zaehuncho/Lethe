@@ -30,6 +30,8 @@ _XMM_ANDS = ("pand", "andps", "andpd")
 _XMM_AND_NOTS = ("pandn", "andnps", "andnpd")
 _XMM_ORS = ("por", "orps", "orpd")
 _XMM_LOGICAL = _XMM_XORS + _XMM_ANDS + _XMM_AND_NOTS + _XMM_ORS
+_XMM_HALF_MEMORY = ("movlps", "movlpd", "movhps", "movhpd")
+_XMM_HALF_REGISTER = ("movhlps", "movlhps")
 
 
 def _asm(source: str) -> bytes:
@@ -221,6 +223,107 @@ def test_randomized_scalar_float_moves_match_unicorn(
         oracle.check_xmm(
             _asm(f"cmp r10, r11; {instruction}"),
             init=_gprs(rax=oracle.MEM_BASE, r10=1, r11=2),
+            xmm_init=xmms,
+            mem=memory,
+        )
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "movhlps xmm0, xmm15",
+        "movlhps xmm0, xmm15",
+        "movhlps xmm15, xmm15",
+        "movlhps xmm15, xmm15",
+    ],
+)
+def test_legacy_half_lane_register_moves_match_unicorn(
+    instruction: str,
+) -> None:
+    oracle.check_xmm(
+        _asm(f"cmp r10, r11; {instruction}"),
+        init=_gprs(r10=1, r11=2),
+        xmm_init=_xmms(
+            xmm0=0xFFEEDDCCBBAA99887766554433221100,
+            xmm15=0x0123456789ABCDEFFEDCBA9876543210,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "movlps xmm0, qword ptr [rax + 3]",
+        "movlps qword ptr [rax + 7], xmm15",
+        "movlpd xmm15, qword ptr [rax + 5]",
+        "movlpd qword ptr [rax + 9], xmm0",
+        "movhps xmm0, qword ptr [rax + 11]",
+        "movhps qword ptr [rax + 13], xmm15",
+        "movhpd xmm15, qword ptr [rax + 15]",
+        "movhpd qword ptr [rax + 17], xmm0",
+    ],
+)
+def test_legacy_half_lane_memory_moves_match_unicorn(
+    instruction: str,
+) -> None:
+    memory = bytearray((index * 43 + 19) & 0xFF for index in range(96))
+    oracle.check_xmm(
+        _asm(f"cmp r10, r11; {instruction}"),
+        init=_gprs(rax=oracle.MEM_BASE, r10=1, r11=2),
+        xmm_init=_xmms(
+            xmm0=0xFFEEDDCCBBAA99887766554433221100,
+            xmm15=0x0123456789ABCDEFFEDCBA9876543210,
+        ),
+        mem=memory,
+    )
+
+
+@pytest.mark.parametrize("mnemonic", _XMM_HALF_REGISTER)
+def test_randomized_half_lane_register_moves_match_unicorn(
+    mnemonic: str,
+) -> None:
+    rng = random.Random(0x584D4D1700 + _XMM_HALF_REGISTER.index(mnemonic))
+    for _ in range(64):
+        destination = rng.randrange(16)
+        source = rng.randrange(16)
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        oracle.check_xmm(
+            _asm(
+                f"cmp r10, r11; {mnemonic} xmm{destination}, xmm{source}"
+            ),
+            init=_gprs(
+                r10=rng.getrandbits(64),
+                r11=rng.getrandbits(64),
+            ),
+            xmm_init=xmms,
+        )
+
+
+@pytest.mark.parametrize("mnemonic", _XMM_HALF_MEMORY)
+@pytest.mark.parametrize("store", [False, True], ids=["load", "store"])
+def test_randomized_half_lane_memory_moves_match_unicorn(
+    mnemonic: str,
+    store: bool,
+) -> None:
+    rng = random.Random(
+        0x584D4D1740 + _XMM_HALF_MEMORY.index(mnemonic) * 2 + store
+    )
+    for _ in range(64):
+        offset = rng.randrange(0, 248)
+        xmm = rng.randrange(16)
+        memory = bytearray(rng.getrandbits(8) for _ in range(256))
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        if store:
+            instruction = f"{mnemonic} qword ptr [rax + {offset}], xmm{xmm}"
+        else:
+            instruction = f"{mnemonic} xmm{xmm}, qword ptr [rax + {offset}]"
+        oracle.check_xmm(
+            _asm(f"cmp r10, r11; {instruction}"),
+            init=_gprs(
+                rax=oracle.MEM_BASE,
+                r10=rng.getrandbits(64),
+                r11=rng.getrandbits(64),
+            ),
             xmm_init=xmms,
             mem=memory,
         )
@@ -544,6 +647,10 @@ def test_randomized_scalar_xmm_memory_transfers_match_unicorn(
         "movdqa xmmword ptr gs:[rax], xmm0",
         "movss xmm0, dword ptr fs:[rax]",
         "movsd qword ptr gs:[rax], xmm0",
+        "movlps xmm0, qword ptr fs:[rax]",
+        "movlpd qword ptr gs:[rax], xmm0",
+        "movhps xmm0, qword ptr fs:[rax]",
+        "movhpd qword ptr gs:[rax], xmm0",
     ],
 )
 def test_segment_overridden_xmm_memory_transfers_fail_closed(
@@ -574,6 +681,10 @@ def test_segment_overridden_xmm_logical_sources_fail_closed(
         bytes.fromhex("67660f6f00"),  # movdqa xmm0,xmmword ptr [eax]
         bytes.fromhex("67f30f1000"),  # movss xmm0,dword ptr [eax]
         bytes.fromhex("67f20f1000"),  # movsd xmm0,qword ptr [eax]
+        bytes.fromhex("670f1200"),    # movlps xmm0,qword ptr [eax]
+        bytes.fromhex("67660f1200"),  # movlpd xmm0,qword ptr [eax]
+        bytes.fromhex("670f1600"),    # movhps xmm0,qword ptr [eax]
+        bytes.fromhex("67660f1600"),  # movhpd xmm0,qword ptr [eax]
         bytes.fromhex("67660fef00"),  # pxor xmm0,xmmword ptr [eax]
         bytes.fromhex("670f5700"),    # xorps xmm0,xmmword ptr [eax]
         bytes.fromhex("67660f5700"),  # xorpd xmm0,xmmword ptr [eax]
@@ -703,6 +814,49 @@ def test_rip_relative_scalar_float_load_rebases_through_image_base(
     )
 
 
+@pytest.mark.parametrize("mnemonic", _XMM_HALF_MEMORY)
+@pytest.mark.parametrize("store", [False, True], ids=["load", "store"])
+def test_rip_relative_half_lane_transfer_rebases_through_image_base(
+    mnemonic: str,
+    store: bool,
+) -> None:
+    code_rva = 0x1000
+    data_rva = 0x3000
+    runtime_image_base = 0x180000000
+    operand = (
+        f"qword ptr [rip], xmm7"
+        if store else "xmm7, qword ptr [rip]"
+    )
+    probe = _asm(f"{mnemonic} {operand}")
+    displacement = data_rva - (code_rva + len(probe))
+    operand = (
+        f"qword ptr [rip + {displacement}], xmm7"
+        if store else f"xmm7, qword ptr [rip + {displacement}]"
+    )
+    encoded, _ = _KS.asm(f"{mnemonic} {operand}", addr=code_rva)
+    code = bytes(encoded)
+    data = bytes.fromhex("0011223344556677")
+    sections = (
+        oracle._OracleSection(
+            ".text", code_rva, len(code), code, 0x60000020
+        ),
+        oracle._OracleSection(
+            ".data", data_rva, len(data), data, 0xC0000040
+        ),
+    )
+    oracle.check_xmm(
+        code,
+        xmm_init=_xmms(xmm7=0xFFEEDDCCBBAA99887766554433221100),
+        mem=data,
+        mem_base=runtime_image_base + data_rva,
+        lift_base=code_rva,
+        image_base=runtime_image_base,
+        code_base=runtime_image_base + code_rva,
+        image_sections=sections,
+        selected_extents=((code_rva, len(code)),),
+    )
+
+
 @pytest.mark.parametrize(
     "instruction",
     [
@@ -718,6 +872,10 @@ def test_rip_relative_scalar_float_load_rebases_through_image_base(
         "vorps xmm0, xmm1, xmm2",
         "vmovss xmm0, xmm1, xmm2",
         "vmovsd xmm0, xmm1, xmm2",
+        "vmovlps xmm0, xmm1, qword ptr [rax]",
+        "vmovhps xmm0, xmm1, qword ptr [rax]",
+        "vmovlpd xmm0, xmm1, qword ptr [rax]",
+        "vmovhpd xmm0, xmm1, qword ptr [rax]",
         "vmovaps ymm0, ymm1",
     ],
 )

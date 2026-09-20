@@ -29,6 +29,9 @@ register/stack arguments are marshalled into the call. Legacy XMM moves and
 bitwise XOR/AND/OR operate on a captured 16-register, two-lane state. MOVD/MOVQ
 and legacy MOVSS/MOVSD scalar transfers plus aligned MOVAPS/MOVDQA and
 unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported. Legacy
+MOVLPS/MOVLPD and MOVHPS/MOVHPD memory transfers preserve the untouched
+64-bit lane, while MOVHLPS/MOVLHPS cover the corresponding register-lane
+shuffles. Legacy
 PXOR/XORPS/XORPD,
 PAND/ANDPS/ANDPD, PANDN/ANDNPS/ANDNPD, and POR/ORPS/ORPD accept register
 sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
@@ -116,6 +119,16 @@ _XMM_MOVES = {
 _XMM_SCALAR_MOVES = {
     Mnemonic.MOVSS: ("movss", 32),
     Mnemonic.MOVSD: ("movsd", 64),
+}
+_XMM_HALF_MEMORY_MOVES = {
+    Mnemonic.MOVLPS: ("movlps", 0),
+    Mnemonic.MOVLPD: ("movlpd", 0),
+    Mnemonic.MOVHPS: ("movhps", 8),
+    Mnemonic.MOVHPD: ("movhpd", 8),
+}
+_XMM_HALF_REGISTER_MOVES = {
+    Mnemonic.MOVHLPS: ("movhlps", 8, 0),
+    Mnemonic.MOVLHPS: ("movlhps", 0, 8),
 }
 _XMM_LOGICAL = {
     Mnemonic.PXOR: ("pxor", "xor", False),
@@ -672,6 +685,68 @@ class _Lifter:
         raise LiftUnsupported(
             f"{mnemonic} requires an XMM register destination or memory store"
         )
+
+    def _xmm_half_memory_move(
+        self,
+        instr,
+        mnemonic: str,
+        lane_offset: int,
+    ) -> None:
+        """Lift legacy low/high 64-bit XMM memory transfers.
+
+        MOVLPS/MOVLPD replace or store the low lane; MOVHPS/MOVHPD do the
+        same for the high lane. The other destination lane is architecturally
+        preserved on loads.
+        """
+        self._require_legacy_binary(instr, mnemonic)
+        destination_kind = instr.op_kind(0)
+        source_kind = instr.op_kind(1)
+        if destination_kind == OpKind.REGISTER and source_kind == OpKind.MEMORY:
+            destination = instr.op_register(0)
+            destination_offset = self._xmm_offset(destination)
+            if self._memory_width(instr) != 64:
+                raise LiftUnsupported(f"{mnemonic} memory source width mismatch")
+            self._emit_effective_address(instr); self.a("load64")
+            self.wr_local(T0 if lane_offset == 0 else T1)
+            preserved_offset = destination_offset + (8 if lane_offset == 0 else 0)
+            self.rd_local(preserved_offset)
+            self.wr_local(T1 if lane_offset == 0 else T0)
+            self._write_xmm_from_temps(destination)
+            return
+        if destination_kind == OpKind.MEMORY and source_kind == OpKind.REGISTER:
+            source_offset = self._xmm_offset(instr.op_register(1))
+            if self._memory_width(instr) != 64:
+                raise LiftUnsupported(f"{mnemonic} memory destination width mismatch")
+            self._emit_effective_address(instr)
+            self.rd_local(source_offset + lane_offset); self.a("store64")
+            return
+        raise LiftUnsupported(
+            f"{mnemonic} requires one XMM register and one 64-bit memory operand"
+        )
+
+    def _xmm_half_register_move(
+        self,
+        instr,
+        mnemonic: str,
+        source_lane_offset: int,
+        destination_lane_offset: int,
+    ) -> None:
+        """Lift MOVHLPS/MOVLHPS while preserving the other destination lane."""
+        self._require_legacy_binary(instr, mnemonic)
+        if (
+            instr.op_kind(0) != OpKind.REGISTER
+            or instr.op_kind(1) != OpKind.REGISTER
+        ):
+            raise LiftUnsupported(f"{mnemonic} requires two XMM registers")
+        destination = instr.op_register(0)
+        destination_offset = self._xmm_offset(destination)
+        source_offset = self._xmm_offset(instr.op_register(1))
+        self.rd_local(source_offset + source_lane_offset)
+        self.wr_local(T0 if destination_lane_offset == 0 else T1)
+        preserved_lane_offset = 8 if destination_lane_offset == 0 else 0
+        self.rd_local(destination_offset + preserved_lane_offset)
+        self.wr_local(T1 if destination_lane_offset == 0 else T0)
+        self._write_xmm_from_temps(destination)
 
     def _read_rmw_destination(self, instr):
         """Read operand zero into SA and preserve its destination geometry.
@@ -1930,6 +2005,19 @@ class _Lifter:
             elif m in _XMM_SCALAR_MOVES:
                 mnemonic, width = _XMM_SCALAR_MOVES[m]
                 self._xmm_scalar_move(instr, mnemonic, width)
+            elif m in _XMM_HALF_MEMORY_MOVES:
+                mnemonic, lane_offset = _XMM_HALF_MEMORY_MOVES[m]
+                self._xmm_half_memory_move(instr, mnemonic, lane_offset)
+            elif m in _XMM_HALF_REGISTER_MOVES:
+                mnemonic, source_lane_offset, destination_lane_offset = (
+                    _XMM_HALF_REGISTER_MOVES[m]
+                )
+                self._xmm_half_register_move(
+                    instr,
+                    mnemonic,
+                    source_lane_offset,
+                    destination_lane_offset,
+                )
             elif m in _XMM_LOGICAL:
                 mnemonic, operation, invert_destination = _XMM_LOGICAL[m]
                 self._xmm_logical(

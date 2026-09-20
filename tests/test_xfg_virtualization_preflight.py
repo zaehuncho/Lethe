@@ -280,6 +280,11 @@ typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
     unsigned __int64, unsigned __int64);
 typedef unsigned __int64 (__cdecl *xfg_xmm_copy_fn)(
     const unsigned char *, unsigned char *, const __m128i *, __m128i *);
+typedef unsigned __int64 (__cdecl *xfg_xmm_halves_fn)(
+    const unsigned __int64 *,
+    const unsigned __int64 *,
+    unsigned __int64 *,
+    unsigned __int64 *);
 """.lstrip(),
         encoding="utf-8",
     )
@@ -352,6 +357,27 @@ __declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_xmm_copy
         (__m128i *)unaligned_destination, unaligned_value);
     _mm_store_si128(aligned_destination, aligned_value);
     return (unsigned __int64)_mm_cvtsi128_si64(unaligned_value);
+}
+#pragma optimize("", on)
+
+#pragma optimize("", off)
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_xmm_halves(
+    const unsigned __int64 *low_source,
+    const unsigned __int64 *high_source,
+    unsigned __int64 *ps_destination,
+    unsigned __int64 *pd_destination)
+{
+    __m128 ps_value = _mm_setzero_ps();
+    __m128d pd_value = _mm_setzero_pd();
+    ps_value = _mm_loadl_pi(ps_value, (const __m64 *)low_source);
+    ps_value = _mm_loadh_pi(ps_value, (const __m64 *)high_source);
+    pd_value = _mm_loadl_pd(pd_value, (const double *)low_source);
+    pd_value = _mm_loadh_pd(pd_value, (const double *)high_source);
+    _mm_storel_pi((__m64 *)ps_destination, ps_value);
+    _mm_storeh_pi((__m64 *)(ps_destination + 1), ps_value);
+    _mm_storel_pd((double *)pd_destination, pd_value);
+    _mm_storeh_pd((double *)(pd_destination + 1), pd_value);
+    return ps_destination[0] ^ ps_destination[1];
 }
 #pragma optimize("", on)
 
@@ -485,6 +511,7 @@ __declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = xfg_u64x6;
 __declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = xfg_ptr_read;
 __declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = xfg_ptr_write;
 __declspec(dllexport) xfg_xmm_copy_fn volatile selected_xfg_xmm_copy = xfg_xmm_copy;
+__declspec(dllexport) xfg_xmm_halves_fn volatile selected_xfg_xmm_halves = xfg_xmm_halves;
 __declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = xfg_f32_bits;
 __declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = xfg_f64_bits;
 __declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_mixed_bits;
@@ -510,6 +537,10 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
         0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F
     };
     __declspec(align(16)) unsigned char xmm_aligned_output[16] = {0};
+    const unsigned __int64 xmm_half_low = 0x1122334455667788ui64;
+    const unsigned __int64 xmm_half_high = 0x8877665544332211ui64;
+    unsigned __int64 xmm_half_ps_output[2] = {0, 0};
+    unsigned __int64 xmm_half_pd_output[2] = {0, 0};
     xfg_f32_word f32_first;
     xfg_f32_word f32_second;
     xfg_f32_word f32_third;
@@ -586,6 +617,16 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     ok = ok && xmm_output[1] == 0x88 && xmm_output[16] == 0x80;
     ok = ok && xmm_aligned_output[0] == 0xF0;
     ok = ok && xmm_aligned_output[15] == 0x0F;
+    ok = ok && selected_xfg_xmm_halves(
+        &xmm_half_low,
+        &xmm_half_high,
+        xmm_half_ps_output,
+        xmm_half_pd_output)
+        == (xmm_half_low ^ xmm_half_high);
+    ok = ok && xmm_half_ps_output[0] == xmm_half_low;
+    ok = ok && xmm_half_ps_output[1] == xmm_half_high;
+    ok = ok && xmm_half_pd_output[0] == xmm_half_low;
+    ok = ok && xmm_half_pd_output[1] == xmm_half_high;
     f32_result.value = selected_xfg_f32_bits(
         f32_first.value, f32_second.value, f32_third.value);
     ok = ok && f32_result.bits == 0xBF000000u;
@@ -1150,6 +1191,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_ptr_read",
         "xfg_ptr_write",
         "xfg_xmm_copy",
+        "xfg_xmm_halves",
         "xfg_f32_bits",
         "xfg_f64_bits",
         "xfg_mixed_bits",
@@ -1181,7 +1223,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         target_size = _straight_line_leaf_size(
             source_image,
             target_rva,
-            limit=160 if name == "xfg_xmm_copy" else 96,
+            limit=224 if name in ("xfg_xmm_copy", "xfg_xmm_halves") else 96,
         )
         assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
         specs.append(
@@ -1223,6 +1265,34 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         and instruction.immediate(1) == 0x28
         for instruction in xmm_copy_instructions
     )
+    xmm_halves = next(spec for spec in specs if spec.name == "xfg_xmm_halves")
+    xmm_halves_instructions = tuple(Decoder(
+        64,
+        source_image.read_at_rva(xmm_halves.rva, xmm_halves.size),
+        ip=source_image.image_base + xmm_halves.rva,
+    ))
+    half_lane_mnemonics = {
+        instruction.mnemonic for instruction in xmm_halves_instructions
+    }
+    assert {
+        Mnemonic.MOVLPS,
+        Mnemonic.MOVHPS,
+        Mnemonic.MOVLPD,
+        Mnemonic.MOVHPD,
+    } <= half_lane_mnemonics
+    for mnemonic in (
+        Mnemonic.MOVLPS,
+        Mnemonic.MOVHPS,
+        Mnemonic.MOVLPD,
+        Mnemonic.MOVHPD,
+    ):
+        forms = tuple(
+            instruction
+            for instruction in xmm_halves_instructions
+            if instruction.mnemonic == mnemonic
+        )
+        assert any(instruction.op1_kind == OpKind.MEMORY for instruction in forms)
+        assert any(instruction.op0_kind == OpKind.MEMORY for instruction in forms)
     vector7 = next(spec for spec in specs if spec.name == "xfg_v128x7")
     vector7_instructions = tuple(Decoder(
         64,
@@ -1400,6 +1470,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["xmm_and_or_family_supported"] is True
         assert function.capabilities["xmm_logical_memory_sources_supported"] is True
         assert function.capabilities["xmm_scalar_float_moves_supported"] is True
+        assert function.capabilities["xmm_half_lane_moves_supported"] is True
         assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
         assert function.capabilities[
             "xmm_aligned_128bit_memory_transfers_supported"
