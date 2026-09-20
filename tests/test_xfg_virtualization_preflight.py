@@ -244,6 +244,13 @@ typedef struct xfg_hva2 {
     __m128i second;
 } xfg_hva2;
 
+typedef struct xfg_hfa4 {
+    float first;
+    float second;
+    float third;
+    float fourth;
+} xfg_hfa4;
+
 typedef union xfg_f32_word {
     float value;
     unsigned int bits;
@@ -264,6 +271,9 @@ typedef __m128i (__vectorcall *xfg_v128x7_fn)(
     __m128i, __m128i, __m128i, __m128i, __m128i, __m128i, __m128i);
 typedef unsigned __int64 (__vectorcall *xfg_hva2_fold_fn)(
     xfg_hva2, unsigned __int64);
+typedef xfg_hva2 (__vectorcall *xfg_hva2_make_fn)(
+    __m128i, __m128i, __m128i);
+typedef xfg_hfa4 (__vectorcall *xfg_hfa4_negate_fn)(xfg_hfa4);
 typedef unsigned __int64 (__cdecl *xfg_pair_fold_fn)(
     xfg_pair16, unsigned __int64);
 typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
@@ -402,12 +412,12 @@ __declspec(noinline) __m128i __vectorcall xfg_v128x7(
     __m128i sixth,
     __m128i seventh)
 {
-    __m128i result = _mm_xor_si128(first, second);
-    result = _mm_xor_si128(result, third);
+    __m128i result = _mm_and_si128(first, seventh);
+    result = _mm_or_si128(result, second);
+    result = _mm_andnot_si128(third, result);
     result = _mm_xor_si128(result, fourth);
     result = _mm_xor_si128(result, fifth);
-    result = _mm_xor_si128(result, sixth);
-    return _mm_xor_si128(result, seventh);
+    return _mm_xor_si128(result, sixth);
 }
 
 __declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
@@ -416,6 +426,26 @@ __declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
 {
     __m128i folded = _mm_xor_si128(value.first, value.second);
     return (unsigned __int64)_mm_cvtsi128_si64(folded) ^ salt;
+}
+
+__declspec(noinline) xfg_hva2 __vectorcall xfg_hva2_make(
+    __m128i first,
+    __m128i second,
+    __m128i mask)
+{
+    xfg_hva2 result;
+    result.first = _mm_xor_si128(first, mask);
+    result.second = _mm_or_si128(second, mask);
+    return result;
+}
+
+__declspec(noinline) xfg_hfa4 __vectorcall xfg_hfa4_negate(xfg_hfa4 value)
+{
+    value.first = -value.first;
+    value.second = -value.second;
+    value.third = -value.third;
+    value.fourth = -value.fourth;
+    return value;
 }
 
 __declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_pair_fold(
@@ -461,6 +491,8 @@ __declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_m
 __declspec(dllexport) xfg_v128x6_fn volatile selected_xfg_v128x6 = xfg_v128x6;
 __declspec(dllexport) xfg_v128x7_fn volatile selected_xfg_v128x7 = xfg_v128x7;
 __declspec(dllexport) xfg_hva2_fold_fn volatile selected_xfg_hva2_fold = xfg_hva2_fold;
+__declspec(dllexport) xfg_hva2_make_fn volatile selected_xfg_hva2_make = xfg_hva2_make;
+__declspec(dllexport) xfg_hfa4_negate_fn volatile selected_xfg_hfa4_negate = xfg_hfa4_negate;
 __declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = xfg_pair_fold;
 __declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = xfg_pair_make;
 
@@ -498,6 +530,10 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     __m128i vector_expected_seven;
     __m128i vector_result;
     xfg_hva2 hva_value;
+    xfg_hva2 hva_result;
+    xfg_hfa4 hfa_value;
+    xfg_hfa4 hfa_result;
+    xfg_f32_word hfa_word;
     int ok = selected_xfg_i32(41) == 374;
 
     f32_first.bits = 0x3F800000u;
@@ -512,9 +548,19 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     vector_expected = _mm_xor_si128(vector_expected, vector_fourth);
     vector_expected = _mm_xor_si128(vector_expected, vector_fifth);
     vector_expected = _mm_xor_si128(vector_expected, vector_sixth);
-    vector_expected_seven = _mm_xor_si128(vector_expected, vector_seventh);
+    vector_expected_seven = _mm_and_si128(vector_first, vector_seventh);
+    vector_expected_seven = _mm_or_si128(vector_expected_seven, vector_second);
+    vector_expected_seven = _mm_andnot_si128(
+        vector_third, vector_expected_seven);
+    vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_fourth);
+    vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_fifth);
+    vector_expected_seven = _mm_xor_si128(vector_expected_seven, vector_sixth);
     hva_value.first = vector_first;
     hva_value.second = vector_second;
+    hfa_value.first = 1.0f;
+    hfa_value.second = -2.0f;
+    hfa_value.third = 0.5f;
+    hfa_value.fourth = -0.0f;
 
     ok = ok && selected_xfg_u64(
         0x1122334455667788ui64,
@@ -564,6 +610,23 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
         == ((unsigned __int64)_mm_cvtsi128_si64(
                 _mm_xor_si128(vector_first, vector_second))
             ^ 0x0F1E2D3C4B5A6978ui64);
+    hva_result = selected_xfg_hva2_make(
+        vector_first, vector_second, vector_third);
+    ok = ok && _mm_movemask_epi8(_mm_cmpeq_epi8(
+        hva_result.first,
+        _mm_xor_si128(vector_first, vector_third))) == 0xFFFF;
+    ok = ok && _mm_movemask_epi8(_mm_cmpeq_epi8(
+        hva_result.second,
+        _mm_or_si128(vector_second, vector_third))) == 0xFFFF;
+    hfa_result = selected_xfg_hfa4_negate(hfa_value);
+    hfa_word.value = hfa_result.first;
+    ok = ok && hfa_word.bits == 0xBF800000u;
+    hfa_word.value = hfa_result.second;
+    ok = ok && hfa_word.bits == 0x40000000u;
+    hfa_word.value = hfa_result.third;
+    ok = ok && hfa_word.bits == 0xBF000000u;
+    hfa_word.value = hfa_result.fourth;
+    ok = ok && hfa_word.bits == 0x00000000u;
     ok = ok && selected_xfg_pair_fold(
         pair_value, 0x0F1E2D3C4B5A6978ui64)
         == (pair_value.low ^ pair_value.high ^ 0x0F1E2D3C4B5A6978ui64);
@@ -1093,12 +1156,20 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_v128x6",
         "xfg_v128x7",
         "xfg_hva2_fold",
+        "xfg_hva2_make",
+        "xfg_hfa4_negate",
         "xfg_pair_fold",
         "xfg_pair_make",
     )
     pointer_targets = {
         name: _exported_pointer_target_rva(source_image, f"selected_{name}")
-        for name in ("xfg_v128x6", "xfg_v128x7", "xfg_hva2_fold")
+        for name in (
+            "xfg_v128x6",
+            "xfg_v128x7",
+            "xfg_hva2_fold",
+            "xfg_hva2_make",
+            "xfg_hfa4_negate",
+        )
     }
     specs: list[virtualization_plan.FunctionSpec] = []
     for name in names:
@@ -1152,6 +1223,58 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         and instruction.immediate(1) == 0x28
         for instruction in xmm_copy_instructions
     )
+    vector7 = next(spec for spec in specs if spec.name == "xfg_v128x7")
+    vector7_instructions = tuple(Decoder(
+        64,
+        source_image.read_at_rva(vector7.rva, vector7.size),
+        ip=source_image.image_base + vector7.rva,
+    ))
+    vector7_mnemonics = {
+        instruction.mnemonic for instruction in vector7_instructions
+    }
+    assert vector7_mnemonics & {Mnemonic.PAND, Mnemonic.ANDPS, Mnemonic.ANDPD}
+    assert vector7_mnemonics & {
+        Mnemonic.PANDN,
+        Mnemonic.ANDNPS,
+        Mnemonic.ANDNPD,
+    }
+    assert vector7_mnemonics & {Mnemonic.POR, Mnemonic.ORPS, Mnemonic.ORPD}
+    assert any(
+        instruction.mnemonic in (
+            Mnemonic.PAND,
+            Mnemonic.ANDPS,
+            Mnemonic.ANDPD,
+            Mnemonic.PANDN,
+            Mnemonic.ANDNPS,
+            Mnemonic.ANDNPD,
+            Mnemonic.POR,
+            Mnemonic.ORPS,
+            Mnemonic.ORPD,
+        )
+        and any(
+            instruction.op_kind(index) == OpKind.MEMORY
+            for index in range(instruction.op_count)
+        )
+        for instruction in vector7_instructions
+    )
+    hfa4 = next(spec for spec in specs if spec.name == "xfg_hfa4_negate")
+    hfa4_instructions = tuple(Decoder(
+        64,
+        source_image.read_at_rva(hfa4.rva, hfa4.size),
+        ip=source_image.image_base + hfa4.rva,
+    ))
+    assert any(
+        instruction.mnemonic == Mnemonic.MOVSS
+        and any(
+            instruction.op_kind(index) == OpKind.MEMORY
+            for index in range(instruction.op_count)
+        )
+        for instruction in hfa4_instructions
+    )
+    assert sum(
+        instruction.mnemonic == Mnemonic.XORPS
+        for instruction in hfa4_instructions
+    ) >= 4
     parsed = pe_analyze.analyze_pe(str(dll))
     assert parsed.is_dll is True
     assert parsed.load_config is not None
@@ -1274,7 +1397,9 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["stack_arguments_supported"] is True
         assert function.capabilities["xmm_register_state_captured"] is True
         assert function.capabilities["xmm_register_moves_and_xor_supported"] is True
+        assert function.capabilities["xmm_and_or_family_supported"] is True
         assert function.capabilities["xmm_logical_memory_sources_supported"] is True
+        assert function.capabilities["xmm_scalar_float_moves_supported"] is True
         assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
         assert function.capabilities[
             "xmm_aligned_128bit_memory_transfers_supported"

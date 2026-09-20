@@ -94,7 +94,7 @@ def test_exact_runtime_candidates_report_lift_rejection_and_handler_flags():
     assert all(item.indirect_target_closure_proven is False for item in report.candidates)
 
 
-def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
+def test_xmm_memory_and_logical_coverage_reports_exact_liftability() -> None:
     supported = (
         _asm("movd xmm0, dword ptr [rcx]; movd eax, xmm0; ret", 0x1300),
         _asm("movq xmm1, qword ptr [rcx]; movq rax, xmm1; ret", 0x1400),
@@ -105,8 +105,13 @@ def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
         _asm("pxor xmm6, xmmword ptr [rcx]; ret", 0x1900),
         _asm("xorps xmm7, xmmword ptr [rcx]; nop; ret", 0x1A00),
         _asm("xorpd xmm8, xmmword ptr [rcx]; ret", 0x1B00),
+        _asm("pand xmm9, xmmword ptr [rcx]; ret", 0x1C00),
+        _asm("pandn xmm10, xmmword ptr [rcx]; ret", 0x1D00),
+        _asm("por xmm11, xmmword ptr [rcx]; ret", 0x1E00),
+        _asm("movss xmm12, dword ptr [rcx]; nop; ret", 0x1F00),
+        _asm("movsd xmm13, qword ptr [rcx]; nop; ret", 0x2000),
     )
-    unsupported = _asm("addps xmm0, xmmword ptr [rcx]; nop; ret", 0x1C00)
+    unsupported = _asm("addps xmm0, xmmword ptr [rcx]; nop; ret", 0x2100)
     parsed = _parsed([
         (0x1300, supported[0], 0),
         (0x1400, supported[1], 0),
@@ -117,20 +122,26 @@ def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
         (0x1900, supported[6], 0),
         (0x1A00, supported[7], 0),
         (0x1B00, supported[8], 0),
-        (0x1C00, unsupported, 0),
+        (0x1C00, supported[9], 0),
+        (0x1D00, supported[10], 0),
+        (0x1E00, supported[11], 0),
+        (0x1F00, supported[12], 0),
+        (0x2000, supported[13], 0),
+        (0x2100, unsupported, 0),
     ])
 
     report = discovery.discover_functions(parsed, exports=())
 
     assert [candidate.liftable for candidate in report.candidates] == [
-        True, True, True, True, True, True, True, True, True, False
+        True, True, True, True, True, True, True, True, True, True, True,
+        True, True, True, False,
     ]
     assert all(
         candidate.rejection_reason is None
-        for candidate in report.candidates[:9]
+        for candidate in report.candidates[:14]
     )
-    assert "addps" in report.candidates[9].rejection_reason
-    assert "mnemonic" in report.candidates[9].rejection_reason
+    assert "addps" in report.candidates[14].rejection_reason
+    assert "mnemonic" in report.candidates[14].rejection_reason
 
 
 def test_export_without_pdata_is_bounded_plain_ret_heuristic():

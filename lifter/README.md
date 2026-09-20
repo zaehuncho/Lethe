@@ -84,17 +84,19 @@ else + a **differential oracle** that proves every lift correct.
   result are differential-checked. The native Win64 entry-thunk test executes
   both operations through an actual generated selected-function thunk.
 - **Cut 12** — legacy XMM0-XMM15 capture plus register-only `movd`, `movq`,
-  `movaps`, `movups`, `movdqa`, `movdqu`, `pxor`, `xorps`, and `xorpd`. Each
+  `movaps`, `movups`, and `movdqa`/`movdqu`; legacy scalar `movss`/`movsd`;
+  and the packed/single/double bitwise `xor`, `and`, `and-not`, and `or`
+  families. Each
   128-bit register occupies two 64-bit VM lanes. Directed and deterministic
   fuzz cases compare the full XMM/GPR/flags state against Unicorn. Native-frame
   and entry-thunk tests exercise plain and rolling bytecode drawn from this
   bounded subset; the real XFG DLL pack exercises XMM-shaped Win64 ABI values
   in eager mode. Cut 15 extends the eager and memory-guard selected-function
-  proof with scalar and unaligned 128-bit XMM memory transfers. Cut 18 adds
-  aligned XMM transfers. Legacy `pxor`, `xorps`, and `xorpd` additionally accept
+  proof with integer-bit scalar and unaligned 128-bit XMM memory transfers.
+  Cut 18 adds
+  aligned XMM transfers. All twelve legacy bitwise forms additionally accept
   aligned 128-bit memory sources while preserving architectural alignment
-  faults. Other SIMD/FP arithmetic memory sources and VEX/EVEX encodings remain
-  fail-closed.
+  faults. Other SIMD/FP arithmetic and VEX/EVEX encodings remain fail-closed.
 - **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
   source at its 32-bit RVA; the lift computes each effective address as runtime
   image base local `504` plus the decoded target RVA, so ASLR never bakes a
@@ -194,8 +196,8 @@ ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
 RIP targets in headers/gaps/discardable sections/code/selected extents,
 segment memory, 16-bit `shld`/`shrd`, memory-target `bt/bts/btr/btc` bit strings,
-SIMD/FP arithmetic memory sources other than aligned legacy
-`pxor`/`xorps`/`xorpd`, other SIMD/FP arithmetic, VEX/EVEX encodings,
+SIMD/FP arithmetic other than the twelve aligned-memory-capable legacy bitwise
+forms, VEX/EVEX encodings,
 YMM/ZMM state, string ops, and
 indirect/external branches.
 

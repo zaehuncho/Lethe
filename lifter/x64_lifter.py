@@ -26,9 +26,11 @@ stack effects and use shadow-validated VM returns. Direct RIP-relative import
 calls (`call qword ptr [rip+disp32]`) are bridged through the Win64 native-call
 trampoline: the slot pointer is resolved at runtime and the already-lifted
 register/stack arguments are marshalled into the call. Legacy XMM moves and
-bitwise XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar
-memory transfers plus aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU
-128-bit memory transfers are supported. Legacy PXOR/XORPS/XORPD accept register
+bitwise XOR/AND/OR operate on a captured 16-register, two-lane state. MOVD/MOVQ
+and legacy MOVSS/MOVSD scalar transfers plus aligned MOVAPS/MOVDQA and
+unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported. Legacy
+PXOR/XORPS/XORPD,
+PAND/ANDPS/ANDPD, PANDN/ANDNPS/ANDNPD, and POR/ORPS/ORPD accept register
 sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
 supported; memory bit strings remain closed. Floating-point/SIMD arithmetic,
 VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
@@ -111,10 +113,23 @@ _XMM_MOVES = {
     Mnemonic.MOVDQA: "movdqa",
     Mnemonic.MOVDQU: "movdqu",
 }
-_XMM_XORS = {
-    Mnemonic.PXOR: "pxor",
-    Mnemonic.XORPS: "xorps",
-    Mnemonic.XORPD: "xorpd",
+_XMM_SCALAR_MOVES = {
+    Mnemonic.MOVSS: ("movss", 32),
+    Mnemonic.MOVSD: ("movsd", 64),
+}
+_XMM_LOGICAL = {
+    Mnemonic.PXOR: ("pxor", "xor", False),
+    Mnemonic.XORPS: ("xorps", "xor", False),
+    Mnemonic.XORPD: ("xorpd", "xor", False),
+    Mnemonic.PAND: ("pand", "and", False),
+    Mnemonic.ANDPS: ("andps", "and", False),
+    Mnemonic.ANDPD: ("andpd", "and", False),
+    Mnemonic.PANDN: ("pandn", "and", True),
+    Mnemonic.ANDNPS: ("andnps", "and", True),
+    Mnemonic.ANDNPD: ("andnpd", "and", True),
+    Mnemonic.POR: ("por", "or", False),
+    Mnemonic.ORPS: ("orps", "or", False),
+    Mnemonic.ORPD: ("orpd", "or", False),
 }
 
 MASK64 = (1 << 64) - 1
@@ -519,7 +534,13 @@ class _Lifter:
             f"{mnemonic} requires XMM/XMM or one XMM and one memory operand"
         )
 
-    def _xmm_logical(self, instr, mnemonic: str) -> None:
+    def _xmm_logical(
+        self,
+        instr,
+        mnemonic: str,
+        operation: str,
+        invert_destination: bool,
+    ) -> None:
         self._require_legacy_binary(instr, mnemonic)
         if instr.op_kind(0) != OpKind.REGISTER:
             raise LiftUnsupported(
@@ -540,10 +561,15 @@ class _Lifter:
             raise LiftUnsupported(
                 f"{mnemonic} source must be an XMM register or 128-bit memory"
             )
-        self.rd_local(destination_offset); self.rd_local(T0); self.a("xor")
+        self.rd_local(destination_offset)
+        if invert_destination:
+            self.a("not")
+        self.rd_local(T0); self.a(operation)
         self.wr_local(T0)
-        self.rd_local(destination_offset + 8); self.rd_local(T1)
-        self.a("xor"); self.wr_local(T1)
+        self.rd_local(destination_offset + 8)
+        if invert_destination:
+            self.a("not")
+        self.rd_local(T1); self.a(operation); self.wr_local(T1)
         self._write_xmm_from_temps(destination)
 
     def _movd_movq(self, instr, *, width: int) -> None:
@@ -596,6 +622,56 @@ class _Lifter:
         if destination_width != width:
             raise LiftUnsupported(f"{mnemonic} GPR destination width mismatch")
         self.rd_local(self._xmm_offset(source)); self.wr_reg(destination)
+
+    def _xmm_scalar_move(self, instr, mnemonic: str, width: int) -> None:
+        """Lift legacy MOVSS/MOVSD with their asymmetric upper-lane rules."""
+        self._require_legacy_binary(instr, mnemonic)
+        destination_kind = instr.op_kind(0)
+        source_kind = instr.op_kind(1)
+        if destination_kind == OpKind.REGISTER:
+            destination = instr.op_register(0)
+            destination_offset = self._xmm_offset(destination)
+            if source_kind == OpKind.REGISTER:
+                source_offset = self._xmm_offset(instr.op_register(1))
+                self.rd_local(source_offset)
+                if width == 32:
+                    self.push_imm(MASK32); self.a("and"); self.wr_local(T0)
+                    self.rd_local(destination_offset)
+                    self.push_imm((~MASK32) & MASK64); self.a("and")
+                    self.rd_local(T0); self.a("or"); self.wr_local(T0)
+                else:
+                    self.wr_local(T0)
+                self.rd_local(destination_offset + 8); self.wr_local(T1)
+            elif source_kind == OpKind.MEMORY:
+                if self._memory_width(instr) != width:
+                    raise LiftUnsupported(
+                        f"{mnemonic} memory source width mismatch"
+                    )
+                self._emit_effective_address(instr); self.a(f"load{width}")
+                self.wr_local(T0)
+                self.push_imm(0); self.wr_local(T1)
+            else:
+                raise LiftUnsupported(
+                    f"{mnemonic} source must be an XMM register or memory"
+                )
+            self._write_xmm_from_temps(destination)
+            return
+        if destination_kind == OpKind.MEMORY:
+            if source_kind != OpKind.REGISTER:
+                raise LiftUnsupported(
+                    f"{mnemonic} memory store requires an XMM source"
+                )
+            source_offset = self._xmm_offset(instr.op_register(1))
+            if self._memory_width(instr) != width:
+                raise LiftUnsupported(
+                    f"{mnemonic} memory destination width mismatch"
+                )
+            self._emit_effective_address(instr)
+            self.rd_local(source_offset); self.a(f"store{width}")
+            return
+        raise LiftUnsupported(
+            f"{mnemonic} requires an XMM register destination or memory store"
+        )
 
     def _read_rmw_destination(self, instr):
         """Read operand zero into SA and preserve its destination geometry.
@@ -1851,8 +1927,14 @@ class _Lifter:
                 self._movd_movq(instr, width=64)
             elif m in _XMM_MOVES:
                 self._xmm_move(instr, _XMM_MOVES[m])
-            elif m in _XMM_XORS:
-                self._xmm_logical(instr, _XMM_XORS[m])
+            elif m in _XMM_SCALAR_MOVES:
+                mnemonic, width = _XMM_SCALAR_MOVES[m]
+                self._xmm_scalar_move(instr, mnemonic, width)
+            elif m in _XMM_LOGICAL:
+                mnemonic, operation, invert_destination = _XMM_LOGICAL[m]
+                self._xmm_logical(
+                    instr, mnemonic, operation, invert_destination
+                )
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:
