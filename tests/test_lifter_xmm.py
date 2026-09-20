@@ -148,13 +148,96 @@ def test_deterministic_register_sequence_fuzz_matches_unicorn() -> None:
     "instruction",
     [
         "pxor xmm0, xmmword ptr [rax]",
-        "xorps xmm0, xmmword ptr [rax]",
-        "xorpd xmm0, xmmword ptr [rax]",
+        "xorps xmm15, xmmword ptr [rax + 16]",
+        "xorpd xmm7, xmmword ptr [rax + 32]",
     ],
 )
-def test_unmodeled_xmm_memory_operands_fail_closed(instruction: str) -> None:
-    with pytest.raises(lifter.LiftUnsupported):
-        lifter.lift_function(_asm(instruction))
+def test_aligned_logical_memory_sources_match_unicorn(
+    instruction: str,
+) -> None:
+    memory = bytearray((index * 37 + 11) & 0xFF for index in range(96))
+    oracle.check_xmm(
+        _asm(f"cmp r10, r11; {instruction}"),
+        init=_gprs(rax=oracle.MEM_BASE, r10=1, r11=2),
+        xmm_init=_xmms(
+            xmm0=0x00112233445566778899AABBCCDDEEFF,
+            xmm7=0xFFEEDDCCBBAA99887766554433221100,
+            xmm15=0xA55AA55AA55AA55A5AA55AA55AA55AA5,
+        ),
+        mem=memory,
+    )
+
+
+@pytest.mark.parametrize("mnemonic", ["pxor", "xorps", "xorpd"])
+def test_randomized_aligned_logical_memory_sources_match_unicorn(
+    mnemonic: str,
+) -> None:
+    seed = 0x584D4D1500 + ("pxor", "xorps", "xorpd").index(mnemonic)
+    rng = random.Random(seed)
+    for _ in range(96):
+        offset = rng.randrange(0, 15) * 16
+        destination = rng.randrange(16)
+        memory = bytearray(rng.getrandbits(8) for _ in range(256))
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        oracle.check_xmm(
+            _asm(
+                f"cmp r10, r11; {mnemonic} xmm{destination}, "
+                f"xmmword ptr [rax + {offset}]"
+            ),
+            init=_gprs(
+                rax=oracle.MEM_BASE,
+                r10=rng.getrandbits(64),
+                r11=rng.getrandbits(64),
+            ),
+            xmm_init=xmms,
+            mem=memory,
+        )
+
+
+@pytest.mark.parametrize("mnemonic", ["pxor", "xorps", "xorpd"])
+def test_unaligned_logical_memory_source_fault_preserves_architectural_state(
+    mnemonic: str,
+) -> None:
+    assembly = lifter.lift_function(
+        _asm(f"{mnemonic} xmm15, xmmword ptr [rax + 1]")
+    )
+    assert assembly.count("load128a") == 1
+
+    blob = daedalus_asm.assemble(assembly)
+    data_size = struct.unpack_from("<H", blob, 0)[0]
+    memory = bytearray.fromhex("a5" * 32)
+    vm = RefVM(
+        blob[2 + data_size:],
+        blob[2:2 + data_size],
+        mem=memory,
+        mem_base=oracle.MEM_BASE,
+    )
+    vm.locals[0:8] = oracle.MEM_BASE.to_bytes(8, "little")
+    xmm_offset = lifter.XMM_OFF[lifter.Register.XMM15]
+    original_xmm = 0x00112233445566778899AABBCCDDEEFF
+    vm.locals[xmm_offset:xmm_offset + 16] = original_xmm.to_bytes(16, "little")
+    original_flags = {
+        lifter.CF: 1,
+        lifter.PF: 1,
+        lifter.ZF: 0,
+        lifter.SF: 1,
+        lifter.OF: 1,
+    }
+    for offset, value in original_flags.items():
+        vm.locals[offset:offset + 8] = value.to_bytes(8, "little")
+
+    with pytest.raises(DaedalusError, match="aligned 128-bit load is unaligned"):
+        vm.run()
+
+    assert bytes(vm.mem) == bytes.fromhex("a5" * 32)
+    assert int.from_bytes(vm.locals[0:8], "little") == oracle.MEM_BASE
+    assert int.from_bytes(
+        vm.locals[xmm_offset:xmm_offset + 16], "little"
+    ) == original_xmm
+    assert {
+        offset: int.from_bytes(vm.locals[offset:offset + 8], "little")
+        for offset in original_flags
+    } == original_flags
 
 
 @pytest.mark.parametrize(
@@ -370,6 +453,9 @@ def test_randomized_scalar_xmm_memory_transfers_match_unicorn(
         "movdqu xmmword ptr gs:[rax], xmm0",
         "movaps xmm0, xmmword ptr fs:[rax]",
         "movdqa xmmword ptr gs:[rax], xmm0",
+        "pxor xmm0, xmmword ptr fs:[rax]",
+        "xorps xmm1, xmmword ptr gs:[rax]",
+        "xorpd xmm2, xmmword ptr fs:[rax]",
     ],
 )
 def test_segment_overridden_xmm_memory_transfers_fail_closed(
@@ -388,6 +474,9 @@ def test_segment_overridden_xmm_memory_transfers_fail_closed(
         bytes.fromhex("67f30f6f00"),  # movdqu xmm0,xmmword ptr [eax]
         bytes.fromhex("670f2800"),    # movaps xmm0,xmmword ptr [eax]
         bytes.fromhex("67660f6f00"),  # movdqa xmm0,xmmword ptr [eax]
+        bytes.fromhex("67660fef00"),  # pxor xmm0,xmmword ptr [eax]
+        bytes.fromhex("670f5700"),    # xorps xmm0,xmmword ptr [eax]
+        bytes.fromhex("67660f5700"),  # xorpd xmm0,xmmword ptr [eax]
     ],
 )
 def test_address_size_overridden_xmm_memory_fails_closed(code: bytes) -> None:
@@ -397,6 +486,42 @@ def test_address_size_overridden_xmm_memory_fails_closed(code: bytes) -> None:
 
 @pytest.mark.parametrize("mnemonic", ["movaps", "movdqa", "movups", "movdqu"])
 def test_rip_relative_128_bit_transfer_rebases_through_image_base(
+    mnemonic: str,
+) -> None:
+    code_rva = 0x1000
+    data_rva = 0x3000
+    runtime_image_base = 0x180000000
+    probe = _asm(f"{mnemonic} xmm7, xmmword ptr [rip]")
+    displacement = data_rva - (code_rva + len(probe))
+    encoded, _ = _KS.asm(
+        f"{mnemonic} xmm7, xmmword ptr [rip + {displacement}]",
+        addr=code_rva,
+    )
+    code = bytes(encoded)
+    data = bytes.fromhex("00112233445566778899aabbccddeeff")
+    sections = (
+        oracle._OracleSection(
+            ".text", code_rva, len(code), code, 0x60000020
+        ),
+        oracle._OracleSection(
+            ".data", data_rva, len(data), data, 0xC0000040
+        ),
+    )
+    oracle.check_xmm(
+        code,
+        xmm_init=_xmms(xmm7=(1 << 128) - 1),
+        mem=data,
+        mem_base=runtime_image_base + data_rva,
+        lift_base=code_rva,
+        image_base=runtime_image_base,
+        code_base=runtime_image_base + code_rva,
+        image_sections=sections,
+        selected_extents=((code_rva, len(code)),),
+    )
+
+
+@pytest.mark.parametrize("mnemonic", ["pxor", "xorps", "xorpd"])
+def test_rip_relative_logical_source_rebases_through_image_base(
     mnemonic: str,
 ) -> None:
     code_rva = 0x1000

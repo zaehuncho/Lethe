@@ -77,18 +77,20 @@ PDATA-proven direct callee native, then proves forced-ASLR packed parity.
 The separate EXE/DLL round-trip gate requires its complete nineteen-check
 contract and rejects reduced, duplicated, nested, or contradictory summaries.
 The same rolling-capable candidate DLL must also preserve real MSVC XFG indirect
-call parity for the EXE fixture and fourteen DLL ABI shapes. Those DLL shapes
+call parity for the EXE fixture and sixteen DLL ABI shapes. Those DLL shapes
 include the prior seven GPR-class signatures plus one pointer-to-pointer
 unaligned 16-byte memory copy, scalar float transport, scalar double transport
-combined with a 64-bit GPR mask, mixed ordinal GPR/XMM arguments, six-register
-`__vectorcall` `__m128i` transport, one 16-byte by-value aggregate, and one
-16-byte hidden-sret return. Distinct XFG call-site type hashes remain byte-exact
+combined with a 64-bit GPR mask, mixed ordinal GPR/XMM arguments, six- and
+seven-register `__vectorcall` `__m128i` transport, one two-vector HVA argument,
+one 16-byte by-value aggregate, and one 16-byte hidden-sret return. Distinct XFG
+call-site type hashes remain byte-exact
 through selected-function materialization. These cases prove the emitted legacy
-register move/XOR, one unaligned XMM copy body, scalar MOVD/MOVQ memory transfers,
-aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU transfers, and GPR load/store
-bodies. The native XFG fixture matrix has not yet exercised an aligned-XMM
-body; SIMD/FP arithmetic, seventh-and-later vector arguments, HVA/HFA
-returns, VEX/AVX/YMM/ZMM, variadics, broader/C++ aggregates, cross-toolchain
+register move/XOR, aligned-memory logical XOR, one mixed aligned/unaligned XMM
+copy body, scalar MOVD/MOVQ memory transfers, aligned MOVAPS/MOVDQA and
+unaligned MOVUPS/MOVDQU transfers, and GPR load/store bodies. Other SIMD/FP
+arithmetic, wider vector/HVA and HFA
+signatures and returns, VEX/AVX/YMM/ZMM, variadics, broader/C++ aggregates,
+cross-toolchain
 compatibility, and clean-VM XFG enforcement remain outside coverage. External
 host calls establish packed runtime parity, not structurally decoded host-side
 XFG dispatch.

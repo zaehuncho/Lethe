@@ -28,7 +28,8 @@ trampoline: the slot pointer is resolved at runtime and the already-lifted
 register/stack arguments are marshalled into the call. Legacy XMM moves and
 bitwise XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar
 memory transfers plus aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU
-128-bit memory transfers are supported. Register-target BT/BTS/BTR/BTC are
+128-bit memory transfers are supported. Legacy PXOR/XORPS/XORPD accept register
+sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
 supported; memory bit strings remain closed. Floating-point/SIMD arithmetic,
 VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
 calls, recursive calls, and unmodeled widths remain explicit whole-function
@@ -519,12 +520,29 @@ class _Lifter:
         )
 
     def _xmm_logical(self, instr, mnemonic: str) -> None:
-        destination, source = self._require_legacy_registers(instr, mnemonic)
+        self._require_legacy_binary(instr, mnemonic)
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported(
+                f"{mnemonic} destination must be an XMM register"
+            )
+        destination = instr.op_register(0)
         destination_offset = self._xmm_offset(destination)
-        source_offset = self._xmm_offset(source)
-        self.rd_local(destination_offset); self.rd_local(source_offset); self.a("xor")
+        if instr.op_kind(1) == OpKind.REGISTER:
+            source_offset = self._xmm_offset(instr.op_register(1))
+            self.rd_local(source_offset); self.wr_local(T0)
+            self.rd_local(source_offset + 8); self.wr_local(T1)
+        elif instr.op_kind(1) == OpKind.MEMORY:
+            self._require_xmm_memory_size(instr, mnemonic)
+            self._emit_effective_address(instr); self.wr_local(T5)
+            self.rd_local(T5); self.a("load128a")
+            self.wr_local(T1); self.wr_local(T0)
+        else:
+            raise LiftUnsupported(
+                f"{mnemonic} source must be an XMM register or 128-bit memory"
+            )
+        self.rd_local(destination_offset); self.rd_local(T0); self.a("xor")
         self.wr_local(T0)
-        self.rd_local(destination_offset + 8); self.rd_local(source_offset + 8)
+        self.rd_local(destination_offset + 8); self.rd_local(T1)
         self.a("xor"); self.wr_local(T1)
         self._write_xmm_from_temps(destination)
 

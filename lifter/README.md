@@ -91,8 +91,10 @@ else + a **differential oracle** that proves every lift correct.
   bounded subset; the real XFG DLL pack exercises XMM-shaped Win64 ABI values
   in eager mode. Cut 15 extends the eager and memory-guard selected-function
   proof with scalar and unaligned 128-bit XMM memory transfers. Cut 18 adds
-  aligned XMM transfers; XMM arithmetic memory sources and VEX/EVEX encodings
-  remain fail-closed.
+  aligned XMM transfers. Legacy `pxor`, `xorps`, and `xorpd` additionally accept
+  aligned 128-bit memory sources while preserving architectural alignment
+  faults. Other SIMD/FP arithmetic memory sources and VEX/EVEX encodings remain
+  fail-closed.
 - **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
   source at its 32-bit RVA; the lift computes each effective address as runtime
   image base local `504` plus the decoded target RVA, so ASLR never bakes a
@@ -192,7 +194,8 @@ ALU with a memory **dest**
 (read-modify-write) when LOCK-prefixed, unvalidated RIP-relative references,
 RIP targets in headers/gaps/discardable sections/code/selected extents,
 segment memory, 16-bit `shld`/`shrd`, memory-target `bt/bts/btr/btc` bit strings,
-XMM arithmetic memory sources, SIMD/FP arithmetic, VEX/EVEX encodings,
+SIMD/FP arithmetic memory sources other than aligned legacy
+`pxor`/`xorps`/`xorpd`, other SIMD/FP arithmetic, VEX/EVEX encodings,
 YMM/ZMM state, string ops, and
 indirect/external branches.
 

@@ -102,8 +102,11 @@ def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
         _asm("movdqu xmm3, xmmword ptr [rcx]; movdqu xmmword ptr [rdx], xmm3; ret", 0x1600),
         _asm("movaps xmm4, xmmword ptr [rcx]; movaps xmmword ptr [rdx], xmm4; ret", 0x1700),
         _asm("movdqa xmm5, xmmword ptr [rcx]; movdqa xmmword ptr [rdx], xmm5; ret", 0x1800),
+        _asm("pxor xmm6, xmmword ptr [rcx]; ret", 0x1900),
+        _asm("xorps xmm7, xmmword ptr [rcx]; nop; ret", 0x1A00),
+        _asm("xorpd xmm8, xmmword ptr [rcx]; ret", 0x1B00),
     )
-    unsupported = _asm("pxor xmm0, xmmword ptr [rcx]; ret", 0x1900)
+    unsupported = _asm("addps xmm0, xmmword ptr [rcx]; nop; ret", 0x1C00)
     parsed = _parsed([
         (0x1300, supported[0], 0),
         (0x1400, supported[1], 0),
@@ -111,20 +114,23 @@ def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
         (0x1600, supported[3], 0),
         (0x1700, supported[4], 0),
         (0x1800, supported[5], 0),
-        (0x1900, unsupported, 0),
+        (0x1900, supported[6], 0),
+        (0x1A00, supported[7], 0),
+        (0x1B00, supported[8], 0),
+        (0x1C00, unsupported, 0),
     ])
 
     report = discovery.discover_functions(parsed, exports=())
 
     assert [candidate.liftable for candidate in report.candidates] == [
-        True, True, True, True, True, True, False
+        True, True, True, True, True, True, True, True, True, False
     ]
     assert all(
         candidate.rejection_reason is None
-        for candidate in report.candidates[:6]
+        for candidate in report.candidates[:9]
     )
-    assert "pxor" in report.candidates[6].rejection_reason
-    assert "register-only operands" in report.candidates[6].rejection_reason
+    assert "addps" in report.candidates[9].rejection_reason
+    assert "mnemonic" in report.candidates[9].rejection_reason
 
 
 def test_export_without_pdata_is_bounded_plain_ret_heuristic():

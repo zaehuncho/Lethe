@@ -239,6 +239,11 @@ typedef struct xfg_pair16 {
     unsigned __int64 high;
 } xfg_pair16;
 
+typedef struct xfg_hva2 {
+    __m128i first;
+    __m128i second;
+} xfg_hva2;
+
 typedef union xfg_f32_word {
     float value;
     unsigned int bits;
@@ -255,12 +260,16 @@ typedef double (__cdecl *xfg_f64_bits_fn)(
 typedef float (__cdecl *xfg_mixed_bits_fn)(unsigned int, float, unsigned int, float);
 typedef __m128i (__vectorcall *xfg_v128x6_fn)(
     __m128i, __m128i, __m128i, __m128i, __m128i, __m128i);
+typedef __m128i (__vectorcall *xfg_v128x7_fn)(
+    __m128i, __m128i, __m128i, __m128i, __m128i, __m128i, __m128i);
+typedef unsigned __int64 (__vectorcall *xfg_hva2_fold_fn)(
+    xfg_hva2, unsigned __int64);
 typedef unsigned __int64 (__cdecl *xfg_pair_fold_fn)(
     xfg_pair16, unsigned __int64);
 typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
     unsigned __int64, unsigned __int64);
 typedef unsigned __int64 (__cdecl *xfg_xmm_copy_fn)(
-    const unsigned char *, unsigned char *);
+    const unsigned char *, unsigned char *, const __m128i *, __m128i *);
 """.lstrip(),
         encoding="utf-8",
     )
@@ -319,14 +328,22 @@ __declspec(dllexport) __declspec(noinline) void __cdecl xfg_ptr_write(
     *destination = value ^ 0x0F1E2D3C4B5A6978ui64;
 }
 
+#pragma optimize("", off)
 __declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_xmm_copy(
-    const unsigned char *source,
-    unsigned char *destination)
+    const unsigned char *unaligned_source,
+    unsigned char *unaligned_destination,
+    const __m128i *aligned_source,
+    __m128i *aligned_destination)
 {
-    __m128i value = _mm_loadu_si128((const __m128i *)source);
-    _mm_storeu_si128((__m128i *)destination, value);
-    return (unsigned __int64)_mm_cvtsi128_si64(value);
+    __m128i unaligned_value = _mm_loadu_si128(
+        (const __m128i *)unaligned_source);
+    __m128i aligned_value = _mm_load_si128(aligned_source);
+    _mm_storeu_si128(
+        (__m128i *)unaligned_destination, unaligned_value);
+    _mm_store_si128(aligned_destination, aligned_value);
+    return (unsigned __int64)_mm_cvtsi128_si64(unaligned_value);
 }
+#pragma optimize("", on)
 
 __declspec(dllexport) __declspec(noinline) float __cdecl xfg_f32_bits(
     float first,
@@ -376,6 +393,31 @@ __declspec(noinline) __m128i __vectorcall xfg_v128x6(
     return _mm_xor_si128(result, sixth);
 }
 
+__declspec(noinline) __m128i __vectorcall xfg_v128x7(
+    __m128i first,
+    __m128i second,
+    __m128i third,
+    __m128i fourth,
+    __m128i fifth,
+    __m128i sixth,
+    __m128i seventh)
+{
+    __m128i result = _mm_xor_si128(first, second);
+    result = _mm_xor_si128(result, third);
+    result = _mm_xor_si128(result, fourth);
+    result = _mm_xor_si128(result, fifth);
+    result = _mm_xor_si128(result, sixth);
+    return _mm_xor_si128(result, seventh);
+}
+
+__declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
+    xfg_hva2 value,
+    unsigned __int64 salt)
+{
+    __m128i folded = _mm_xor_si128(value.first, value.second);
+    return (unsigned __int64)_mm_cvtsi128_si64(folded) ^ salt;
+}
+
 __declspec(dllexport) __declspec(noinline) unsigned __int64 __cdecl xfg_pair_fold(
     xfg_pair16 value,
     unsigned __int64 salt)
@@ -417,6 +459,8 @@ __declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = xfg_f32_b
 __declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = xfg_f64_bits;
 __declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_mixed_bits;
 __declspec(dllexport) xfg_v128x6_fn volatile selected_xfg_v128x6 = xfg_v128x6;
+__declspec(dllexport) xfg_v128x7_fn volatile selected_xfg_v128x7 = xfg_v128x7;
+__declspec(dllexport) xfg_hva2_fold_fn volatile selected_xfg_hva2_fold = xfg_hva2_fold;
 __declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = xfg_pair_fold;
 __declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = xfg_pair_make;
 
@@ -429,6 +473,11 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
         0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0
     };
     unsigned char xmm_output[18] = {0};
+    __declspec(align(16)) const unsigned char xmm_aligned_input[16] = {
+        0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87,
+        0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F
+    };
+    __declspec(align(16)) unsigned char xmm_aligned_output[16] = {0};
     xfg_f32_word f32_first;
     xfg_f32_word f32_second;
     xfg_f32_word f32_third;
@@ -444,8 +493,11 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     __m128i vector_fourth = _mm_set_epi32(13, 14, 15, 16);
     __m128i vector_fifth = _mm_set_epi32(17, 18, 19, 20);
     __m128i vector_sixth = _mm_set_epi32(21, 22, 23, 24);
+    __m128i vector_seventh = _mm_set_epi32(25, 26, 27, 28);
     __m128i vector_expected;
+    __m128i vector_expected_seven;
     __m128i vector_result;
+    xfg_hva2 hva_value;
     int ok = selected_xfg_i32(41) == 374;
 
     f32_first.bits = 0x3F800000u;
@@ -460,6 +512,9 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     vector_expected = _mm_xor_si128(vector_expected, vector_fourth);
     vector_expected = _mm_xor_si128(vector_expected, vector_fifth);
     vector_expected = _mm_xor_si128(vector_expected, vector_sixth);
+    vector_expected_seven = _mm_xor_si128(vector_expected, vector_seventh);
+    hva_value.first = vector_first;
+    hva_value.second = vector_second;
 
     ok = ok && selected_xfg_u64(
         0x1122334455667788ui64,
@@ -476,9 +531,15 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     selected_xfg_ptr_write(&written, 0x8877665544332211ui64);
     ok = ok && written
         == (0x8877665544332211ui64 ^ 0x0F1E2D3C4B5A6978ui64);
-    ok = ok && selected_xfg_xmm_copy(xmm_input + 1, xmm_output + 1)
+    ok = ok && selected_xfg_xmm_copy(
+        xmm_input + 1,
+        xmm_output + 1,
+        (const __m128i *)xmm_aligned_input,
+        (__m128i *)xmm_aligned_output)
         == 0x1122334455667788ui64;
     ok = ok && xmm_output[1] == 0x88 && xmm_output[16] == 0x80;
+    ok = ok && xmm_aligned_output[0] == 0xF0;
+    ok = ok && xmm_aligned_output[15] == 0x0F;
     f32_result.value = selected_xfg_f32_bits(
         f32_first.value, f32_second.value, f32_third.value);
     ok = ok && f32_result.bits == 0xBF000000u;
@@ -493,6 +554,16 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
         vector_fourth, vector_fifth, vector_sixth);
     ok = ok && _mm_movemask_epi8(
         _mm_cmpeq_epi8(vector_result, vector_expected)) == 0xFFFF;
+    vector_result = selected_xfg_v128x7(
+        vector_first, vector_second, vector_third,
+        vector_fourth, vector_fifth, vector_sixth, vector_seventh);
+    ok = ok && _mm_movemask_epi8(
+        _mm_cmpeq_epi8(vector_result, vector_expected_seven)) == 0xFFFF;
+    ok = ok && selected_xfg_hva2_fold(
+        hva_value, 0x0F1E2D3C4B5A6978ui64)
+        == ((unsigned __int64)_mm_cvtsi128_si64(
+                _mm_xor_si128(vector_first, vector_second))
+            ^ 0x0F1E2D3C4B5A6978ui64);
     ok = ok && selected_xfg_pair_fold(
         pair_value, 0x0F1E2D3C4B5A6978ui64)
         == (pair_value.low ^ pair_value.high ^ 0x0F1E2D3C4B5A6978ui64);
@@ -1020,25 +1091,32 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_f64_bits",
         "xfg_mixed_bits",
         "xfg_v128x6",
+        "xfg_v128x7",
+        "xfg_hva2_fold",
         "xfg_pair_fold",
         "xfg_pair_make",
     )
-    vector_slot_rva, vector_target_rva = _exported_pointer_target_rva(
-        source_image, "selected_xfg_v128x6"
-    )
+    pointer_targets = {
+        name: _exported_pointer_target_rva(source_image, f"selected_{name}")
+        for name in ("xfg_v128x6", "xfg_v128x7", "xfg_hva2_fold")
+    }
     specs: list[virtualization_plan.FunctionSpec] = []
     for name in names:
-        if name == "xfg_v128x6":
-            target_rva = vector_target_rva
+        if name in pointer_targets:
+            target_rva = pointer_targets[name][1]
         else:
             target_rva = source_image.find_export_rva(name)
             assert target_rva is not None
-        target_size = _straight_line_leaf_size(source_image, target_rva)
+        target_size = _straight_line_leaf_size(
+            source_image,
+            target_rva,
+            limit=160 if name == "xfg_xmm_copy" else 96,
+        )
         assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
         specs.append(
             virtualization_plan.FunctionSpec(name, target_rva, target_size)
         )
-    from iced_x86 import Decoder, Mnemonic, OpKind
+    from iced_x86 import Decoder, Mnemonic, OpKind, Register
     xmm_copy = next(spec for spec in specs if spec.name == "xfg_xmm_copy")
     xmm_copy_instructions = tuple(Decoder(
         64,
@@ -1053,14 +1131,38 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         )
         for instruction in xmm_copy_instructions
     )
+    aligned_memory = tuple(
+        instruction
+        for instruction in xmm_copy_instructions
+        if instruction.mnemonic in (Mnemonic.MOVDQA, Mnemonic.MOVAPS)
+        and any(
+            instruction.op_kind(index) == OpKind.MEMORY
+            for index in range(instruction.op_count)
+        )
+    )
+    assert aligned_memory
+    assert any(
+        instruction.memory_base == Register.RSP
+        and instruction.memory_displacement in (0, 16)
+        for instruction in aligned_memory
+    )
+    assert any(
+        instruction.mnemonic == Mnemonic.SUB
+        and instruction.op0_register == Register.RSP
+        and instruction.immediate(1) == 0x28
+        for instruction in xmm_copy_instructions
+    )
     parsed = pe_analyze.analyze_pe(str(dll))
     assert parsed.is_dll is True
     assert parsed.load_config is not None
     assert parsed.load_config.guard_flags & 0x00800000
     assert parsed.load_config.xfg_present is True
-    assert vector_slot_rva in {
+    relocation_targets = {
         relocation.target_rva for relocation in parsed.dir64_relocations
     }
+    assert {
+        slot_rva for slot_rva, _target_rva in pointer_targets.values()
+    } <= relocation_targets
     run_all_rva = source_image.find_export_rva("xfg_run_all")
     assert run_all_rva is not None
     run_all_runtime = next(
@@ -1144,17 +1246,18 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
     assert materialized.parsed.load_config == parsed.load_config
     assert materialized.parsed.generated_cfg_targets == ()
     assert len(materialized.manifest.functions) == len(specs)
-    materialized_vector_slot = pe_analyze._slice_at_rva(
-        materialized.parsed.sections,
-        vector_slot_rva,
-        8,
-        what="materialized vectorcall selected-function slot",
-    )
-    assert (
-        int.from_bytes(materialized_vector_slot, "little")
-        - materialized.parsed.image_base
-        == vector_target_rva
-    )
+    for name, (slot_rva, target_rva) in pointer_targets.items():
+        materialized_pointer_slot = pe_analyze._slice_at_rva(
+            materialized.parsed.sections,
+            slot_rva,
+            8,
+            what=f"materialized {name} selected-function slot",
+        )
+        assert (
+            int.from_bytes(materialized_pointer_slot, "little")
+            - materialized.parsed.image_base
+            == target_rva
+        )
     thunk_rvas: set[int] = set()
     functions_by_name = {
         function.name: function
@@ -1171,7 +1274,11 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         assert function.capabilities["stack_arguments_supported"] is True
         assert function.capabilities["xmm_register_state_captured"] is True
         assert function.capabilities["xmm_register_moves_and_xor_supported"] is True
+        assert function.capabilities["xmm_logical_memory_sources_supported"] is True
         assert function.capabilities["xmm_scalar_memory_transfers_supported"] is True
+        assert function.capabilities[
+            "xmm_aligned_128bit_memory_transfers_supported"
+        ] is True
         assert function.capabilities[
             "xmm_unaligned_128bit_memory_transfers_supported"
         ] is True
