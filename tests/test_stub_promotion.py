@@ -218,9 +218,13 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 15
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 16
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 15
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 16
+    assert (
+        "tests/test_xmm_store128_native.py::"
+        "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
+    ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert (
         "tests/test_native_virtualization_runtime.py::"
         "test_packed_executable_calls_virtualized_native_callee"

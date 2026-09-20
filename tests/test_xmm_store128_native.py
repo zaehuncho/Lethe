@@ -198,6 +198,145 @@ target_link_options(store128_guard PRIVATE
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="alignment-fault proof is Windows-only")
+def test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("iced_x86")
+    if not shutil.which("cmake") or not _visual_studio_available():
+        pytest.skip("CMake + the Visual Studio x64 toolchain are required")
+
+    source = tmp_path / "source"
+    build = tmp_path / "build"
+    source.mkdir()
+    (source / "aligned_transfer.c").write_text(
+        r'''
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdint.h>
+
+extern void dvm_load128_aligned(
+    const void *source, uint64_t *low, uint64_t *high);
+extern void dvm_store128_aligned(
+    void *destination, uint64_t low, uint64_t high);
+
+static int valid_roundtrip(void)
+{
+    __declspec(align(16)) uint8_t block[16] = {0};
+    uint64_t low = 0;
+    uint64_t high = 0;
+    dvm_store128_aligned(
+        block,
+        UINT64_C(0x1122334455667788),
+        UINT64_C(0x99AABBCCDDEEFF00));
+    dvm_load128_aligned(block, &low, &high);
+    return (low == UINT64_C(0x1122334455667788) &&
+            high == UINT64_C(0x99AABBCCDDEEFF00)) ? 0 : 1;
+}
+
+static int unaligned_store_faults_without_write(void)
+{
+    __declspec(align(16)) uint8_t block[32];
+    unsigned int index;
+    int faulted = 0;
+    for (index = 0; index < 32; ++index)
+        block[index] = 0xA5;
+    __try {
+        dvm_store128_aligned(
+            block + 1,
+            UINT64_C(0x1122334455667788),
+            UINT64_C(0x99AABBCCDDEEFF00));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        faulted = 1;
+    }
+    for (index = 0; index < 32; ++index) {
+        if (block[index] != 0xA5)
+            return 2;
+    }
+    return faulted ? 0 : 3;
+}
+
+static int unaligned_load_faults_without_outputs(void)
+{
+    __declspec(align(16)) uint8_t block[32] = {0};
+    uint64_t low = UINT64_C(0xA5A5A5A5A5A5A5A5);
+    uint64_t high = UINT64_C(0x5A5A5A5A5A5A5A5A);
+    int faulted = 0;
+    __try {
+        dvm_load128_aligned(block + 1, &low, &high);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        faulted = 1;
+    }
+    if (low != UINT64_C(0xA5A5A5A5A5A5A5A5) ||
+            high != UINT64_C(0x5A5A5A5A5A5A5A5A))
+        return 4;
+    return faulted ? 0 : 5;
+}
+
+int main(void)
+{
+    int result = valid_roundtrip();
+    if (result != 0)
+        return result;
+    result = unaligned_store_faults_without_write();
+    return result == 0 ? unaligned_load_faults_without_outputs() : result;
+}
+'''.lstrip(),
+        encoding="ascii",
+    )
+    helper = (ROOT / "stub/src/daedalus_store128.asm").as_posix()
+    (source / "CMakeLists.txt").write_text(
+        f"""
+cmake_minimum_required(VERSION 3.20)
+project(lethe_aligned128_native C ASM_MASM)
+add_executable(aligned128 aligned_transfer.c "{helper}")
+target_compile_options(aligned128 PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/O2>)
+target_link_options(aligned128 PRIVATE
+    /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT
+    /EXPORT:dvm_load128_aligned /EXPORT:dvm_store128_aligned)
+""".lstrip(),
+        encoding="ascii",
+    )
+    configured = _run([
+        "cmake", "-S", str(source), "-B", str(build),
+        "-G", "Visual Studio 17 2022", "-A", "x64",
+    ], tmp_path)
+    assert configured.returncode == 0, configured.stdout
+    compiled = _run(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        tmp_path,
+    )
+    assert compiled.returncode == 0, compiled.stdout
+    executable = build / "Release/aligned128.exe"
+    executed = _run([str(executable)], executable.parent)
+    assert executed.returncode == 0, executed.stdout
+
+    image = assemble._StubImage(executable.read_bytes())
+    from iced_x86 import Decoder, Mnemonic, OpKind
+    for name in ("dvm_load128_aligned", "dvm_store128_aligned"):
+        helper_rva = image.find_export_rva(name)
+        assert helper_rva is not None
+        instructions = []
+        for instruction in Decoder(
+            64,
+            image.read_at_rva(helper_rva, 48),
+            ip=image.image_base + helper_rva,
+        ):
+            instructions.append(instruction)
+            if instruction.mnemonic == Mnemonic.RET:
+                break
+        memory_xmm = [
+            instruction.mnemonic for instruction in instructions
+            if instruction.mnemonic in (Mnemonic.MOVDQA, Mnemonic.MOVDQU)
+            and any(
+                instruction.op_kind(index) == OpKind.MEMORY
+                for index in range(instruction.op_count)
+            )
+        ]
+        assert memory_xmm == [Mnemonic.MOVDQA]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="rolling STORE128 proof is Windows-only")
 def test_shuffled_rolling_store128_dispatch_and_guard_fault_are_atomic(
     tmp_path: Path,

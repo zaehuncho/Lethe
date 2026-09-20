@@ -24,7 +24,7 @@
 #include "daedalus_opcodes_shuffled.h"
 #else
 #define DVM_OPCODE_MAPPING_SHA256 \
-    "e6beba7d0f8e4eb3b192331678705ceb3c474b4be1526dd62364501c79abc5f1"
+    "bc43af12ba3d0bdc0fd00f5bd9c84602f54b26a61c22ddbcf7af35de1aebc01f"
 #define DVM_HANDLER_VARIANT_SHA256 \
     "41b31ad73ed541bd478cc97567fdee815d4154666608703b7e1ac2ebcc8b873d"
 #define DVM_HANDLER_VARIANT_ADD    0
@@ -53,6 +53,10 @@ __declspec(dllexport) const char daedalus_handler_variant_sha256[] =
 /* Forward-declare the MASM trampoline for N_CALL_PTR (daedalus_trampoline.asm). */
 extern uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv);
 extern void dvm_store128_unaligned(void *destination, uint64_t low, uint64_t high);
+extern void dvm_load128_aligned(
+    const void *source, uint64_t *low, uint64_t *high);
+extern void dvm_store128_aligned(
+    void *destination, uint64_t low, uint64_t high);
 
 /* ---- tiny local helpers (no CRT) ---------------------------------------- */
 
@@ -405,6 +409,33 @@ static int dvm_run(DaedalusVM *vm)
             if (dvm_pop(vm, &high) || dvm_pop(vm, &low) || dvm_pop(vm, &addr))
                 return -1;
             dvm_store128_unaligned((void *)(uintptr_t)addr, low, high);
+            vm->pc += 1;
+            break;
+        }
+        case DVM_LOAD128A: {
+            uint64_t addr, low, high;
+            if (vm->sp <= 0 || vm->sp >= DVM_STACK_SIZE)
+                return -1;
+            addr = vm->stack[vm->sp - 1];
+            dvm_load128_aligned(
+                (const void *)(uintptr_t)addr, &low, &high);
+            /* Commit stack state only after the aligned read succeeds. */
+            vm->stack[vm->sp - 1] = low;
+            vm->stack[vm->sp] = high;
+            vm->sp += 1;
+            vm->pc += 1;
+            break;
+        }
+        case DVM_STORE128A: {
+            uint64_t addr, low, high;
+            if (vm->sp < 3)
+                return -1;
+            addr = vm->stack[vm->sp - 3];
+            low = vm->stack[vm->sp - 2];
+            high = vm->stack[vm->sp - 1];
+            dvm_store128_aligned((void *)(uintptr_t)addr, low, high);
+            /* Preserve the operand stack when the MOVDQA store faults. */
+            vm->sp -= 3;
             vm->pc += 1;
             break;
         }

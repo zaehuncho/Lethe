@@ -27,9 +27,9 @@ calls (`call qword ptr [rip+disp32]`) are bridged through the Win64 native-call
 trampoline: the slot pointer is resolved at runtime and the already-lifted
 register/stack arguments are marshalled into the call. Legacy XMM moves and
 bitwise XOR operate on a captured 16-register, two-lane state. MOVD/MOVQ scalar
-memory transfers and unaligned MOVUPS/MOVDQU 128-bit memory transfers are
-supported. Register-target BT/BTS/BTR/BTC are supported; memory bit strings
-remain closed. Floating-point/SIMD arithmetic, aligned XMM memory forms,
+memory transfers plus aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU
+128-bit memory transfers are supported. Register-target BT/BTS/BTR/BTC are
+supported; memory bit strings remain closed. Floating-point/SIMD arithmetic,
 VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
 calls, recursive calls, and unmodeled widths remain explicit whole-function
 bailouts.
@@ -490,18 +490,19 @@ class _Lifter:
             self._read_xmm(source)
             self._write_xmm_from_temps(destination)
             return
-        if mnemonic not in ("movups", "movdqu"):
-            raise LiftUnsupported(
-                f"{mnemonic} memory operands require unproven alignment/fault parity"
-            )
+        aligned = mnemonic in ("movaps", "movdqa")
         if destination_kind == OpKind.REGISTER and source_kind == OpKind.MEMORY:
             destination = instr.op_register(0)
             self._xmm_offset(destination)
             self._require_xmm_memory_size(instr, mnemonic)
             self._emit_effective_address(instr); self.wr_local(T5)
-            self.rd_local(T5); self.a("load64"); self.wr_local(T0)
-            self.rd_local(T5); self.push_imm(8); self.a("add")
-            self.a("load64"); self.wr_local(T1)
+            if aligned:
+                self.rd_local(T5); self.a("load128a")
+                self.wr_local(T1); self.wr_local(T0)
+            else:
+                self.rd_local(T5); self.a("load64"); self.wr_local(T0)
+                self.rd_local(T5); self.push_imm(8); self.a("add")
+                self.a("load64"); self.wr_local(T1)
             self._write_xmm_from_temps(destination)
             return
         if destination_kind == OpKind.MEMORY and source_kind == OpKind.REGISTER:
@@ -511,7 +512,7 @@ class _Lifter:
             self._emit_effective_address(instr); self.wr_local(T5)
             self._read_xmm(source)
             self.rd_local(T5); self.rd_local(T0); self.rd_local(T1)
-            self.a("store128")
+            self.a("store128a" if aligned else "store128")
             return
         raise LiftUnsupported(
             f"{mnemonic} requires XMM/XMM or one XMM and one memory operand"

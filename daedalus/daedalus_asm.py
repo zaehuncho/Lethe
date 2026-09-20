@@ -91,6 +91,8 @@ OPCODES = {
     'rot3':           (0x36, 0, 'none'),
     'pick':           (0x37, 1, 'imm'),
     'store128':       (0x38, 0, 'none'),
+    'load128a':       (0x39, 0, 'none'),
+    'store128a':      (0x3A, 0, 'none'),
 }
 
 

@@ -1,4 +1,4 @@
-"""Legacy XMM register operations and exact unaligned memory transfers."""
+"""Legacy XMM register operations and exact 128-bit memory transfers."""
 from __future__ import annotations
 
 import random
@@ -147,10 +147,6 @@ def test_deterministic_register_sequence_fuzz_matches_unicorn() -> None:
 @pytest.mark.parametrize(
     "instruction",
     [
-        "movaps xmm0, xmmword ptr [rax]",
-        "movaps xmmword ptr [rax], xmm0",
-        "movdqa xmm0, xmmword ptr [rax]",
-        "movdqa xmmword ptr [rax], xmm0",
         "pxor xmm0, xmmword ptr [rax]",
         "xorps xmm0, xmmword ptr [rax]",
         "xorpd xmm0, xmmword ptr [rax]",
@@ -172,6 +168,10 @@ def test_unmodeled_xmm_memory_operands_fail_closed(instruction: str) -> None:
         "movups xmmword ptr [rax + 3], xmm15",
         "movdqu xmm15, xmmword ptr [rax + 5]",
         "movdqu xmmword ptr [rax + 7], xmm0",
+        "movaps xmm0, xmmword ptr [rax]",
+        "movaps xmmword ptr [rax + 16], xmm15",
+        "movdqa xmm15, xmmword ptr [rax + 32]",
+        "movdqa xmmword ptr [rax + 48], xmm0",
     ],
 )
 def test_exact_memory_transfer_forms_match_unicorn(instruction: str) -> None:
@@ -215,6 +215,34 @@ def test_randomized_unaligned_128_bit_transfers_match_unicorn(
         )
 
 
+@pytest.mark.parametrize("mnemonic", ["movaps", "movdqa"])
+@pytest.mark.parametrize("store", [False, True], ids=["load", "store"])
+def test_randomized_aligned_128_bit_transfers_match_unicorn(
+    mnemonic: str, store: bool
+) -> None:
+    rng = random.Random(0x584D4D1380 + store + (mnemonic == "movdqa") * 2)
+    for _ in range(96):
+        offset = rng.randrange(0, 15) * 16
+        destination = rng.randrange(16)
+        source = rng.randrange(16)
+        memory = bytearray(rng.getrandbits(8) for _ in range(256))
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        if store:
+            instruction = (
+                f"{mnemonic} xmmword ptr [rax + {offset}], xmm{source}"
+            )
+        else:
+            instruction = (
+                f"{mnemonic} xmm{destination}, xmmword ptr [rax + {offset}]"
+            )
+        oracle.check_xmm(
+            _asm(instruction),
+            init=_gprs(rax=oracle.MEM_BASE),
+            xmm_init=xmms,
+            mem=memory,
+        )
+
+
 def test_unaligned_128_store_uses_one_atomic_vm_store_operation() -> None:
     code = _asm("movdqu xmmword ptr [rax + 1], xmm15")
     assembly = lifter.lift_function(code)
@@ -236,6 +264,67 @@ def test_unaligned_128_store_uses_one_atomic_vm_store_operation() -> None:
     with pytest.raises(DaedalusError, match="mem OOB"):
         vm.run()
     assert bytes(vm.mem) == memory
+
+
+@pytest.mark.parametrize("mnemonic", ["movaps", "movdqa"])
+@pytest.mark.parametrize("store", [False, True], ids=["load", "store"])
+def test_aligned_128_transfer_uses_fault_preserving_vm_operation(
+    mnemonic: str, store: bool
+) -> None:
+    instruction = (
+        f"{mnemonic} xmmword ptr [rax + 1], xmm15"
+        if store else f"{mnemonic} xmm15, xmmword ptr [rax + 1]"
+    )
+    assembly = lifter.lift_function(_asm(instruction))
+    expected = "store128a" if store else "load128a"
+    assert assembly.count(expected) == 1
+
+    blob = daedalus_asm.assemble(assembly)
+    data_size = struct.unpack_from("<H", blob, 0)[0]
+    memory = bytearray.fromhex("a5" * 32)
+    vm = RefVM(
+        blob[2 + data_size:],
+        blob[2:2 + data_size],
+        mem=memory,
+        mem_base=oracle.MEM_BASE,
+    )
+    vm.locals[0:8] = oracle.MEM_BASE.to_bytes(8, "little")
+    xmm_offset = lifter.XMM_OFF[lifter.Register.XMM15]
+    original_xmm = 0x00112233445566778899AABBCCDDEEFF
+    vm.locals[xmm_offset:xmm_offset + 16] = original_xmm.to_bytes(16, "little")
+    with pytest.raises(DaedalusError, match="aligned 128-bit .* is unaligned"):
+        vm.run()
+    assert bytes(vm.mem) == bytes.fromhex("a5" * 32)
+    assert int.from_bytes(
+        vm.locals[xmm_offset:xmm_offset + 16], "little"
+    ) == original_xmm
+
+
+@pytest.mark.parametrize("store", [False, True], ids=["load", "store"])
+def test_reference_aligned128_fault_preserves_operand_stack(store: bool) -> None:
+    address = oracle.MEM_BASE + 1
+    lines = [".code", f"push_imm64 0x{address:X}"]
+    expected_stack = [address]
+    if store:
+        low = 0x1122334455667788
+        high = 0x99AABBCCDDEEFF00
+        lines.extend([f"push_imm64 0x{low:X}", f"push_imm64 0x{high:X}"])
+        expected_stack.extend([low, high])
+    lines.extend(["store128a" if store else "load128a", "push_imm8 0", "halt"])
+    blob = daedalus_asm.assemble("\n".join(lines))
+    data_size = struct.unpack_from("<H", blob, 0)[0]
+    memory = bytearray.fromhex("a5" * 32)
+    vm = RefVM(
+        blob[2 + data_size:],
+        blob[2:2 + data_size],
+        mem=memory,
+        mem_base=oracle.MEM_BASE,
+    )
+    with pytest.raises(DaedalusError, match="aligned 128-bit .* is unaligned"):
+        vm.run()
+    assert vm.stack == expected_stack
+    assert vm.pc == sum(9 for _ in expected_stack)
+    assert bytes(vm.mem) == bytes.fromhex("a5" * 32)
 
 
 @pytest.mark.parametrize("mnemonic,width", [("movd", 4), ("movq", 8)])
@@ -279,6 +368,8 @@ def test_randomized_scalar_xmm_memory_transfers_match_unicorn(
         "movq qword ptr gs:[rax], xmm0",
         "movups xmm0, xmmword ptr fs:[rax]",
         "movdqu xmmword ptr gs:[rax], xmm0",
+        "movaps xmm0, xmmword ptr fs:[rax]",
+        "movdqa xmmword ptr gs:[rax], xmm0",
     ],
 )
 def test_segment_overridden_xmm_memory_transfers_fail_closed(
@@ -295,6 +386,8 @@ def test_segment_overridden_xmm_memory_transfers_fail_closed(
         bytes.fromhex("67f30f7e00"),  # movq xmm0,qword ptr [eax]
         bytes.fromhex("670f1000"),    # movups xmm0,xmmword ptr [eax]
         bytes.fromhex("67f30f6f00"),  # movdqu xmm0,xmmword ptr [eax]
+        bytes.fromhex("670f2800"),    # movaps xmm0,xmmword ptr [eax]
+        bytes.fromhex("67660f6f00"),  # movdqa xmm0,xmmword ptr [eax]
     ],
 )
 def test_address_size_overridden_xmm_memory_fails_closed(code: bytes) -> None:
@@ -302,8 +395,8 @@ def test_address_size_overridden_xmm_memory_fails_closed(code: bytes) -> None:
         lifter.lift_function(code)
 
 
-@pytest.mark.parametrize("mnemonic", ["movups", "movdqu"])
-def test_rip_relative_unaligned_transfer_rebases_through_image_base(
+@pytest.mark.parametrize("mnemonic", ["movaps", "movdqa", "movups", "movdqu"])
+def test_rip_relative_128_bit_transfer_rebases_through_image_base(
     mnemonic: str,
 ) -> None:
     code_rva = 0x1000

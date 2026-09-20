@@ -100,26 +100,31 @@ def test_xmm_memory_transfer_coverage_reports_exact_liftability() -> None:
         _asm("movq xmm1, qword ptr [rcx]; movq rax, xmm1; ret", 0x1400),
         _asm("movups xmm2, xmmword ptr [rcx]; movups xmmword ptr [rdx], xmm2; ret", 0x1500),
         _asm("movdqu xmm3, xmmword ptr [rcx]; movdqu xmmword ptr [rdx], xmm3; ret", 0x1600),
+        _asm("movaps xmm4, xmmword ptr [rcx]; movaps xmmword ptr [rdx], xmm4; ret", 0x1700),
+        _asm("movdqa xmm5, xmmword ptr [rcx]; movdqa xmmword ptr [rdx], xmm5; ret", 0x1800),
     )
-    aligned = _asm("movaps xmm0, xmmword ptr [rcx]; nop; ret", 0x1700)
+    unsupported = _asm("pxor xmm0, xmmword ptr [rcx]; ret", 0x1900)
     parsed = _parsed([
         (0x1300, supported[0], 0),
         (0x1400, supported[1], 0),
         (0x1500, supported[2], 0),
         (0x1600, supported[3], 0),
-        (0x1700, aligned, 0),
+        (0x1700, supported[4], 0),
+        (0x1800, supported[5], 0),
+        (0x1900, unsupported, 0),
     ])
 
     report = discovery.discover_functions(parsed, exports=())
 
     assert [candidate.liftable for candidate in report.candidates] == [
-        True, True, True, True, False
+        True, True, True, True, True, True, False
     ]
     assert all(
         candidate.rejection_reason is None
-        for candidate in report.candidates[:4]
+        for candidate in report.candidates[:6]
     )
-    assert "alignment/fault parity" in report.candidates[4].rejection_reason
+    assert "pxor" in report.candidates[6].rejection_reason
+    assert "register-only operands" in report.candidates[6].rejection_reason
 
 
 def test_export_without_pdata_is_bounded_plain_ret_heuristic():

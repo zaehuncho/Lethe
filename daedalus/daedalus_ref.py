@@ -277,6 +277,31 @@ class RefVM:
                     raise DaedalusError("store into read-only data")
                 value = low.to_bytes(8, 'little') + high.to_bytes(8, 'little')
                 buf[idx:idx + 16] = value
+            elif m == 'load128a':
+                if not self.stack:
+                    raise DaedalusError("stack underflow")
+                if len(self.stack) >= DVM_STACK_SIZE:
+                    raise DaedalusError("stack overflow")
+                addr = self.stack[-1]
+                if addr & 15:
+                    raise DaedalusError("aligned 128-bit load is unaligned")
+                buf, idx = self._mem_ref(addr, 16)
+                low = int.from_bytes(buf[idx:idx + 8], 'little')
+                high = int.from_bytes(buf[idx + 8:idx + 16], 'little')
+                self.stack[-1] = low
+                self.stack.append(high)
+            elif m == 'store128a':
+                if len(self.stack) < 3:
+                    raise DaedalusError("stack underflow")
+                addr, low, high = self.stack[-3:]
+                if addr & 15:
+                    raise DaedalusError("aligned 128-bit store is unaligned")
+                buf, idx = self._mem_ref(addr, 16)
+                if not isinstance(buf, bytearray):
+                    raise DaedalusError("store into read-only data")
+                value = low.to_bytes(8, 'little') + high.to_bytes(8, 'little')
+                buf[idx:idx + 16] = value
+                del self.stack[-3:]
             elif m == 'push_arg':
                 if operand >= len(self.args):
                     raise DaedalusError("arg index OOB")

@@ -81,6 +81,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_xmm_store128_native.py::"
     "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic",
     "tests/test_xmm_store128_native.py::"
+    "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries",
+    "tests/test_xmm_store128_native.py::"
     "test_shuffled_rolling_store128_dispatch_and_guard_fault_are_atomic",
     "tests/test_xfg_virtualization_preflight.py::"
     "test_real_xfg_direct_only_plan_preserves_source_gfid_identity",

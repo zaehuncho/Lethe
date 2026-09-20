@@ -213,6 +213,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         "xmm_register_state_captured": True,
         "xmm_register_moves_and_xor_supported": True,
         "xmm_scalar_memory_transfers_supported": True,
+        "xmm_aligned_128bit_memory_transfers_supported": True,
         "xmm_unaligned_128bit_memory_transfers_supported": True,
         "simd_fp_arithmetic_supported": False,
         "return_address_shadow_validated": False,
