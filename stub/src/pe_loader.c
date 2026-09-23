@@ -119,6 +119,24 @@ static int decrypt_section(const uint8_t key[32], uint8_t *base,
                            target_old, &ignored);
         return 1;
     }
+    /* VirtualLock keeps the decrypted-plaintext scratch out of the pagefile,
+       but the number of pages a process may lock is bounded by its MINIMUM
+       working-set size, which is small by default. A large section's stored
+       size exceeds it, so VirtualLock fails with ERROR_WORKING_SET_QUOTA and
+       would reject a perfectly valid image. Raise the working-set floor to
+       cover this buffer (plus slack for the already-locked metadata buffers)
+       before locking. This does NOT relax the fail-closed contract below: if
+       the lock still fails, startup is still rejected. */
+    {
+        SIZE_T ws_min = 0, ws_max = 0;
+        SIZE_T need = (SIZE_T)sd->stored_size + (SIZE_T)0x200000; /* +2 MiB */
+        if (GetProcessWorkingSetSize(GetCurrentProcess(), &ws_min, &ws_max) &&
+            ws_min < need) {
+            SIZE_T new_max = (ws_max > need + (SIZE_T)0x100000)
+                           ? ws_max : need + (SIZE_T)0x100000;
+            SetProcessWorkingSetSize(GetCurrentProcess(), need, new_max);
+        }
+    }
     if (!VirtualLock(scratch, sd->stored_size)) {
         VirtualFree(scratch, 0, MEM_RELEASE);
         if (target_writable)
@@ -382,7 +400,16 @@ static FARPROC resolve_forwarder(const char *fwd, int depth)
     __stosb((uint8_t *)dll_lower, 0, sizeof(dll_lower));   /* wipe */
     if (!mod) return NULL;
 
-    /* Parse the function part after the dot */
+    /* Parse the function part after the dot and resolve it with GetProcAddress.
+       The forwarder target is frequently an API-set contract (e.g. kernel32's
+       GetProcessMitigationPolicy forwards to
+       api-ms-win-core-processthreads-l1-1-1), and that contract can resolve to a
+       host that forwards the same name again. A custom by-hash export re-walk
+       then loops over the forwarder chain until the depth cap and fails. The
+       Windows loader resolves API-set redirection and chained forwarders to the
+       final implementation with no loop, so defer to it here. The function name
+       comes from the OS module's own (already plaintext) export table -- never
+       the packed payload -- so this leaks nothing about the protected image. */
     {
         const char *func = dot + 1;
         if (*func == '#') {
@@ -392,11 +419,13 @@ static FARPROC resolve_forwarder(const char *fwd, int depth)
                 ord = (uint16_t)(ord * 10 + (*func - '0'));
                 func++;
             }
-            result = resolve_export(mod, 0, ord, 0, depth);
+            /* MAKEINTRESOURCEA(ord): resolve the forwarded export by ordinal. */
+            result = GetProcAddress((HMODULE)mod, (LPCSTR)(uintptr_t)ord);
         } else {
-            result = resolve_export(mod, import_hash(func), 0, 1, depth);
+            result = GetProcAddress((HMODULE)mod, func);
         }
     }
+    (void)depth;
     return result;
 }
 

@@ -73,14 +73,21 @@ else + a **differential oracle** that proves every lift correct.
   `AX`/`DX:AX`/`EDX:EAX`/`RDX:RAX` products, narrow parent preservation,
   32-bit zero-extension, and defined `CF`/`OF` results are differential-checked
   against Unicorn. The packed native corpus exercises both 64-bit forms.
+- **Cut 11** — expanded scalar capabilities, RMW memory shifts, bit-tests, and bytecode compaction:
+  - Sign-extension primitives: `cbw`, `cwde`, `cdqe`, `cwd`, `cdq`, `cqo` for accumulator and DX:AX / EDX:EAX / RDX:RAX pairs.
+  - Narrow 8-bit and 16-bit shifts and rotates (`shl`, `shr`, `sar`, `rol`, `ror`) with immediate and `CL` shift counts.
+  - 16-bit two- and three-operand `imul` with exact 16-bit product overflow calculation for `CF`/`OF`.
+  - Memory destinations for shifts and rotates (RMW forms: `op [mem], imm` and `op [mem], cl`).
+  - Bit-test family: `bt`, `bts`, `btr`, `btc` across 16/32/64-bit register and memory destinations, with immediate and register indices, calculating exact `CF` updates.
+  - High-8 sub-registers: `ah`, `bh`, `ch`, `dh` reads, writes, and in-place arithmetic with architectural parent GPR preservation (bits 0..7 and 16..63 untouched).
+  - Backward-liveness dead-flag elimination (`optimize_flags=True`): prunes dead flag-computation bytecode when overwritten before consumption, reducing bytecode size while maintaining strict differential parity.
 
 Still **bails** (left native — correctness over coverage): external, indirect,
 recursive, over-depth, or context-ambiguous `call`/`ret` graphs; `ret imm16`,
 `div`/`idiv` because the current thunk cannot deliver architectural `#DE`,
 ALU with a memory **dest**
-(read-modify-write) when LOCK-prefixed, RIP-relative/segment memory, 8/16-bit
-shift/rotate or two-/three-operand `imul`, high-8 `AH/BH/CH/DH`, SIMD, string ops, and
-indirect/external branches.
+(read-modify-write) when LOCK-prefixed, RIP-relative/segment memory,
+SIMD, string ops, and indirect/external branches.
 
 ## Extending it (the fan-out contract)
 To add an instruction:

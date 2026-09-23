@@ -469,9 +469,6 @@ def test_fuzz_setcc_cmovcc_and_dirty_parent_aliases() -> None:
 @pytest.mark.parametrize(
     "source,reason",
     (
-        ("mov ah, 1", "high-8"),
-        ("setb bh", "high-8"),
-        ("xchg ah, bl", "high-8"),
         ("xchg qword ptr [rbx], rax", "atomic"),
         ("lock add dword ptr [rbx], 1", "LOCK-prefixed"),
         ("movzx eax, byte ptr fs:[rbx]", "segment-overridden"),

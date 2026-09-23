@@ -273,20 +273,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--shard-auth",
         default=None,
         metavar="TOKEN",
-        help=("Bearer token for shard upload authentication; prefer the "
-              "LETHE_SHARD_AUTH environment variable to avoid argv exposure"),
+        help=("owner admin secret for shard upload; prefer the "
+              "LETHE_SHARD_ADMIN_SECRET environment variable to avoid argv exposure"),
     )
     parser.add_argument(
         "--shard-license-id",
         default=None,
         metavar="LICENSE",
-        help="license this build's shard is bound to (required with --server-shard)",
+        help="legacy option ignored for public release shards",
     )
     parser.add_argument(
         "--shard-hwid-hash",
         default=None,
         metavar="HEX",
-        help="SHA-256 hex of the target machine HWID (required with --server-shard)",
+        help="legacy option ignored for public release shards",
     )
     parser.add_argument(
         "--shard-max-activations",
@@ -492,7 +492,11 @@ def main(argv: "list[str] | None" = None) -> int:
         is_dll=(True if args.dll else None),  # None => auto-detect from the header
         server_shard=args.server_shard,
         shard_url=args.shard_url,
-        shard_auth=(args.shard_auth or os.environ.get("LETHE_SHARD_AUTH")),
+        shard_auth=(args.shard_auth
+                    or os.environ.get("LETHE_SHARD_ADMIN_SECRET")
+                    or os.environ.get("LETHE_SHARD_AUTH")),
+        shard_edge_auth=os.environ.get("LETHE_SHARD_EDGE_AUTH"),
+        shard_admin_totp=os.environ.get("LETHE_SHARD_ADMIN_TOTP"),
         shard_license_id=args.shard_license_id,
         shard_hwid_hash=args.shard_hwid_hash,
         shard_max_activations=args.shard_max_activations,

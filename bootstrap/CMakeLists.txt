@@ -30,6 +30,7 @@ target_link_libraries(LetheShardBootstrap PRIVATE
     bcrypt
     winhttp
     advapi32
+    crypt32
     shlwapi
 )
 

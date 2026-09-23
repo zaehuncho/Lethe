@@ -37,7 +37,7 @@ _IMAGE_FILE_DLL = 0x2000
 # bricks the packed binary (it is keyed to a shard the real server never receives),
 # so a hostname mismatch HARD-FAILS the pack. Override only with an explicit
 # allow_unpinned_host / --allow-unpinned-host (e.g. a staging host).
-_SHARD_API_HOST = "shard.example.invalid"
+_SHARD_API_HOST = "api.zaeorion.com"
 _MAX_SHARD_RESPONSE = 64 * 1024
 
 
@@ -96,9 +96,13 @@ class PackOptions:
     is_dll: Optional[bool] = None       # None => auto-detect from the PE header
     server_shard: bool = False          # Tier 3: XOR a server-held shard into the key
     shard_url: Optional[str] = None     # experimental shard gate base URL
-    shard_auth: Optional[str] = None    # Bearer token for shard upload
-    shard_license_id: Optional[str] = None   # bind shard to a specific license
-    shard_hwid_hash: Optional[str] = None    # SHA-256 hex of target machine HWID
+    shard_auth: Optional[str] = None    # owner admin secret for shard upload
+    shard_edge_auth: Optional[str] = None    # edge secret; pack-time only
+    shard_admin_totp: Optional[str] = None   # optional owner TOTP; pack-time only
+    # Legacy v2 fields retained so older callers deserialize, but the v3 public
+    # release upload never sends them: customer enforcement is per session.
+    shard_license_id: Optional[str] = None
+    shard_hwid_hash: Optional[str] = None
     shard_max_activations: int = 0           # 0 = unlimited
     shard_ttl_hours: int = 0                 # 0 = no expiry
     allow_unpinned_host: bool = False        # allow a shard_url host != _SHARD_API_HOST
@@ -245,6 +249,8 @@ def _validate_build_id(build_id: str) -> str:
 
 
 def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
+                  edge_auth: Optional[str] = None,
+                  admin_totp: Optional[str] = None,
                   license_id: str = "", hwid_hash: str = "",
                   max_activations: int = 0, ttl_hours: int = 0,
                   allow_unpinned_host: bool = False,
@@ -252,9 +258,9 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
                   progress: ProgressFn = None) -> dict:
     """Upload a build's server shard to the Lambda shard gate (POST /api/shard/store).
 
-    The shard is sent hex-encoded and bound to ``license_id`` + ``hwid_hash``
-    under the signing-stable SHA-256 PE content ``build_id``. The server
-    encrypts it at rest
+    The shard is sent hex-encoded under the signing-stable SHA-256 PE content
+    ``build_id``. The server encrypts it at rest. Customer/license/machine
+    enforcement happens at retrieval time; the shared release row is unbound.
     and returns ``{ok, build_id, expires_at}``. Raises on any non-success so the
     caller can delete the half-baked output (a shard that never reached the
     server leaves the packed binary permanently unrunnable).
@@ -263,7 +269,7 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
     if len(shard) != 32:
         raise ValueError("server shard must be exactly 32 bytes")
     if not auth.strip():
-        raise ValueError("shard upload authentication token must not be empty")
+        raise ValueError("shard upload owner secret must not be empty")
     if max_activations < 0 or ttl_hours < 0:
         raise ValueError("shard activation and TTL limits must be non-negative")
     # --- HTTPS enforcement: never send the shard + Bearer token in cleartext --
@@ -289,19 +295,26 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
     endpoint = f"{parsed.scheme}://{parsed.netloc}/api/shard/store"
     body = json.dumps({
         "build_id": build_id,
-        "license_id": license_id,
-        "hwid_hash": hwid_hash,
+        "license_id": "",
+        "hwid_hash": "",
         "shard": shard.hex(),
         "max_activations": int(max_activations),
         "ttl_hours": int(ttl_hours),
     }).encode()
+    request_headers = {
+        "Content-Type": "application/json",
+        "X-Orion-Admin-Secret": auth,
+    }
+    resolved_edge_auth = edge_auth or os.environ.get("LETHE_SHARD_EDGE_AUTH", "")
+    resolved_totp = admin_totp or os.environ.get("LETHE_SHARD_ADMIN_TOTP", "")
+    if resolved_edge_auth:
+        request_headers["X-Edge-Auth"] = resolved_edge_auth
+    if resolved_totp:
+        request_headers["X-Orion-Admin-TOTP"] = resolved_totp
     req = urllib.request.Request(
         endpoint,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {auth}",
-        },
+        headers=request_headers,
         method="POST",
     )
     # Pin the CA chain instead of trusting the whole system store (anti-MITM).
@@ -323,6 +336,11 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
         raise RuntimeError(
             f"shard upload rejected: HTTP {e.code} "
             f"({error_detail})") from None
+    except (OSError, TimeoutError) as e:
+        # Never include request data in the exception: it contains the shard.
+        raise RuntimeError(
+            f"shard upload failed before a valid response: {type(e).__name__}"
+        ) from None
 
     try:
         data = json.loads(payload)
@@ -727,19 +745,9 @@ def pack_file(input_path: str, options: PackOptions,
                     "server_shard=True requires both shard_url and shard_auth — "
                     "without them, the packed binary would be permanently "
                     "unrunnable (keyed to a shard that was never uploaded)")
-            # v2 shard gate binds each build to a license + a target machine's
-            # HWID hash at upload time; both are mandatory for a usable build.
-            _license_id = getattr(options, "shard_license_id", None)
-            _hwid_hash = getattr(options, "shard_hwid_hash", None)
-            if not _license_id or not _hwid_hash:
-                raise ValueError(
-                    "server_shard=True requires shard_license_id and "
-                    "shard_hwid_hash — the v2 shard gate binds each build to a "
-                    "license and a target machine's HWID hash at upload time")
-            _hh = _hwid_hash.strip().lower()
-            if len(_hh) != 64 or any(c not in "0123456789abcdef" for c in _hh):
-                raise ValueError(
-                    "shard_hwid_hash must be a SHA-256 hex digest (64 hex chars)")
+            # v3 uses one shard per public release. Legacy caller fields are
+            # deliberately ignored and never uploaded; the backend rejects a
+            # per-customer build row.
 
         # --- lazy imports of the sibling builder modules --------------------
         # Imported here (not at module load) so the front-ends can import the
@@ -955,8 +963,9 @@ def pack_file(input_path: str, options: PackOptions,
                 _upload_shard(asm_result.server_shard,
                               build_id=build_id,
                               url=eff.shard_url, auth=eff.shard_auth,
-                              license_id=eff.shard_license_id or "",
-                              hwid_hash=eff.shard_hwid_hash or "",
+                              edge_auth=getattr(eff, "shard_edge_auth", None),
+                              admin_totp=getattr(eff, "shard_admin_totp", None),
+                              license_id="", hwid_hash="",
                               max_activations=eff.shard_max_activations,
                               ttl_hours=eff.shard_ttl_hours,
                               allow_unpinned_host=getattr(eff, "allow_unpinned_host", False),

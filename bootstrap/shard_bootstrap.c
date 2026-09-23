@@ -1,11 +1,12 @@
 /*
  * Lethe shard bootstrap — tiny launcher shim.
  *
- * This executable sits next to protected.exe. On launch it:
+ * This executable is shipped as OrionNative.exe beside OrionNative.packed.exe.
+ * On launch it:
  *   1. Computes the signing-stable PE content ID used as build_id
- *   2. Reads the license key from settings.json
- *   3. Computes the HWID (matches SecurityManager::machineId)
- *   4. POSTs to the shard gate Worker (/api/shard/fetch)
+ *   2. Reads a DPAPI-protected customer session written by the signed launcher
+ *   3. Uses the exact persisted machine_id from /api/activate (no second HWID derivation)
+ *   4. POSTs to /api/shard/retrieve with the revocable customer bearer
  *   5. Sets NV_RT_GATE env var
  *   6. Spawns the packed exe (inherits env, forwards exit code)
  *
@@ -22,6 +23,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
 #include <shlwapi.h>
 #include <ctype.h>
 #include <stddef.h>
@@ -32,12 +34,13 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-#define SHARD_HOST      L"shard.example.invalid"
-#define SHARD_PATH      L"/api/shard/fetch"
-#define PACKED_EXE_NAME "protected.exe"
-#define SETTINGS_FILE   "settings.json"
+#define SHARD_HOST      L"api.zaeorion.com"
+#define SHARD_PATH      L"/api/shard/retrieve"
+#define PACKED_EXE_NAME "OrionNative.packed.exe"
+#define SESSION_FILE    "NexusVision\\Orion Native\\.vault\\shard_session.dat"
 
 static int read_exact_at(HANDLE file, ULONGLONG offset, void *buf, DWORD size)
 {
@@ -168,179 +171,273 @@ done:
     return ret;
 }
 
-static int read_license_key(const char *dir, char *key_out, size_t key_max)
+static int json_string_field(const char *json, const char *field,
+                             char *out, size_t out_size)
 {
-    char path[MAX_PATH] = {0};
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    char *data = NULL;
-    size_t dataSize = 0;
-    int result = -1;
-    LARGE_INTEGER size = {0};
-
-    if (!dir || !key_out || key_max < 2) return -1;
-    SecureZeroMemory(key_out, key_max);
-    int pathChars = snprintf(path, sizeof(path), "%s\\%s", dir, SETTINGS_FILE);
-    if (pathChars < 0 || (size_t)pathChars >= sizeof(path)) goto done;
-
-    hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                        OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) goto done;
-
-    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 ||
-        size.QuadPart > 1024 * 1024) goto done;
-    dataSize = (size_t)size.QuadPart + 1;
-
-    data = (char *)malloc(dataSize);
-    if (!data) goto done;
-    ZeroMemory(data, dataSize);
-
-    DWORD bytesRead = 0;
-    if (!ReadFile(hFile, data, (DWORD)size.QuadPart, &bytesRead, NULL) ||
-        bytesRead != (DWORD)size.QuadPart) goto done;
-    CloseHandle(hFile);
-    hFile = INVALID_HANDLE_VALUE;
-    data[bytesRead] = '\0';
-
-    const char *needle = "\"license_key\"";
-    char *pos = strstr(data, needle);
-    if (!pos) goto done;
+    char needle[96] = {0};
+    if (!json || !field || !out || out_size < 2) return -1;
+    if (snprintf(needle, sizeof(needle), "\"%s\"", field) < 0) return -1;
+    const char *pos = strstr(json, needle);
+    if (!pos) return -1;
     pos += strlen(needle);
-    while (*pos && (*pos == ' ' || *pos == ':' || *pos == '\t')) pos++;
-    if (*pos != '"') goto done;
-    pos++;
-    char *end = strchr(pos, '"');
-    if (!end || (size_t)(end - pos) >= key_max) goto done;
-
-    memcpy(key_out, pos, (size_t)(end - pos));
-    key_out[end - pos] = '\0';
-    result = 0;
-
-done:
-    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-    if (data) {
-        SecureZeroMemory(data, dataSize);
-        free(data);
+    while (*pos == ' ' || *pos == '\t' || *pos == ':') pos++;
+    if (*pos++ != '"') return -1;
+    const char *end = strchr(pos, '"');
+    if (!end || end == pos || (size_t)(end - pos) >= out_size) return -1;
+    for (const char *p = pos; p < end; ++p) {
+        if ((unsigned char)*p < 0x21 || (unsigned char)*p > 0x7e ||
+            *p == '\\') return -1;
     }
-    SecureZeroMemory(path, sizeof(path));
-    if (result != 0) SecureZeroMemory(key_out, key_max);
-    return result;
-}
-
-static int compute_hwid(char *hwid_out, size_t hwid_max)
-{
-    if (!hwid_out || hwid_max < 65) return -1;
-
-    BCRYPT_ALG_HANDLE alg = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0)
-        return -1;
-    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return -1;
-    }
-
-    /* Component 1: hostname (matches QSysInfo::machineHostName) */
-    char computer[MAX_COMPUTERNAME_LENGTH + 1];
-    DWORD compSize = sizeof(computer);
-    if (GetComputerNameA(computer, &compSize))
-        BCryptHashData(hash, (PUCHAR)computer, compSize, 0);
-    BCryptHashData(hash, (PUCHAR)"|", 1, 0);
-
-    /* Component 2: SMBIOS UUID from firmware (matches QSysInfo::machineUniqueId).
-       GetSystemFirmwareTable('RSMB') returns the raw SMBIOS table; the UUID is
-       in the System Information structure (type 1) at offset 0x08, 16 bytes. */
-    {
-        DWORD smbiosSize = GetSystemFirmwareTable('RSMB', 0, NULL, 0);
-        if (smbiosSize > 0 && smbiosSize < 65536) {
-            BYTE *smbios = (BYTE *)malloc(smbiosSize);
-            if (smbios && GetSystemFirmwareTable('RSMB', 0, smbios, smbiosSize) == smbiosSize) {
-                DWORD offset = 8;  /* skip RawSMBIOSData header */
-                while (offset + 4 < smbiosSize) {
-                    BYTE type = smbios[offset];
-                    BYTE len  = smbios[offset + 1];
-                    if (type == 1 && len >= 0x19 && offset + 0x18 < smbiosSize) {
-                        BCryptHashData(hash, smbios + offset + 0x08, 16, 0);
-                        break;
-                    }
-                    /* skip to next structure: past formatted area + string table */
-                    DWORD next = offset + len;
-                    while (next + 1 < smbiosSize &&
-                           !(smbios[next] == 0 && smbios[next + 1] == 0))
-                        next++;
-                    next += 2;
-                    if (next <= offset + len) break;
-                    offset = next;
-                }
-            }
-            free(smbios);
-        }
-    }
-    BCryptHashData(hash, (PUCHAR)"|", 1, 0);
-
-    /* Component 3: Windows MachineGuid from registry (per-install, survives reboots;
-       matches SecurityManager::registryValueMachineGuid) */
-    {
-        HKEY key = NULL;
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                          "SOFTWARE\\Microsoft\\Cryptography",
-                          0, KEY_READ | KEY_WOW64_64KEY, &key) == ERROR_SUCCESS) {
-            char guid[256] = {0};
-            DWORD guidSize = sizeof(guid);
-            if (RegQueryValueExA(key, "MachineGuid", NULL, NULL,
-                                 (LPBYTE)guid, &guidSize) == ERROR_SUCCESS && guidSize > 0) {
-                BCryptHashData(hash, (PUCHAR)guid, guidSize - 1, 0);
-            }
-            RegCloseKey(key);
-        }
-    }
-
-    BYTE digest[32];
-    if (BCryptFinishHash(hash, digest, 32, 0) != 0) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return -1;
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-
-    for (int i = 0; i < 32; i++)
-        sprintf(hwid_out + i * 2, "%02x", digest[i]);
-    hwid_out[64] = '\0';
+    memcpy(out, pos, (size_t)(end - pos));
+    out[end - pos] = '\0';
     return 0;
 }
 
-static int fetch_shard(const char *build_id, const char *license_key,
-                       const char *hwid, char *shard_out)
+static int is_hex_string(const char *value, size_t exact_length)
+{
+    if (!value || strlen(value) != exact_length) return 0;
+    for (size_t i = 0; i < exact_length; ++i)
+        if (!isxdigit((unsigned char)value[i])) return 0;
+    return 1;
+}
+
+/* The signed outer launcher writes this record only after /api/activate. The
+ * bootstrap never derives a second HWID and never reads a plaintext license key. */
+static int read_session_credential(char *token, size_t token_size,
+                                   char *token_id, size_t token_id_size,
+                                   char *machine_id, size_t machine_id_size)
+{
+    char local_appdata[MAX_PATH] = {0};
+    char path[MAX_PATH * 2] = {0};
+    HANDLE file = INVALID_HANDLE_VALUE;
+    BYTE *encrypted = NULL;
+    DATA_BLOB input = {0};
+    DATA_BLOB output = {0};
+    LARGE_INTEGER size = {0};
+    int result = -1;
+
+    if (!token || !token_id || !machine_id) return -1;
+    SecureZeroMemory(token, token_size);
+    SecureZeroMemory(token_id, token_id_size);
+    SecureZeroMemory(machine_id, machine_id_size);
+    DWORD chars = GetEnvironmentVariableA(
+        "LOCALAPPDATA", local_appdata, (DWORD)sizeof(local_appdata));
+    if (chars == 0 || chars >= sizeof(local_appdata)) goto done;
+    int path_chars = snprintf(path, sizeof(path), "%s\\%s", local_appdata, SESSION_FILE);
+    if (path_chars < 0 || (size_t)path_chars >= sizeof(path))
+        goto done;
+
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) goto done;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        size.QuadPart > 16 * 1024) goto done;
+    encrypted = (BYTE *)malloc((size_t)size.QuadPart);
+    if (!encrypted) goto done;
+    DWORD bytes_read = 0;
+    if (!ReadFile(file, encrypted, (DWORD)size.QuadPart, &bytes_read, NULL) ||
+        bytes_read != (DWORD)size.QuadPart) goto done;
+    input.pbData = encrypted;
+    input.cbData = bytes_read;
+    if (!CryptUnprotectData(&input, NULL, NULL, NULL, NULL,
+                            CRYPTPROTECT_UI_FORBIDDEN, &output)) goto done;
+    if (!output.pbData || output.cbData == 0 || output.cbData > 4096) goto done;
+
+    char json[4097] = {0};
+    memcpy(json, output.pbData, output.cbData);
+    if (json_string_field(json, "token", token, token_size) != 0 ||
+        json_string_field(json, "token_id", token_id, token_id_size) != 0 ||
+        json_string_field(json, "machine_id", machine_id, machine_id_size) != 0 ||
+        !is_hex_string(machine_id, 64)) {
+        SecureZeroMemory(json, sizeof(json));
+        goto done;
+    }
+    SecureZeroMemory(json, sizeof(json));
+    result = 0;
+
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (output.pbData) {
+        SecureZeroMemory(output.pbData, output.cbData);
+        LocalFree(output.pbData);
+    }
+    if (encrypted) {
+        SecureZeroMemory(encrypted, (size_t)size.QuadPart);
+        free(encrypted);
+    }
+    SecureZeroMemory(local_appdata, sizeof(local_appdata));
+    SecureZeroMemory(path, sizeof(path));
+    if (result != 0) {
+        SecureZeroMemory(token, token_size);
+        SecureZeroMemory(token_id, token_id_size);
+        SecureZeroMemory(machine_id, machine_id_size);
+    }
+    return result;
+}
+
+/* [SERVER-SHARD blocker #5, Codex finding #1] Issuer-SPKI certificate pin for the
+ * shard-retrieve TLS call. This is the SAME issuer-key pin set the Venice license
+ * client and OrionActivate broker enforce (see native_orion/src/PinnedSpki.h in
+ * the NexusVision repo). This is a SEPARATE repo and C, so the hex values are
+ * duplicated here by hand — KEEP THEM BYTE-IDENTICAL to PinnedSpki.h if the pin
+ * set is ever rotated. Pinning the stable INTERMEDIATE key (not the rotating
+ * leaf) survives Cloudflare's ~90-day leaf renewals yet fails CLOSED against a
+ * rogue/edge MITM cert. WinHTTP's normal hostname+chain validation still runs
+ * first; this narrows the trusted CA set. */
+static const char *const kApiPinnedSpki[] = {
+    "908769e8d34477cc2cba0632c88605b22d7294c0840f78596d247c645b1afc0e", /* GTS WE1 */
+    "be1efc292835472e0d6aa183575d30fdc4dbf551f7050519a0258d6bddd6fc46", /* GTS WE2 */
+    "9847e5653e5e9e847516e5cb818606aa7544a19be67fd7366d506988e8d84347", /* GTS Root R4 */
+    "3586d4ecf070578cbd27aedce20b964e48bc149faeb9dad72f46b857869172b8", /* LE E5 */
+    "d016e1fe311948aca64f2de44ce86c9a51ca041df6103bb52a88eb3f761f57d7", /* LE E6 */
+    "cbbc559b44d524d6a132bdac672744da3407f12aae5d5f722c5f6c7913871c75", /* LE E7 */
+    "885bf0572252c6741dc9a52f5044487fef2a93b811cdedfad7624cc283b7cdd5", /* LE E8 */
+    "f1440a9b76e1e41e53a4cb461329bf6337b419726be513e42e19f1c691c5d4b2", /* LE E9 */
+    "2bbad93ab5c79279ec121507f272cbe0c6647a3aae52e22f388afab426b4adba", /* LE R10 */
+    "6ddac18698f7f1f7e1c69b9bce420d974ac6f94ca8b2c761701623f99c767dc7", /* LE R11 */
+    "919c0df7a787b597ed056ace654b1de9c0387acf349f73734a4fd7b58cf612a4", /* LE R12 */
+    "025490860b498ab73c6a12f27a49ad5fe230fafe3ac8f6112c9b7d0aad46941d", /* LE R13 */
+    "f1647a5ee3efac54c892e930584fe47979b7acd1c76c1271bca1c5076d869888", /* LE R14 */
+};
+
+static int spki_sha256_hex(const unsigned char *der, DWORD len, char out[65])
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    unsigned char digest[32];
+    static const char *hexchars = "0123456789abcdef";
+    int ok = 0;
+    if (!der || len == 0) return 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0 &&
+        BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) == 0 &&
+        BCryptHashData(hash, (PUCHAR)der, len, 0) == 0 &&
+        BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0) {
+        DWORD i;
+        for (i = 0; i < sizeof(digest); ++i) {
+            out[i * 2]     = hexchars[(digest[i] >> 4) & 0x0f];
+            out[i * 2 + 1] = hexchars[digest[i] & 0x0f];
+        }
+        out[64] = '\0';
+        ok = 1;
+    }
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    SecureZeroMemory(digest, sizeof(digest));
+    return ok;
+}
+
+static int cert_spki_pinned(PCCERT_CONTEXT cert)
+{
+    DWORD der = 0;
+    unsigned char *blob = NULL;
+    char hex[65];
+    size_t i;
+    int matched = 0;
+    if (!cert || !cert->pCertInfo) return 0;
+    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
+                             &cert->pCertInfo->SubjectPublicKeyInfo, 0, NULL,
+                             NULL, &der) || der == 0)
+        return 0;
+    blob = (unsigned char *)malloc(der);
+    if (!blob) return 0;
+    if (CryptEncodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
+                            &cert->pCertInfo->SubjectPublicKeyInfo, 0, NULL,
+                            blob, &der) &&
+        spki_sha256_hex(blob, der, hex)) {
+        for (i = 0; i < sizeof(kApiPinnedSpki) / sizeof(kApiPinnedSpki[0]); ++i) {
+            if (strcmp(hex, kApiPinnedSpki[i]) == 0) { matched = 1; break; }
+        }
+    }
+    free(blob);
+    return matched;
+}
+
+/* Returns 1 iff SOME cert in the server's verified chain carries a pinned issuer
+ * SPKI. FAILS CLOSED (0) on any read/build failure or no match. */
+static int verify_server_spki_pin(HINTERNET request)
+{
+    PCCERT_CONTEXT leaf = NULL;
+    DWORD leaf_size = sizeof(leaf);
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    CERT_CHAIN_PARA chain_para;
+    int matched = 0;
+
+    if (!WinHttpQueryOption(request, WINHTTP_OPTION_SERVER_CERT_CONTEXT,
+                            &leaf, &leaf_size) || !leaf)
+        return 0;
+
+    ZeroMemory(&chain_para, sizeof(chain_para));
+    chain_para.cbSize = sizeof(chain_para);
+    if (CertGetCertificateChain(NULL, leaf, NULL, leaf->hCertStore, &chain_para,
+                                0, NULL, &chain) &&
+        chain && chain->cChain > 0 && chain->rgpChain[0]) {
+        DWORD e;
+        const CERT_SIMPLE_CHAIN *simple = chain->rgpChain[0];
+        for (e = 0; e < simple->cElement; ++e) {
+            if (cert_spki_pinned(simple->rgpElement[e]->pCertContext)) {
+                matched = 1;
+                break;
+            }
+        }
+    }
+    if (chain) CertFreeCertificateChain(chain);
+    CertFreeCertificateContext(leaf);
+    return matched;
+}
+
+static int fetch_shard(const char *build_id, const char *token,
+                       const char *token_id, const char *machine_id,
+                       char *shard_out, char *error_out, size_t error_size)
 {
     char body[768] = {0};
     char response[1024] = {0};
+    char header_utf8[768] = {0};
+    wchar_t headers[768] = {0};
     HINTERNET session = NULL;
     HINTERNET connect = NULL;
     HINTERNET request = NULL;
     int result = -1;
 
-    if (!build_id || !license_key || !hwid || !shard_out)
+    if (!build_id || !token || !token_id || !machine_id || !shard_out ||
+        !error_out || error_size < 2)
         goto done;
     SecureZeroMemory(shard_out, 65);
+    SecureZeroMemory(error_out, error_size);
 
-    const unsigned char *license_char = (const unsigned char *)license_key;
-    if (!*license_char) goto done;
-    for (; *license_char; ++license_char) {
-        if (*license_char < 0x21 || *license_char > 0x7e ||
-            *license_char == '"' || *license_char == '\\')
+    const unsigned char *token_char = (const unsigned char *)token;
+    if (!*token_char) goto done;
+    for (; *token_char; ++token_char) {
+        if (*token_char < 0x21 || *token_char > 0x7e ||
+            *token_char == '"' || *token_char == '\\')
             goto done;
     }
 
     int body_chars = snprintf(
         body, sizeof(body),
-        "{\"build_id\":\"%s\",\"license_key\":\"%s\",\"hwid\":\"%s\"}",
-        build_id, license_key, hwid);
+        "{\"build_id\":\"%s\",\"machine_id\":\"%s\"}",
+        build_id, machine_id);
     if (body_chars < 0 || (size_t)body_chars >= sizeof(body)) goto done;
+    int header_chars = snprintf(
+        header_utf8, sizeof(header_utf8),
+        "Content-Type: application/json\r\n"
+        "Authorization: Bearer %s\r\n"
+        "X-Orion-Token-Id: %s\r\n",
+        token, token_id);
+    if (header_chars < 0 || (size_t)header_chars >= sizeof(header_utf8)) goto done;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, header_utf8, -1,
+                            headers, (int)(sizeof(headers) / sizeof(headers[0]))) <= 0)
+        goto done;
 
     session = WinHttpOpen(L"LetheShardBootstrap/0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) goto done;
     if (!WinHttpSetTimeouts(session, 10000, 10000, 15000, 15000)) goto done;
+    DWORD secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+    secure_protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+    if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                          &secure_protocols, sizeof(secure_protocols))) goto done;
 
     connect = WinHttpConnect(session, SHARD_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!connect) goto done;
@@ -354,10 +451,14 @@ static int fetch_shard(const char *build_id, const char *license_key,
     if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
                           &redirect_policy, sizeof(redirect_policy))) goto done;
 
-    const wchar_t *headers = L"Content-Type: application/json\r\n";
     DWORD bodyLen = (DWORD)body_chars;
     if (!WinHttpSendRequest(request, headers, (DWORD)-1, body, bodyLen, bodyLen, 0) ||
         !WinHttpReceiveResponse(request, NULL)) goto done;
+
+    /* [Codex finding #1] Enforce the issuer-SPKI pin BEFORE reading the body. A
+     * pin failure aborts (fail closed) — no shard is parsed off an unpinned TLS
+     * session. */
+    if (!verify_server_spki_pin(request)) goto done;
 
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
@@ -381,6 +482,8 @@ static int fetch_shard(const char *build_id, const char *license_key,
     response[totalRead] = '\0';
 
     if (statusCode != 200) {
+        if (json_string_field(response, "error", error_out, error_size) != 0)
+            snprintf(error_out, error_size, "http_%lu", statusCode);
         result = statusCode ? (int)statusCode : -1;
         goto done;
     }
@@ -420,6 +523,8 @@ done:
     if (result != 0 && shard_out) SecureZeroMemory(shard_out, 65);
     SecureZeroMemory(body, sizeof(body));
     SecureZeroMemory(response, sizeof(response));
+    SecureZeroMemory(header_utf8, sizeof(header_utf8));
+    SecureZeroMemory(headers, sizeof(headers));
     return result;
 }
 
@@ -432,9 +537,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     char cmdLine[MAX_PATH + 3] = {0};
     char buildId[65] = {0};
     char launchBuildId[65] = {0};
-    char licenseKey[256] = {0};
-    char hwid[65] = {0};
+    char token[256] = {0};
+    char tokenId[96] = {0};
+    char machineId[65] = {0};
     char shard[65] = {0};
+    char shardError[96] = {0};
     HANDLE packedFile = INVALID_HANDLE_VALUE;
     BOOL gateSet = FALSE;
     STARTUPINFOA si;
@@ -466,75 +573,89 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     packedFile = CreateFileA(packedPath, GENERIC_READ, FILE_SHARE_READ, NULL,
                              OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (packedFile == INVALID_HANDLE_VALUE) {
-        MessageBoxA(NULL, "protected.exe not found next to bootstrap.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "The protected Venice application is missing. Reinstall Venice.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
     if (pe_content_id(packedFile, buildId) != 0) {
-        MessageBoxA(NULL, "Failed to compute build content ID.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice could not validate this installation. Reinstall Venice.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
-    if (read_license_key(exeDir, licenseKey, sizeof(licenseKey)) != 0) {
-        MessageBoxA(NULL, "License key not found in settings.json.\n"
-                    "Please activate the protected application first.",
-                    "Lethe Launch Error", MB_ICONERROR);
+    if (read_session_credential(token, sizeof(token), tokenId, sizeof(tokenId),
+                                machineId, sizeof(machineId)) != 0) {
+        MessageBoxA(NULL, "Connect Discord at zaeorion.com/connect, then reopen Venice.\n\n"
+                    "A fresh install needs the signed Venice activation broker before "
+                    "server-shard mode can ship.",
+                    "Venice Sign-In Required", MB_ICONINFORMATION);
         goto cleanup;
     }
 
-    if (compute_hwid(hwid, sizeof(hwid)) != 0) {
-        MessageBoxA(NULL, "Failed to compute hardware ID.",
-                    "Lethe Launch Error", MB_ICONERROR);
-        goto cleanup;
-    }
-
-    int fetchResult = fetch_shard(buildId, licenseKey, hwid, shard);
-    if (fetchResult != 0) {
+    int fetchResult = -1;
+    for (;;) {
+        fetchResult = fetch_shard(buildId, token, tokenId, machineId,
+                                  shard, shardError, sizeof(shardError));
+        if (fetchResult == 0) break;
         char msg[256];
-        if (fetchResult == 403)
-            snprintf(msg, sizeof(msg), "License validation failed (403).\nPlease check your license.");
-        else if (fetchResult == 429)
-            snprintf(msg, sizeof(msg), "Too many launch attempts. Please try again later.");
-        else if (fetchResult == 404)
-            snprintf(msg, sizeof(msg), "Build not recognized by server (404).");
+        if (strcmp(shardError, "machine_mismatch") == 0)
+            snprintf(msg, sizeof(msg), "This subscription is linked to another PC.\n"
+                     "Use /hwid_reset in Discord, then select Retry.");
+        else if (strcmp(shardError, "build_revoked") == 0 ||
+                 strcmp(shardError, "build_expired") == 0 ||
+                 strcmp(shardError, "build_not_found") == 0)
+            snprintf(msg, sizeof(msg), "This Venice build is no longer available.\n"
+                     "Update Venice before trying again.");
+        else if (strcmp(shardError, "rate_limited") == 0)
+            snprintf(msg, sizeof(msg), "Too many launch attempts.\n"
+                     "Wait one minute, then select Retry.");
+        else if (strcmp(shardError, "license_revoked") == 0 ||
+                 strcmp(shardError, "license_inactive") == 0 ||
+                 strcmp(shardError, "license_expired") == 0 ||
+                 strcmp(shardError, "subscription_required") == 0 ||
+                 strcmp(shardError, "token_expired") == 0 ||
+                 strcmp(shardError, "invalid_token") == 0 ||
+                 strcmp(shardError, "missing_token") == 0)
+            snprintf(msg, sizeof(msg), "Your Venice access is not active.\n"
+                     "Subscribe at zaeorion.com or open a Discord ticket.");
         else
-            snprintf(msg, sizeof(msg), "Failed to contact license server (error %d).\n"
-                     "Please check your internet connection.", fetchResult);
-        MessageBoxA(NULL, msg, "Lethe Launch Error", MB_ICONERROR);
+            snprintf(msg, sizeof(msg), "Can't reach Venice servers.\n"
+                     "Check your connection, then select Retry.");
+        int choice = MessageBoxA(NULL, msg, "Venice Launch Error",
+                                 MB_ICONERROR | MB_RETRYCANCEL);
         SecureZeroMemory(msg, sizeof(msg));
-        goto cleanup;
+        if (choice != IDRETRY) goto cleanup;
     }
 
     /* Re-hash the same locked handle after the network round trip. */
     if (pe_content_id(packedFile, launchBuildId) != 0 ||
         memcmp(buildId, launchBuildId, sizeof(buildId)) != 0) {
-        MessageBoxA(NULL, "Packed executable changed before launch.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice changed before launch. Reinstall Venice.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
     if (!SetEnvironmentVariableA("NV_RT_GATE", shard)) {
-        MessageBoxA(NULL, "Failed to prepare the runtime gate.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice could not prepare the protected runtime.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
     gateSet = TRUE;
     SecureZeroMemory(shard, sizeof(shard));
-    SecureZeroMemory(licenseKey, sizeof(licenseKey));
+    SecureZeroMemory(token, sizeof(token));
 
     int commandChars = snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", packedPath);
     if (commandChars < 0 || (size_t)commandChars >= sizeof(cmdLine)) {
-        MessageBoxA(NULL, "Packed executable command line is too long.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice command line is too long.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
     if (!CreateProcessA(packedPath, cmdLine, NULL, NULL, FALSE,
                         0, NULL, exeDir, &si, &pi)) {
-        MessageBoxA(NULL, "Failed to launch protected.exe.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice could not start the protected application.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
@@ -544,15 +665,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     gateSet = FALSE;
 
     if (WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_OBJECT_0) {
-        MessageBoxA(NULL, "Failed while waiting for protected.exe.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice lost contact with the protected application.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
 
     DWORD exitCode = 0;
     if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
-        MessageBoxA(NULL, "Failed to read protected.exe exit status.",
-                    "Lethe Launch Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Venice could not read the application exit status.",
+                    "Venice Launch Error", MB_ICONERROR);
         goto cleanup;
     }
     result = (int)exitCode;
@@ -563,8 +684,10 @@ cleanup:
     if (pi.hProcess) CloseHandle(pi.hProcess);
     if (pi.hThread) CloseHandle(pi.hThread);
     SecureZeroMemory(shard, sizeof(shard));
-    SecureZeroMemory(licenseKey, sizeof(licenseKey));
-    SecureZeroMemory(hwid, sizeof(hwid));
+    SecureZeroMemory(token, sizeof(token));
+    SecureZeroMemory(tokenId, sizeof(tokenId));
+    SecureZeroMemory(machineId, sizeof(machineId));
+    SecureZeroMemory(shardError, sizeof(shardError));
     SecureZeroMemory(buildId, sizeof(buildId));
     SecureZeroMemory(launchBuildId, sizeof(launchBuildId));
     SecureZeroMemory(cmdLine, sizeof(cmdLine));

@@ -54,6 +54,7 @@ _R8 = [Register.AL, Register.CL, Register.DL, Register.BL, Register.SPL,
        Register.R10L, Register.R11L, Register.R12L, Register.R13L, Register.R14L,
        Register.R15L]
 _HIGH8 = {Register.AH, Register.CH, Register.DH, Register.BH}
+_HIGH8_OFF = {Register.AH: 0, Register.CH: 8, Register.DH: 16, Register.BH: 24}
 REG_OFF = {r: i * 8 for i, r in enumerate(_R64)}
 REG32_OFF = {r: i * 8 for i, r in enumerate(_R32)}   # 32-bit reg -> parent offset
 REG16_OFF = {r: i * 8 for i, r in enumerate(_R16)}
@@ -66,6 +67,7 @@ SA, SB, SR = 160, 168, 176                   # scratch: operand a, b, result
 # extra scratch for the wide (64x64->128) multiply used by imul overflow synthesis
 T0, T1, T2, T3, T4, T5 = 184, 192, 200, 208, 216, 224
 PF = 232                                      # parity flag (even low-byte parity)
+ALL_FLAGS = frozenset({"CF", "PF", "ZF", "SF", "OF"})
 CALL_DEPTH = 240                              # active internal CALL frames
 CALL_RET_BASE = 248                           # 32 x architectural return RIP
 CALL_STACK_CAPACITY = 32
@@ -136,12 +138,19 @@ def _lbl(addr: int) -> str:
 
 
 class _Lifter:
-    def __init__(self, code: bytes, base: int) -> None:
+    def __init__(self, code: bytes, base: int, optimize_flags: bool = True) -> None:
         self.code = code
         self.base = base
         self.end = base + len(code)
+        self.optimize_flags = optimize_flags
         self.a = _Asm()
         self._lblctr = 0
+        self.live_flags_by_ip: dict[int, set[str]] = {}
+
+    def _get_live_flags(self, ip: int) -> set[str] | None:
+        if not self.optimize_flags:
+            return None
+        return self.live_flags_by_ip.get(ip, ALL_FLAGS)
 
     def _new_label(self) -> str:
         """A unique intra-instruction label (for CL-shift zero-count guards).
@@ -154,7 +163,7 @@ class _Lifter:
         """Return (local_offset, width_bits) for a supported GPR, else bail.
 
         Every low sub-register shares its parent's 64-bit local. High-8 aliases
-        remain rejected because their encoding depends on the absence of REX."""
+        (AH, CH, DH, BH) map to bits 8..15 of RAX, RCX, RDX, RBX."""
         if reg in REG_OFF:
             return REG_OFF[reg], 64
         if reg in REG32_OFF:
@@ -163,11 +172,18 @@ class _Lifter:
             return REG16_OFF[reg], 16
         if reg in REG8_OFF:
             return REG8_OFF[reg], 8
-        if reg in _HIGH8:
-            raise LiftUnsupported(f"high-8 register {reg!r} is not supported")
+        if reg in _HIGH8_OFF:
+            return _HIGH8_OFF[reg], 8
         raise LiftUnsupported(f"unsupported register {reg!r}")
 
     def rd_reg(self, reg) -> None:
+        if reg in _HIGH8_OFF:
+            off = _HIGH8_OFF[reg]
+            self.a(f"local_addr {off}")
+            self.a("load64")
+            self.push_imm(8); self.a("shr")
+            self.push_imm(0xFF); self.a("and")
+            return
         off, width = self._reg_info(reg)
         self.a(f"local_addr {off}")
         self.a("load64")
@@ -177,6 +193,17 @@ class _Lifter:
 
     def wr_reg(self, reg) -> None:
         # value on top of stack -> reg local. store64 pops [addr, val].
+        if reg in _HIGH8_OFF:
+            off = _HIGH8_OFF[reg]
+            self.push_imm(0xFF); self.a("and")
+            self.push_imm(8); self.a("shl")
+            self.a(f"local_addr {off}"); self.a("load64")
+            self.push_imm((~(0xFF << 8)) & MASK64); self.a("and")
+            self.a("or")
+            self.a(f"local_addr {off}")
+            self.a("swap")
+            self.a("store64")
+            return
         off, width = self._reg_info(reg)
         mask = _width_mask(width)
         if width == 32:                       # 32-bit writes zero-extend
@@ -294,38 +321,47 @@ class _Lifter:
         self.rd_local(T5); self.push_imm(1); self.a("and")
         self.push_imm(0); self.a("cmp_eq"); self.wr_local(PF)
 
-    def _zf_sf_from_sr(self, signbit: int = SIGN64) -> None:
-        # ZF = (SR == 0)
-        self.rd_local(SR); self.push_imm(0); self.a("cmp_eq"); self.wr_local(ZF)
-        # SF = (SR >> signbit) & 1
-        self.rd_local(SR); self.push_imm(signbit); self.a("shr")
-        self.push_imm(1); self.a("and"); self.wr_local(SF)
-        self._pf_from_sr()
+    def _zf_sf_from_sr(self, signbit: int = SIGN64, live_flags: set[str] | None = None) -> None:
+        if live_flags is None or "ZF" in live_flags:
+            self.rd_local(SR); self.push_imm(0); self.a("cmp_eq"); self.wr_local(ZF)
+        if live_flags is None or "SF" in live_flags:
+            self.rd_local(SR); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and"); self.wr_local(SF)
+        if live_flags is None or "PF" in live_flags:
+            self._pf_from_sr()
 
-    def flags_logical(self, signbit: int = SIGN64) -> None:
-        self._zf_sf_from_sr(signbit)
-        self.push_imm(0); self.wr_local(CF)
-        self.push_imm(0); self.wr_local(OF)
+    def flags_logical(self, signbit: int = SIGN64, live_flags: set[str] | None = None) -> None:
+        if live_flags is not None and not live_flags:
+            return
+        self._zf_sf_from_sr(signbit, live_flags)
+        if live_flags is None or "CF" in live_flags:
+            self.push_imm(0); self.wr_local(CF)
+        if live_flags is None or "OF" in live_flags:
+            self.push_imm(0); self.wr_local(OF)
 
-    def flags_add(self, set_cf: bool = True, signbit: int = SIGN64) -> None:
-        self._zf_sf_from_sr(signbit)
-        if set_cf:                                   # CF = (SR < SA) unsigned
+    def flags_add(self, set_cf: bool = True, signbit: int = SIGN64, live_flags: set[str] | None = None) -> None:
+        if live_flags is not None and not live_flags:
+            return
+        self._zf_sf_from_sr(signbit, live_flags)
+        if set_cf and (live_flags is None or "CF" in live_flags):
             self.rd_local(SR); self.rd_local(SA); self.a("cmp_lt"); self.wr_local(CF)
-        # OF = ((SA ^ SR) & (SB ^ SR)) >> signbit & 1
-        self.rd_local(SA); self.rd_local(SR); self.a("xor")
-        self.rd_local(SB); self.rd_local(SR); self.a("xor")
-        self.a("and"); self.push_imm(signbit); self.a("shr")
-        self.push_imm(1); self.a("and"); self.wr_local(OF)
+        if live_flags is None or "OF" in live_flags:
+            self.rd_local(SA); self.rd_local(SR); self.a("xor")
+            self.rd_local(SB); self.rd_local(SR); self.a("xor")
+            self.a("and"); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and"); self.wr_local(OF)
 
-    def flags_sub(self, set_cf: bool = True, signbit: int = SIGN64) -> None:
-        self._zf_sf_from_sr(signbit)
-        if set_cf:                                   # CF = (SA < SB) unsigned
+    def flags_sub(self, set_cf: bool = True, signbit: int = SIGN64, live_flags: set[str] | None = None) -> None:
+        if live_flags is not None and not live_flags:
+            return
+        self._zf_sf_from_sr(signbit, live_flags)
+        if set_cf and (live_flags is None or "CF" in live_flags):
             self.rd_local(SA); self.rd_local(SB); self.a("cmp_lt"); self.wr_local(CF)
-        # OF = ((SA ^ SB) & (SA ^ SR)) >> signbit & 1
-        self.rd_local(SA); self.rd_local(SB); self.a("xor")
-        self.rd_local(SA); self.rd_local(SR); self.a("xor")
-        self.a("and"); self.push_imm(signbit); self.a("shr")
-        self.push_imm(1); self.a("and"); self.wr_local(OF)
+        if live_flags is None or "OF" in live_flags:
+            self.rd_local(SA); self.rd_local(SB); self.a("xor")
+            self.rd_local(SA); self.rd_local(SR); self.a("xor")
+            self.a("and"); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and"); self.wr_local(OF)
 
     # -- instruction lifters --------------------------------------------
     def _mask_sr(self, width: int) -> None:
@@ -347,12 +383,13 @@ class _Lifter:
         self._mask_sr(width); self.wr_local(SR)
         if writeback:
             self._write_rmw_destination(dst, width)
+        live = self._get_live_flags(instr.ip)
         if kind == "add":
-            self.flags_add(set_cf=set_cf, signbit=signbit)
+            self.flags_add(set_cf=set_cf, signbit=signbit, live_flags=live)
         elif kind == "sub":
-            self.flags_sub(set_cf=set_cf, signbit=signbit)
+            self.flags_sub(set_cf=set_cf, signbit=signbit, live_flags=live)
         else:
-            self.flags_logical(signbit=signbit)
+            self.flags_logical(signbit=signbit, live_flags=live)
 
     def _mov(self, instr) -> None:
         if instr.op_kind(0) == OpKind.MEMORY:
@@ -524,11 +561,11 @@ class _Lifter:
         self._write_rmw_destination(dst, width)
 
         if subtract:
-            self.flags_sub(set_cf=False, signbit=signbit)
+            self.flags_sub(set_cf=False, signbit=signbit, live_flags=self._get_live_flags(instr.ip))
             self.rd_local(SA); self.rd_local(SB); self.a("cmp_lt"); self.wr_local(T2)
             self.rd_local(T1); self.rd_local(T0); self.a("cmp_lt")
         else:
-            self.flags_add(set_cf=False, signbit=signbit)
+            self.flags_add(set_cf=False, signbit=signbit, live_flags=self._get_live_flags(instr.ip))
             self.rd_local(T1); self.rd_local(SA); self.a("cmp_lt"); self.wr_local(T2)
             self.rd_local(SR); self.rd_local(T1); self.a("cmp_lt")
         self.rd_local(T2); self.a("or"); self.wr_local(CF)
@@ -540,16 +577,17 @@ class _Lifter:
         if vmop == "neg":
             self.rd_local(SA); self.a("neg"); self._mask_sr(width); self.wr_local(SR)
             self._write_rmw_destination(dst, width)
-            # neg flags: like sub of 0 - SA. CF = (SA != 0); OF/SF/ZF from SR.
-            self._zf_sf_from_sr(signbit)
-            self.rd_local(SA); self.push_imm(0); self.a("cmp_ne"); self.wr_local(CF)
-            # OF = (SA == SR) at sign bit -> ((0^SA)&(0^SR))>>signbit; reuse sub form
-            self.push_imm(0); self.wr_local(SB)  # SB=0 (subtrahend a=0 form)
-            # emulate 0 - SA: treat SA as SB, 0 as SA for the sub OF formula
-            self.rd_local(SB); self.rd_local(SA); self.a("xor")   # 0 ^ SA
-            self.rd_local(SB); self.rd_local(SR); self.a("xor")   # 0 ^ SR
-            self.a("and"); self.push_imm(signbit); self.a("shr")
-            self.push_imm(1); self.a("and"); self.wr_local(OF)
+            live = self._get_live_flags(instr.ip)
+            if live:
+                self._zf_sf_from_sr(signbit, live)
+                if "CF" in live:
+                    self.rd_local(SA); self.push_imm(0); self.a("cmp_ne"); self.wr_local(CF)
+                if "OF" in live:
+                    self.push_imm(0); self.wr_local(SB)  # SB=0 (subtrahend a=0 form)
+                    self.rd_local(SB); self.rd_local(SA); self.a("xor")   # 0 ^ SA
+                    self.rd_local(SB); self.rd_local(SR); self.a("xor")   # 0 ^ SR
+                    self.a("and"); self.push_imm(signbit); self.a("shr")
+                    self.push_imm(1); self.a("and"); self.wr_local(OF)
         else:  # not: no flags affected
             self.rd_local(SA); self.a("not"); self._mask_sr(width); self.wr_local(SR)
             self._write_rmw_destination(dst, width)
@@ -562,69 +600,74 @@ class _Lifter:
         self.rd_local(SA); self.rd_local(SB)
         self.a("add" if add else "sub"); self._mask_sr(width); self.wr_local(SR)
         self._write_rmw_destination(dst, width)
-        (self.flags_add if add else self.flags_sub)(set_cf=False, signbit=signbit)
+        live = self._get_live_flags(instr.ip)
+        (self.flags_add if add else self.flags_sub)(set_cf=False, signbit=signbit, live_flags=live)
 
     def _shift(self, instr, vmop: str) -> None:
-        # shl/shr reg, imm|cl.
-        dst, width = self.require_reg(instr, 0)
-        if width < 32:
-            raise LiftUnsupported("8/16-bit shifts are not yet modeled")
+        # shl/shr reg|mem, imm|cl.
+        dst, width = self._read_rmw_destination(instr)
         if (instr.op_kind(1) == OpKind.REGISTER
                 and instr.op_register(1) == Register.CL):
-            self._shift_cl(dst, width, vmop)   # dynamic (CL) count -- cut 3
+            self._shift_cl(dst, width, vmop, instr)
             return
         if instr.op_kind(1) not in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
                                     OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
             raise LiftUnsupported("shift by non-immediate/CL not supported")
         signbit = _width_signbit(width)
-        # x64 masks the shift count by 5 bits for 32-bit ops, 6 bits for 64-bit.
-        cnt = instr.immediate(1) & (31 if width == 32 else 63)
+        cnt_mask = 63 if width == 64 else 31
+        cnt = instr.immediate(1) & cnt_mask
         if cnt == 0:
-            return  # no-op, flags unchanged
-        self.rd_reg(dst); self.wr_local(SA)
+            if dst is not None and width == 32:
+                self._write_rmw_destination(dst, width)
+            return
         self.rd_local(SA); self.push_imm(cnt); self.a(vmop)
         self._mask_sr(width); self.wr_local(SR)
-        self.rd_local(SR); self.wr_reg(dst)
-        # flags: ZF/SF from result; CF = last bit shifted out; OF only defined for
-        # count==1 (leave as computed). CF for shl = bit (width-cnt) of SA; shr =
-        # bit (cnt-1) of SA. cnt in [1, width-1] here so the bit index is valid.
-        self._zf_sf_from_sr(signbit)
-        bit = ((32 if width == 32 else 64) - cnt) if vmop == "shl" else (cnt - 1)
-        self.rd_local(SA); self.push_imm(bit); self.a("shr")
-        self.push_imm(1); self.a("and"); self.wr_local(CF)
-        self.push_imm(0); self.wr_local(OF)   # approximate OF as 0 (cnt!=1 undefined)
+        self._write_rmw_destination(dst, width)
+        live = self._get_live_flags(instr.ip)
+        if live:
+            self._zf_sf_from_sr(signbit, live)
+            if "CF" in live:
+                if cnt <= width:
+                    bit = (width - cnt) if vmop == "shl" else (cnt - 1)
+                    self.rd_local(SA); self.push_imm(bit); self.a("shr")
+                    self.push_imm(1); self.a("and"); self.wr_local(CF)
+                else:
+                    self.push_imm(0); self.wr_local(CF)
+            if "OF" in live:
+                self.push_imm(0); self.wr_local(OF)
 
     def _read_cl_count(self, width: int) -> None:
-        """SB = CL & (width-1). CL is the low 8 bits of rcx; since width-1 <= 63
-        this equals (rcx & 0xFF) & (width-1)."""
-        self.rd_local(REG_OFF[Register.RCX]); self.push_imm(width - 1)
+        """SB = CL & (63 if 64-bit else 31)."""
+        self.rd_local(REG_OFF[Register.RCX])
+        self.push_imm(63 if width == 64 else 31)
         self.a("and"); self.wr_local(SB)
 
-    def _shift_cl(self, dst, width: int, vmop: str) -> None:
-        # shl/shr reg, CL -- dynamic count masked by (width-1). The VM shl/shr
-        # take the count off the stack, so a dynamic count is a direct fit.
+    def _shift_cl(self, dst, width: int, vmop: str, instr) -> None:
         signbit = _width_signbit(width)
         self._read_cl_count(width)                 # SB = cnt
-        # Value is written unconditionally: x86 writes the destination even when
-        # the masked count is 0, so a 32-bit shift zero-extends the parent no
-        # matter the count (cnt==0 -> shift by 0 -> the low bits, zero-extended).
-        self.rd_reg(dst); self.wr_local(SA)
         self.rd_local(SA); self.rd_local(SB); self.a(vmop)
         self._mask_sr(width); self.wr_local(SR)
-        self.rd_local(SR); self.wr_reg(dst)
-        # Flags are unchanged when cnt==0; guard the flag writes behind jz.
+        if dst is not None and width == 32:
+            self._write_rmw_destination(dst, width)
+        else:
+            skip_wr = self._new_label()
+            self.rd_local(SB); self.a(f"jz {skip_wr}")
+            self._write_rmw_destination(dst, width)
+            self.a.label(skip_wr)
         skip = self._new_label()
         self.rd_local(SB); self.a(f"jz {skip}")
-        self._zf_sf_from_sr(signbit)
-        # CF = last bit shifted out: shl -> bit (width-cnt) of x; shr -> bit
-        # (cnt-1) of x. In this branch cnt in [1, width-1] so the index is valid.
-        self.rd_local(SA)
-        if vmop == "shl":
-            self.push_imm(width); self.rd_local(SB); self.a("sub")
-        else:
-            self.rd_local(SB); self.push_imm(1); self.a("sub")
-        self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
-        self.push_imm(0); self.wr_local(OF)        # OF defined only for cnt==1
+        live = self._get_live_flags(instr.ip)
+        if live:
+            self._zf_sf_from_sr(signbit, live)
+            if "CF" in live:
+                self.rd_local(SA)
+                if vmop == "shl":
+                    self.push_imm(width); self.rd_local(SB); self.a("sub")
+                else:
+                    self.rd_local(SB); self.push_imm(1); self.a("sub")
+                self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+            if "OF" in live:
+                self.push_imm(0); self.wr_local(OF)
         self.a.label(skip)
 
     def _shift_count(self, instr):
@@ -639,12 +682,10 @@ class _Lifter:
         raise LiftUnsupported("shift/rotate count must be an immediate or CL")
 
     def _sar(self, instr) -> None:
-        # sar reg, imm|cl -- arithmetic shift right (no VM sar; synthesized).
-        dst, width = self.require_reg(instr, 0)
-        if width < 32:
-            raise LiftUnsupported("8/16-bit sar is not yet modeled")
+        # sar reg|mem, imm|cl -- arithmetic shift right.
+        dst, width = self._read_rmw_destination(instr)
         signbit = _width_signbit(width)
-        mask = width - 1
+        mask = 63 if width == 64 else 31
         mask_val = _width_mask(width)
         src, raw = self._shift_count(instr)
         is_imm = src == "imm"
@@ -655,35 +696,56 @@ class _Lifter:
         def push_cnt():
             self.push_imm(cnt) if is_imm else self.rd_local(SB)
 
-        # Value (count-0 safe, written unconditionally so 32-bit sar zero-extends):
-        #   SR = (x >> n) | (sign_all & fill_mask)
-        #   sign_all = 0 - sign(x)  (all-ones if x negative)
-        #   fill_mask = ~(MASK >> n) & MASK  (top n bits; 0 when n==0)
-        self.rd_reg(dst); self.wr_local(SA)
-        self.rd_local(SA); push_cnt(); self.a("shr")               # x >> n
+        # Value:
+        self.rd_local(SA); push_cnt(); self.a("shr")
         self.rd_local(SA); self.push_imm(signbit); self.a("shr")
-        self.push_imm(1); self.a("and"); self.a("neg")             # sign_all
+        self.push_imm(1); self.a("and"); self.a("neg")
         self.push_imm(mask_val); push_cnt(); self.a("shr")
-        self.a("not"); self.push_imm(mask_val); self.a("and")      # fill_mask
-        self.a("and")                                              # sign_all & fill
-        self.a("or")                                               # | (x>>n)
+        self.a("not"); self.push_imm(mask_val); self.a("and")
+        self.a("and")
+        self.a("or")
         self._mask_sr(width); self.wr_local(SR)
-        self.rd_local(SR); self.wr_reg(dst)
-
-        # Flags: unchanged when n==0; else ZF/SF from result, CF = bit(n-1), OF=0.
-        def emit_flags():
-            self._zf_sf_from_sr(signbit)
-            self.rd_local(SA)
-            if is_imm:
-                self.push_imm(cnt - 1)
-            else:
-                self.rd_local(SB); self.push_imm(1); self.a("sub")
-            self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
-            self.push_imm(0); self.wr_local(OF)
 
         if is_imm:
-            if cnt != 0:
-                emit_flags()
+            if cnt == 0:
+                if dst is not None and width == 32:
+                    self._write_rmw_destination(dst, width)
+                return
+            self._write_rmw_destination(dst, width)
+        else:
+            if dst is not None and width == 32:
+                self._write_rmw_destination(dst, width)
+            else:
+                skip_wr = self._new_label()
+                self.rd_local(SB); self.a(f"jz {skip_wr}")
+                self._write_rmw_destination(dst, width)
+                self.a.label(skip_wr)
+
+        live = self._get_live_flags(instr.ip)
+        def emit_flags():
+            if not live:
+                return
+            self._zf_sf_from_sr(signbit, live)
+            if "CF" in live:
+                self.rd_local(SA)
+                if is_imm:
+                    self.push_imm(min(cnt - 1, signbit))
+                else:
+                    self.rd_local(SB); self.push_imm(1); self.a("sub"); self.wr_local(T0)
+                    clamp = self._new_label()
+                    bit_ok = self._new_label()
+                    self.push_imm(signbit); self.rd_local(T0); self.a("cmp_lt")
+                    self.a(f"jnz {clamp}")
+                    self.rd_local(T0); self.a(f"jmp {bit_ok}")
+                    self.a.label(clamp)
+                    self.push_imm(signbit)
+                    self.a.label(bit_ok)
+                self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+            if "OF" in live:
+                self.push_imm(0); self.wr_local(OF)
+
+        if is_imm:
+            emit_flags()
         else:
             skip = self._new_label()
             self.rd_local(SB); self.a(f"jz {skip}")
@@ -691,48 +753,61 @@ class _Lifter:
             self.a.label(skip)
 
     def _rotate(self, instr, direction: str) -> None:
-        # rol/ror reg, imm|cl -- synthesized from shl/shr/or (no VM rotate op).
-        dst, width = self.require_reg(instr, 0)
-        if width < 32:
-            raise LiftUnsupported("8/16-bit rotates are not yet modeled")
-        mask = width - 1
+        # rol/ror reg|mem, imm|cl.
+        dst, width = self._read_rmw_destination(instr)
+        cnt_mask = 63 if width == 64 else 31
         src, raw = self._shift_count(instr)
         is_imm = src == "imm"
-        cnt = (raw & mask) if is_imm else None
+        cnt = (raw & cnt_mask) if is_imm else None
         if not is_imm:
             self._read_cl_count(width)              # SB = cnt
 
-        def push_cnt():
-            self.push_imm(cnt) if is_imm else self.rd_local(SB)
+        rot_mask = width - 1
+        if is_imm:
+            rot_cnt = cnt & rot_mask
+        else:
+            self.rd_local(SB); self.push_imm(rot_mask); self.a("and"); self.wr_local(T0)
 
-        self.rd_reg(dst); self.wr_local(SA)
-        # Value is count-0 safe thanks to the VM masking the shift count by 63:
-        # at n==0 the (width-n) shift becomes a shift by `width`, which the VM
-        # reduces so the two halves recombine to x. Written unconditionally so a
-        # 32-bit rotate zero-extends the parent regardless of the count.
-        if direction == "rol":                     # (x << n) | (x >> (width-n))
-            self.rd_local(SA); push_cnt(); self.a("shl")
-            self.rd_local(SA); self.push_imm(width); push_cnt(); self.a("sub")
+        def push_rot():
+            self.push_imm(rot_cnt) if is_imm else self.rd_local(T0)
+
+        if direction == "rol":
+            self.rd_local(SA); push_rot(); self.a("shl")
+            self.rd_local(SA); self.push_imm(width); push_rot(); self.a("sub")
             self.a("shr"); self.a("or")
-        else:                                       # ror: (x >> n) | (x << (width-n))
-            self.rd_local(SA); push_cnt(); self.a("shr")
-            self.rd_local(SA); self.push_imm(width); push_cnt(); self.a("sub")
+        else:
+            self.rd_local(SA); push_rot(); self.a("shr")
+            self.rd_local(SA); self.push_imm(width); push_rot(); self.a("sub")
             self.a("shl"); self.a("or")
         self._mask_sr(width); self.wr_local(SR)
-        self.rd_local(SR); self.wr_reg(dst)
 
-        # Only CF is affected (ZF/SF untouched; OF defined only for count==1 and
-        # left unwritten). Unchanged when cnt==0.
+        if is_imm:
+            if cnt == 0:
+                if dst is not None and width == 32:
+                    self._write_rmw_destination(dst, width)
+                return
+            self._write_rmw_destination(dst, width)
+        else:
+            if dst is not None and width == 32:
+                self._write_rmw_destination(dst, width)
+            else:
+                skip_wr = self._new_label()
+                self.rd_local(SB); self.a(f"jz {skip_wr}")
+                self._write_rmw_destination(dst, width)
+                self.a.label(skip_wr)
+
+        live = self._get_live_flags(instr.ip)
         def emit_cf():
-            if direction == "rol":                 # CF = LSB of result
+            if not live or "CF" not in live:
+                return
+            if direction == "rol":
                 self.rd_local(SR); self.push_imm(1); self.a("and"); self.wr_local(CF)
-            else:                                  # ror: CF = MSB of result
+            else:
                 self.rd_local(SR); self.push_imm(width - 1); self.a("shr")
                 self.push_imm(1); self.a("and"); self.wr_local(CF)
 
         if is_imm:
-            if cnt != 0:
-                emit_cf()
+            emit_cf()
         else:
             skip = self._new_label()
             self.rd_local(SB); self.a(f"jz {skip}")
@@ -905,8 +980,8 @@ class _Lifter:
             self._implicit_mul(instr, signed=True)
             return
         dst, width = self.require_reg(instr, 0)
-        if width < 32:
-            raise LiftUnsupported("8/16-bit imul overflow is not yet modeled")
+        if width not in (16, 32, 64):
+            raise LiftUnsupported(f"unsupported imul width {width}")
         n = instr.op_count
         if n == 2:                          # dst = op0 * op1
             self.push_operand(instr, 0, width); self.wr_local(SA)
@@ -922,10 +997,14 @@ class _Lifter:
         self.rd_local(SR); self.wr_reg(dst)
         # CF = OF = 1 iff the full signed product does not fit in `width` bits.
         # SF/ZF/AF/PF are left UNDEFINED by Intel -- not written/checked.
-        if width == 32:
-            self._imul_of_32()
-        else:
-            self._imul_of_64()
+        live = self._get_live_flags(instr.ip)
+        if live is None or ("CF" in live or "OF" in live):
+            if width == 16:
+                self._imul_of_16()
+            elif width == 32:
+                self._imul_of_32()
+            else:
+                self._imul_of_64()
 
     def _push_sext32(self, off: int) -> None:
         """Push the sign-extension to 64 bits of the 32-bit value at local `off`
@@ -939,6 +1018,15 @@ class _Lifter:
     def _store_cf_of(self) -> None:
         """Top of stack holds the overflow bit -> CF and OF."""
         self.a("dup"); self.wr_local(CF); self.wr_local(OF)
+
+    def _imul_of_16(self) -> None:
+        self.rd_local(SA); self._push_sign_extended(16)
+        self.rd_local(SB); self._push_sign_extended(16)
+        self.a("mul")
+        self.wr_local(T1)
+        self.rd_local(SR); self._push_sign_extended(16)
+        self.rd_local(T1); self.a("cmp_ne")
+        self._store_cf_of()
 
     def _imul_of_32(self) -> None:
         # Sign-extend both 32-bit factors to 64 bits, take the exact 64-bit
@@ -955,6 +1043,85 @@ class _Lifter:
         self.a("and"); self.a("neg")
         self.a("cmp_ne")
         self._store_cf_of()
+
+    def _cbw(self) -> None:
+        self.rd_reg(Register.AL)
+        self._push_sign_extended(8)
+        self.push_imm(MASK16); self.a("and")
+        self.wr_reg(Register.AX)
+
+    def _cwde(self) -> None:
+        self.rd_reg(Register.AX)
+        self._push_sign_extended(16)
+        self.push_imm(MASK32); self.a("and")
+        self.wr_reg(Register.EAX)
+
+    def _cdqe(self) -> None:
+        self.rd_reg(Register.EAX)
+        self._push_sign_extended(32)
+        self.wr_reg(Register.RAX)
+
+    def _cwd(self) -> None:
+        self.rd_reg(Register.AX)
+        self.push_imm(SIGN16); self.a("shr")
+        self.push_imm(1); self.a("and"); self.a("neg")
+        self.push_imm(MASK16); self.a("and")
+        self.wr_reg(Register.DX)
+
+    def _cdq(self) -> None:
+        self.rd_reg(Register.EAX)
+        self.push_imm(SIGN32); self.a("shr")
+        self.push_imm(1); self.a("and"); self.a("neg")
+        self.push_imm(MASK32); self.a("and")
+        self.wr_reg(Register.EDX)
+
+    def _cqo(self) -> None:
+        self.rd_reg(Register.RAX)
+        self.push_imm(SIGN64); self.a("shr")
+        self.push_imm(1); self.a("and"); self.a("neg")
+        self.wr_reg(Register.RDX)
+
+    def _bittest(self, instr, mnemonic) -> None:
+        dst, width = self._read_rmw_destination(instr)
+        if width not in (16, 32, 64):
+            raise LiftUnsupported("bit test requires 16/32/64-bit operand width")
+        k1 = instr.op_kind(1)
+        bit_mask = width - 1
+        if k1 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
+                  OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
+            bit_idx = instr.immediate(1) & bit_mask
+            is_imm = True
+        elif k1 == OpKind.REGISTER:
+            src_reg = instr.op_register(1)
+            self.rd_reg(src_reg); self.push_imm(bit_mask); self.a("and"); self.wr_local(T0)
+            is_imm = False
+        else:
+            raise LiftUnsupported("bit test index must be immediate or register")
+
+        def push_bit():
+            self.push_imm(bit_idx) if is_imm else self.rd_local(T0)
+
+        # CF = (SA >> bit) & 1
+        self.rd_local(SA); push_bit(); self.a("shr")
+        self.push_imm(1); self.a("and"); self.wr_local(CF)
+
+        if mnemonic == Mnemonic.BT:
+            return
+
+        # Writeback for BTS, BTR, BTC
+        self.push_imm(1); push_bit(); self.a("shl"); self.wr_local(T1)
+        self.rd_local(SA)
+        if mnemonic == Mnemonic.BTS:
+            self.rd_local(T1); self.a("or")
+        elif mnemonic == Mnemonic.BTR:
+            self.rd_local(T1); self.a("not"); self.a("and")
+        elif mnemonic == Mnemonic.BTC:
+            self.rd_local(T1); self.a("xor")
+        else:
+            raise LiftUnsupported(f"unsupported bit test mnemonic {mnemonic!r}")
+
+        self._mask_sr(width); self.wr_local(SR)
+        self._write_rmw_destination(dst, width)
 
     # conditional-jump condition emitters: leave a 0/1 on the stack (1 == take).
     def _cc(self, m) -> None:
@@ -1072,6 +1239,8 @@ class _Lifter:
     # -- top-level -------------------------------------------------------
     def lift(self) -> str:
         instructions = _decode_exact(self.code, self.base)
+        if self.optimize_flags:
+            self.live_flags_by_ip = _compute_flag_liveness(instructions, self.base, self.end)
         call_analysis = _analyze_internal_calls(instructions, self.base, self.end)
         internal_returns = frozenset(call_analysis.internal_return_rvas)
         top_level_returns = frozenset(call_analysis.top_level_return_rvas)
@@ -1088,6 +1257,20 @@ class _Lifter:
                 self._extend_move(instr, signed=True)
             elif m == Mnemonic.MOVSXD:
                 self._extend_move(instr, signed=True, movsxd=True)
+            elif m == Mnemonic.CBW:
+                self._cbw()
+            elif m == Mnemonic.CWDE:
+                self._cwde()
+            elif m == Mnemonic.CDQE:
+                self._cdqe()
+            elif m == Mnemonic.CWD:
+                self._cwd()
+            elif m == Mnemonic.CDQ:
+                self._cdq()
+            elif m == Mnemonic.CQO:
+                self._cqo()
+            elif m in (Mnemonic.BT, Mnemonic.BTS, Mnemonic.BTR, Mnemonic.BTC):
+                self._bittest(instr, m)
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:
@@ -1199,6 +1382,120 @@ _CONDITION = {
 _CC = {mnemonics[0] for mnemonics in _CONDITION_GROUPS.values()}
 _SETCC = {mnemonics[1] for mnemonics in _CONDITION_GROUPS.values()}
 _CMOVCC = {mnemonics[2] for mnemonics in _CONDITION_GROUPS.values()}
+
+_CONDITION_FLAG_READS = {
+    "e": {"ZF"},
+    "ne": {"ZF"},
+    "b": {"CF"},
+    "ae": {"CF"},
+    "s": {"SF"},
+    "ns": {"SF"},
+    "o": {"OF"},
+    "no": {"OF"},
+    "p": {"PF"},
+    "np": {"PF"},
+    "be": {"CF", "ZF"},
+    "a": {"CF", "ZF"},
+    "l": {"SF", "OF"},
+    "ge": {"SF", "OF"},
+    "le": {"ZF", "SF", "OF"},
+    "g": {"ZF", "SF", "OF"},
+}
+
+
+def _compute_flag_liveness(instructions, base: int, end: int) -> dict[int, set[str]]:
+    """Backward dataflow analysis: computes live-out flags for each instruction."""
+    starts = {instr.ip for instr in instructions}
+    gen: dict[int, set[str]] = {}
+    kill: dict[int, set[str]] = {}
+    succs: dict[int, list[int]] = {}
+
+    for instr in instructions:
+        ip = instr.ip
+        m = instr.mnemonic
+        g: set[str] = set()
+        k: set[str] = set()
+
+        if m in _CC or m in _SETCC or m in _CMOVCC:
+            cond = _CONDITION.get(m)
+            if cond in _CONDITION_FLAG_READS:
+                g |= _CONDITION_FLAG_READS[cond]
+        elif m in (Mnemonic.ADC, Mnemonic.SBB):
+            g.add("CF")
+            k |= ALL_FLAGS
+        elif m in (Mnemonic.ADD, Mnemonic.SUB, Mnemonic.CMP, Mnemonic.NEG):
+            k |= ALL_FLAGS
+        elif m in (Mnemonic.AND, Mnemonic.OR, Mnemonic.XOR, Mnemonic.TEST):
+            k |= ALL_FLAGS
+        elif m in (Mnemonic.INC, Mnemonic.DEC):
+            k |= {"PF", "ZF", "SF", "OF"}
+        elif m in (Mnemonic.SHL, Mnemonic.SHR, Mnemonic.SAR, Mnemonic.ROL, Mnemonic.ROR):
+            k1 = instr.op_kind(1)
+            is_imm = k1 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
+                            OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64)
+            if is_imm:
+                cnt = instr.immediate(1) & 63
+                if cnt != 0:
+                    if m in (Mnemonic.ROL, Mnemonic.ROR):
+                        k.add("CF")
+                    else:
+                        k |= ALL_FLAGS
+        elif m in (Mnemonic.MUL, Mnemonic.IMUL):
+            k |= {"CF", "OF"}
+        elif m in (Mnemonic.BT, Mnemonic.BTS, Mnemonic.BTR, Mnemonic.BTC):
+            k.add("CF")
+        elif m == Mnemonic.CALL:
+            g |= ALL_FLAGS
+
+        gen[ip] = g
+        kill[ip] = k
+
+        next_ip = ip + instr.len
+        if m == Mnemonic.JMP:
+            if instr.op_kind(0) == OpKind.NEAR_BRANCH64:
+                tgt = instr.near_branch_target
+                succs[ip] = [tgt] if tgt in starts else []
+            else:
+                succs[ip] = []
+        elif m in _CC:
+            s_list = []
+            if instr.op_kind(0) == OpKind.NEAR_BRANCH64:
+                tgt = instr.near_branch_target
+                if tgt in starts:
+                    s_list.append(tgt)
+            if next_ip in starts:
+                s_list.append(next_ip)
+            succs[ip] = s_list
+        elif m == Mnemonic.RET:
+            succs[ip] = []
+        else:
+            succs[ip] = [next_ip] if next_ip in starts else []
+
+    live_in = {instr.ip: set() for instr in instructions}
+    live_out = {instr.ip: set() for instr in instructions}
+
+    for instr in instructions:
+        if instr.mnemonic == Mnemonic.RET or instr.ip + instr.len == end:
+            live_out[instr.ip] = set(ALL_FLAGS)
+
+    changed = True
+    while changed:
+        changed = False
+        for instr in reversed(instructions):
+            ip = instr.ip
+            new_out = set()
+            for s in succs[ip]:
+                new_out |= live_in[s]
+            if instr.mnemonic == Mnemonic.RET or instr.ip + instr.len == end:
+                new_out |= ALL_FLAGS
+            new_in = (new_out - kill[ip]) | gen[ip]
+            if new_out != live_out[ip] or new_in != live_in[ip]:
+                live_out[ip] = new_out
+                live_in[ip] = new_in
+                changed = True
+
+    return live_out
+
 
 
 def _decode_exact(code: bytes, base: int):
@@ -1324,8 +1621,8 @@ def analyze_internal_calls(code: bytes, base: int = 0x1000) -> InternalCallAnaly
     return _analyze_internal_calls(instructions, base, base + len(code))
 
 
-def lift_function(code: bytes, base: int = 0x1000) -> str:
+def lift_function(code: bytes, base: int = 0x1000, optimize_flags: bool = True) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
     `base` is the virtual address the code is decoded at (for branch targets)."""
-    return _Lifter(code, base).lift()
+    return _Lifter(code, base, optimize_flags=optimize_flags).lift()
