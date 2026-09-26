@@ -1434,13 +1434,18 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
                        LETHE_FLAG_ANTIDEBUG | LETHE_FLAG_MEMGUARD |
                        LETHE_FLAG_PAGED_DVM | LETHE_FLAG_LOAD_CONFIG |
                        LETHE_FLAG_DLL_PRELOAD_IAT |
-                       LETHE_FLAG_PROCESS_HARDENING))
+                       LETHE_FLAG_PROCESS_HARDENING |
+                       LETHE_FLAG_TAMPER_MONITOR))
         return 1;
     if (!!(cpi->flags & LETHE_FLAG_DLL_PRELOAD_IAT) != !!cpi->is_dll)
         return 1;
     if (cpi->is_dll &&
         (cpi->flags & (LETHE_FLAG_MEMGUARD |
                        LETHE_FLAG_PROCESS_HARDENING)))
+        return 1;
+    /* The tamper monitor owns a background worker thread, which is unsafe to spawn
+       under the loader lock for a DLL; it is EXE-only, rejected here fail-closed. */
+    if (cpi->is_dll && (cpi->flags & LETHE_FLAG_TAMPER_MONITOR))
         return 1;
     DIAG(1);
 
@@ -1829,6 +1834,17 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
             goto fail;
     }
     DIAG(11);
+
+    /* 12b. Opt-in runtime tamper monitor (EXE-only). Installed at the same late
+       phase as TLS process-attach: every final page protection is set, the
+       metadata envelope is wiped, and the stub .text is stable RX, so the
+       self-integrity baseline and the periodic battery see the steady state the
+       OEP will run in. Fail-closed like memguard: a requested monitor that
+       cannot arm rejects startup rather than running unprotected. */
+    if (cpi->flags & LETHE_FLAG_TAMPER_MONITOR) {
+        if (tamperguard_install(image_base, cpi) != 0)
+            goto fail;
+    }
 
     /* 13. cleanup */
     pl_zero(key, sizeof(key));

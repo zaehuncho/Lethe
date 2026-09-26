@@ -719,3 +719,45 @@ int antidbg_check_extended(const void *image_base, uint32_t text_rva,
     (void)text_size;
     return antidbg_check();
 }
+
+/*
+ * Periodic-safe runtime battery for the tamper monitor (stub_hooks.h).
+ *
+ * This is ADDITIVE and does not alter antidbg_check()'s dispatch. It reuses only
+ * the existing static checks that remain correct when re-run repeatedly after
+ * startup and that catch attach-after-start:
+ *   - CheckRemoteDebuggerPresent   (check_remote_debugger)
+ *   - NtQIP(ProcessDebugPort)      (check_debug_port)
+ *   - NtQIP(ProcessDebugObjectHandle) (check_debug_object)
+ *   - RDTSC timing gate            (check_rdtsc_timing)
+ * The process-creation-time PEB/heap/NtGlobalFlag flags are intentionally
+ * excluded here: they describe how the process was launched, not a live attach,
+ * so they belong to the one-shot startup path. The hardware-breakpoint (DR0-DR3)
+ * probe lives in the monitor (tamperguard.c) rather than here, because the
+ * release contract forbids a self-GetThreadContext in this translation unit.
+ *
+ * ``seed`` rotates the evaluation order each tick so patching one fixed prologue
+ * does not silently defeat the whole battery over the process lifetime. On a hit
+ * the key material is destroyed (as the tripwires do) before returning nonzero.
+ */
+__declspec(noinline) int antidbg_run_runtime_battery(uint32_t seed)
+{
+    int detected = 0;
+    unsigned i;
+    unsigned rot = (unsigned)(seed % 4u);
+
+    for (i = 0; i < 4u && !detected; ++i) {
+        switch ((i + rot) & 3u) {
+        case 0: detected = check_remote_debugger(); break;
+        case 1: detected = check_debug_port();      break;
+        case 2: detected = check_debug_object();    break;
+        default: detected = check_rdtsc_timing();   break;
+        }
+    }
+
+    if (detected) {
+        wipe_master_key();
+        return 1;
+    }
+    return 0;
+}

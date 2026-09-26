@@ -245,6 +245,14 @@ def build_parser() -> argparse.ArgumentParser:
               "default DLL search directories"),
     )
     parser.add_argument(
+        "--tamper-monitor",
+        action="store_true",
+        help=("EXPERIMENTAL opt-in runtime tamper monitor: a background worker "
+              "periodically re-runs the anti-debug battery plus code/VM-page "
+              "integrity checks and fails closed on tamper (EXE-only, off until "
+              "acceptance-tested)"),
+    )
+    parser.add_argument(
         "--level",
         type=_level_type,
         default=9,
@@ -487,6 +495,7 @@ def main(argv: "list[str] | None" = None) -> int:
         anti_debug=(args.anti_debug == "on"),
         memory_guard=args.memory_guard,
         process_hardening=args.process_hardening,
+        tamper_monitor=args.tamper_monitor,
         compression_level=args.level,
         output_path=output_path,
         is_dll=(True if args.dll else None),  # None => auto-detect from the header

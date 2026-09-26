@@ -239,6 +239,7 @@ def _candidate_is_live(info: container.PackInfo, offset: int,
         | container.FLAG_ANTIDEBUG | container.FLAG_MEMGUARD
         | container.FLAG_PAGED_DVM | container.FLAG_LOAD_CONFIG
         | container.FLAG_DLL_PRELOAD_IAT | container.FLAG_PROCESS_HARDENING
+        | container.FLAG_TAMPER_MONITOR
     )
     if info.flags & ~allowed_flags:
         return False
