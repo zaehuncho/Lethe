@@ -92,7 +92,7 @@ try:  # package import (normal case)
         build_metadata, pack_section_descs,
         FLAG_HAS_TLS, FLAG_HAS_EXCEPTIONS, FLAG_ANTIDEBUG, FLAG_MEMGUARD,
         FLAG_PAGED_DVM, FLAG_LOAD_CONFIG, FLAG_DLL_PRELOAD_IAT,
-        FLAG_PROCESS_HARDENING,
+        FLAG_PROCESS_HARDENING, FLAG_TAMPER_MONITOR,
     )
     from .pe_analyze import ParsedPE
 except ImportError:  # pragma: no cover - allows standalone / importlib file loading
@@ -101,7 +101,7 @@ except ImportError:  # pragma: no cover - allows standalone / importlib file loa
         build_metadata, pack_section_descs,
         FLAG_HAS_TLS, FLAG_HAS_EXCEPTIONS, FLAG_ANTIDEBUG, FLAG_MEMGUARD,
         FLAG_PAGED_DVM, FLAG_LOAD_CONFIG, FLAG_DLL_PRELOAD_IAT,
-        FLAG_PROCESS_HARDENING,
+        FLAG_PROCESS_HARDENING, FLAG_TAMPER_MONITOR,
     )
     from pe_analyze import ParsedPE  # type: ignore
 
@@ -150,6 +150,7 @@ class PayloadOptions:
     anti_debug: bool = False
     memory_guard: bool = False
     process_hardening: bool = False
+    tamper_monitor: bool = False
     compression_level: int = 9
 
 
@@ -387,13 +388,14 @@ def build_payload(
     """Compress + encrypt ``parsed`` into a :class:`PayloadArtifacts`.
 
     ``options`` exposes ``anti_debug``, ``memory_guard``,
-    ``process_hardening`` and ``compression_level`` -- e.g.
+    ``process_hardening``, ``tamper_monitor`` and ``compression_level`` -- e.g.
     :class:`PayloadOptions` or the orchestrator's ``PackOptions``. Absent
     attributes fall back to the :class:`PayloadOptions` defaults.
     """
     anti_debug = bool(getattr(options, "anti_debug", False))
     memory_guard = bool(getattr(options, "memory_guard", False))
     process_hardening = bool(getattr(options, "process_hardening", False))
+    tamper_monitor = bool(getattr(options, "tamper_monitor", False))
     level = int(getattr(options, "compression_level", 9))
     if not isinstance(paged_vm, bool):
         raise TypeError("paged_vm must be a boolean")
@@ -405,6 +407,10 @@ def build_payload(
     if parsed.is_dll and process_hardening:
         raise ValueError(
             "process hardening is EXE-only and must not mutate a DLL host")
+    if parsed.is_dll and tamper_monitor:
+        raise ValueError(
+            "the runtime tamper monitor is EXE-only; a DLL cannot safely own its "
+            "background worker thread under the loader lock")
     if paged_vm != requires_paged_vm:
         raise ValueError(
             "paged_vm must match the materialized selected-function paging contract"
@@ -474,6 +480,8 @@ def build_payload(
         flags |= FLAG_MEMGUARD
     if process_hardening:
         flags |= FLAG_PROCESS_HARDENING
+    if tamper_monitor:
+        flags |= FLAG_TAMPER_MONITOR
     if paged_vm:
         flags |= FLAG_PAGED_DVM
     if parsed.load_config is not None:

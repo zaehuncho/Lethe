@@ -907,6 +907,40 @@ int memguard_install(void *image_base, const PackInfo *pi,
 }
 
 /*
+ * Continuous self-integrity check (stub_hooks.h). Under the existing lock,
+ * recompute the CRC32 of every PG_ACTIVE page and compare it against the
+ * split-time baseline (GuardPage.crc). An ACTIVE page is plaintext + immutable
+ * PAGE_EXECUTE_READ, so the recovered code bytes are readable and, on a clean
+ * run, byte-identical to the baseline. A mismatch means a resident code page was
+ * patched behind the guard's back (e.g. via a transient RW VirtualProtect). This
+ * is ADDITIVE and read-only: it never advances or rewinds the page-state machine
+ * and never re-encrypts. Returns nonzero on the first mismatch, else 0.
+ */
+int memguard_verify_active_pages(void)
+{
+    MemGuardCtx *ctx = g_ctx;
+    uint32_t i;
+    int mismatch = 0;
+
+    if (!ctx || !g_lock_ready) {
+        return 0;   /* memguard not installed -> nothing to verify */
+    }
+
+    EnterCriticalSection(&g_lock);
+    for (i = 0; i < ctx->page_count; ++i) {
+        GuardPage *g = &ctx->pages[i];
+        if (g->state == PG_ACTIVE) {
+            if (mg_crc32(g->va, g->size) != g->crc) {
+                mismatch = 1;
+                break;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+    return mismatch;
+}
+
+/*
  * Optional clean teardown. Removes the VEH and wipes + frees the guarded region
  * (page keys included). Safe to call once; a no-op if memguard was not installed.
  */

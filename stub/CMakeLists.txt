@@ -19,6 +19,7 @@ add_library(lethe_stub_x64 SHARED
     src/antidebug.c
     src/antidump.c
     src/memguard.c
+    src/tamperguard.c
     src/daedalus_vm.c
     src/stub_entrypoints.asm
     src/daedalus_trampoline.asm
@@ -175,6 +176,33 @@ endif()
 option(DVM_SHUFFLE_OPCODES "Enable per-build opcode shuffling for Daedalus VM" ON)
 set(DVM_SHUFFLE_SEED "" CACHE STRING
     "Optional hex seed for a reproducible opcode permutation (empty = random)")
+
+# Tamper-monitor cadence seed (tamperguard.c). Derived from DVM_SHUFFLE_SEED so a
+# reproducible build reproduces the monitor's jitter schedule; independently
+# overridable via -DTAMPER_SEED=0x.... Empty + no shuffle seed => the C default.
+# The value only jitters the sampling cadence (mixed with runtime CSPRNG entropy
+# at install), so it is not security-sensitive; it exists for reproducibility.
+set(TAMPER_SEED "" CACHE STRING
+    "Optional 32-bit hex seed for the tamper-monitor cadence (empty => derived from DVM_SHUFFLE_SEED)")
+set(_tamper_seed_value "${TAMPER_SEED}")
+if(NOT _tamper_seed_value AND DVM_SHUFFLE_SEED)
+    # Collapse the (possibly long) hex shuffle seed to a uint32 literal: keep the
+    # trailing 8 hex digits so any-length seed maps deterministically to 32 bits.
+    string(REGEX REPLACE "^0[xX]" "" _ts_hex "${DVM_SHUFFLE_SEED}")
+    string(REGEX REPLACE "[^0-9A-Fa-f]" "" _ts_hex "${_ts_hex}")
+    string(LENGTH "${_ts_hex}" _ts_len)
+    if(_ts_len GREATER 8)
+        math(EXPR _ts_start "${_ts_len} - 8")
+        string(SUBSTRING "${_ts_hex}" ${_ts_start} 8 _ts_hex)
+    endif()
+    if(_ts_hex)
+        set(_tamper_seed_value "0x${_ts_hex}")
+    endif()
+endif()
+if(_tamper_seed_value)
+    target_compile_definitions(lethe_stub_x64 PRIVATE
+        "LETHE_TAMPER_SEED=${_tamper_seed_value}u")
+endif()
 
 # Guard against a silent security DOWNGRADE: the rolling ('VR') containers are
 # emitted by generate_programs, which runs only inside the shuffle block below.

@@ -56,6 +56,24 @@ int antidbg_tripwire_rdtsc(void);  /* RDTSC timing gate               */
 int antidbg_tripwire_debug_port(void); /* NtQIP ProcessDebugPort recheck */
 
 /*
+ * Periodic-safe anti-debug battery for the runtime tamper monitor.
+ *
+ * Re-runs ONLY the subset of the existing antidebug checks that stay correct
+ * when invoked repeatedly long after startup (i.e. that catch attach-after-start
+ * without false-positiving on a clean process): CheckRemoteDebuggerPresent, the
+ * NtQIP ProcessDebugPort / ProcessDebugObjectHandle kernel queries, and the
+ * RDTSC timing gate. It does NOT re-read the process-creation-time PEB/heap
+ * flags (those describe how the process was launched, not a live attach).
+ *
+ * ``seed`` rotates the check order per invocation so a single patched prologue
+ * cannot silently defeat the whole battery across ticks. Returns nonzero on
+ * confident detection (and, like the tripwires, destroys the key material first
+ * so a resumed process finds nothing to lift); 0 on a clean tick. AV-benign;
+ * never crashes, never calls ExitProcess/TerminateProcess itself.
+ */
+int antidbg_run_runtime_battery(uint32_t seed);
+
+/*
  * Post-load hardening (late phase).
  *
  * Called by the loader AFTER the image is fully unpacked (sections decrypted,
@@ -151,6 +169,43 @@ int  memguard_install(void *image_base, const PackInfo *pi,
  * Called by the DLL stub on DLL_PROCESS_DETACH.
  */
 void memguard_shutdown(void);
+
+/*
+ * Continuous self-integrity check for the runtime tamper monitor.
+ *
+ * Under the existing memguard lock, recompute the CRC32 of every currently
+ * PG_ACTIVE (plaintext, immutable-RX) guarded page and compare it against the
+ * split-time baseline captured when the section was first faulted in. Returns
+ * nonzero if ANY active page's plaintext no longer matches its baseline (a
+ * patched code page), else 0. A no-op returning 0 when memguard is not
+ * installed. Does not mutate the page-state machine; read-only verification.
+ */
+int memguard_verify_active_pages(void);
+
+/*
+ * Runtime tamper-resistance monitor (opt-in, LETHE_FLAG_TAMPER_MONITOR).
+ *
+ * Installed by the loader at the tls_process_attach step (EXE only), after every
+ * final page protection is set and the metadata envelope is wiped. Spawns a
+ * single background worker that, on a jittered interval, re-runs the
+ * periodic-safe anti-debug battery (antidbg_run_runtime_battery), the memguard
+ * self-integrity check (memguard_verify_active_pages), a hardware-breakpoint
+ * (DR0-DR3) probe, and a CRC self-check of the stub's own .text. Any positive
+ * result FAILS CLOSED: it wipes the remaining key material and terminates the
+ * process deterministically. A clean run is a pure no-op that never touches OEP
+ * execution. Its context lives in a VirtualLock'd, guard-page-flanked region.
+ *
+ * Returns 0 on success (monitor armed); nonzero on failure. The loader treats an
+ * authenticated tamper-monitor request as best-effort defense-in-depth layered
+ * over the mandatory checks, but installs it fail-closed like memguard.
+ */
+int  tamperguard_install(void *image_base, const PackInfo *pi);
+
+/*
+ * Clean teardown: signal + join the worker, remove state, wipe + free the
+ * guard-page-flanked context. Safe to call once; no-op if never installed.
+ */
+void tamperguard_shutdown(void);
 
 #ifdef __cplusplus
 }

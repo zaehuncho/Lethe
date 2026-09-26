@@ -52,6 +52,7 @@ FLAG_PAGED_DVM      = 1 << 4
 FLAG_LOAD_CONFIG    = 1 << 5
 FLAG_DLL_PRELOAD_IAT = 1 << 6
 FLAG_PROCESS_HARDENING = 1 << 7
+FLAG_TAMPER_MONITOR = 1 << 8   # opt-in periodic runtime tamper monitor (0x100)
 
 LOAD_CONFIG_INDEX_MAGIC = b"LCFGIDX1"
 _LOAD_CONFIG_INDEX = struct.Struct("<8sII")

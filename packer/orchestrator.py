@@ -100,6 +100,7 @@ class PackOptions:
     anti_debug: bool = False
     memory_guard: bool = False          # opt-in; AV-test first (see plan §8)
     process_hardening: bool = False     # opt-in irreversible EXE process policy
+    tamper_monitor: bool = False        # opt-in EXE-only runtime tamper monitor
     compression_level: int = 9
     output_path: Optional[str] = None   # default: <input>.packed<ext>
     is_dll: Optional[bool] = None       # None => auto-detect from the PE header
@@ -788,6 +789,10 @@ def pack_file(input_path: str, options: PackOptions,
         if is_dll and eff.process_hardening:
             raise ValueError(
                 "process hardening is EXE-only and must not mutate a DLL host")
+        if is_dll and eff.tamper_monitor:
+            raise ValueError(
+                "the runtime tamper monitor is EXE-only; a DLL cannot safely own "
+                "its background worker thread under the loader lock")
 
         # --- 1. analyze ------------------------------------------------------
         _emit(progress, f"analyzing {os.path.basename(input_path)} "
