@@ -56,14 +56,35 @@ def _load_shuffled_map(path: Path):
     return mod.SHUFFLED_OPCODES
 
 
+def _mutate_master(shuffled_map_path: Path) -> bytes:
+    """Per-build master seed for the mutation engine, deterministic from the
+    build's opcode shuffle (unique per build since the shuffle is per build)."""
+    import hashlib
+    return hashlib.sha256(
+        b"daedalus-mutate-master-v1|" + shuffled_map_path.read_bytes()
+    ).digest()
+
+
 def _assemble(vasm_path: Path, shuffled_map: dict, daedalus_asm,
-              mba: bool = True) -> bytes:
+              mba: bool = True, *, mutate_master: bytes | None = None,
+              mutate_level: int = 0, symbol: str | None = None) -> bytes:
     source = vasm_path.read_text(encoding="utf-8")
     if mba:
-        # Solver-hostile arithmetic: rewrite xor/add into MBA expansions BEFORE
-        # assembly (proven semantics-preserving by tests/test_mba.py).
-        import daedalus_mba
-        source = daedalus_mba.rewrite_source(source)
+        # Solver-hostile arithmetic: rewrite arithmetic into MBA expansions (and,
+        # at higher levels, seeded substitution + junk) BEFORE assembly (proven
+        # semantics-preserving by tests/test_mba.py and tests/test_mutate.py).
+        # DEFAULT level 0 == the historical fixed MBA expansion, byte-for-byte
+        # identical to the pre-metamorphism pipeline.
+        import daedalus_mutate
+        seed = None
+        if mutate_level > 0 and mutate_master is not None and symbol is not None:
+            from metamorph_seed import MetamorphSeed, DOMAIN_MBA
+            seed = MetamorphSeed(mutate_master).subseed_for_program(
+                DOMAIN_MBA, symbol
+            )
+        source = daedalus_mutate.mutate_source(
+            source, seed=seed, level=mutate_level
+        )
     blob = daedalus_asm.assemble(source, opcodes=shuffled_map)
     return bytes(blob)
 
@@ -109,12 +130,17 @@ def main() -> int:
                          "(requires the stub built with -DDVM_ROLLING=ON)")
     ap.add_argument("--no-mba", action="store_true",
                     help="Disable the MBA arithmetic rewrite (on by default)")
+    ap.add_argument("--mutate-level", type=int, default=0,
+                    help="Metamorphic mutation intensity (0=byte-identical "
+                         "legacy MBA; 1=seeded MBA; 2=+subst/junk; 3=+recursion)")
     args = ap.parse_args()
 
     daedalus_dir = Path(__file__).resolve().parent
     daedalus_asm = _load_asm(daedalus_dir)
     shuffled_map = _load_shuffled_map(args.shuffled_map)
     mba = not args.no_mba
+    mutate_level = args.mutate_level
+    mutate_master = _mutate_master(args.shuffled_map) if mutate_level > 0 else None
     optable = _shuffled_optable(shuffled_map) if args.rolling else None
 
     header = [
@@ -134,8 +160,12 @@ def main() -> int:
         if not vasm_path.is_file():
             print(f"error: {vasm_path} not found", file=sys.stderr)
             return 1
-        blob = _assemble(vasm_path, shuffled_map, daedalus_asm, mba=mba)
-        note = "MBA" if mba else "plain"
+        blob = _assemble(vasm_path, shuffled_map, daedalus_asm, mba=mba,
+                         mutate_master=mutate_master, mutate_level=mutate_level,
+                         symbol=sym)
+        note = ("MBA" if mba else "plain")
+        if mba and mutate_level > 0:
+            note = f"mutate-L{mutate_level}"
         if args.rolling:
             import daedalus_rolling
             seed = _derive_seed(args.shuffled_map, sym)
