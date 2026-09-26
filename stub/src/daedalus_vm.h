@@ -43,6 +43,13 @@ extern "C" {
 #define DVM_LOCAL_SIZE  1024
 #define DVM_RET_STACK_SIZE 32
 
+/* Per-run dispatch watchdog: a program that executes more than DVM_MAX_STEPS
+ * instructions (a self-loop, a corrupted jump, a decode that never reaches
+ * HALT) fails closed. Mirrors daedalus_ref.RefVM.run(max_steps=1_000_000).
+ * Enforced in dvm_run only under DVM_ROLLING_V2 (the hardened build); other
+ * builds are byte-identical to today. */
+#define DVM_MAX_STEPS 1000000u
+
 /* x64-lifter runtime frame. Keep this register order and local layout in sync
  * with lifter/x64_lifter.py (GPR_NAMES / REG_OFF / CF..PF). The frame API is
  * deliberately separate from the legacy args[] API: lifted target functions

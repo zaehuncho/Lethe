@@ -13,6 +13,21 @@
 #include "key_scatter.h"
 #include "crypto.h"
 
+#ifdef DVM_ROLLING
+#include <intrin.h>            /* __fastfail                                     */
+#include "daedalus_rolling.h"  /* dvm_rolling_selftest (fail-fast at init)       */
+
+/* Recompute the pinned rolling primitive vectors (v1, and v2 under
+ * DVM_ROLLING_V2) once at stub init. A nonzero result means the C codec drifted
+ * from the pack-time Python oracle, so decoding would silently mis-key: brick
+ * the run immediately rather than run corrupt bytecode. */
+static __forceinline void lethe_rolling_selftest_or_die(void)
+{
+    if (dvm_rolling_selftest() != 0)
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+#endif
+
 /*
  * The PackInfo sentinel that the builder scans for by magic bytes.
  * Placed in .data (writable, initialized) so find_packinfo_rva() finds
@@ -104,6 +119,10 @@ void __cdecl StubExeEntry(void)
     void *base = (void *)GetModuleHandleW(NULL);
     int antidebug_on = (g_packinfo.flags & LETHE_FLAG_ANTIDEBUG) != 0;
 
+#ifdef DVM_ROLLING
+    lethe_rolling_selftest_or_die();
+#endif
+
     if (antidebug_on) {
         if (antidbg_check_extended(base, g_packinfo.stub_text_rva,
                                    g_packinfo.stub_text_size))
@@ -138,6 +157,10 @@ BOOL WINAPI StubDllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 
     if (reason == DLL_PROCESS_ATTACH) {
         int antidebug_on = (g_packinfo.flags & LETHE_FLAG_ANTIDEBUG) != 0;
+
+#ifdef DVM_ROLLING
+        lethe_rolling_selftest_or_die();
+#endif
 
         if (antidebug_on) {
             if (antidbg_check_extended(base, g_packinfo.stub_text_rva,
