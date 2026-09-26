@@ -138,6 +138,18 @@ endforeach()
 # differential proof: daedalus/daedalus_rolling.py + tests/test_rolling_bytecode.py).
 # Declared before the shuffle block because that block reads it.
 option(DVM_ROLLING "Compile+emit history-keyed rolling-bytecode virtualization" OFF)
+# v2 whole-program integrity chaining (rolling 'VS' containers). Additive and OFF
+# by default. ON compiles the v2 chained decoder + step watchdog and makes
+# generate_programs emit 'VS' containers. The v2 codec is built on the rolling
+# decoder/encoder, so ON forces DVM_ROLLING (which in turn requires
+# DVM_SHUFFLE_OPCODES via the existing gate below). Declared before the shuffle
+# block because that block reads it to choose the generate_programs flag.
+option(DVM_ROLLING_V2 "Compile+emit v2 whole-program-chained rolling bytecode" OFF)
+if(DVM_ROLLING_V2 AND NOT DVM_ROLLING)
+    message(STATUS "DVM_ROLLING_V2=ON forces DVM_ROLLING=ON")
+    set(DVM_ROLLING ON CACHE BOOL
+        "Compile+emit history-keyed rolling-bytecode virtualization" FORCE)
+endif()
 # Observation-poison: fold an anti-instrumentation signal into the rolling
 # accumulator so a debugger silently mis-keys (zero-FP on clean runs). Kill-
 # switch; default ON when rolling is on. Production and candidate builds compile
@@ -148,6 +160,9 @@ option(DVM_ROLL_POISON "Fold anti-instrumentation poison into rolling decode" ON
 if(DVM_ROLLING)
     target_sources(lethe_stub_x64 PRIVATE src/daedalus_rolling.c)
     target_compile_definitions(lethe_stub_x64 PRIVATE DVM_ROLLING)
+    if(DVM_ROLLING_V2)
+        target_compile_definitions(lethe_stub_x64 PRIVATE DVM_ROLLING_V2)
+    endif()
     if(DVM_ROLL_POISON)
         target_compile_definitions(lethe_stub_x64 PRIVATE DVM_ROLL_POISON)
     endif()
@@ -217,6 +232,17 @@ if(DVM_ROLLING AND NOT DVM_SHUFFLE_OPCODES)
         "DVM_ROLLING -- otherwise the stub would ship un-rolled bytecode.")
 endif()
 
+# v2 is built on the rolling decoder/encoder: DVM_ROLLING_V2 implies DVM_ROLLING.
+# Normally the option block above already forced DVM_ROLLING ON; this is the
+# defensive invariant (e.g. a stale cache that left DVM_ROLLING OFF) so a v2 build
+# can never ship the v2 gate without the rolling runtime it depends on.
+if(DVM_ROLLING_V2 AND NOT DVM_ROLLING)
+    message(FATAL_ERROR
+        "DVM_ROLLING_V2 requires DVM_ROLLING=ON (the v2 'VS' codec builds on the "
+        "rolling decoder). Enable DVM_ROLLING (it is forced automatically) or "
+        "disable DVM_ROLLING_V2.")
+endif()
+
 if(DVM_SHUFFLE_OPCODES)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(_dvm_daedalus_dir  "${CMAKE_CURRENT_SOURCE_DIR}/../daedalus")
@@ -253,7 +279,9 @@ if(DVM_SHUFFLE_OPCODES)
     # When DVM_ROLLING is ON, emit history-keyed rolling ('VR') containers so
     # the crypto-critical programs ship as self-decrypting ciphertext. MBA
     # arithmetic rewrite is always on (proven semantics-preserving).
-    if(DVM_ROLLING)
+    if(DVM_ROLLING_V2)
+        set(_dvm_rolling_flag "--rolling-v2")
+    elseif(DVM_ROLLING)
         set(_dvm_rolling_flag "--rolling")
     else()
         set(_dvm_rolling_flag "")

@@ -235,12 +235,22 @@ static __forceinline uint64_t dvm_sem_cmp_ne(uint64_t a, uint64_t b)
 
 static int dvm_run(DaedalusVM *vm)
 {
+#ifdef DVM_ROLLING_V2
+    /* Per-run dispatch watchdog (hardened build). A local counter -> no
+     * DaedalusVM layout change. Fail closed on a self-loop / runaway. */
+    uint32_t dvm_steps = 0;
+#endif
     while (1) {
         uint8_t op;
         const uint8_t *ip = NULL;
                                 /* plaintext of the CURRENT instruction      */
 #ifdef DVM_ROLLING
         uint8_t dvm_win[DVM_ROLL_MAX_INSTR];
+#endif
+
+#ifdef DVM_ROLLING_V2
+        if (++dvm_steps > DVM_MAX_STEPS)
+            return -1;    /* watchdog: caller (daedalus_vm_exec) wipes state */
 #endif
 
         if (vm->pc >= vm->code_size)
@@ -263,8 +273,20 @@ static int dvm_run(DaedalusVM *vm)
             uint32_t dvm_ilen;
             /* Reconstruct just this instruction from the history-keyed
              * ciphertext; a mid-block start, byte flip or wrong seed faults. */
+#ifdef DVM_ROLLING_V2
+            int dvm_frc;
+            if (vm->roll.v2)   /* 'VS': whole-program chained decode */
+                dvm_frc = dvm_rolling_fetch_v2(&vm->roll, vm->pc,
+                                               dvm_win, &dvm_ilen);
+            else               /* 'VR': v1 per-block decode */
+                dvm_frc = dvm_rolling_fetch(&vm->roll, vm->pc,
+                                            dvm_win, &dvm_ilen);
+            if (dvm_frc != 0)
+                return -1;
+#else
             if (dvm_rolling_fetch(&vm->roll, vm->pc, dvm_win, &dvm_ilen) != 0)
                 return -1;
+#endif
             ip = dvm_win;
         }
 #endif
@@ -837,7 +859,11 @@ static int dvm_prepare(DaedalusVM *vm,
 #ifdef DVM_ROLLING
     if (program_size >= (uint32_t)(2 + DVM_ROLL_SEED_LEN + 2)
         && program[0] == (uint8_t)DVM_ROLL_MAGIC0
-        && program[1] == (uint8_t)DVM_ROLL_MAGIC1) {
+        && (program[1] == (uint8_t)DVM_ROLL_MAGIC1
+#ifdef DVM_ROLLING_V2
+            || program[1] == (uint8_t)DVM_ROLL_MAGIC1_V2   /* 'VS' */
+#endif
+           )) {
         uint32_t off = 2;
         const uint8_t *seed = program + off;
         uint16_t data_size;
@@ -862,6 +888,19 @@ static int dvm_prepare(DaedalusVM *vm,
         vm->code = program + off;
         vm->code_size = program_size - off;
         vm->rolling = 1;
+#ifdef DVM_ROLLING_V2
+        if (program[1] == (uint8_t)DVM_ROLL_MAGIC1_V2) {
+            /* v2 'VS' container: embedded programs decode with a zero whiten
+             * (this container is internal to the stub build, not an ABI). */
+            uint8_t zero_whiten[DVM_ROLL_SEED_LEN];
+            int wi;
+            for (wi = 0; wi < DVM_ROLL_SEED_LEN; wi++) zero_whiten[wi] = 0;
+            if (dvm_rolling_init_v2(&vm->roll, vm->code, vm->code_size,
+                                    seed, zero_whiten,
+                                    leaders, leader_count) != 0)
+                return -1;                    /* over cap / malformed -> fail */
+        } else
+#endif
         dvm_rolling_init(&vm->roll, vm->code, vm->code_size,
                          seed, leaders, leader_count);
     } else

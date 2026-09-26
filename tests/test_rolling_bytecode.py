@@ -345,6 +345,248 @@ def test_primitive_vectors_stable():
     assert vr.fold(0, b"\x01", 0) != vr.fold(0, b"\x01", 1)
 
 
+# ===========================================================================
+# ROLLING v2 -- whole-program integrity chaining ('VS' container)
+# ===========================================================================
+# The pinned v2 primitive vectors below are copied verbatim into the C selftest
+# (stub/src/daedalus_rolling.c dvm_rolling_selftest); if either side drifts, the
+# C selftest fails fast at stub init and bricks the build rather than mis-decode.
+V2_SEED16 = bytes(range(16))
+V2_CHAIN0 = 0x4E6E010263A69610   # chain_digest(seed, 0, {1,2,3})
+V2_CHAIN1 = 0xD3CCB4E0E11B886D   # chain_digest(seed, chain0, {4,5})
+V2_RESYNC2_A = 0xB021B17DF773C886  # resync2(seed, 0, 0)
+V2_RESYNC2_B = 0x70B929A49C334A8D  # resync2(seed, 7, chain0)
+V2_WHITEN_F0 = bytes([0xF0] * 16)
+V2_KS_F0 = (0x4B, 0x9A, 0xB2, 0xD0)  # keystream(seed^0xF0, 7, resync2_b)[0:4]
+
+DVM_MAX_STEPS = 1_000_000  # mirror of stub/src/daedalus_vm.h DVM_MAX_STEPS
+
+
+def test_v2_primitive_vectors_pinned():
+    """Pin the exact v2 constants the C selftest recomputes (bit-exactness)."""
+    assert vr.chain_digest(V2_SEED16, 0, bytes([1, 2, 3])) == V2_CHAIN0
+    assert vr.chain_digest(V2_SEED16, V2_CHAIN0, bytes([4, 5])) == V2_CHAIN1
+    assert vr.resync2(V2_SEED16, 0, 0) == V2_RESYNC2_A
+    assert vr.resync2(V2_SEED16, 7, V2_CHAIN0) == V2_RESYNC2_B
+    eff = vr.effective_seed(V2_SEED16, V2_WHITEN_F0)
+    assert eff[:4] == bytes([0xF0, 0xF1, 0xF2, 0xF3])
+    ks = vr.keystream(eff, 7, V2_RESYNC2_B)
+    assert tuple(ks[:4]) == V2_KS_F0
+    # domain separation: v2 chain uses tag 'C', resync2 folds the chain, so it
+    # must NOT coincide with v1 resync (tag 'R', no chain).
+    assert vr.resync2(V2_SEED16, 0, 0) != vr.resync(V2_SEED16, 0)
+
+
+def test_v2_codec_roundtrip_real_programs():
+    """decode_stream_v2(encrypt_code_v2(code, seed, whiten=0)) == code for every
+    real program and >=64 seeds."""
+    blobs = _real_program_blobs()
+    assert blobs
+    for name, blob in blobs.items():
+        _data, code = _split(blob)
+        for s in range(64):
+            seed = _seed(s)
+            ct, leaders = vr.encrypt_code_v2(code, seed, whiten=0)
+            recovered = vr.decode_stream_v2(ct, seed, leaders, whiten=0)
+            assert recovered == code, f"{name}: v2 round-trip mismatch @seed {s}"
+
+
+def test_v2_container_roundtrip():
+    """The 'VS' container packs/unpacks and decodes with a zero whiten (what the
+    stub uses for embedded programs)."""
+    blobs = _real_program_blobs()
+    for name, blob in blobs.items():
+        data, code = _split(blob)
+        seed = _seed(11)
+        cont = vr.pack_rolling_blob_v2(blob, seed, whiten=0)
+        assert cont[:2] == b"VS", f"{name}: not a 'VS' container"
+        r_seed, r_data, r_ct, leaders = vr.unpack_rolling_blob_v2(cont)
+        assert r_seed == seed and r_data == data, name
+        assert vr.decode_stream_v2(r_ct, r_seed, leaders, whiten=0) == code, name
+
+
+def _run_rolling_v2(blob, args, seed, whiten=0):
+    data, code = _split(blob)
+    ct, leaders = vr.encrypt_code_v2(code, seed, whiten=whiten)
+    dec = vr.RollingDecoderV2(ct, seed, leaders, whiten=whiten)
+    vm = RefVM(code, data, args, decoder=dec)
+    val = vm.run()
+    return val, vm.trace
+
+
+def test_v2_interpreter_equivalence_synthetic():
+    """RefVM on plaintext vs on v2-decoded ciphertext: identical halt value AND
+    identical dispatch trace on the synthetic pure-ISA programs."""
+    for name, src, args, expected in SYNTH:
+        blob = daedalus_asm.assemble(src)
+        plain_val, plain_trace = run_plaintext(blob, args)
+        assert plain_val == expected, f"{name}: plaintext {plain_val} != {expected}"
+        for s in range(8):
+            roll_val, roll_trace = _run_rolling_v2(blob, args, _seed(s))
+            assert roll_val == plain_val, f"{name}: v2 halt {roll_val} != {plain_val} @seed {s}"
+            assert roll_trace == plain_trace, f"{name}: v2 trace diverged @seed {s}"
+
+
+def test_v2_chain_path_independence():
+    """compute_chain agrees with an independent prefix walk, and the chain is a
+    function of CIPHERTEXT only (never the plaintext)."""
+    blob = daedalus_asm.assemble(SYNTH[3][1])  # loop_countdown: several blocks
+    _data, code = _split(blob)
+    seed = _seed(3)
+    ct, leaders = vr.encrypt_code_v2(code, seed, whiten=0)
+    ls = sorted(leaders)
+    chain = vr.compute_chain(seed, ct, ls)
+    # independent prefix walk over the ciphertext blocks
+    ref, acc = [], 0
+    for i in range(len(ls)):
+        ref.append(acc)
+        end = ls[i + 1] if i + 1 < len(ls) else len(ct)
+        acc = vr.chain_digest(seed, acc, ct[ls[i]:end])
+    assert ref == chain
+    # the chain must not reference plaintext: recomputing it over the SAME
+    # ciphertext with the plaintext unavailable yields the same values.
+    assert vr.compute_chain(seed, bytes(ct), ls) == chain
+    # and it is genuinely chained (not all-zero / not per-block-independent)
+    assert any(c != 0 for c in chain[1:])
+
+
+def test_v2_whiten_parity():
+    """A nonzero whiten round-trips; the wrong whiten mis-keys and faults (or at
+    least fails to reproduce the program)."""
+    blob = daedalus_asm.assemble(SYNTH[0][1])
+    _data, code = _split(blob)
+    seed = _seed(1)
+    w = bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+    ct, leaders = vr.encrypt_code_v2(code, seed, whiten=w)
+    # correct whiten -> exact round-trip
+    assert vr.decode_stream_v2(ct, seed, leaders, whiten=w) == code
+    # wrong whiten -> different effective seed -> garbage or fault
+    try:
+        wrong = vr.decode_stream_v2(ct, seed, leaders, whiten=0)
+        assert wrong != code, "wrong whiten reproduced the program"
+    except daedalus_ref.DaedalusError:
+        pass
+
+
+def test_v2_whole_program_avalanche():
+    """Flipping ONE ciphertext byte in block j corrupts decode within block j AND
+    within every block > j -- strictly stronger than v1's per-block avalanche."""
+    src = """
+    .code
+      push_arg 0
+    loop:
+      dup
+      jz done
+      push_imm8 1
+      sub
+      push_imm32 0x01020304
+      push_imm32 0x05060708
+      add
+      pop
+      jmp loop
+    done:
+      push_imm8 7
+      halt
+    """
+    blob = daedalus_asm.assemble(src)
+    _data, code = _split(blob)
+    seed = _seed(5)
+    ct, leaders = vr.encrypt_code_v2(code, seed, whiten=0)
+    ls = sorted(leaders)
+    assert len(ls) >= 3, "need >=3 blocks for a whole-program avalanche test"
+
+    j = 1                                   # a non-final block
+    flip_at = ls[j] + (1 if ls[j] + 1 < ls[j + 1] else 0)
+    tampered = bytearray(ct)
+    tampered[flip_at] ^= 0x01
+
+    # (a) chain avalanche (the mechanism): the ciphertext chain is unchanged
+    #     at/before block j and DIFFERS for every block after j.
+    cg = vr.compute_chain(seed, ct, ls)
+    cb = vr.compute_chain(seed, bytes(tampered), ls)
+    for i in range(len(ls)):
+        if i <= j:
+            assert cg[i] == cb[i], f"chain changed at/before block {i} (<= j)"
+        else:
+            assert cg[i] != cb[i], f"chain unchanged at block {i} (> j)"
+
+    # (b) rigorous whole-program corruption: a different chain feeds resync2, so
+    #     EVERY block after j re-enters with a different accumulator -> its whole
+    #     keystream (hence its decode) is corrupted.
+    eff = vr.effective_seed(seed, 0)
+    for i in range(j + 1, len(ls)):
+        assert vr.resync2(eff, ls[i], cg[i]) != vr.resync2(eff, ls[i], cb[i]), \
+            f"block {i} (> j) re-enters with an unchanged accumulator"
+
+    def decode_block_v2(ctbytes, i):
+        d = vr.RollingDecoderV2(bytes(ctbytes), seed, ls, whiten=0)
+        out, pc = bytearray(), ls[i]
+        end = ls[i + 1] if i + 1 < len(ls) else len(ctbytes)
+        try:
+            while pc < end:
+                _m, w, _k, _o, plain = d.fetch(pc)
+                out += plain
+                pc += 1 + w
+        except daedalus_ref.DaedalusError:
+            return None                     # a decode fault is corruption
+        return bytes(out)
+
+    # (b') concrete decode-level: every block after j decodes differently (or
+    #     faults) when entered at its own leader.
+    for i in range(j + 1, len(ls)):
+        assert decode_block_v2(tampered, i) != decode_block_v2(ct, i), \
+            f"v2 block {i} (> j) decoded identically after tamper"
+
+    # (c) within block j: decode diverges at/after the flip (the v1 floor).
+    assert decode_block_v2(tampered, j) != decode_block_v2(ct, j)
+
+    # (d) STRICTLY STRONGER THAN v1: under the v1 codec, the same-position flip
+    #     leaves every block after j byte-identical (v1 reseeds per block, with
+    #     no dependence on other blocks' ciphertext).
+    v1ct, v1leaders = vr.encrypt_code(code, seed)
+    v1ls = sorted(v1leaders)
+    v1flip = v1ls[j] + (1 if v1ls[j] + 1 < v1ls[j + 1] else 0)
+    v1tampered = bytearray(v1ct)
+    v1tampered[v1flip] ^= 0x01
+
+    def decode_block_v1(ctbytes, i):
+        d = vr.RollingDecoder(bytes(ctbytes), seed, v1ls)
+        out, pc = bytearray(), v1ls[i]
+        end = v1ls[i + 1] if i + 1 < len(v1ls) else len(ctbytes)
+        try:
+            while pc < end:
+                _m, w, _k, _o, plain = d.fetch(pc)
+                out += plain
+                pc += 1 + w
+        except daedalus_ref.DaedalusError:
+            return None
+        return bytes(out)
+
+    later_intact = 0
+    for i in range(j + 1, len(v1ls)):
+        good = decode_block_v1(v1ct, i)
+        assert good is not None and decode_block_v1(v1tampered, i) == good, \
+            f"v1 block {i} (> j) changed after tamper -- expected per-block only"
+        later_intact += 1
+    assert later_intact >= 1
+
+
+def test_v2_watchdog_self_loop_faults():
+    """The reference VM's step cap mirrors DVM_MAX_STEPS, and a self-loop (a
+    program that never reaches HALT) fails closed -- the C dvm_run watchdog."""
+    import inspect
+    default_cap = inspect.signature(RefVM.run).parameters["max_steps"].default
+    assert default_cap == DVM_MAX_STEPS, "RefVM step cap drifted from DVM_MAX_STEPS"
+    blob = daedalus_asm.assemble(".code\nloop:\n  jmp loop\n")
+    _data, code = _split(blob)
+    vm = RefVM(code, b"", [])
+    try:
+        vm.run(max_steps=5000)              # small cap for speed; same mechanism
+        assert False, "self-loop did not fault"
+    except daedalus_ref.DaedalusError:
+        pass
+
+
 def _main():
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
