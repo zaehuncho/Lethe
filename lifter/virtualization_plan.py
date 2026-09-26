@@ -907,6 +907,8 @@ def _compile_one(
     rolling: bool,
     rolling_seed: bytes | None,
     opcode_table: OpcodeTable,
+    mutate_level: int = 0,
+    mutate_master: bytes | None = None,
 ) -> _Compiled:
     try:
         original = bytes(reader.read_file_backed_executable(spec.rva, spec.size))
@@ -923,6 +925,29 @@ def _compile_one(
     try:
         call_analysis = x64_lifter.analyze_internal_calls(original, base=spec.rva)
         assembly = x64_lifter.lift_function(original, base=spec.rva)
+        # OPTIONAL, DEFAULT-OFF metamorphic mutation of the lifted .vasm between
+        # lift and assembly. At mutate_level 0 (the default) the lifter/oracle
+        # path is untouched and stays byte-identical/green; only an explicit
+        # non-zero level engages the seeded, oracle-proven transformation engine.
+        if mutate_level > 0:
+            try:  # package import
+                from daedalus import daedalus_mutate
+                from daedalus.metamorph_seed import MetamorphSeed, DOMAIN_MBA
+            except ImportError:  # standalone: daedalus/ on sys.path
+                import daedalus_mutate  # type: ignore
+                from metamorph_seed import MetamorphSeed, DOMAIN_MBA  # type: ignore
+            master = (
+                mutate_master
+                if mutate_master is not None
+                else (rolling_seed if rolling_seed is not None
+                      else opcode_table.sha256.encode("ascii"))
+            )
+            fn_seed = MetamorphSeed(master).subseed_for_program(
+                DOMAIN_MBA, spec.name
+            )
+            assembly = daedalus_mutate.mutate_source(
+                assembly, seed=fn_seed, level=mutate_level
+            )
         program = daedalus_asm.assemble(
             assembly, opcodes=opcode_table.assembler_mapping()
         )
@@ -976,6 +1001,8 @@ def compile_virtualization_manifest(
     source_exception_metadata: SourceExceptionMetadata | None = None,
     require_source_exception_metadata: bool = False,
     program_sealer: Callable[[FunctionSpec, bytes], tuple[bytes, bytes]] | None = None,
+    mutate_level: int = 0,
+    mutate_master: bytes | None = None,
 ) -> VirtualizationManifest:
     """Compile an all-or-nothing selected-function virtualization manifest.
 
@@ -1051,6 +1078,8 @@ def compile_virtualization_manifest(
             "authenticated page envelopes are incompatible with rolling programs"
         )
 
+    if not isinstance(mutate_level, int) or mutate_level < 0:
+        raise VirtualizationPlanError("mutate_level must be a non-negative integer")
     compiled = tuple(
         _compile_one(
             spec,
@@ -1058,6 +1087,8 @@ def compile_virtualization_manifest(
             rolling=rolling,
             rolling_seed=rolling_seed,
             opcode_table=opcode_table,
+            mutate_level=mutate_level,
+            mutate_master=mutate_master,
         )
         for spec in ordered
     )

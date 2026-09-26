@@ -130,6 +130,119 @@ def test_mba_composes_with_rolling():
         assert vr.decode_stream(ct, seed, leaders) == code
 
 
+# ---------------------------------------------------------------------------
+# NEW: exact-identity catalogue proofs (daedalus_mba.CATALOGUE)
+# ---------------------------------------------------------------------------
+_REF = {
+    "xor": lambda a, b: a ^ b,
+    "add": lambda a, b: (a + b) & MASK64,
+    "sub": lambda a, b: (a - b) & MASK64,
+    "and": lambda a, b: a & b,
+    "or":  lambda a, b: a | b,
+}
+
+
+def _identity_prog(tree):
+    """A program that halts with args[0] OP args[1] computed via `tree`."""
+    ops, _peak = daedalus_mba.emit_expansion(tree)
+    body = "\n".join("      " + ins for ins in ops)
+    return f".code\n  push_arg 0\n  push_arg 1\n{body}\n      halt\n"
+
+
+def test_every_catalogue_identity_is_exact_over_random_inputs():
+    """Each NEW MBA identity in the catalogue must equal the operation it stands
+    for, for 200+ random (a, b) via the reference interpreter. A wrong identity
+    would silently corrupt a crypto routine -- it is caught here, not shipped."""
+    rng = random.Random(20240926)
+    total = 0
+    for op, trees in daedalus_mba.CATALOGUE.items():
+        assert 2 <= len(trees) <= 3, f"{op}: expected 2-3 identities"
+        for idx, tree in enumerate(trees):
+            src = _identity_prog(tree)
+            # include the boundary cases plus 200 random pairs
+            pairs = [(0, 0), (MASK64, MASK64), (0, MASK64), (MASK64, 0), (1, MASK64)]
+            pairs += [(rng.getrandbits(64), rng.getrandbits(64)) for _ in range(200)]
+            for a, b in pairs:
+                got = _run(src, [a, b])
+                assert got == _REF[op](a, b), (
+                    f"{op} identity #{idx} wrong for a=0x{a:016X} b=0x{b:016X}: "
+                    f"got 0x{got:016X}")
+            total += 1
+    assert total == 15, f"expected 15 catalogue identities, proved {total}"
+
+
+def test_seeded_rewrite_matches_reference_and_is_stack_safe():
+    """A seeded catalogue rewrite over xor/add/sub/and/or must preserve semantics
+    for random inputs and never exceed the operand-stack ceiling."""
+    import daedalus_mutate
+    src = """
+    .code
+      push_arg 0
+      push_arg 1
+      xor
+      push_arg 0
+      and
+      push_arg 1
+      or
+      push_arg 0
+      add
+      push_arg 1
+      sub
+      halt
+    """
+    rng = random.Random(7)
+    for seed in (b"s0", b"s1", b"s2"):
+        d = daedalus_mutate.stack_depth_map(src)
+        rewritten = daedalus_mba.rewrite_source(
+            src, ops=("xor", "add", "sub", "and", "or"),
+            seed=seed, depth=1, templates=daedalus_mba.CATALOGUE, depth_in=d)
+        # stack safety of the rewritten program
+        peak = max([x for x in daedalus_mutate.stack_depth_map(rewritten)
+                    if x is not None] + [0])
+        assert peak <= daedalus_mba.CEILING
+        for _ in range(200):
+            a = rng.getrandbits(64); b = rng.getrandbits(64)
+            assert _run(src, [a, b]) == _run(rewritten, [a, b])
+
+
+def test_seeded_determinism_and_variation():
+    """Same seed => byte-identical rewrite; different seed => different bytes.
+
+    Uses a multi-site program so two seeds selecting the same per-site template
+    everywhere (each site has only 2-3 choices) is vanishingly unlikely."""
+    src = """
+    .code
+      push_arg 0
+      push_arg 1
+      xor
+      push_arg 0
+      xor
+      push_arg 1
+      xor
+      push_arg 0
+      xor
+      push_arg 1
+      xor
+      push_arg 0
+      xor
+      halt
+    """
+    kw = dict(ops=("xor",), depth=0, templates=daedalus_mba.CATALOGUE)
+    a = daedalus_mba.rewrite_source(src, seed=b"alpha", **kw)
+    a2 = daedalus_mba.rewrite_source(src, seed=b"alpha", **kw)
+    b = daedalus_mba.rewrite_source(src, seed=b"beta", **kw)
+    assert a == a2, "same seed must reproduce byte-identical output"
+    assert a != b, "different seeds must diverge"
+
+
+def test_default_rewrite_is_byte_identical_to_legacy():
+    """The default (no seed/templates) path is byte-for-byte the legacy MBA."""
+    for vasm in sorted(PROGRAMS_DIR.glob("*.vasm")):
+        text = vasm.read_text(encoding="utf-8")
+        assert (daedalus_mba.rewrite_source(text)
+                == daedalus_mba._legacy_rewrite(text, ("xor", "add"), "  "))
+
+
 def _main():
     import traceback
     fns = [v for k, v in sorted(globals().items())
