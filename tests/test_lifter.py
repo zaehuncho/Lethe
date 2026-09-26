@@ -630,9 +630,8 @@ def test_fuzz_mem_ops():
     "ret 8",                # callee stack cleanup cannot use the common thunk
     "movsb",                # string op
     "mul qword ptr fs:[rbx]",  # segment-overridden source
-    # lea forms outside the faithful subset
-    "lea rax, [rip+0x10]",  # RIP-relative lea
-    "lea eax, [rip+8]",     # RIP-relative lea (32-bit dest)
+    # lea forms outside the faithful subset. (RIP-relative lea/load/store are now
+    # supported via the live image-base local -- see tests/test_lifter_riprel.py.)
     "lea rax, [ebx+ecx]",   # 32-bit-addressed lea (mod-2^32, not modeled)
     "lea rax, fs:[rbx]",    # segment-overridden lea
     # memory forms still outside the faithful subset

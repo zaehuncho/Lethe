@@ -93,13 +93,21 @@ def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
 
 
 def check(code: bytes, init=None, flags=("CF", "PF", "ZF", "SF", "OF"), mem=None,
-          mem_base=MEM_BASE):
+          mem_base=MEM_BASE, *, code_rva=BASE, runtime_image_base=0):
     """Assert the lifted bytecode matches Unicorn on regs, the given flags, and
     (when `mem` initial bytes are given) the final memory region. Raises
-    AssertionError on any mismatch."""
+    AssertionError on any mismatch.
+
+    `code_rva` / `runtime_image_base` place the code at a specific RVA under a
+    specific (possibly ASLR-relocated) image base: Unicorn executes at
+    `runtime_image_base + code_rva` while the VM lifts at `code_rva` with the
+    IMAGE_BASE local set to `runtime_image_base`. The defaults reproduce the
+    original preferred-base behaviour exactly."""
     init = list(init) if init is not None else _default_init()
-    ur, uf, um = run_unicorn(code, init, mem, mem_base)
-    dr, df, dm = run_daedalus(code, init, mem, mem_base)
+    code_base = (runtime_image_base + code_rva) & MASK64
+    ur, uf, um = run_unicorn(code, init, mem, mem_base, code_base=code_base)
+    dr, df, dm = run_daedalus(code, init, mem, mem_base,
+                              lift_base=code_rva, image_base=runtime_image_base)
     for i in range(16):
         assert ur[i] == dr[i], (
             f"reg {L.GPR_NAMES[i]} mismatch: unicorn=0x{ur[i]:016X} "
@@ -155,3 +163,50 @@ def check_function(code: bytes, init=None,
         )
     assert um == dm, f"stack mismatch:\n  unicorn ={um.hex()}\n  daedalus={dm.hex()}"
     return (ur, uf), (dr, df)
+
+
+def run_daedalus_capture(code: bytes, init, mem=None, mem_base=MEM_BASE,
+                         lift_base=BASE, image_base=0):
+    """Like run_daedalus but returns (halt_value, regs). Used to assert the fault
+    contract: a faulting lift HALTs nonzero and commits no register."""
+    blob = daedalus_asm.assemble(L.lift_function(code, base=lift_base))
+    ds = struct.unpack_from("<H", blob, 0)[0]
+    data, prog = blob[2:2 + ds], blob[2 + ds:]
+    vm = RefVM(prog, data, args=[],
+               mem=(bytes(mem) if mem is not None else None), mem_base=mem_base)
+    for i in range(16):
+        vm.locals[i * 8:i * 8 + 8] = (init[i] & MASK64).to_bytes(8, "little")
+    vm.locals[L.IMAGE_BASE:L.IMAGE_BASE + 8] = (
+        image_base & MASK64
+    ).to_bytes(8, "little")
+    halt = vm.run()
+    regs = [int.from_bytes(vm.locals[i * 8:i * 8 + 8], "little") for i in range(16)]
+    return halt, regs
+
+
+def check_fault(code: bytes, init=None, mem=None, mem_base=MEM_BASE, *,
+                code_rva=BASE, runtime_image_base=0):
+    """Assert BOTH engines fault on `code`: Unicorn raises a CPU exception (a #DE)
+    and the RefVM returns a nonzero HALT while committing NO register (every GPR
+    equals its initial value). Returns the RefVM HALT value."""
+    from unicorn import UcError
+
+    init = list(init) if init is not None else _default_init()
+    code_base = (runtime_image_base + code_rva) & MASK64
+    try:
+        run_unicorn(code, init, mem, mem_base, code_base=code_base)
+    except UcError:
+        pass
+    else:
+        raise AssertionError("unicorn did not fault as expected")
+
+    halt, regs = run_daedalus_capture(
+        code, init, mem, mem_base,
+        lift_base=code_rva, image_base=runtime_image_base,
+    )
+    assert halt != 0, f"RefVM did not fault: HALT returned {halt}"
+    for i in range(16):
+        assert regs[i] == (init[i] & MASK64), (
+            f"faulting lift committed reg {L.GPR_NAMES[i]}: "
+            f"init=0x{init[i] & MASK64:016X} final=0x{regs[i]:016X}")
+    return halt

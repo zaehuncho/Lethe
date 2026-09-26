@@ -20,10 +20,15 @@ arithmetic, shifts/rotates at 32/64 bits, one-/two-/three-operand IMUL, one-
 operand MUL, MOVZX/MOVSX/
 MOVSXD, SETcc/CMOVcc, register XCHG, BSWAP, ADC, and SBB. High-8 aliases,
 scalar memory destinations, immediate stores, parity conditions, and balanced
-PUSH/POP/LEAVE stack frames are covered. Direct non-recursive calls to proven
-instruction boundaries inside the same selected extent preserve architectural
-stack effects and use shadow-validated VM returns. Atomic XCHG/LOCK forms,
-SIMD, external/indirect/recursive calls, and unmodeled widths remain explicit
+PUSH/POP/LEAVE stack frames are covered. 8/16/32-bit DIV and IDIV produce exact
+quotient/remainder pairs and deliver an architectural #DE (a nonzero VM HALT that
+commits no register) on divide-by-zero or quotient overflow; SHLD/SHRD cover the
+32/64-bit register-destination double shifts; RIP-relative lea/load/store are
+ASLR-corrected through the live image-base local. Direct non-recursive calls to
+proven instruction boundaries inside the same selected extent preserve
+architectural stack effects and use shadow-validated VM returns. Atomic XCHG/LOCK
+forms, 64-bit DIV/IDIV, SHLD/SHRD memory or 16-bit forms, SIMD,
+external/indirect/recursive calls, and unmodeled widths remain explicit
 whole-function bailouts.
 """
 from __future__ import annotations
@@ -603,6 +608,42 @@ class _Lifter:
         live = self._get_live_flags(instr.ip)
         (self.flags_add if add else self.flags_sub)(set_cf=False, signbit=signbit, live_flags=live)
 
+    def _shl_shr_of_count1(self, vmop: str, width: int) -> None:
+        """OF for a 1-bit shl/shr, from the ORIGINAL operand in SA (x86 defines
+        OF only for count == 1).
+
+          * SHL/SAL: OF = (result sign changed) = bit[w-1](src) XOR bit[w-2](src).
+          * SHR:     OF = bit[w-1](src) (the MSB of the original operand)."""
+        signbit = _width_signbit(width)
+        if vmop == "shl":
+            self.rd_local(SA); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and")
+            self.rd_local(SA); self.push_imm(signbit - 1); self.a("shr")
+            self.push_imm(1); self.a("and")
+            self.a("xor"); self.wr_local(OF)
+        else:  # shr
+            self.rd_local(SA); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and"); self.wr_local(OF)
+
+    def _rotate_of_count1(self, direction: str, width: int) -> None:
+        """OF for a 1-bit rol/ror, from the result in SR (x86 defines OF only for
+        a 1-bit rotate).
+
+          * ROL: OF = CF(after) XOR MSB(result) = bit0(result) XOR bit[w-1](result).
+          * ROR: OF = XOR of the two most-significant result bits."""
+        signbit = _width_signbit(width)
+        if direction == "rol":
+            self.rd_local(SR); self.push_imm(1); self.a("and")
+            self.rd_local(SR); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and")
+            self.a("xor"); self.wr_local(OF)
+        else:  # ror
+            self.rd_local(SR); self.push_imm(signbit); self.a("shr")
+            self.push_imm(1); self.a("and")
+            self.rd_local(SR); self.push_imm(signbit - 1); self.a("shr")
+            self.push_imm(1); self.a("and")
+            self.a("xor"); self.wr_local(OF)
+
     def _shift(self, instr, vmop: str) -> None:
         # shl/shr reg|mem, imm|cl.
         dst, width = self._read_rmw_destination(instr)
@@ -634,7 +675,11 @@ class _Lifter:
                 else:
                     self.push_imm(0); self.wr_local(CF)
             if "OF" in live:
-                self.push_imm(0); self.wr_local(OF)
+                if cnt == 1:
+                    self._shl_shr_of_count1(vmop, width)
+                else:
+                    # OF is architecturally undefined for count != 1.
+                    self.push_imm(0); self.wr_local(OF)
 
     def _read_cl_count(self, width: int) -> None:
         """SB = CL & (63 if 64-bit else 31)."""
@@ -667,7 +712,15 @@ class _Lifter:
                     self.rd_local(SB); self.push_imm(1); self.a("sub")
                 self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
             if "OF" in live:
-                self.push_imm(0); self.wr_local(OF)
+                # OF is defined only when the masked count is exactly 1.
+                of_one = self._new_label()
+                of_done = self._new_label()
+                self.rd_local(SB); self.push_imm(1); self.a("cmp_eq")
+                self.a(f"jnz {of_one}")
+                self.push_imm(0); self.wr_local(OF); self.a(f"jmp {of_done}")
+                self.a.label(of_one)
+                self._shl_shr_of_count1(vmop, width)
+                self.a.label(of_done)
         self.a.label(skip)
 
     def _shift_count(self, instr):
@@ -806,24 +859,41 @@ class _Lifter:
                 self.rd_local(SR); self.push_imm(width - 1); self.a("shr")
                 self.push_imm(1); self.a("and"); self.wr_local(CF)
 
+        of_live = bool(live) and "OF" in live
+
         if is_imm:
             emit_cf()
+            # OF is defined only for a 1-bit rotate; left unmodeled otherwise.
+            if of_live and cnt == 1:
+                self._rotate_of_count1(direction, width)
         else:
             skip = self._new_label()
             self.rd_local(SB); self.a(f"jz {skip}")
             emit_cf()
+            if of_live:
+                of_skip = self._new_label()
+                self.rd_local(SB); self.push_imm(1); self.a("cmp_eq")
+                self.a(f"jz {of_skip}")
+                self._rotate_of_count1(direction, width)
+                self.a.label(of_skip)
             self.a.label(skip)
 
     def _emit_effective_address(self, instr) -> None:
         """Push the effective address of the instruction's memory operand.
         Used by memory load (push_operand) and store (_mov). Bails on
-        RIP-relative, segment overrides, or a non-64-bit base/index (32-bit
-        addressing computes mod 2^32, which our 64-bit arithmetic would not
-        reproduce)."""
-        if instr.is_ip_rel_memory_operand:
-            raise LiftUnsupported("RIP-relative memory operand")
+        segment overrides or a non-64-bit base/index (32-bit addressing computes
+        mod 2^32, which our 64-bit arithmetic would not reproduce).
+
+        RIP-relative operands are ASLR-corrected: iced folds RIP into
+        `memory_displacement` as an RVA-based target (next_ip + disp) relative to
+        the decode base, so the runtime VA is `image_base + that RVA`. Adding the
+        live IMAGE_BASE local reproduces the loader-relocated address exactly."""
         if instr.segment_prefix != Register.NONE:
             raise LiftUnsupported("segment-overridden memory operand")
+        if instr.is_ip_rel_memory_operand:
+            self.push_imm(instr.memory_displacement & MASK64)
+            self.rd_local(IMAGE_BASE); self.a("add")
+            return
         base = instr.memory_base
         index = instr.memory_index
         scale = instr.memory_index_scale
@@ -845,10 +915,16 @@ class _Lifter:
         dst, width = self.require_reg(instr, 0)
         if instr.op_kind(1) != OpKind.MEMORY:
             raise LiftUnsupported("lea without a memory operand")
-        if instr.is_ip_rel_memory_operand:
-            raise LiftUnsupported("lea RIP-relative memory")
         if instr.segment_prefix != Register.NONE:
             raise LiftUnsupported("lea with a segment override")
+        if instr.is_ip_rel_memory_operand:
+            # RIP-relative: dst = image_base + RVA target (see
+            # _emit_effective_address). A 32-bit dst truncates via wr_reg, exactly
+            # the x86 zero-extension of the 32-bit effective address.
+            self.push_imm(instr.memory_displacement & MASK64)
+            self.rd_local(IMAGE_BASE); self.a("add")
+            self.wr_reg(dst)
+            return
         base = instr.memory_base
         index = instr.memory_index
         scale = instr.memory_index_scale
@@ -1043,6 +1119,237 @@ class _Lifter:
         self.a("and"); self.a("neg")
         self.a("cmp_ne")
         self._store_cf_of()
+
+    # -- DIV / IDIV ------------------------------------------------------
+    _DIVIDE_REGISTERS = {
+        # width -> (dividend precision bits, quotient reg, remainder reg)
+        8: (16, Register.AL, Register.AH),
+        16: (32, Register.AX, Register.DX),
+        32: (64, Register.EAX, Register.EDX),
+    }
+
+    def _emit_fault(self) -> None:
+        """Deliver an architectural #DE: return a nonzero HALT so the native VM
+        thunk aborts before committing ANY register, exactly as Unicorn raises
+        on divide-by-zero or quotient overflow."""
+        self.push_imm(1); self.a("halt")
+
+    def _divide(self, instr, *, signed: bool) -> None:
+        """Lift DIV/IDIV for 8/16/32-bit operands with exact quotient/remainder.
+
+        Result flags are architecturally undefined and are neither written nor
+        checked. Divide-by-zero and quotient overflow both fault (nonzero HALT)
+        before any register is written. 64-bit forms are out of scope and bail."""
+        width = self._one_operand_width(instr)   # validates LOCK/op_count/operand
+        if width == 64:
+            raise LiftUnsupported(
+                "DIV/IDIV require architectural #DE divide-fault delivery, "
+                "which the VM/native thunk contract cannot reproduce"
+            )
+        precision, quotient_reg, remainder_reg = self._DIVIDE_REGISTERS[width]
+        width_mask = _width_mask(width)
+        precision_mask = _width_mask(precision)
+
+        # Divisor read ONCE (register or memory source, as MUL/IMUL allow).
+        self.push_operand(instr, 0, width); self.wr_local(SB)
+        # #DE on a zero divisor.
+        nonzero = self._new_label()
+        self.rd_local(SB); self.push_imm(0); self.a("cmp_ne"); self.a(f"jnz {nonzero}")
+        self._emit_fault()
+        self.a.label(nonzero)
+
+        # Dividend = (high:low) as one 2*width-bit word, captured before writeback.
+        self.rd_reg(remainder_reg); self.push_imm(width); self.a("shl")
+        self.rd_reg(quotient_reg); self.a("or"); self.wr_local(SA)
+
+        if signed:
+            self._idiv_core(width, precision, width_mask, precision_mask,
+                            quotient_reg, remainder_reg)
+        else:
+            self._div_core(width, width_mask, quotient_reg, remainder_reg)
+
+    def _div_core(self, width, width_mask, quotient_reg, remainder_reg) -> None:
+        # Unsigned: SA / SB. Divisor already proven nonzero.
+        self.rd_local(SA); self.rd_local(SB); self.a("div"); self.wr_local(T0)  # quotient
+        self.rd_local(SA); self.rd_local(SB); self.a("mod"); self.wr_local(T1)  # remainder
+        # #DE if the quotient does not fit in `width` bits.
+        ok = self._new_label()
+        self.rd_local(T0); self.push_imm(width); self.a("shr")
+        self.push_imm(0); self.a("cmp_eq"); self.a(f"jnz {ok}")
+        self._emit_fault()
+        self.a.label(ok)
+        self.rd_local(T0); self.wr_reg(quotient_reg)
+        self.rd_local(T1); self.wr_reg(remainder_reg)
+
+    def _idiv_core(self, width, precision, width_mask, precision_mask,
+                   quotient_reg, remainder_reg) -> None:
+        # Signed division truncated toward zero, synthesized from unsigned div/mod
+        # over magnitudes. Divisor already proven nonzero.
+        sign_dividend = precision - 1
+        sign_divisor = width - 1
+        # sd = sign(dividend) -> T4 ; sv = sign(divisor) -> T5
+        self.rd_local(SA); self.push_imm(sign_dividend); self.a("shr")
+        self.push_imm(1); self.a("and"); self.wr_local(T4)
+        self.rd_local(SB); self.push_imm(sign_divisor); self.a("shr")
+        self.push_imm(1); self.a("and"); self.wr_local(T5)
+        # |dividend| -> T0
+        dividend_pos = self._new_label(); dividend_done = self._new_label()
+        self.rd_local(T4); self.a(f"jz {dividend_pos}")
+        self.rd_local(SA); self.a("neg"); self.push_imm(precision_mask); self.a("and")
+        self.wr_local(T0); self.a(f"jmp {dividend_done}")
+        self.a.label(dividend_pos); self.rd_local(SA); self.wr_local(T0)
+        self.a.label(dividend_done)
+        # |divisor| -> T1
+        divisor_pos = self._new_label(); divisor_done = self._new_label()
+        self.rd_local(T5); self.a(f"jz {divisor_pos}")
+        self.rd_local(SB); self.a("neg"); self.push_imm(width_mask); self.a("and")
+        self.wr_local(T1); self.a(f"jmp {divisor_done}")
+        self.a.label(divisor_pos); self.rd_local(SB); self.wr_local(T1)
+        self.a.label(divisor_done)
+        # unsigned magnitudes: uq -> T2, ur -> T3
+        self.rd_local(T0); self.rd_local(T1); self.a("div"); self.wr_local(T2)
+        self.rd_local(T0); self.rd_local(T1); self.a("mod"); self.wr_local(T3)
+        # signed quotient (full 64-bit two's complement) -> SR; negate iff signs differ
+        quotient_pos = self._new_label(); quotient_done = self._new_label()
+        self.rd_local(T4); self.rd_local(T5); self.a("xor"); self.a(f"jz {quotient_pos}")
+        self.rd_local(T2); self.a("neg"); self.wr_local(SR); self.a(f"jmp {quotient_done}")
+        self.a.label(quotient_pos); self.rd_local(T2); self.wr_local(SR)
+        self.a.label(quotient_done)
+        # #DE if the signed quotient does not fit signed `width`:
+        #   sign_extend(quotient[width-1:0]) != quotient
+        ok = self._new_label()
+        self.rd_local(SR)
+        self._push_sign_extended(width)          # clobbers T0 (no longer needed)
+        self.rd_local(SR); self.a("cmp_eq"); self.a(f"jnz {ok}")
+        self._emit_fault()
+        self.a.label(ok)
+        # signed remainder takes the sign of the dividend.
+        remainder_pos = self._new_label(); remainder_done = self._new_label()
+        self.rd_local(T4); self.a(f"jz {remainder_pos}")
+        self.rd_local(T3); self.a("neg"); self.wr_local(T3)
+        self.a.label(remainder_pos)
+        self.a.label(remainder_done)
+        self.rd_local(SR); self.wr_reg(quotient_reg)
+        self.rd_local(T3); self.wr_reg(remainder_reg)
+
+    # -- SHLD / SHRD -----------------------------------------------------
+    def _shld_shrd_of_count1(self, signbit: int) -> None:
+        # OF (defined only for a 1-bit double shift) = sign changed:
+        #   MSB(original dst in SA) XOR MSB(result in SR).
+        self.rd_local(SA); self.push_imm(signbit); self.a("shr")
+        self.push_imm(1); self.a("and")
+        self.rd_local(SR); self.push_imm(signbit); self.a("shr")
+        self.push_imm(1); self.a("and")
+        self.a("xor"); self.wr_local(OF)
+
+    def _shld_shrd(self, instr, *, left: bool) -> None:
+        """Lift SHLD/SHRD (double-precision shift), register destination only.
+
+        dst<-op0, src<-op1, count<-op2 (imm8 or CL). 32/64-bit only; memory
+        destinations and 16-bit forms bail (matching the shift/RMW conventions)."""
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported("shld/shrd memory destination is not modeled")
+        dst, width = self.require_reg(instr, 0)
+        if width not in (32, 64):
+            raise LiftUnsupported("shld/shrd only 32/64-bit destinations are modeled")
+        if instr.op_kind(1) != OpKind.REGISTER:
+            raise LiftUnsupported("shld/shrd source must be a register")
+        _src, src_width = self.require_reg(instr, 1)
+        if src_width != width:
+            raise LiftUnsupported("shld/shrd operands have different widths")
+        signbit = _width_signbit(width)
+        cnt_mask = 63 if width == 64 else 31
+
+        k2 = instr.op_kind(2)
+        if k2 == OpKind.REGISTER and instr.op_register(2) == Register.CL:
+            is_imm = False
+            cnt = None
+        elif k2 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
+                    OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64):
+            is_imm = True
+            cnt = instr.immediate(2) & cnt_mask
+        else:
+            raise LiftUnsupported("shld/shrd count must be an immediate or CL")
+
+        self.rd_reg(dst); self.wr_local(SA)                 # SA = original dst
+        self.push_operand(instr, 1, width); self.wr_local(SB)  # SB = src
+        if not is_imm:
+            self.rd_local(REG_OFF[Register.RCX]); self.push_imm(cnt_mask)
+            self.a("and"); self.wr_local(T0)                # T0 = masked count
+
+        def push_cnt():
+            self.push_imm(cnt) if is_imm else self.rd_local(T0)
+
+        def push_width_minus_cnt():
+            if is_imm:
+                self.push_imm(width - cnt)
+            else:
+                self.push_imm(width); self.rd_local(T0); self.a("sub")
+
+        # result = (dst<<c)|(src>>(w-c))  [shld]  /  (dst>>c)|(src<<(w-c))  [shrd]
+        if left:
+            self.rd_local(SA); push_cnt(); self.a("shl")
+            self.rd_local(SB); push_width_minus_cnt(); self.a("shr")
+        else:
+            self.rd_local(SA); push_cnt(); self.a("shr")
+            self.rd_local(SB); push_width_minus_cnt(); self.a("shl")
+        self.a("or")
+        self._mask_sr(width); self.wr_local(SR)
+
+        live = self._get_live_flags(instr.ip)
+
+        def emit_flags():
+            if live is not None and not live:
+                return
+            self._zf_sf_from_sr(signbit, live)
+            if live is None or "CF" in live:
+                self.rd_local(SA)
+                if left:                       # CF = bit[w-c] of original dst
+                    push_width_minus_cnt()
+                else:                          # CF = bit[c-1] of original dst
+                    if is_imm:
+                        self.push_imm(cnt - 1)
+                    else:
+                        self.rd_local(T0); self.push_imm(1); self.a("sub")
+                self.a("shr"); self.push_imm(1); self.a("and"); self.wr_local(CF)
+            if live is None or "OF" in live:
+                if is_imm:
+                    if cnt == 1:
+                        self._shld_shrd_of_count1(signbit)
+                    else:
+                        self.push_imm(0); self.wr_local(OF)
+                else:
+                    of_one = self._new_label(); of_done = self._new_label()
+                    self.rd_local(T0); self.push_imm(1); self.a("cmp_eq")
+                    self.a(f"jnz {of_one}")
+                    self.push_imm(0); self.wr_local(OF); self.a(f"jmp {of_done}")
+                    self.a.label(of_one)
+                    self._shld_shrd_of_count1(signbit)
+                    self.a.label(of_done)
+
+        # Writeback + flags. A masked count of 0 performs no shift and leaves the
+        # flags unchanged, but a 32-bit destination is STILL written (its low 32
+        # bits are unchanged yet the parent's upper 32 bits are zeroed), exactly
+        # like a shift-by-CL of masked count 0. A 64-bit destination is untouched.
+        if is_imm:
+            if cnt == 0:
+                if width == 32:
+                    self.rd_local(SR); self.wr_reg(dst)
+                return
+            self.rd_local(SR); self.wr_reg(dst)
+            emit_flags()
+        else:
+            if width == 32:
+                self.rd_local(SR); self.wr_reg(dst)
+            else:
+                skip_wr = self._new_label()
+                self.rd_local(T0); self.a(f"jz {skip_wr}")
+                self.rd_local(SR); self.wr_reg(dst)
+                self.a.label(skip_wr)
+            skip = self._new_label()
+            self.rd_local(T0); self.a(f"jz {skip}")
+            emit_flags()
+            self.a.label(skip)
 
     def _cbw(self) -> None:
         self.rd_reg(Register.AL)
@@ -1319,11 +1626,14 @@ class _Lifter:
                 self._implicit_mul(instr, signed=False)
             elif m == Mnemonic.IMUL:
                 self._imul(instr)
-            elif m in (Mnemonic.DIV, Mnemonic.IDIV):
-                raise LiftUnsupported(
-                    "DIV/IDIV require architectural #DE divide-fault delivery, "
-                    "which the VM/native thunk contract cannot reproduce"
-                )
+            elif m == Mnemonic.DIV:
+                self._divide(instr, signed=False)
+            elif m == Mnemonic.IDIV:
+                self._divide(instr, signed=True)
+            elif m == Mnemonic.SHLD:
+                self._shld_shrd(instr, left=True)
+            elif m == Mnemonic.SHRD:
+                self._shld_shrd(instr, left=False)
             elif m == Mnemonic.XCHG:
                 self._xchg(instr)
             elif m == Mnemonic.BSWAP:
@@ -1438,8 +1748,16 @@ def _compute_flag_liveness(instructions, base: int, end: int) -> dict[int, set[s
                 if cnt != 0:
                     if m in (Mnemonic.ROL, Mnemonic.ROR):
                         k.add("CF")
+                        if cnt == 1:      # OF defined only for a 1-bit rotate
+                            k.add("OF")
                     else:
                         k |= ALL_FLAGS
+        elif m in (Mnemonic.SHLD, Mnemonic.SHRD):
+            k2 = instr.op_kind(2)
+            is_imm = k2 in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16,
+                            OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64)
+            if is_imm and (instr.immediate(2) & 63) != 0:
+                k |= ALL_FLAGS
         elif m in (Mnemonic.MUL, Mnemonic.IMUL):
             k |= {"CF", "OF"}
         elif m in (Mnemonic.BT, Mnemonic.BTS, Mnemonic.BTR, Mnemonic.BTC):
