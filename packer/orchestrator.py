@@ -312,15 +312,26 @@ def _same_file_or_path(left: str, right: str) -> bool:
 
 
 def detect_is_dll(input_path: str) -> bool:
-    """Auto-detect EXE vs DLL straight from the COFF Characteristics field."""
+    """Classify a bounded PE header; leave full image validation to the parser."""
     with open(input_path, "rb") as f:
-        f.seek(0x3C)
-        (e_lfanew,) = struct.unpack("<I", f.read(4))
+        dos_header = f.read(0x40)
+        if len(dos_header) != 0x40:
+            raise ValueError(f"{input_path} is not a valid PE (truncated DOS header)")
+        if dos_header[:2] != b"MZ":
+            raise ValueError(f"{input_path} is not a valid PE (no DOS signature)")
+        (e_lfanew,) = struct.unpack_from("<I", dos_header, 0x3C)
+        if e_lfanew < 0x40:
+            raise ValueError(f"{input_path} is not a valid PE (PE header overlaps DOS header)")
+        # Four signature bytes plus the complete twenty-byte COFF header.
+        if e_lfanew > os.fstat(f.fileno()).st_size - 24:
+            raise ValueError(f"{input_path} is not a valid PE (truncated PE/COFF header)")
         f.seek(e_lfanew)
-        if f.read(4) != b"PE\x00\x00":
+        pe_header = f.read(24)
+        if len(pe_header) != 24:
+            raise ValueError(f"{input_path} is not a valid PE (truncated PE/COFF header)")
+        if pe_header[:4] != b"PE\x00\x00":
             raise ValueError(f"{input_path} is not a valid PE (no PE signature)")
-        f.seek(e_lfanew + 4 + 18)        # file header + offset of Characteristics
-        (characteristics,) = struct.unpack("<H", f.read(2))
+        (characteristics,) = struct.unpack_from("<H", pe_header, 22)
     return bool(characteristics & _IMAGE_FILE_DLL)
 
 

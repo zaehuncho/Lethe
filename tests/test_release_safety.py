@@ -356,3 +356,258 @@ def test_validator_rejects_ambiguous_live_containers(tmp_path):
 
     assert not result.ok
     assert "ambiguous output" in result.reason
+
+
+def _detection_header_fixture(*, offset=0x40, characteristics=0x0022):
+    """Header-only bytes: not an executable image and never given to a PE parser."""
+    blob = bytearray(offset + 24)
+    blob[:2] = b"MZ"
+    struct.pack_into("<I", blob, 0x3C, offset)
+    blob[offset:offset + 4] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", blob, offset + 4,
+                     0x8664, 1, 0, 0, 0, 0, characteristics)
+    return bytes(blob)
+
+
+def _detection_bad_fixture(case):
+    blob = bytearray(_detection_header_fixture())
+    if case == "empty":
+        return b""
+    if case == "short-dos":
+        return bytes(blob[:0x3F])
+    if case == "missing-mz":
+        blob[:2] = b"ZZ"
+    elif case in ("offset-zero", "offset-before-dos-end", "offset-at-eof",
+                  "offset-past-eof", "offset-u32-max"):
+        offset = {
+            "offset-zero": 0,
+            "offset-before-dos-end": 0x3F,
+            "offset-at-eof": len(blob),
+            "offset-past-eof": len(blob) + 1,
+            "offset-u32-max": 0xFFFFFFFF,
+        }[case]
+        struct.pack_into("<I", blob, 0x3C, offset)
+    elif case == "short-signature":
+        return bytes(blob[:0x40 + 3])
+    elif case == "signature-only":
+        return bytes(blob[:0x40 + 4])
+    elif case == "short-coff":
+        return bytes(blob[:0x40 + 4 + 18])
+    elif case == "one-characteristics-byte":
+        return bytes(blob[:-1])
+    elif case == "missing-pe":
+        blob[0x40:0x44] = b"PE!!"
+    else:
+        raise AssertionError(case)
+    return bytes(blob)
+
+
+def _detection_forbid_native_parser(monkeypatch):
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("header detection must stop before native PE parsing")
+
+    monkeypatch.setattr(pe_analyze, "analyze_pe", unexpected)
+
+
+@pytest.mark.parametrize("offset,characteristics,expected", [
+    (0x40, 0x0022, False),
+    (0x40, 0x2022, True),
+    (0x80, 0x2000, True),
+    (0x80, 0xDFFF, False),
+    (0x1000, 0xFFFF, True),
+    (0x1000, 0, False),
+], ids=["exact-end-exe", "exact-end-dll", "dos-stub-dll",
+        "unrelated-flags", "large-dos-stub-dll", "clear-flags-exe"])
+def test_detect_is_dll_classifies_complete_headers_without_native_parser(
+        monkeypatch, tmp_path, offset, characteristics, expected):
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / ("misleading.exe" if expected else "misleading.dll")
+    raw = _detection_header_fixture(offset=offset, characteristics=characteristics)
+    source.write_bytes(raw)
+
+    assert orchestrator.detect_is_dll(str(source)) is expected
+    assert source.read_bytes() == raw
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("empty", "truncated DOS header"),
+    ("short-dos", "truncated DOS header"),
+    ("missing-mz", "no DOS signature"),
+    ("offset-zero", "overlaps DOS header"),
+    ("offset-before-dos-end", "overlaps DOS header"),
+    ("offset-at-eof", "truncated PE/COFF header"),
+    ("offset-past-eof", "truncated PE/COFF header"),
+    ("offset-u32-max", "truncated PE/COFF header"),
+    ("short-signature", "truncated PE/COFF header"),
+    ("signature-only", "truncated PE/COFF header"),
+    ("short-coff", "truncated PE/COFF header"),
+    ("one-characteristics-byte", "truncated PE/COFF header"),
+    ("missing-pe", "no PE signature"),
+])
+def test_detect_is_dll_rejects_malformed_headers_as_value_error(
+        monkeypatch, tmp_path, case, reason):
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "invalid.exe"
+    raw = _detection_bad_fixture(case)
+    source.write_bytes(raw)
+
+    with pytest.raises(ValueError, match=reason) as caught:
+        orchestrator.detect_is_dll(str(source))
+
+    assert str(source) in str(caught.value)
+    assert source.read_bytes() == raw
+
+
+class _DetectionReadObserver:
+    def __init__(self, source, reads, seeks, *, short_second=None):
+        self.source = source
+        self.reads = reads
+        self.seeks = seeks
+        self.short_second = short_second
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.source.close()
+
+    def fileno(self):
+        return self.source.fileno()
+
+    def read(self, size=-1):
+        assert 0 < size <= 0x40, "only fixed-size header reads are permitted"
+        self.reads.append(size)
+        raw = self.source.read(size)
+        if len(self.reads) == 2 and self.short_second is not None:
+            return raw[:self.short_second]
+        return raw
+
+    def seek(self, offset):
+        self.seeks.append(offset)
+        return self.source.seek(offset)
+
+
+def _detection_observe_reads(monkeypatch, *, short_second=None):
+    import builtins
+
+    reads, seeks = [], []
+
+    def opened(path, mode):
+        return _DetectionReadObserver(
+            builtins.open(path, mode), reads, seeks, short_second=short_second)
+
+    monkeypatch.setattr(orchestrator, "open", opened, raising=False)
+    return reads, seeks
+
+
+def test_detect_is_dll_reads_at_most_88_bytes_without_reading_body(monkeypatch, tmp_path):
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "large-fixture.exe"
+    source.write_bytes(_detection_header_fixture(offset=0x1000) + b"x" * (1024 * 1024))
+    reads, _seeks = _detection_observe_reads(monkeypatch)
+
+    assert orchestrator.detect_is_dll(str(source)) is False
+    assert 0 < sum(reads) <= 88
+
+
+def test_detect_is_dll_rejects_out_of_bounds_offset_before_seeking(monkeypatch, tmp_path):
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "invalid.exe"
+    source.write_bytes(_detection_bad_fixture("offset-u32-max"))
+    reads, seeks = _detection_observe_reads(monkeypatch)
+
+    with pytest.raises(ValueError, match="truncated PE/COFF header"):
+        orchestrator.detect_is_dll(str(source))
+
+    assert reads == [0x40]
+    assert seeks == []
+
+
+@pytest.mark.parametrize("short_second", [0, 4, 23])
+def test_detect_is_dll_handles_short_read_after_size_check(
+        monkeypatch, tmp_path, short_second):
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "short-read.exe"
+    raw = _detection_header_fixture()
+    source.write_bytes(raw)
+    _detection_observe_reads(monkeypatch, short_second=short_second)
+
+    with pytest.raises(ValueError, match="truncated PE/COFF header"):
+        orchestrator.detect_is_dll(str(source))
+
+    assert source.read_bytes() == raw
+
+
+def test_detect_is_dll_preserves_missing_file_os_error(monkeypatch, tmp_path):
+    _detection_forbid_native_parser(monkeypatch)
+    with pytest.raises(FileNotFoundError):
+        orchestrator.detect_is_dll(str(tmp_path / "missing.exe"))
+
+
+@pytest.mark.parametrize("case", ["empty", "one-characteristics-byte"])
+def test_pack_file_reports_detection_value_error_and_removes_private_snapshot(
+        monkeypatch, tmp_path, case):
+    _detection_forbid_native_parser(monkeypatch)
+    monkeypatch.delenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", raising=False)
+    source = tmp_path / "invalid.exe"
+    output = tmp_path / "previous.exe"
+    raw = _detection_bad_fixture(case)
+    source.write_bytes(raw)
+    output.write_bytes(b"previous release")
+
+    result = orchestrator.pack_file(
+        str(source), orchestrator.PackOptions(output_path=str(output)))
+
+    assert result.ok is False
+    assert result.error.startswith("ValueError:")
+    assert "is not a valid PE" in result.error
+    assert source.read_bytes() == raw
+    assert output.read_bytes() == b"previous release"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["invalid.exe", "previous.exe"]
+
+
+@pytest.mark.parametrize("case", ["empty", "one-characteristics-byte"])
+def test_limited_inputs_wrap_detection_errors_before_native_preflight(
+        monkeypatch, tmp_path, case):
+    from tools import pack_limited_release as limited
+
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "invalid.exe"
+    raw = _detection_bad_fixture(case)
+    source.write_bytes(raw)
+
+    with pytest.raises(limited.LimitedReleaseError, match="cannot inspect") as caught:
+        limited._inputs(SimpleNamespace(exe=[str(source)], dll=[]))
+
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "is not a valid PE" in str(caught.value)
+    assert source.read_bytes() == raw
+    assert list(tmp_path.iterdir()) == [source]
+
+
+@pytest.mark.parametrize("case", ["empty", "one-characteristics-byte"])
+def test_limited_cli_renders_detection_failure_without_traceback(
+        monkeypatch, tmp_path, capsys, case):
+    from tools import pack_limited_release as limited
+
+    _detection_forbid_native_parser(monkeypatch)
+    source = tmp_path / "invalid.exe"
+    raw = _detection_bad_fixture(case)
+    source.write_bytes(raw)
+    # Exercise the real input/error boundary only; no candidate admission,
+    # signing, packing, or successful publication is mocked or claimed here.
+    monkeypatch.setattr(limited, "build_bundle", limited._inputs)
+
+    status = limited.main([
+        "--stub-path", str(tmp_path / "unused-stub.dll"),
+        "--output-dir", str(tmp_path / "unused-output"), "--exe", str(source),
+    ])
+
+    captured = capsys.readouterr()
+    assert status == limited.EXIT_ERROR
+    assert captured.out == ""
+    assert "limited release: FAILED: cannot inspect" in captured.err
+    assert "is not a valid PE" in captured.err
+    assert "Traceback" not in captured.err
+    assert source.read_bytes() == raw
+    assert list(tmp_path.iterdir()) == [source]
