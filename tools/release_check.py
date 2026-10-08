@@ -83,9 +83,39 @@ def _tracked_files() -> list[str]:
     return [line for line in _git("ls-files").splitlines() if line]
 
 
+def _candidate_publication_paths(payload: dict) -> set[str]:
+    """Allow only the candidate backings authenticated by this release.
+
+    The producer retains these beside the release-specific evidence. A broad
+    directory allowance would also admit unrelated files, so derive exact Git
+    paths from the verified candidate instead. Bind both reads of its manifest
+    to the already authenticated release payload.
+    """
+    expected_hash = payload["candidate"]["manifest_sha256"]
+    if release_attestation.sha256_file(MANIFEST) != expected_hash:
+        raise release_attestation.ReleaseAttestationError(
+            "candidate publication manifest changed after release verification")
+    candidate = release_attestation.validate_candidate_identity(STUB, MANIFEST)
+    paths: set[str] = set()
+    for record in candidate["evidence"]:
+        backing = release_attestation._contained_evidence_path(
+            STUB.parent, record["path"])
+        try:
+            relative = backing.relative_to(ROOT.resolve()).as_posix()
+        except ValueError as exc:
+            raise release_attestation.ReleaseAttestationError(
+                "candidate publication evidence escapes the source tree") from exc
+        paths.add(relative)
+    if release_attestation.sha256_file(MANIFEST) != expected_hash:
+        raise release_attestation.ReleaseAttestationError(
+            "candidate publication manifest changed during revalidation")
+    return paths
+
+
 def _check_manifest(errors: list[str]) -> dict | None:
     try:
         payload = release_attestation.verify_release_bundle(STUB)
+        candidate_publication_paths = _candidate_publication_paths(payload)
     except (OSError, release_attestation.ReleaseAttestationError) as exc:
         errors.append(f"signed prebuilt release is invalid: {exc}")
         return None
@@ -113,7 +143,9 @@ def _check_manifest(errors: list[str]) -> dict | None:
             + ", ".join(unexpected_assessment))
     unexpected_publication = [
         path for path in publication_drift.splitlines()
-        if path not in RELEASE_OUTPUT_PATHS and not path.startswith(RELEASE_EVIDENCE_PREFIX)
+        if path not in RELEASE_OUTPUT_PATHS
+        and path not in candidate_publication_paths
+        and not path.startswith(RELEASE_EVIDENCE_PREFIX)
     ]
     if unexpected_publication:
         errors.append(

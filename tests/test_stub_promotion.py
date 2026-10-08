@@ -31,10 +31,12 @@ def _clean_repo(tmp_path: Path) -> tuple[Path, str]:
         '[project]\nname = "candidate"\nversion = "0.0.0"\n'
         'requires-python = ">=3.12,<3.13"\n',
         encoding="utf-8",
+        newline="\n",
     )
     (repo / "uv.lock").write_text(
         'version = 1\nrevision = 3\nrequires-python = "==3.12.*"\n',
         encoding="utf-8",
+        newline="\n",
     )
     _git(repo, "init", "-q")
     _git(repo, "config", "user.name", "Lethe Test")
@@ -64,6 +66,55 @@ def test_repository_gate_rejects_non_exact_source_commit(tmp_path: Path) -> None
         promote_stub.inspect_repository(repo, commit[:12])
     with pytest.raises(promote_stub.PromotionError, match="source commit mismatch"):
         promote_stub.inspect_repository(repo, "0" * 40)
+
+
+@pytest.mark.parametrize("relative", promote_stub.REQUIRED_LOCKED_FILES)
+def test_repository_gate_rejects_clean_autocrlf_dependency_byte_drift(
+    tmp_path: Path, relative: str,
+) -> None:
+    repo, commit = _clean_repo(tmp_path)
+    _git(repo, "config", "core.autocrlf", "true")
+    committed = subprocess.check_output(
+        ["git", "cat-file", "blob", f"{commit}:{relative}"], cwd=repo,
+    )
+    assert b"\r\n" not in committed
+    (repo / relative).unlink()
+    _git(repo, "checkout", "--", relative)
+    # Git's normalized clean status does not mean the candidate binds Git bytes.
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    assert (repo / relative).read_bytes() == committed.replace(b"\n", b"\r\n")
+    assert (repo / relative).read_bytes() != committed
+
+    with pytest.raises(promote_stub.PromotionError, match="dependency input.*Git blob"):
+        promote_stub.inspect_repository(repo, commit)
+
+
+def test_repository_gate_lf_checkout_binds_exact_git_dependency_bytes(
+    tmp_path: Path,
+) -> None:
+    repo, _commit = _clean_repo(tmp_path)
+    _git(repo, "config", "core.autocrlf", "true")
+    (repo / ".gitattributes").write_bytes(
+        (promote_stub.ROOT / ".gitattributes").read_bytes())
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-q", "-m", "dependency checkout policy")
+    commit = _git(repo, "rev-parse", "HEAD")
+    # Force a real checkout, so the test covers attributes rather than write_text.
+    for relative in promote_stub.REQUIRED_LOCKED_FILES:
+        (repo / relative).unlink()
+    _git(repo, "checkout", "--", *promote_stub.REQUIRED_LOCKED_FILES)
+    assert _git(repo, "check-attr", "eol", "--", "uv.lock") == "uv.lock: eol: lf"
+    assert _git(repo, "status", "--porcelain=v1") == ""
+
+    inspected = promote_stub.inspect_repository(repo, commit)
+
+    for relative in promote_stub.REQUIRED_LOCKED_FILES:
+        committed = subprocess.check_output(
+            ["git", "cat-file", "blob", f"{commit}:{relative}"], cwd=repo,
+        )
+        assert b"\r\n" not in committed
+        assert (repo / relative).read_bytes() == committed
+        assert inspected["locked_files"][relative] == hashlib.sha256(committed).hexdigest()
 
 
 def test_atomic_manifest_write_never_replaces_target_on_swap_failure(

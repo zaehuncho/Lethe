@@ -323,6 +323,15 @@ requires bounded WIN_CERTIFICATE tables rather than accepting boolean claims.
 Publication is an atomic new-directory swap. Verification replays the all-scope
 production gate from the bundled release matrix and native evidence.
 
+Publishing that verified bundle into `stub/prebuilt` must retain both its
+candidate `evidence/` files and its `release-evidence/` files, not only the DLL
+and two manifests. The source-tree release check permits only the exact
+candidate backing paths listed by the revalidated candidate manifest whose hash
+matches the signed release payload. An unlisted file under `evidence/` is not
+authorized merely because it shares that directory prefix. Missing or modified
+candidate records still fail verification; unrelated source changes after
+attestation remain forbidden.
+
 ## 7. Release record
 
 Record source commit, lockfile hash, toolchain versions, shuffle seed, native

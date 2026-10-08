@@ -353,6 +353,24 @@ def _git(root: Path, *args: str) -> str:
     return completed.stdout
 
 
+def _git_blob(root: Path, commit: str, relative: str) -> bytes:
+    """Read exact committed bytes without checkout filters or text conversion."""
+    completed = subprocess.run(
+        ["git", "-c", f"safe.directory={root.as_posix()}",
+         "cat-file", "blob", f"{commit}:{relative}"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise PromotionError(
+            f"cannot read dependency input Git blob: {relative} "
+            f"({completed.returncode})"
+        )
+    return completed.stdout
+
+
 def inspect_repository(root: Path, expected_commit: str) -> dict[str, Any]:
     if COMMIT_RE.fullmatch(expected_commit) is None:
         raise PromotionError("--source-commit must be a full lowercase Git commit id")
@@ -372,17 +390,28 @@ def inspect_repository(root: Path, expected_commit: str) -> dict[str, Any]:
         raise PromotionError(f"source tree is not clean: {preview}{suffix}")
 
     locked: dict[str, str] = {}
+    locked_bytes: dict[str, bytes] = {}
     for relative in REQUIRED_LOCKED_FILES:
         _git(root, "ls-files", "--error-unmatch", "--", relative)
         path = root / relative
         if not path.is_file():
             raise PromotionError(f"required dependency input is missing: {relative}")
-        locked[relative] = sha256_file(path)
+        actual = path.read_bytes()
+        committed_bytes = _git_blob(root, expected_commit, relative)
+        # Git's clean status permits checkout filters and CRLF conversion.
+        # Candidate and release provenance bind byte hashes, not normalized text.
+        if actual != committed_bytes:
+            raise PromotionError(
+                f"dependency input does not match exact source Git blob: {relative}; "
+                "check checkout filters and line endings"
+            )
+        locked_bytes[relative] = actual
+        locked[relative] = hashlib.sha256(actual).hexdigest()
 
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = tomllib.loads(locked_bytes["pyproject.toml"].decode("utf-8"))
     if project.get("project", {}).get("requires-python") != ">=3.12,<3.13":
         raise PromotionError("pyproject.toml must pin the supported Python 3.12 line")
-    lock_header = (root / "uv.lock").read_text(encoding="utf-8").splitlines()[:8]
+    lock_header = locked_bytes["uv.lock"].decode("utf-8").splitlines()[:8]
     if 'requires-python = "==3.12.*"' not in lock_header:
         raise PromotionError("uv.lock must pin requires-python to ==3.12.*")
 
