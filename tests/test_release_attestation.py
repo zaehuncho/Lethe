@@ -1534,3 +1534,232 @@ def test_release_verifier_rejects_revoked_evidence_provider(tmp_path: Path) -> N
         release_attestation.verify_release_bundle(
             output / "lethe_stub_x64.dll", trust_store_path=trust,
             evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+
+# Capture the real helpers while the module imports, before the autouse release
+# fixture replaces them. These tests stop at mocked host/build/process boundaries;
+# synthetic archive/stub bytes are never compiled, loaded, signed, or executed.
+_REAL_RELEASE_REBUILD = release_stub._rebuild_candidate_stub
+_REAL_RELEASE_REPLAY = release_stub._replay_rebuilt_candidate
+_REAL_PORTABLE_REPLAY_RECORD = release_stub._portable_replay_record
+
+
+@pytest.fixture
+def _release_rebuild_setup_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import io
+    import subprocess
+    import tarfile
+
+    archive = io.BytesIO()
+    content = b"# synthetic archive fixture; never configured\n"
+    with tarfile.open(fileobj=archive, mode="w") as stream:
+        member = tarfile.TarInfo("stub/CMakeLists.txt")
+        member.size = len(content)
+        stream.addfile(member, io.BytesIO(content))
+    calls = {"archive": [], "host": [], "build": []}
+    host = {
+        "python": str(tmp_path / "fixture-python.exe"),
+        "python_version": "3.12.10", "uv_version": "0.11.29",
+        "cmake": "fixture-cmake", "cmake_version": "4.4.0",
+        "ctest": "fixture-ctest", "ctest_version": "4.4.0",
+        "powershell": "fixture-powershell",
+    }
+    toolchain = {
+        "cmake_generator": "Visual Studio 17 2022", "cmake_platform": "x64",
+        "compiler_id": "MSVC", "compiler_version": "19.44.35228.0",
+        "compile_policy": "/W4 /WX /Brepro", "link_policy": "/Brepro /INCREMENTAL:NO",
+    }
+    provenance = {
+        "dvm_shuffle_seed": "01" * 32,
+        "dvm_opcode_mapping_sha256": "1" * 64,
+        "dvm_handler_variant_sha256": "2" * 64,
+        "dvm_python_map_sha256": "3" * 64,
+        "dvm_native_map_sha256": "4" * 64,
+        "dvm_rolling": True, "dvm_roll_poison": False, "dvm_paged_runtime": True,
+    }
+    candidate = {
+        "source_commit": SOURCE_COMMIT,
+        **{key: host[key] for key in ("python_version", "uv_version", "cmake_version", "ctest_version")},
+        **{key: toolchain[key] for key in ("cmake_generator", "cmake_platform", "compiler_id", "compiler_version")},
+        "warning_policy": toolchain["compile_policy"],
+        "reproducible_link": toolchain["link_policy"], **provenance,
+    }
+    stub = tmp_path / "candidate.dll"
+    stub_bytes = b"synthetic stub bytes; not a PE and never executed"
+    stub.write_bytes(stub_bytes)
+
+    def archived_git(argv, **kwargs):
+        calls["archive"].append([str(item) for item in argv])
+        assert argv[-3:] == ["archive", "--format=tar", SOURCE_COMMIT]
+        assert kwargs["cwd"] == release_stub.ROOT
+        return subprocess.CompletedProcess(argv, 0, archive.getvalue(), b"")
+
+    def inspected_host(root):
+        calls["host"].append(root)
+        return dict(host)
+
+    def fixture_build(argv, *, cwd, label):
+        calls["build"].append((list(argv), cwd, label))
+        assert (cwd / "stub/CMakeLists.txt").read_bytes() == content
+        if label == "build":
+            output = Path(argv[2]) / "Release" / promote_stub.PREBUILT.name
+            output.parent.mkdir(parents=True)
+            output.write_bytes(stub_bytes)
+
+    monkeypatch.setattr(release_stub.subprocess, "run", archived_git)
+    monkeypatch.setattr(promote_stub, "inspect_host", inspected_host)
+    monkeypatch.setattr(promote_stub, "inspect_cmake_toolchain", lambda _build: dict(toolchain))
+    monkeypatch.setattr(promote_stub, "inspect_generated_dvm_provenance", lambda _build, _seed: dict(provenance))
+    monkeypatch.setattr(release_stub, "_run_build", fixture_build)
+    return candidate, stub, calls
+
+
+def test_real_release_rebuild_creates_fresh_root_before_archive(
+    tmp_path: Path, _release_rebuild_setup_fixture,
+) -> None:
+    candidate, stub, calls = _release_rebuild_setup_fixture
+    root = tmp_path / "fresh-rebuild"
+    assert not root.exists()
+    result = _REAL_RELEASE_REBUILD(candidate, root, stub)
+    assert result == stub.read_bytes()
+    assert (root / "source/stub/CMakeLists.txt").is_file()
+    assert (root / "build/Release" / promote_stub.PREBUILT.name).read_bytes() == result
+    assert len(calls["archive"]) == len(calls["host"]) == 1
+    assert [item[2] for item in calls["build"]] == ["configure", "build"]
+
+
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_real_release_rebuild_rejects_existing_root_without_mutation(
+    tmp_path: Path, _release_rebuild_setup_fixture, kind: str,
+) -> None:
+    candidate, stub, calls = _release_rebuild_setup_fixture
+    root = tmp_path / "existing-rebuild"
+    if kind == "directory":
+        root.mkdir()
+        marker = root / "keep.txt"
+    else:
+        marker = root
+    marker.write_bytes(b"retained existing bytes")
+    with pytest.raises(release_stub.ReleaseError, match="release rebuild setup failed"):
+        _REAL_RELEASE_REBUILD(candidate, root, stub)
+    assert marker.read_bytes() == b"retained existing bytes"
+    if kind == "directory":
+        assert sorted(path.name for path in root.iterdir()) == ["keep.txt"]
+    assert calls == {"archive": [], "host": [], "build": []}
+
+
+@pytest.mark.parametrize("failure", [PermissionError, FileNotFoundError])
+def test_real_release_rebuild_root_io_failure_is_structured_before_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _release_rebuild_setup_fixture, failure,
+) -> None:
+    candidate, stub, calls = _release_rebuild_setup_fixture
+    root = tmp_path / "failed-rebuild"
+    original = Path.mkdir
+
+    def fail_root(path, *args, **kwargs):
+        if path == root:
+            raise failure("synthetic root setup failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_root)
+    with pytest.raises(release_stub.ReleaseError, match="release rebuild setup failed") as caught:
+        _REAL_RELEASE_REBUILD(candidate, root, stub)
+    assert isinstance(caught.value.__cause__, failure)
+    assert not root.exists()
+    assert calls == {"archive": [], "host": [], "build": []}
+
+
+def test_real_release_rebuild_archive_directory_io_failure_stops_before_configure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _release_rebuild_setup_fixture,
+) -> None:
+    candidate, stub, calls = _release_rebuild_setup_fixture
+    root = tmp_path / "archive-io-failure"
+    original = Path.mkdir
+
+    def fail_source(path, *args, **kwargs):
+        if path == root / "source":
+            raise PermissionError("synthetic source setup failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_source)
+    with pytest.raises(release_stub.ReleaseError, match="release rebuild setup failed") as caught:
+        _REAL_RELEASE_REBUILD(candidate, root, stub)
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert root.is_dir() and list(root.iterdir()) == []
+    assert len(calls["archive"]) == 1
+    assert calls["host"] == calls["build"] == []
+
+
+def test_real_release_rebuild_git_archive_failure_stops_before_configure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _release_rebuild_setup_fixture,
+) -> None:
+    import subprocess
+
+    candidate, stub, calls = _release_rebuild_setup_fixture
+    root = tmp_path / "archive-command-failure"
+    monkeypatch.setattr(release_stub.subprocess, "run", lambda argv, **_kwargs:
+                        subprocess.CompletedProcess(argv, 1, b"", b"synthetic git failure"))
+    with pytest.raises(release_stub.ReleaseError, match="cannot archive candidate source"):
+        _REAL_RELEASE_REBUILD(candidate, root, stub)
+    assert root.is_dir() and list(root.iterdir()) == []
+    assert calls["host"] == calls["build"] == []
+
+
+def test_real_release_replay_uses_isolated_shared_argv_and_portable_basetemp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stop after validating the synthetic runtime record, before fixture builds.
+    # No CTest, compiler, pytest child, packed binary, or product is launched.
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "profile"))
+    host = {"ctest": "fixture-ctest", "python": "fixture-python", "powershell": "fixture-powershell"}
+    monkeypatch.setattr(promote_stub, "inspect_host", lambda _root: dict(host))
+    stub = tmp_path / "candidate.dll"
+    stub.write_bytes(b"synthetic replay artifact")
+    candidate = {"source_commit": SOURCE_COMMIT, "ctest": {"total": 1}}
+    actual = []
+    portable = []
+
+    class RuntimeValidated(Exception):
+        pass
+
+    def fake_run(argv, **kwargs):
+        name = kwargs["name"]
+        if name == "roundtrip-fixture-build":
+            raise RuntimeValidated
+        if name == "ctest-inventory":
+            stdout = '{"tests":[{"name":"fixture"}]}'
+        elif name == "candidate-bound-native-runtime-hardening":
+            actual.append((list(argv), kwargs["env_overrides"]))
+            stdout = f"{promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT} passed in 0.01s\n"
+        else:
+            assert name == "ctest"
+            stdout = "1 test passed\n"
+        return promote_stub.CommandRecord(
+            name=name, argv=[str(item) for item in argv], exit_code=0, stdout=stdout, stderr="",
+            source_commit=kwargs["source_commit"], artifact_sha256=kwargs["artifact_sha256"])
+
+    def portable_record(record, portable_argv):
+        if record.name == "candidate-bound-native-runtime-hardening":
+            portable.append(list(portable_argv))
+        return _REAL_PORTABLE_REPLAY_RECORD(record, portable_argv)
+
+    monkeypatch.setattr(promote_stub, "_run", fake_run)
+    monkeypatch.setattr(release_stub, "_portable_replay_record", portable_record)
+    roots = [tmp_path / "rebuild-one", tmp_path / "rebuild-two"]
+    for root in roots:
+        with pytest.raises(RuntimeValidated):
+            _REAL_RELEASE_REPLAY(candidate, root, stub)
+    assert len(actual) == len(portable) == 2
+    for root, (argv, environment), portable_argv in zip(roots, actual, portable):
+        expected = promote_stub._runtime_hardening_argv(host, root)
+        basetemp = promote_stub._runtime_hardening_basetemp(root)
+        assert argv == expected
+        assert argv[6] == "--basetemp=" + str(basetemp)
+        assert argv[7:] == list(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+        assert portable_argv == ["tool://python", *expected[1:6],
+                                 "--basetemp=external://" + basetemp.name, *expected[7:]]
+        assert environment == {"PYTHONPATH": str(root / "source"),
+                               **promote_stub._runtime_hardening_environment(stub)}
+        assert basetemp.parent.is_dir()
+    assert actual[0][0][6] != actual[1][0][6]
+    assert portable[0][6] != portable[1][6]
+    assert stub.read_bytes() == b"synthetic replay artifact"

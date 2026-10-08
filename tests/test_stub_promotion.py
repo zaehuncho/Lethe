@@ -326,6 +326,7 @@ def test_native_runtime_environment_enables_export_proof_for_exact_stub(tmp_path
 def test_release_replay_uses_required_export_nodes_and_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "profile"))
     stub = tmp_path / "candidate.dll"
     stub.write_bytes(b"fixture-stub")
     monkeypatch.setattr(promote_stub, "inspect_host", lambda _root: {
@@ -355,7 +356,11 @@ def test_release_replay_uses_required_export_nodes_and_environment(
         release_stub._replay_rebuilt_candidate(
             {"source_commit": "a" * 40, "ctest": {"total": 1}}, tmp_path, stub,
         )
-    assert captured["argv"][6:] == list(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+    assert captured["argv"] == promote_stub._runtime_hardening_argv(
+        {"python": "python"}, tmp_path)
+    assert captured["argv"][6] == (
+        "--basetemp=" + str(promote_stub._runtime_hardening_basetemp(tmp_path)))
+    assert captured["argv"][7:] == list(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
     assert captured["environment"] == {
         "PYTHONPATH": str(tmp_path / "source"),
         **promote_stub._runtime_hardening_environment(stub),

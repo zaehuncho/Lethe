@@ -154,7 +154,13 @@ def _rebuild_candidate_stub(
 ) -> bytes:
     source = rebuild_root / "source"
     build = rebuild_root / "build"
-    _archive_source(candidate["source_commit"], source)
+    try:
+        # The caller supplies a fresh child of its private snapshot directory.
+        # Reject reuse rather than mixing stale source/build files into provenance.
+        rebuild_root.mkdir()
+        _archive_source(candidate["source_commit"], source)
+    except OSError as exc:
+        raise ReleaseError(f"release rebuild setup failed: {exc}") from exc
     try:
         host = promote_stub.inspect_host(ROOT)
     except promote_stub.PromotionError as exc:
@@ -282,12 +288,14 @@ def _replay_rebuilt_candidate(
         "PYTHONPATH": str(source),
         **promote_stub._runtime_hardening_environment(rebuilt_stub),
     }
+    runtime_basetemp = promote_stub._runtime_hardening_basetemp(rebuild_root)
+    runtime_basetemp.parent.mkdir(parents=True, exist_ok=True)
     runtime = run(
-        [host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS],
+        promote_stub._runtime_hardening_argv(host, rebuild_root),
         name="candidate-bound-native-runtime-hardening",
         portable_argv=["tool://python", "-m", "pytest", "-q", "-p",
                        "no:cacheprovider",
+                       "--basetemp=external://" + runtime_basetemp.name,
                        *promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS],
         env_overrides=test_environment,
     )
