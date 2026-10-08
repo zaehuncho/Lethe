@@ -47,7 +47,7 @@ The new flat directory contains canonical `prepared.json` plus one
 `<lowercase-sha256>.bin` file per distinct retained byte sequence. Equal
 content used by multiple purposes shares a file and is captured only once
 during reload. The descriptor uses its own schema version 1 and kind
-`lethe-prepared-evidence-bundle`; this does not modify the v1 release schemas
+`lethe-prepared-evidence-bundle`; this does not modify the production release protocol
 or v2 challenge/receipt schemas.
 
 The exact descriptor fields are `schema`, `kind`, `release_authorized`,

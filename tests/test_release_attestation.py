@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_COMMIT = "a" * 40
 RELEASE_COMMIT = "b" * 40
 REAL_VALIDATE_CANDIDATE_GIT = release_stub._validate_candidate_git_provenance
+ISSUED_AT_UTC = "2026-09-01T12:01:00Z"
 
 
 @pytest.fixture(autouse=True)
 def _release_source_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        release_attestation, "_utc_now",
+        lambda: datetime(2026, 9, 1, 12, 1, tzinfo=timezone.utc), raising=False)
     monkeypatch.setattr(
         release_stub, "_inspect_release_source", lambda _candidate: RELEASE_COMMIT)
     monkeypatch.setattr(
@@ -281,6 +286,39 @@ def _vm_cells(root: Path, subject_id: str) -> list[dict]:
     return cells
 
 
+def _scanner_receipt(scanner: dict, subject: dict, output_sha256: str) -> dict:
+    receipt = {
+        **scanner, "schema": 1, "kind": "lethe-scanner-receipt",
+        "subject_id": subject["subject_id"],
+        "subject_sha256_before": subject["subject_sha256"],
+        "subject_sha256_after": subject["subject_sha256"],
+        "subject_size_bytes_before": subject["subject_size_bytes"],
+        "subject_size_bytes_after": subject["subject_size_bytes"],
+        "source_commit": subject["source_commit"],
+        "candidate_manifest_sha256": subject["candidate_manifest_sha256"],
+        "protected_with_stub_sha256": subject["protected_with_stub_sha256"],
+        "scan_started_at_utc": "2026-09-01T11:59:00Z",
+        "scan_completed_at_utc": "2026-09-01T12:00:00Z",
+        "collected_at_utc": "2026-09-01T12:00:30Z",
+        "definitions_updated_at_utc": "2026-09-01T11:00:00Z",
+        "status": "completed", "verdict": "clean", "detections": 0,
+        "exit_code": 0, "output_sha256": output_sha256,
+    }
+    if scanner["scanner_id"] == "microsoft-defender":
+        state = {
+            "AMServiceEnabled": True, "AntivirusEnabled": True,
+            "RealTimeProtectionEnabled": True,
+            "AMEngineVersion": scanner["engine_version"],
+            "AntivirusSignatureVersion": scanner["definitions_version"],
+            "AntivirusSignatureLastUpdated": receipt["definitions_updated_at_utc"],
+        }
+        receipt["defender_before"] = {
+            **state, "observed_at_utc": "2026-09-01T11:58:50Z"}
+        receipt["defender_after"] = {
+            **state, "observed_at_utc": "2026-09-01T12:00:10Z"}
+    return receipt
+
+
 def _external(
     tmp_path: Path,
     stub: Path,
@@ -346,9 +384,11 @@ def _external(
         })
     scanners = [
         {"scanner_id": "microsoft-defender", "tool_name": "Microsoft Defender",
-         "tool_version": "4.18.26070.2004", "definitions_version": "1.437.42.0"},
+         "tool_version": "4.18.26070.2004", "engine_version": "1.1.26070.3",
+         "definitions_version": "1.437.42.0"},
         {"scanner_id": "independent-engine", "tool_name": "Independent Scanner",
-         "tool_version": "3.2.1", "definitions_version": "2026.09.01"},
+         "tool_version": "3.2.1", "engine_version": "3.2.1-engine",
+         "definitions_version": "2026.09.01"},
     ]
     common = {
         "schema": 1, "status": "passed", "source_commit": SOURCE_COMMIT,
@@ -366,7 +406,7 @@ def _external(
                 json.dumps({"status": "clean", "detections": 0}))
             receipt_path, receipt_hash = _backing(
                 root, f"scanner/{item['subject_id']}/{scanner_id}.receipt.json",
-                json.dumps({"scanner_id": scanner_id, "verified": True}))
+                json.dumps(_scanner_receipt(scanner, item, output_hash)))
             scans.append({
                 "scanner_id": scanner_id,
                 "status": "passed",
@@ -409,7 +449,7 @@ def _external(
                          for item in registry],
         },
         "scanner": {
-            **common, "scanners": scanners,
+            **common, "schema": 2, "scanners": scanners,
             "subjects": scanner_subjects,
         },
         "clean-vm": {
@@ -479,11 +519,11 @@ def _external(
     return external
 
 
-def _release(tmp_path: Path):
+def _release_arguments(tmp_path: Path, *, provider_key=None):
     stub, manifest, _candidate_payload = _candidate(tmp_path)
     matrix_path = tmp_path / "release-matrix.json"
     matrix = _green_matrix(matrix_path)
-    external = _external(tmp_path, stub, manifest, matrix)
+    external = _external(tmp_path, stub, manifest, matrix, provider_key=provider_key)
     key = Ed25519PrivateKey.generate()
     trust = _trust(tmp_path, key)
     private = tmp_path / "release-key.pem"
@@ -492,7 +532,7 @@ def _release(tmp_path: Path):
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ))
-    output = release_stub.create_release_bundle(
+    arguments = dict(
         candidate_dir=stub.parent,
         external_evidence_manifest=external,
         private_key_path=private,
@@ -501,6 +541,15 @@ def _release(tmp_path: Path):
         evidence_trust_store_path=_evidence_trust(external),
         release_matrix_path=matrix_path,
     )
+    return arguments, key
+
+
+def _release(tmp_path: Path, *, provider_key=None):
+    arguments, key = _release_arguments(tmp_path, provider_key=provider_key)
+    output = release_stub.create_release_bundle(**arguments)
+    trust = arguments["trust_store_path"]
+    matrix_path = arguments["release_matrix_path"]
+    external = arguments["external_evidence_manifest"]
     return output, trust, matrix_path, key, _evidence_trust(external)
 
 
@@ -516,6 +565,112 @@ def _evidence_trust(external: Path) -> Path:
     return external.parent.parent / "evidence-trust.json"
 
 
+def _rewrite_signed_scanner(external: Path, provider_key, evidence_trust: Path, mutation: str):
+    manifest = json.loads(external.read_text(encoding="utf-8"))
+    record = next(item for item in manifest["records"] if item["kind"] == "scanner")
+    document_path = external.parent / record["path"]
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    scan = next(item for item in document["subjects"][0]["scans"]
+                if item["scanner_id"] == "microsoft-defender")
+    receipt_path = external.parent / scan["receipt_path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if mutation == "malformed-receipt":
+        receipt = {"verified": True}
+    elif mutation == "disabled-defender":
+        receipt["defender_before"]["AMServiceEnabled"] = False
+        receipt["defender_after"]["AMServiceEnabled"] = False
+    elif mutation in {"stale-definitions", "future-definitions"}:
+        timestamp = ("2026-08-01T11:00:00Z" if mutation == "stale-definitions"
+                     else "2026-09-02T11:00:00Z")
+        receipt["definitions_updated_at_utc"] = timestamp
+        for field in ("defender_before", "defender_after"):
+            receipt[field]["AntivirusSignatureLastUpdated"] = timestamp
+    elif mutation == "wrong-subject-binding":
+        receipt["subject_sha256_after"] = "f" * 64
+    elif mutation == "wrong-subject-size":
+        receipt["subject_size_bytes_after"] += 1
+    elif mutation == "engine-drift":
+        receipt["defender_after"]["AMEngineVersion"] = "different-engine"
+    elif mutation == "empty-raw-output":
+        output = external.parent / scan["output_path"]
+        output.write_bytes(b"")
+        scan["output_sha256"] = release_attestation.sha256_file(output)
+        receipt["output_sha256"] = scan["output_sha256"]
+    elif mutation == "legacy-scanner-schema":
+        document["schema"] = 1
+    elif mutation == "malformed-json":
+        pass
+    else:
+        raise AssertionError(mutation)
+    if mutation == "malformed-json":
+        receipt_path.write_bytes(b"{not-json")
+    else:
+        _json(receipt_path, receipt)
+    scan["receipt_sha256"] = release_attestation.sha256_file(receipt_path)
+    _json(document_path, document)
+    record["sha256"] = release_attestation.sha256_file(document_path)
+    raw = provider_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    signed = release_attestation.provider_signature_payload(
+        key_id=release_attestation.public_key_id(raw), evidence_kind="scanner", document=document)
+    signature_path = external.parent / record["provider_signature_path"]
+    _json(signature_path, {
+        "schema": 1, "payload": signed,
+        "signature_base64": base64.b64encode(provider_key.sign(
+            release_attestation.canonical_json_bytes(signed))).decode("ascii"),
+    })
+    record["provider_signature_sha256"] = release_attestation.sha256_file(signature_path)
+    _json(external, manifest)
+    # The semantic rejection below must not merely be a stale signature/hash.
+    verified = release_attestation.verify_provider_signature(
+        record, document, evidence_root=external.parent,
+        trust_policy=release_attestation.load_evidence_trust_store(evidence_trust))
+    assert verified == signed
+
+
+_INVALID_SCANNER_MUTATIONS = [
+    "malformed-receipt", "malformed-json", "disabled-defender",
+    "stale-definitions", "future-definitions",
+    "wrong-subject-binding", "wrong-subject-size", "engine-drift", "empty-raw-output",
+    "legacy-scanner-schema",
+]
+
+
+@pytest.mark.parametrize("mutation", _INVALID_SCANNER_MUTATIONS)
+def test_release_creation_rejects_freshly_resigned_invalid_scanner_receipt(tmp_path, mutation):
+    provider_key = Ed25519PrivateKey.generate()
+    arguments, _key = _release_arguments(tmp_path, provider_key=provider_key)
+    _rewrite_signed_scanner(
+        arguments["external_evidence_manifest"], provider_key,
+        arguments["evidence_trust_store_path"], mutation)
+    with pytest.raises(release_stub.ReleaseError, match="scanner|Defender") as failure:
+        release_stub.create_release_bundle(**arguments)
+    assert "signature" not in str(failure.value).lower()
+    assert not arguments["output_dir"].exists()
+
+
+@pytest.mark.parametrize("mutation", _INVALID_SCANNER_MUTATIONS)
+def test_release_verification_rejects_freshly_resigned_invalid_scanner_receipt(tmp_path, mutation):
+    provider_key = Ed25519PrivateKey.generate()
+    output, trust, matrix, key, evidence_trust = _release(tmp_path, provider_key=provider_key)
+    external = output / "release-evidence/external-manifest.json"
+    _rewrite_signed_scanner(external, provider_key, evidence_trust, mutation)
+    attestation = output / "lethe_stub_x64.release.json"
+    envelope = json.loads(attestation.read_text(encoding="utf-8"))
+    for record in envelope["payload"]["evidence"]:
+        if record["kind"] in {"scanner", "external-manifest"}:
+            record["sha256"] = release_attestation.sha256_file(output / record["path"])
+    signature = key.sign(release_attestation.canonical_json_bytes(envelope["payload"]))
+    envelope["signature_base64"] = base64.b64encode(signature).decode("ascii")
+    _json(attestation, envelope)
+    key.public_key().verify(signature, release_attestation.canonical_json_bytes(envelope["payload"]))
+    with pytest.raises(release_attestation.ReleaseAttestationError, match="scanner|Defender") as failure:
+        release_attestation.verify_release_bundle(
+            output / "lethe_stub_x64.dll", trust_store_path=trust,
+            evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+    assert "signature" not in str(failure.value).lower()
+
+
 def test_signed_release_accepts_different_green_release_matrix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -524,6 +679,8 @@ def test_signed_release_accepts_different_green_release_matrix(
     payload = release_attestation.verify_release_bundle(
         stub, trust_store_path=trust, evidence_trust_store_path=evidence_trust,
         matrix_path=matrix)
+    assert payload["schema"] == 2
+    assert payload["issued_at_utc"] == ISSUED_AT_UTC
     assert payload["production_ready"] is True
     assert payload["candidate"]["candidate_matrix_sha256"] != payload["release_matrix_sha256"]
     assert payload["candidate"]["dvm_rolling"] is True
@@ -540,6 +697,73 @@ def test_signed_release_accepts_different_green_release_matrix(
         release_attestation, "DEFAULT_EVIDENCE_TRUST_STORE", evidence_trust)
     monkeypatch.setattr(release_attestation, "DEFAULT_MATRIX", matrix)
     assemble._validate_release_stub_manifest(str(stub), stub.read_bytes())
+
+
+@pytest.mark.parametrize("mutation", [
+    "legacy-payload", "missing-issuance", "future-issuance", "noncanonical-issuance",
+])
+def test_resigned_release_requires_canonical_nonfuture_issuance(tmp_path, mutation):
+    output, trust, matrix, key, evidence_trust = _release(tmp_path)
+    attestation = output / "lethe_stub_x64.release.json"
+    envelope = json.loads(attestation.read_text(encoding="utf-8"))
+    if mutation == "legacy-payload":
+        envelope["payload"]["schema"] = 1
+    elif mutation == "missing-issuance":
+        envelope["payload"].pop("issued_at_utc")
+    elif mutation == "future-issuance":
+        envelope["payload"]["issued_at_utc"] = "2026-10-01T12:01:00Z"
+    else:
+        envelope["payload"]["issued_at_utc"] = "2026-09-01T12:01:00+00:00"
+    payload_bytes = release_attestation.canonical_json_bytes(envelope["payload"])
+    signature = key.sign(payload_bytes)
+    envelope["signature_base64"] = base64.b64encode(signature).decode("ascii")
+    _json(attestation, envelope)
+    key.public_key().verify(signature, payload_bytes)
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError, match="payload|issu|future|timestamp",
+    ) as failure:
+        release_attestation.verify_release_bundle(
+            output / "lethe_stub_x64.dll", trust_store_path=trust,
+            evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+    assert "signature" not in str(failure.value).lower()
+
+
+def test_signed_release_scanner_freshness_is_as_of_issuance_not_current_time(tmp_path, monkeypatch):
+    output, trust, matrix, _key, evidence_trust = _release(tmp_path)
+    monkeypatch.setattr(
+        release_attestation, "_utc_now",
+        lambda: datetime(2027, 3, 1, 12, 1, tzinfo=timezone.utc))
+    payload = release_attestation.verify_release_bundle(
+        output / "lethe_stub_x64.dll", trust_store_path=trust,
+        evidence_trust_store_path=evidence_trust, matrix_path=matrix)
+    assert payload["schema"] == 2
+    assert payload["issued_at_utc"] == ISSUED_AT_UTC
+
+
+def test_release_creation_rechecks_scanner_freshness_at_final_issuance(tmp_path, monkeypatch):
+    arguments, _key = _release_arguments(tmp_path)
+    clock = {"now": datetime(2026, 9, 1, 12, 1, tzinfo=timezone.utc)}
+    preliminary_passed = []
+    real_validate = release_stub._validate_external_manifest
+
+    def validate_then_advance(*args, **kwargs):
+        result = real_validate(*args, **kwargs)
+        preliminary_passed.append(clock["now"])
+        # Collection is initially fresh, but expires while constructing the
+        # signed bundle. Final verification must reject before publication.
+        clock["now"] = datetime(2026, 9, 3, 12, 1, tzinfo=timezone.utc)
+        return result
+
+    monkeypatch.setattr(release_attestation, "_utc_now", lambda: clock["now"])
+    monkeypatch.setattr(release_stub, "_validate_external_manifest", validate_then_advance)
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError,
+        match="scanner collection is outside the release issuance freshness window",
+    ):
+        release_stub.create_release_bundle(**arguments)
+    assert preliminary_passed == [datetime(2026, 9, 1, 12, 1, tzinfo=timezone.utc)]
+    assert not arguments["output_dir"].exists()
+    assert not list(tmp_path.glob(".release.*.tmp"))
 
 
 def test_unsigned_claim_wrong_key_revocation_and_tampering_fail(
@@ -1092,6 +1316,16 @@ def test_provider_signature_rejects_forged_document(tmp_path: Path) -> None:
     scanner = external.parent / "scanner.json"
     document = json.loads(scanner.read_text(encoding="utf-8"))
     document["scanners"][1]["tool_version"] = "9.9.9-forged"
+    # Keep the claimed tool identity internally consistent so this remains a
+    # provider-signature regression rather than stopping at receipt semantics.
+    for subject in document["subjects"]:
+        scan = next(row for row in subject["scans"]
+                    if row["scanner_id"] == "independent-engine")
+        receipt_path = external.parent / scan["receipt_path"]
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["tool_version"] = "9.9.9-forged"
+        _json(receipt_path, receipt)
+        scan["receipt_sha256"] = release_attestation.sha256_file(receipt_path)
     _json(scanner, document)
     _refresh_external_record(external, "scanner")
 

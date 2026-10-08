@@ -139,7 +139,16 @@ named evidence is not a valid release action.
 Candidate and production release identity are separate. The candidate manifest
 hashes a frozen candidate matrix and promotion evidence. A detached Ed25519
 attestation later binds that candidate, the current green release matrix, the
-release-source commit, and every external evidence record. The verifier trusts
+release-source commit, and every external evidence record. Its schema-2 signed
+payload includes `issued_at_utc`; the outer envelope remains schema 1. Scanner
+documents use schema 2 and typed, provider-bound per-run receipts use schema 1.
+The verifier rejects legacy release payloads/scanner documents and issuance
+more than five minutes in the future. It replays scanner freshness at the signed
+issuance, not the current date, so an otherwise valid installed release does
+not age-expire. The producer repeats receipt validation with the final signed
+issuance immediately before publication. See the
+[scanner receipt policy](RELEASE_CHECKLIST.md) for the definitions, observation,
+and collection windows. The verifier trusts
 only active public keys pinned in `packer/release_trust.json` and re-evaluates
 the all-scope gate with the bundled native evidence. Scanner, clean-VM, and
 application documents also require detached Ed25519 provider attestations from

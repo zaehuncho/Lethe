@@ -7,12 +7,14 @@ import json
 import os
 import re
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from . import scanner_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,8 @@ DEFAULT_EVIDENCE_TRUST_STORE = Path(__file__).with_name("evidence_trust.json")
 DEFAULT_MATRIX = ROOT / "docs" / "production_compatibility.json"
 ATTESTATION_KIND = "lethe-production-release"
 EVIDENCE_ATTESTATION_KIND = "lethe-external-evidence"
+RELEASE_PAYLOAD_SCHEMA = 2
+SCANNER_DOCUMENT_SCHEMA = 2
 KEY_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -59,7 +63,7 @@ AUTHENTICODE_RECEIPT_FIELDS = frozenset({
     "timestamp_thumbprint", "timestamp_subject", "timestamp_not_after_utc",
 })
 SCANNER_FIELDS = frozenset({
-    "scanner_id", "tool_name", "tool_version", "definitions_version",
+    "scanner_id", "tool_name", "tool_version", "engine_version", "definitions_version",
 })
 SCAN_RESULT_FIELDS = frozenset({
     "scanner_id", "status", "detections", "scan_time_utc", "output_sha256",
@@ -84,6 +88,25 @@ REQUIRED_VM_CELLS = {
 
 class ReleaseAttestationError(ValueError):
     """A production-release signature or binding is invalid."""
+
+
+def _utc_now() -> datetime:
+    """Injectable clock; evidence freshness is replayed at signed issuance."""
+    return datetime.now(timezone.utc)
+
+
+def _issuance_timestamp() -> str:
+    return _utc_now().astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z")
+
+
+def _validate_release_issuance(value: Any) -> None:
+    try:
+        issued = scanner_evidence.parse_utc(value, "release issuance")
+    except scanner_evidence.ScannerEvidenceError as exc:
+        raise ReleaseAttestationError(str(exc)) from exc
+    if issued > _utc_now() + timedelta(minutes=5):
+        raise ReleaseAttestationError("release issuance is materially in the future")
 
 
 def canonical_json_bytes(payload: Any) -> bytes:
@@ -556,6 +579,7 @@ def _validate_semantic_evidence(
     candidate_manifest_sha256: str,
     gate: dict[str, Any],
     evidence_path: Path,
+    issued_at_utc: str | None = None,
 ) -> None:
     kind = record["kind"]
     if kind == "external-manifest":
@@ -619,7 +643,8 @@ def _validate_semantic_evidence(
         if seen_replays != REQUIRED_RELEASE_REPLAY_IDS:
             raise ReleaseAttestationError("release rebuild replay kinds are incomplete")
         return
-    if document.get("schema") != 1:
+    expected_schema = SCANNER_DOCUMENT_SCHEMA if kind == "scanner" else 1
+    if type(document.get("schema")) is not int or document["schema"] != expected_schema:
         raise ReleaseAttestationError(f"{kind} evidence has an unsupported schema")
     if document.get("source_commit") != source_commit:
         raise ReleaseAttestationError(f"{kind} evidence names a different source commit")
@@ -708,12 +733,19 @@ def _validate_semantic_evidence(
                     raise ReleaseAttestationError(
                         f"scanner subject result[{scan_index}] is not a clean receipt")
                 by_scanner[scanner_id] = scan
-                _validate_backing_file(
-                    evidence_path.parent, scan.get("output_path"),
-                    scan.get("output_sha256"), "scanner raw output")
-                _validate_backing_file(
-                    evidence_path.parent, scan.get("receipt_path"),
-                    scan.get("receipt_sha256"), "scanner receipt")
+                # Resolve paths here; the receipt validator reads/hashes both
+                # with explicit bounds rather than hashing unbounded files first.
+                output_path = _contained_evidence_path(
+                    evidence_path.parent, scan.get("output_path"))
+                receipt_path = _contained_evidence_path(
+                    evidence_path.parent, scan.get("receipt_path"))
+                try:
+                    scanner_evidence.validate_scan_receipt(
+                        receipt_path, scanner=scanner_registry[scanner_id],
+                        scan=scan, subject=entry, raw_output_path=output_path,
+                        issued_at_utc=issued_at_utc)
+                except scanner_evidence.ScannerEvidenceError as exc:
+                    raise ReleaseAttestationError(f"scanner receipt is invalid: {exc}") from exc
             if set(by_scanner) != set(scanner_registry):
                 raise ReleaseAttestationError("scanner subject engine set differs from registry")
         elif kind == "clean-vm":
@@ -794,7 +826,8 @@ def _validate_scanner_registry(scanners: Any) -> dict[str, dict[str, Any]]:
                 or EVIDENCE_ID_RE.fullmatch(scanner_id) is None
                 or scanner_id in registry
                 or not all(isinstance(scanner.get(field), str) and scanner[field].strip()
-                           for field in ("tool_name", "tool_version", "definitions_version"))):
+                           for field in ("tool_name", "tool_version", "engine_version",
+                                         "definitions_version"))):
             raise ReleaseAttestationError(f"scanner registry[{index}] is invalid")
         registry[scanner_id] = scanner
     if "microsoft-defender" not in registry or len(registry) < 2:
@@ -1021,7 +1054,14 @@ def verify_release_bundle(
             or not isinstance(envelope.get("payload"), dict)):
         raise ReleaseAttestationError("release attestation envelope is malformed")
     payload = envelope["payload"]
-    if payload.get("schema") != 1 or payload.get("kind") != ATTESTATION_KIND:
+    payload_fields = {
+        "schema", "kind", "key_id", "production_ready", "artifact", "candidate",
+        "release_matrix_sha256", "release_source_commit", "production_gate",
+        "evidence", "issued_at_utc",
+    }
+    if (set(payload) != payload_fields or type(payload.get("schema")) is not int
+            or payload["schema"] != RELEASE_PAYLOAD_SCHEMA
+            or payload.get("kind") != ATTESTATION_KIND):
         raise ReleaseAttestationError("release attestation payload is malformed")
     key_id = payload.get("key_id")
     trusted, release_key_ids = _load_trust_store_details(trust_store_path)
@@ -1040,6 +1080,10 @@ def verify_release_bundle(
             signature, canonical_json_bytes(payload))
     except InvalidSignature as exc:
         raise ReleaseAttestationError("release attestation signature is invalid") from exc
+
+    # Authenticate the issuance time before using it as the freshness reference.
+    # There is no wall-clock age expiry for a previously valid installed release.
+    _validate_release_issuance(payload.get("issued_at_utc"))
 
     artifact = payload.get("artifact")
     if artifact != {
@@ -1121,6 +1165,7 @@ def verify_release_bundle(
             candidate_manifest_sha256=manifest_hash,
             gate=gate,
             evidence_path=evidence_path,
+            issued_at_utc=payload["issued_at_utc"],
         )
     if kinds != REQUIRED_EVIDENCE_KINDS:
         missing = REQUIRED_EVIDENCE_KINDS - kinds

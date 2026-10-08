@@ -170,8 +170,11 @@ hash, and must contain a complete non-skipped pytest pass.
 - Pack the application, then Authenticode-sign the packed output and launcher.
 - Verify signatures and timestamp chains on a clean machine.
 - Run current Windows Defender scans and launch/runtime smoke tests on a clean VM.
-- Record Defender service/antivirus state and signature version/update time before
-  scanning. A silent `MpCmdRun` process with exit code zero is not sufficient
+- Record Defender service/antivirus state, engine version, and signature
+  version/update time immediately before and after scanning. Both observations
+  must show the service and antivirus enabled with unchanged engine and
+  definitions. Record real-time protection state without requiring it for an
+  on-demand scan. A silent `MpCmdRun` process with exit code zero is not sufficient
   scanner evidence, especially when the service is disabled or definitions are
   absent. Retain the actual per-file scan result and scan-tool output; do not
   infer a clean verdict from process status alone. See Microsoft's
@@ -193,7 +196,8 @@ application, and clean-VM record must cover that exact registry with
 pack-report hash, protection-profile hash, source commit, and candidate-manifest
 hash. Scanner evidence requires current Microsoft Defender plus at least one
 independent scanner; every subject must contain that exact engine set with tool,
-version, definitions, scan time, output hash, and receipt hash. Each subject
+tool version, engine version, definitions, scan time, output hash, and receipt
+hash. Each subject
 requires at least two passing application workflows and all four clean-VM
 cells: Windows 10 22H2 with VBS off, supported Windows 11 with VBS off,
 supported Windows 11 with VBS/HVCI on, and Windows 11 with Hyper-V on. Each VM
@@ -213,6 +217,37 @@ all declared hashes. The evidence bundle must contain hash-addressed pack
 reports, protection profiles, per-engine raw scanner output and receipts,
 per-cell clean-VM result logs, and structured application workflow results and
 logs. Missing, linked, escaped, forged, or changed backing files fail release.
+
+The production scanner document uses schema **2** and each scanner-registry
+entry includes `engine_version`. Every per-run receipt uses schema **1**, kind
+`lethe-scanner-receipt`, and the exact fields validated by
+`packer/scanner_evidence.py`. Receipts bind the subject's before/after hash and
+size, source commit, candidate manifest, protecting stub, scanner/tool/engine/
+definitions identity, raw-output hash, and a completed clean zero-detection
+result. Provider authentication remains mandatory; a receipt is not trusted
+merely because it declares a clean verdict. Receipt parsing is limited to
+64 KiB of duplicate-free, finite-number JSON and raw output to 16 MiB of
+nonempty meaningful bytes. These are per-file validation limits, not a total
+input-directory snapshot size limit.
+
+Lethe's freshness policy requires canonical UTC timestamps at second precision.
+Definitions must not be future-dated and must be at most 24 hours old at scan
+completion. Defender's before observation, scan start, scan completion, after
+observation, and collection are ordered. The before-to-start,
+completion-to-after, and after-to-collection gaps are each at most five minutes;
+scan duration itself is not limited to five minutes. An independent scanner
+must collect within five minutes of completion. Collection must fall within
+24 hours before signed release issuance, with at most five minutes of forward
+clock skew. These windows are Lethe policy, not a claim about Microsoft defaults.
+
+The signed production release **payload** also uses schema **2** and includes
+`issued_at_utc`. The outer release envelope, provider envelopes, external
+manifest, and per-run scanner receipts remain schema **1**. Legacy scanner
+documents and release payloads are rejected rather than silently promoted.
+Final verification repeats all receipt checks using the signed issuance before
+publication; later installed-release verification uses that same issuance, not
+the current date, so valid historical evidence does not expire merely with age.
+Issuance more than five minutes ahead of the verifier's clock is rejected.
 
 `packer.external_evidence_phase_b` is the evidence-only v2 preparation boundary.
 It snapshots already-built candidate and EXE/DLL material once, requires an

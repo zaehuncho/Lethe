@@ -533,6 +533,9 @@ def _validate_external_manifest(
     candidate: dict[str, Any],
     evidence_trust_store_path: Path | None = None,
 ) -> tuple[dict[str, Any], list[tuple[dict[str, str], Path, dict[str, Any]]]]:
+    # Preliminary freshness at collection ingestion; final bundle verification
+    # rechecks against the later signed issuance time immediately before publish.
+    issued_at_utc = release_attestation._issuance_timestamp()
     manifest = _read_json(path, "external evidence manifest")
     stub_hash = release_attestation.sha256_file(stub)
     candidate_hash = release_attestation.sha256_file(candidate_manifest)
@@ -609,6 +612,7 @@ def _validate_external_manifest(
                 candidate_manifest_sha256=candidate_hash,
                 gate={},
                 evidence_path=evidence_path,
+                issued_at_utc=issued_at_utc,
             )
         except release_attestation.ReleaseAttestationError as exc:
             raise ReleaseError(f"external evidence {record_id} is invalid: {exc}") from exc
@@ -835,7 +839,8 @@ def _create_release_bundle_from_snapshot(
             "sha256": release_attestation.sha256_file(rebuild_path),
         })
         payload = {
-            "schema": 1,
+            "schema": release_attestation.RELEASE_PAYLOAD_SCHEMA,
+            "issued_at_utc": release_attestation._issuance_timestamp(),
             "kind": release_attestation.ATTESTATION_KIND,
             "key_id": key_id,
             "production_ready": True,
