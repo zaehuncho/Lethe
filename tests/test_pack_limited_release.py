@@ -202,7 +202,7 @@ def test_bundle_never_replaces_existing_output(monkeypatch, tmp_path):
     assert marker.read_text(encoding="ascii") == "original"
 
 
-@pytest.mark.parametrize(("rva", "size"), [(0x2000, 80), (0x2000, 0), (0, 80)])
+@pytest.mark.parametrize(("rva", "size"), [(0x2000, 0), (0, 80)])
 def test_bundle_rejects_exe_exports_before_any_packing(monkeypatch, tmp_path, rva, size):
     stub = _candidate(tmp_path)
     exe, dll = tmp_path / "product.exe", tmp_path / "product.dll"
@@ -217,13 +217,23 @@ def test_bundle_rejects_exe_exports_before_any_packing(monkeypatch, tmp_path, rv
     calls = []
     monkeypatch.setattr(limited.orchestrator, "pack_file", lambda *args: calls.append(args))
 
-    with pytest.raises(limited.LimitedReleaseError, match="EXE export directories are unsupported"):
+    with pytest.raises(limited.LimitedReleaseError, match="incomplete EXE export directory"):
         limited.build_bundle(_args(tmp_path, exe, dll))
     assert calls == []
     assert not (tmp_path / "dist").exists()
     assert not list(tmp_path.glob(".dist.stage-*"))
     assert exe.read_bytes() == b"exe-source"
     assert dll.read_bytes() == b"dll-source"
+
+
+def test_exported_exe_preflight_defers_to_export_capable_assembler(monkeypatch, tmp_path):
+    exe = tmp_path / "exports.exe"
+    exe.write_bytes(b"source")
+    monkeypatch.setattr(limited.orchestrator, "detect_is_dll", lambda _p: False)
+    monkeypatch.setattr(pe_analyze, "analyze_pe", lambda _p: SimpleNamespace(
+        export_directory_rva=0x2000, export_directory_size=80))
+    assert limited._inputs(SimpleNamespace(exe=[str(exe)], dll=[])) == [("exe", exe)]
+    assert exe.read_bytes() == b"source"
 
 
 def test_exe_export_preflight_parser_error_fails_closed(monkeypatch, tmp_path):

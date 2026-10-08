@@ -70,7 +70,8 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-frozen sixteen-node native hardening, selected-function, 128-bit memory, and XFG
+frozen twenty-two-node native hardening, selected-function, 128-bit memory, XFG,
+and post-startup EXE export
 replay, the complete nineteen-check EXE/DLL round trip, and native production
 corpus against one immutable stub SHA-256 before evaluating the `all` production
 matrix. The native replay
@@ -131,9 +132,10 @@ hash, and must contain a complete non-skipped pytest pass.
 
 ## 5. Experimental feature containment
 
-- The constrained `lethe-limited-v1` helper rejects EXEs with export directories.
-  The current EXE assembler omits the outer export directory; a structurally
-  valid container does not prove export or application compatibility. Do not
+- The constrained `lethe-limited-v1` helper admits exported EXEs only through a
+  matching export-capable assembler/runtime (`lethe_exe_export_abi=1`). A
+  structurally valid container does not prove application compatibility. Early
+  original-dependency attach callbacks into the EXE remain unsupported. Do not
   distribute exported-EXE outputs produced by earlier versions of that helper
   without separately verified export-preservation and real-host runtime evidence.
 
@@ -260,10 +262,14 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of sixteen
+The candidate-bound native runtime record must name the frozen list of twenty-two
 node IDs spanning hardening stress, selected-function virtualization E2E,
-plain and shuffled-rolling STORE128 atomic-fault checks, and XFG preflight. Its
-terminal pytest summary must report exactly sixteen passes
+plain and shuffled-rolling STORE128 atomic-fault checks, XFG preflight, and
+post-startup EXE exports (one positive plus five directory/snapshot mutations).
+The count-zero mutation may be rejected by Windows before the stub executes;
+it is not proof that the stub's own verifier ran. The optional early-attach
+characterization is excluded and does not establish support. The mandatory
+terminal pytest summary must report exactly twenty-two passes
 with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.

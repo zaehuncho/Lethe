@@ -130,7 +130,11 @@ def _parse_pe_layout(data: bytes) -> _PELayout:
     if struct.unpack_from("<H", data, optional)[0] != _PE32_PLUS:
         raise ValueError("output is not PE32+ (x64)")
     image_size = struct.unpack_from("<I", data, optional + 0x38)[0]
-    export_rva, export_size = struct.unpack_from("<II", data, optional + 0x70)
+    directory_count = struct.unpack_from("<I", data, optional + 0x6C)[0]
+    if directory_count > (opt_size - 0x70) // 8:
+        raise ValueError("data directory count exceeds optional header capacity")
+    export_rva, export_size = (struct.unpack_from("<II", data, optional + 0x70)
+                               if directory_count else (0, 0))
     if image_size == 0:
         raise ValueError("output has a zero SizeOfImage")
 
@@ -247,28 +251,25 @@ def _candidate_is_live(info: container.PackInfo, offset: int,
         return False
     if bool(info.flags & container.FLAG_DLL_PRELOAD_IAT) != layout.is_dll:
         return False
-    if layout.is_dll:
-        if (info.dll_export_rva, info.dll_export_size) != (
-                layout.export_rva, layout.export_size):
-            return False
-        if info.dll_export_rva == 0 or info.dll_export_size == 0:
-            if (info.dll_export_rva != 0 or info.dll_export_size != 0 or
-                    any(info.dll_export_sha256_128)):
-                return False
-        else:
-            if (info.dll_export_size < 40 or
-                    info.dll_export_rva + info.dll_export_size >
-                    info.original_size_of_image or
-                    not any(info.dll_export_sha256_128)):
-                return False
-            export_owner = layout.section_for_rva_range(
-                info.dll_export_rva, info.dll_export_size, raw=True)
-            if (export_owner is None or
-                    not (export_owner.characteristics & _SCN_MEM_READ)):
-                return False
-    elif (info.dll_export_rva != 0 or info.dll_export_size != 0 or
-          any(info.dll_export_sha256_128)):
+    # Both image kinds bind the outer export directory, including its absence.
+    if (info.dll_export_rva, info.dll_export_size) != (
+            layout.export_rva, layout.export_size):
         return False
+    if info.dll_export_rva == 0 or info.dll_export_size == 0:
+        if (info.dll_export_rva != 0 or info.dll_export_size != 0 or
+                any(info.dll_export_sha256_128)):
+            return False
+    else:
+        if (info.dll_export_size < 40 or
+                info.dll_export_rva + info.dll_export_size >
+                info.original_size_of_image or
+                not any(info.dll_export_sha256_128)):
+            return False
+        export_owner = layout.section_for_rva_range(
+            info.dll_export_rva, info.dll_export_size, raw=True)
+        if (export_owner is None or
+                not (export_owner.characteristics & _SCN_MEM_READ)):
+            return False
     if not (1 <= info.section_count <= _MAX_SECTIONS):
         return False
     if not (0 < info.original_size_of_image <= layout.image_size):

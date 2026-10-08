@@ -6,8 +6,8 @@ packs unmanaged AMD64 EXEs and DLLs with the stable base container while keeping
 anti-debug, memory guard, process hardening, server shards, and selected-function
 virtualization disabled.  The output is a transactional directory containing
 the packed files and a hash manifest.  Product-specific runtime testing and
-Authenticode signing still happen after packing. EXEs with export directories
-are rejected: the current EXE assembler does not preserve their export table.
+Authenticode signing still happen after packing. Exported EXEs require a
+matching export-capable stub; early dependency-to-EXE callbacks are unsupported.
 """
 from __future__ import annotations
 
@@ -111,10 +111,9 @@ def _inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
                 parsed = pe_analyze.analyze_pe(str(path))
             except (OSError, ValueError) as exc:
                 raise LimitedReleaseError(f"cannot preflight EXE {path}: {exc}") from exc
-            if parsed.export_directory_rva or parsed.export_directory_size:
+            if bool(parsed.export_directory_rva) != bool(parsed.export_directory_size):
                 raise LimitedReleaseError(
-                    f"EXE export directories are unsupported by {PROFILE_ID}: {path}; "
-                    "packing would discard loader-visible exports"
+                    f"incomplete EXE export directory geometry: {path}"
                 )
         normalized.append((kind, path))
     return normalized

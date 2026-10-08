@@ -292,6 +292,73 @@ def _validate(path, fixture: _Fixture):
     )
 
 
+def _with_exe_export_snapshot(fixture: _Fixture) -> None:
+    """Authenticate a visible snapshot in the fixture's preserved resource span."""
+    info = _info(fixture)
+    offset = _meta_file_offset(fixture)
+    key = _derive(fixture.artifacts.aes_key, fixture.artifacts.kdf_salt,
+                  container.HKDF_INFO_META)
+    compressed = AESGCM(key).decrypt(
+        info.meta_nonce,
+        bytes(fixture.data[offset:offset + info.meta_stored_size]) + info.meta_tag,
+        container.build_metadata_aad(info))
+    snapshot = bytes(range(40))
+    fixture.data[_RSRC_FILE_OFFSET:_RSRC_FILE_OFFSET + 40] = snapshot
+    fixture.artifacts.rsrc_bytes = snapshot
+    optional = 0x98
+    struct.pack_into("<I", fixture.data, optional + 0x6C, 16)
+    struct.pack_into("<II", fixture.data, optional + 0x70, 0x2000, 40)
+    struct.pack_into("<I", fixture.data, optional + 0xF0 + 4 * 40 + 8, 40)
+    _replace_info(fixture, dll_export_rva=0x2000, dll_export_size=40,
+                  dll_export_sha256_128=hashlib.sha256(snapshot).digest()[:16])
+    _reseal_metadata_compressed(fixture, compressed)
+    info = _info(fixture)
+    fixture.artifacts.metadata = dataclasses.replace(
+        fixture.artifacts.metadata,
+        meta_stored=bytes(fixture.data[offset:offset + info.meta_stored_size]),
+        meta_tag=info.meta_tag)
+
+
+def test_exe_export_snapshot_does_not_require_dll_preload(tmp_path):
+    fixture = _build_fixture()
+    _with_exe_export_snapshot(fixture)
+    assert not _info(fixture).is_dll
+    assert not _info(fixture).flags & container.FLAG_DLL_PRELOAD_IAT
+    path = tmp_path / "exports.exe"
+    path.write_bytes(fixture.data)
+    assert _validate(path, fixture).ok
+
+
+@pytest.mark.parametrize("count", [0, 17, 0xFFFFFFFF])
+def test_export_directory_count_tamper_rejected(tmp_path, count):
+    fixture = _build_fixture()
+    _with_exe_export_snapshot(fixture)
+    struct.pack_into("<I", fixture.data, 0x98 + 0x6C, count)
+    path = tmp_path / "bad-directory-count.exe"
+    path.write_bytes(fixture.data)
+    assert not report.validate_packed(str(path)).ok
+
+
+def test_exe_empty_authenticated_exports_rejects_injected_directory(tmp_path):
+    fixture = _build_fixture()
+    struct.pack_into("<I", fixture.data, 0x98 + 0x6C, 16)
+    struct.pack_into("<II", fixture.data, 0x98 + 0x70, 0x2000, 40)
+    path = tmp_path / "injected-export.exe"
+    path.write_bytes(fixture.data)
+    assert not report.validate_packed(str(path)).ok
+
+
+def test_exe_export_snapshot_byte_tamper_rejected(tmp_path):
+    fixture = _build_fixture()
+    _with_exe_export_snapshot(fixture)
+    fixture.data[_RSRC_FILE_OFFSET + 20] ^= 1
+    path = tmp_path / "tampered-export.exe"
+    path.write_bytes(fixture.data)
+    result = _validate(path, fixture)
+    assert not result.ok
+    assert "export snapshot hash" in result.reason
+
+
 def test_metadata_aad_v2_golden_vector_is_stable():
     info = container.PackInfo(
         flags=0x01020304,

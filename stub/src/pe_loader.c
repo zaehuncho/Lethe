@@ -192,7 +192,7 @@ static int pl_all_zero(const uint8_t *p, size_t n)
     return accumulator == 0;
 }
 
-static int verify_dll_export_snapshot(
+static int verify_export_snapshot(
     const uint8_t *base, uint32_t packed_image_size, const PackInfo *pi)
 {
     uint8_t actual_hash[32];
@@ -200,15 +200,36 @@ static int verify_dll_export_snapshot(
     uint32_t e_lfanew;
     uint32_t export_rva;
     uint32_t export_size;
+    uint32_t directory_count;
     uint16_t optional_size;
     size_t i;
     int rc;
 
-    if (!(pi->flags & LETHE_FLAG_DLL_PRELOAD_IAT)) {
-        return (pi->dll_export_rva == 0 && pi->dll_export_size == 0 &&
-                pl_all_zero(pi->dll_export_sha256_128,
-                            sizeof(pi->dll_export_sha256_128))) ? 0 : 1;
-    }
+    /* Bind the loader-visible PE directory to the authenticated PackInfo.
+       This comparison is required even for an authenticated absent directory.
+       The DLL-prefixed ABI fields are shared by both image types. */
+    if (packed_image_size < 0x40u)
+        return 1;
+    e_lfanew = *(const uint32_t *)(base + 0x3cu);
+    if ((uint64_t)e_lfanew + 24u + 120u > packed_image_size ||
+        *(const uint32_t *)(base + e_lfanew) != IMAGE_NT_SIGNATURE ||
+        *(const uint16_t *)(base + e_lfanew + 24u) !=
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return 1;
+    optional_size = *(const uint16_t *)(base + e_lfanew + 20u);
+    if (optional_size < 120u ||
+        (uint64_t)e_lfanew + 24u + optional_size > packed_image_size)
+        return 1;
+    directory_count = *(const uint32_t *)(base + e_lfanew + 24u + 108u);
+    if (directory_count > (uint32_t)(optional_size - 112u) / 8u)
+        return 1;
+    export_rva = directory_count ?
+        *(const uint32_t *)(base + e_lfanew + 24u + 112u) : 0u;
+    export_size = directory_count ?
+        *(const uint32_t *)(base + e_lfanew + 24u + 116u) : 0u;
+    if (export_rva != pi->dll_export_rva ||
+        export_size != pi->dll_export_size)
+        return 1;
 
     if (pi->dll_export_rva == 0 || pi->dll_export_size == 0) {
         return (pi->dll_export_rva == 0 && pi->dll_export_size == 0 &&
@@ -219,25 +240,6 @@ static int verify_dll_export_snapshot(
         (uint64_t)pi->dll_export_rva + pi->dll_export_size >
             pi->original_size_of_image ||
         (uint64_t)pi->dll_export_rva + pi->dll_export_size > packed_image_size)
-        return 1;
-
-    /* Bind the loader-visible PE directory to the authenticated PackInfo.
-       Windows has already consumed this directory for static consumers. */
-    if (packed_image_size < 0x40u)
-        return 1;
-    e_lfanew = *(const uint32_t *)(base + 0x3cu);
-    if ((uint64_t)e_lfanew + 24u + 120u > packed_image_size ||
-        *(const uint32_t *)(base + e_lfanew) != IMAGE_NT_SIGNATURE ||
-        *(const uint16_t *)(base + e_lfanew + 24u) !=
-            IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return 1;
-    optional_size = *(const uint16_t *)(base + e_lfanew + 20u);
-    if (optional_size < 120u)
-        return 1;
-    export_rva = *(const uint32_t *)(base + e_lfanew + 24u + 112u);
-    export_size = *(const uint32_t *)(base + e_lfanew + 24u + 116u);
-    if (export_rva != pi->dll_export_rva ||
-        export_size != pi->dll_export_size)
         return 1;
 
     rc = crypto_sha256(base + pi->dll_export_rva,
@@ -1569,7 +1571,7 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
     DIAG(23);
     if (rc != 0)
         goto fail;
-    if (verify_dll_export_snapshot(base, packed_image_size, cpi) != 0)
+    if (verify_export_snapshot(base, packed_image_size, cpi) != 0)
         goto fail;
     DIAG(3);
 

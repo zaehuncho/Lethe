@@ -55,6 +55,9 @@ static volatile uint32_t  s_pdata_count = 0;
  * table plus pre-decrypt IAT capture; refusing older stubs prevents silently
  * falling back to LoadLibrary while Windows holds the loader lock. */
 __declspec(dllexport) const char lethe_dll_preload_abi[] = "1";
+/* EXE export tables use the same authenticated snapshot fields as DLLs, but
+ * never acquire the DLL-specific preloaded-import lifecycle. */
+__declspec(dllexport) const char lethe_exe_export_abi[] = "1";
 
 __declspec(noinline) static int stash_oep(void *raw)
 {

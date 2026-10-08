@@ -6,11 +6,15 @@ the strict public-release gate. It creates a separate, explicit
 `lethe-limited-v1` bundle from an intact schema-2 candidate.
 
 The profile supports unmanaged AMD64 PE32+ EXEs and DLLs that pass Lethe's
-preflight. EXEs with export directories are rejected: the current EXE assembler
-does not preserve their loader-visible export table. DLL exports remain in the
+preflight. Exported EXEs require a matching export-capable stub
+(`lethe_exe_export_abi=1`); older stubs fail closed. Native tests cover named,
+ordinal-only, data and forwarded exports after startup, plus a plugin loaded
+after startup calling into the EXE during plugin attach. **Original dependencies
+calling into the EXE during early attach remain unsupported** and fail the
+separate characterization test. DLL exports remain in the
 declared DLL fixture envelope; name/ordinal parity alone is not runtime proof.
 The profile uses compression, authenticated encrypted sections, relocation,
-TLS, resource, import, DLL-export, and unwind handling from the base packer. It keeps
+TLS, resource, import, EXE/DLL-export, and unwind handling from the base packer. It keeps
 anti-debug, memory guard, process hardening, server shards, and selected-function
 virtualization disabled.
 

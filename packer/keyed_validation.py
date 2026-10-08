@@ -293,8 +293,6 @@ def validate_staged_output(
 
         export_range = None
         if info.dll_export_rva or info.dll_export_size:
-            _require(bool(info.flags & container.FLAG_DLL_PRELOAD_IAT),
-                     "export snapshot is present without the DLL preload flag")
             _require(info.dll_export_rva > 0 and info.dll_export_size >= 40,
                      "authenticated export snapshot geometry is invalid")
             export_bytes = _read_mapped_rva(

@@ -66,9 +66,10 @@ pass `rolling=False` and `paged=True`.
 The candidate-bound runtime command is mandatory during promotion and release
 replay. It runs `test_native_runtime_hardening_stress.py`,
 `test_native_virtualization_runtime.py`,
-`test_xmm_store128_native.py`, and
-`test_xfg_virtualization_preflight.py` against the exact rebuilt artifact,
-requires all sixteen cases without skips, and proves the selected EXE leaf emits
+`test_xmm_store128_native.py`, `test_xfg_virtualization_preflight.py`, and
+the six required post-startup/export-tamper nodes in `test_native_exe_exports.py`
+against the exact rebuilt artifact. It requires all twenty-two cases without
+skips, and proves the selected EXE leaf emits
 a paged-v1 program whose eager and memory-guard packed outputs match the
 original. The DLL E2E case additionally proves a source-bound schema-v3
 selection with a canonical padded suffix preserves host-visible behavior. A
@@ -76,6 +77,10 @@ separate candidate-bound EXE case virtualizes a caller while leaving its
 PDATA-proven direct callee native, then proves forced-ASLR packed parity.
 The separate EXE/DLL round-trip gate requires its complete nineteen-check
 contract and rejects reduced, duplicated, nested, or contradictory summaries.
+The optional early-dependency-attach EXE export characterization remains
+unsupported and is excluded from the required nodes. The kernel readiness
+report is inspection only, not a kernel runtime or a universal `.sys` contract;
+see [kernel-driver status](KERNEL_DRIVER_SUPPORT.md).
 The same rolling-capable candidate DLL must also preserve real MSVC XFG indirect
 call parity for the EXE fixture and nineteen DLL ABI shapes. Those DLL shapes
 include the prior seven GPR-class signatures plus one pointer-to-pointer

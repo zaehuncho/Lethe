@@ -66,7 +66,7 @@ typedef struct PackInfo {
     uint8_t  kdf_salt[16];
     uint32_t stub_text_rva;             /* region hashed for the key binding */
     uint32_t stub_text_size;
-    uint32_t dll_export_rva;            /* loader-visible export snapshot */
+    uint32_t dll_export_rva;            /* EXE/DLL loader-visible export snapshot */
     uint32_t dll_export_size;
     uint8_t  dll_export_sha256_128[16]; /* authenticated SHA-256 prefix */
 } PackInfo;                             /* 192 bytes */

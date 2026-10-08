@@ -149,7 +149,8 @@ class PackInfo:
     kdf_salt: bytes = b"\x00" * 16
     stub_text_rva: int = 0
     stub_text_size: int = 0
-    # The loader-visible export snapshot exists before DLL initialization.
+    # The loader-visible export snapshot exists before runtime initialization.
+    # The historical DLL field names also carry EXE exports (capability ABI 1).
     # Its truncated SHA-256 is authenticated by the metadata AAD and verified
     # by the stub before any protected source section is restored.
     dll_export_rva: int = 0

@@ -280,9 +280,7 @@ def _replay_rebuilt_candidate(
     )
     test_environment = {
         "PYTHONPATH": str(source),
-        "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
-        "LETHE_RUN_NATIVE_VM_E2E": "1",
-        "LETHE_NATIVE_RUNTIME_STUB_PATH": str(rebuilt_stub),
+        **promote_stub._runtime_hardening_environment(rebuilt_stub),
     }
     runtime = run(
         [host["python"], "-m", "pytest", "-q", "-p", "no:cacheprovider",

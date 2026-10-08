@@ -36,7 +36,7 @@ turn on debugger-sensitive poison behavior.
 Candidate promotion and release replay run the exact rolling-capable DLL through
 the native selected-function paged-v1 E2E gate in both eager and memory-guard
 modes and through the source-bound schema-v3 padded-DLL E2E gate. Any skip,
-output mismatch, non-paged program, or test count other than sixteen rejects the
+output mismatch, non-paged program, or test count other than twenty-two rejects the
 candidate/release replay.
 The separate EXE/DLL round-trip gate is frozen at nineteen checks and rejects
 reduced or ambiguous terminal summaries.
@@ -63,6 +63,10 @@ reduced or ambiguous terminal summaries.
   avoided. Every signed release still requires a clean-VM scan and smoke test.
 
 ## Quickstart
+
+[Driver inspection only—not packing or virtualization](docs/KERNEL_DRIVER_SUPPORT.md)
+provides a bounded, read-only report for an explicitly supplied driver artifact.
+The user-mode packer continues to reject drivers.
 
 ```powershell
 # pack a supported unmanaged x64 EXE
@@ -100,8 +104,11 @@ The constrained `lethe-limited-v1` path deliberately disables experimental
 hardening and selected-function virtualization, publishes both files only after
 structural validation, and writes exact source/output hashes. It still requires
 product-specific EXE and DLL-host runtime testing, scanning, and Authenticode
-signing before distribution. EXEs with export directories are rejected because
-the current EXE assembler does not preserve their loader-visible export table.
+signing before distribution. Exported EXEs require a matching stub with
+`lethe_exe_export_abi=1`. Named, ordinal-only, data and forwarded exports have a
+post-startup native regression gate. Callbacks into an EXE from an original
+dependency's early DLL attach remain unsupported; export parity is not proof of
+whole-application compatibility.
 See [`docs/LIMITED_RELEASE.md`](docs/LIMITED_RELEASE.md).
 
 The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packing

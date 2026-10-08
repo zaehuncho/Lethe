@@ -637,8 +637,8 @@ def _read_original_header(input_path: Optional[str], parsed) -> _OrigHeader:
     h = _OrigHeader()
     # fallbacks from parsed (if pe_analyze surfaced them)
     h.subsystem = _get(parsed, "subsystem", default=h.subsystem)
-    h.export_rva = _get(parsed, "export_rva", "exports_rva", default=0)
-    h.export_size = _get(parsed, "export_size", "exports_size", default=0)
+    h.export_rva = _get(parsed, "export_directory_rva", "export_rva", "exports_rva", default=0)
+    h.export_size = _get(parsed, "export_directory_size", "export_size", "exports_size", default=0)
 
     path = input_path or _get(parsed, "input_path", "path", default=None)
     if path and os.path.isfile(path):
@@ -670,6 +670,17 @@ def _read_original_header(input_path: Optional[str], parsed) -> _OrigHeader:
         except (OSError, struct.error):
             pass  # keep parsed/defaults
     return h
+
+
+def _require_exe_export_support(stub, orig: _OrigHeader, *, is_dll: bool) -> None:
+    """Do not emit an exported EXE for a runtime that cannot verify its table."""
+    if is_dll or not (orig.export_rva or orig.export_size):
+        return
+    capability_rva = stub.find_export_rva("lethe_exe_export_abi")
+    if capability_rva is None or stub.cstr_at_rva(capability_rva) != "1":
+        raise AssembleError(
+            "EXE export preservation requires lethe_exe_export_abi=1; "
+            "rebuild the stub from matching sources")
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +860,7 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     FA = 0x200      # FileAlignment    (output; MSVC default)
 
     orig = _read_original_header(input_path, parsed)
+    _require_exe_export_support(stub, orig, is_dll=is_dll)
 
     # -- 1. graft geometry: one constant delta for the whole stub -----------
     stub_secs = [s for s in stub.sections]
@@ -1028,7 +1040,9 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     descs: List[container.SectionDesc] = [d for (_ct, d) in protected]
     (rsrc_rva, rsrc_bytes,
      rsrc_directory_rva, rsrc_directory_size) = _extract_rsrc(parsed)
-    dll_export_snapshot = _dll_export_snapshot(parsed, orig) if is_dll else {}
+    # The historical dll_export_* ABI slots also authenticate EXE exports.
+    # DLL_PRELOAD_IAT remains exclusively a DLL import-lifecycle flag.
+    dll_export_snapshot = _dll_export_snapshot(parsed, orig)
     dll_export_rva = int(orig.export_rva) if dll_export_snapshot else 0
     dll_export_size = int(orig.export_size) if dll_export_snapshot else 0
     dll_export_hash = bytes(16)
@@ -1351,7 +1365,7 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
         delay_import_dir=(
             int(_get(parsed, "delay_import_rva", default=0)),
             int(_get(parsed, "delay_import_size", default=0))),
-        export_dir=(orig.export_rva, orig.export_size) if (is_dll and orig.export_rva) else (0, 0),
+        export_dir=(orig.export_rva, orig.export_size),
         load_config_dir=load_config_dir,
         guard_cf_enabled=cfg_plan.source_guard_cf_enabled,
         ext_dll_characteristics=ext_dll_characteristics,
@@ -1458,7 +1472,11 @@ def _extract_rsrc(parsed) -> Tuple[int, bytes, int, int]:
 
 
 def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
-    """Build the minimal file-backed export bytes Windows needs before DllMain.
+    """Build the minimal loader-visible export bytes for either EXEs or DLLs.
+
+    The helper and PackInfo fields retain their historical DLL names. For EXEs,
+    this preserves post-startup GetProcAddress and plugin callbacks; it does not
+    make original code callable before the protected runtime has initialized.
 
     A dependent image resolves a DLL's static imports *before* the dependency's
     entry point runs.  Protected sections are otherwise emitted as zero-backed
@@ -1471,6 +1489,11 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
     ordinal arrays or strings escape the declared export directory instead of
     emitting a partial table that happens to work with ``GetProcAddress`` but
     fails when the Windows loader resolves a static consumer.
+
+    Direct targets must name a restored source section, including its raw tail
+    or zero-fill/BSS extent. Zero address-table entries remain ordinal holes.
+    Header targets and alignment padding are unsupported: output headers are
+    rebuilt, and bytes outside source section extents are not restored.
     """
     export_rva = int(orig.export_rva)
     export_size = int(orig.export_size)
@@ -1480,14 +1503,25 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
         raise AssembleError(
             "DLL export directory must have a nonzero RVA and at least a "
             "40-byte IMAGE_EXPORT_DIRECTORY")
+    image_size = int(_get(parsed, "size_of_image", "sizeof_image"))
     export_end = export_rva + export_size
-    if export_end > int(_get(parsed, "size_of_image", "sizeof_image")):
+    if export_end > image_size:
         raise AssembleError("DLL export directory escapes SizeOfImage")
+
+    source_sections = list(_get(parsed, "sections", default=[]) or [])
+    mapped_ranges = []
+    for section in source_sections:
+        section_rva = int(_get(section, "rva", "virtual_address"))
+        section_span = max(
+            int(_get(section, "virtual_size", "vsize", default=0)),
+            len(_get(section, "raw", "content", "data", default=b"")))
+        if section_rva > 0 and section_span > 0 and section_rva + section_span <= image_size:
+            mapped_ranges.append((section_rva, section_rva + section_span))
 
     owner = None
     owner_raw = b""
     owner_rva = 0
-    for section in _get(parsed, "sections", default=[]) or []:
+    for section in source_sections:
         section_rva = int(_get(section, "rva", "virtual_address"))
         section_raw = bytes(_get(section, "raw", "content", "data", default=b""))
         if (section_rva <= export_rva and
@@ -1534,6 +1568,10 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
         target_rva = struct.unpack_from("<I", functions, index * 4)[0]
         if export_rva <= target_rva < export_end:
             export_cstr(target_rva, f"forwarder[{index}]")
+        elif target_rva and not any(
+                start <= target_rva < end for start, end in mapped_ranges):
+            raise AssembleError(
+                f"export direct target[{index}] does not name a mapped source section")
 
     sparse = bytearray(len(owner_raw))
     start = export_rva - owner_rva

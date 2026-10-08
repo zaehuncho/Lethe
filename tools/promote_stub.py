@@ -58,6 +58,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_virtualization_runtime.py",
     "test_xmm_store128_native.py",
     "test_xfg_virtualization_preflight.py",
+    "test_native_exe_exports.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_runtime_hardening_stress.py::"
@@ -92,6 +93,18 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_real_xfg_selected_function_pack_preserves_indirect_call_parity",
     "tests/test_xfg_virtualization_preflight.py::"
     "test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_preserves_exports_after_startup",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_rejects_visible_export_tamper[directory-count]",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_rejects_visible_export_tamper[directory-size]",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_rejects_visible_export_tamper[function-count]",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_rejects_visible_export_tamper[eat-target]",
+    "tests/test_native_exe_exports.py::"
+    "test_packed_exe_rejects_visible_export_tamper[forwarder-name]",
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
 REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT = 19
@@ -173,6 +186,16 @@ def _runtime_hardening_basetemp(stage_dir: Path) -> Path:
         str(stage_dir.resolve()).encode("utf-8")
     ).hexdigest()[:12]
     return Path.home() / ".lethe-pytest" / identity
+
+
+def _runtime_hardening_environment(stub: Path) -> dict[str, str]:
+    """Enable the same artifact-bound mandatory gates in promotion and replay."""
+    return {
+        "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+        "LETHE_RUN_NATIVE_VM_E2E": "1",
+        "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
+        "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
+    }
 
 
 def _runtime_hardening_argv(
@@ -1276,11 +1299,7 @@ def execute(args: argparse.Namespace) -> Path | None:
         name="candidate-bound-native-runtime-hardening",
         path_name="runtime-hardening.json",
         artifact_hash=artifact_hash,
-        env_overrides={
-            "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
-            "LETHE_RUN_NATIVE_VM_E2E": "1",
-            "LETHE_NATIVE_RUNTIME_STUB_PATH": str(built_stub.resolve()),
-        },
+        env_overrides=_runtime_hardening_environment(built_stub),
     )
     try:
         validate_runtime_hardening_record(

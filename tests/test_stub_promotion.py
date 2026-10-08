@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tools import promote_stub
+from tools import promote_stub, release_stub
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -217,10 +217,11 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_virtualization_runtime.py",
         "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
+        "test_native_exe_exports.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 16
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 22
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 16
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 22
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
@@ -241,6 +242,73 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "tests/test_xmm_store128_native.py::"
         "test_shuffled_rolling_store128_dispatch_and_guard_fault_are_atomic"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+
+
+def test_release_runtime_gate_mandates_exports_without_early_characterization() -> None:
+    prefix = "tests/test_native_exe_exports.py::"
+    expected = {prefix + "test_packed_exe_preserves_exports_after_startup"}
+    expected.update(
+        prefix + f"test_packed_exe_rejects_visible_export_tamper[{mutation}]"
+        for mutation in (
+            "directory-count", "directory-size", "function-count", "eat-target",
+            "forwarder-name",
+        )
+    )
+    selected = {
+        node for node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+        if node.startswith(prefix)
+    }
+    assert selected == expected
+    assert not any("early_dependency_attach" in node for node in selected)
+
+
+def test_native_runtime_environment_enables_export_proof_for_exact_stub(tmp_path: Path) -> None:
+    stub = tmp_path / "candidate.dll"
+    assert promote_stub._runtime_hardening_environment(stub) == {
+        "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
+        "LETHE_RUN_NATIVE_VM_E2E": "1",
+        "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
+        "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
+    }
+
+
+def test_release_replay_uses_required_export_nodes_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = tmp_path / "candidate.dll"
+    stub.write_bytes(b"fixture-stub")
+    monkeypatch.setattr(promote_stub, "inspect_host", lambda _root: {
+        "ctest": "ctest", "python": "python",
+    })
+    captured = {}
+
+    class RuntimeReached(Exception):
+        pass
+
+    def fake_run(argv, **kwargs):
+        if kwargs["name"] == "candidate-bound-native-runtime-hardening":
+            captured.update(argv=argv, environment=kwargs["env_overrides"])
+            raise RuntimeReached
+        stdout = (
+            '{"tests":[{"name":"fixture"}]}'
+            if kwargs["name"] == "ctest-inventory" else "1 test passed\n"
+        )
+        return promote_stub.CommandRecord(
+            name=kwargs["name"], argv=[str(item) for item in argv], exit_code=0,
+            stdout=stdout, stderr="", source_commit=kwargs["source_commit"],
+            artifact_sha256=kwargs["artifact_sha256"],
+        )
+
+    monkeypatch.setattr(promote_stub, "_run", fake_run)
+    with pytest.raises(RuntimeReached):
+        release_stub._replay_rebuilt_candidate(
+            {"source_commit": "a" * 40, "ctest": {"total": 1}}, tmp_path, stub,
+        )
+    assert captured["argv"][6:] == list(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)
+    assert captured["environment"] == {
+        "PYTHONPATH": str(tmp_path / "source"),
+        **promote_stub._runtime_hardening_environment(stub),
+    }
 
 
 def test_corpus_evidence_is_bound_to_commit_and_artifact(tmp_path: Path) -> None:
