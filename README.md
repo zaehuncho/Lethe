@@ -100,7 +100,9 @@ The constrained `lethe-limited-v1` path deliberately disables experimental
 hardening and selected-function virtualization, publishes both files only after
 structural validation, and writes exact source/output hashes. It still requires
 product-specific EXE and DLL-host runtime testing, scanning, and Authenticode
-signing before distribution. See [`docs/LIMITED_RELEASE.md`](docs/LIMITED_RELEASE.md).
+signing before distribution. EXEs with export directories are rejected because
+the current EXE assembler does not preserve their loader-visible export table.
+See [`docs/LIMITED_RELEASE.md`](docs/LIMITED_RELEASE.md).
 
 The packer ships a prebuilt stub (`stub/prebuilt/lethe_stub_x64.dll`), so packing
 itself needs **no compiler**. Ordinary native builds stay under `stub/build` and

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import pack_limited_release as limited
+from packer import pe_analyze
 
 
 def _args(tmp_path: Path, exe: Path, dll: Path):
@@ -32,6 +33,10 @@ def _candidate(tmp_path: Path) -> Path:
 
 
 def _patch_candidate(monkeypatch, stub: Path):
+    monkeypatch.setattr(
+        pe_analyze, "analyze_pe",
+        lambda _path: SimpleNamespace(export_directory_rva=0, export_directory_size=0),
+    )
     monkeypatch.setattr(
         limited.release_attestation,
         "validate_candidate_identity",
@@ -195,3 +200,40 @@ def test_bundle_never_replaces_existing_output(monkeypatch, tmp_path):
     with pytest.raises(limited.LimitedReleaseError, match="already exists"):
         limited.build_bundle(_args(tmp_path, exe, dll))
     assert marker.read_text(encoding="ascii") == "original"
+
+
+@pytest.mark.parametrize(("rva", "size"), [(0x2000, 80), (0x2000, 0), (0, 80)])
+def test_bundle_rejects_exe_exports_before_any_packing(monkeypatch, tmp_path, rva, size):
+    stub = _candidate(tmp_path)
+    exe, dll = tmp_path / "product.exe", tmp_path / "product.dll"
+    exe.write_bytes(b"exe-source")
+    dll.write_bytes(b"dll-source")
+    _patch_candidate(monkeypatch, stub)
+    monkeypatch.setattr(limited.orchestrator, "detect_is_dll", lambda p: p.endswith(".dll"))
+    monkeypatch.setattr(
+        pe_analyze, "analyze_pe",
+        lambda _path: SimpleNamespace(export_directory_rva=rva, export_directory_size=size),
+    )
+    calls = []
+    monkeypatch.setattr(limited.orchestrator, "pack_file", lambda *args: calls.append(args))
+
+    with pytest.raises(limited.LimitedReleaseError, match="EXE export directories are unsupported"):
+        limited.build_bundle(_args(tmp_path, exe, dll))
+    assert calls == []
+    assert not (tmp_path / "dist").exists()
+    assert not list(tmp_path.glob(".dist.stage-*"))
+    assert exe.read_bytes() == b"exe-source"
+    assert dll.read_bytes() == b"dll-source"
+
+
+def test_exe_export_preflight_parser_error_fails_closed(monkeypatch, tmp_path):
+    exe = tmp_path / "product.exe"
+    exe.write_bytes(b"invalid-source")
+    monkeypatch.setattr(limited.orchestrator, "detect_is_dll", lambda _p: False)
+
+    def fail(_path):
+        raise ValueError("fixture malformed directory")
+
+    monkeypatch.setattr(pe_analyze, "analyze_pe", fail)
+    with pytest.raises(limited.LimitedReleaseError, match="fixture malformed directory"):
+        limited._inputs(SimpleNamespace(exe=[str(exe)], dll=[]))

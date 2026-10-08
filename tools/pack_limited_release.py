@@ -6,7 +6,8 @@ packs unmanaged AMD64 EXEs and DLLs with the stable base container while keeping
 anti-debug, memory guard, process hardening, server shards, and selected-function
 virtualization disabled.  The output is a transactional directory containing
 the packed files and a hash manifest.  Product-specific runtime testing and
-Authenticode signing still happen after packing.
+Authenticode signing still happen after packing. EXEs with export directories
+are rejected: the current EXE assembler does not preserve their export table.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from packer import orchestrator, release_attestation, report  # noqa: E402
+from packer import orchestrator, pe_analyze, release_attestation, report  # noqa: E402
 
 
 PROFILE_ID = "lethe-limited-v1"
@@ -105,6 +106,16 @@ def _inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
             raise LimitedReleaseError(
                 f"{path} was supplied as {kind.upper()} but its PE header is {detected}"
             )
+        if kind == "exe":
+            try:
+                parsed = pe_analyze.analyze_pe(str(path))
+            except (OSError, ValueError) as exc:
+                raise LimitedReleaseError(f"cannot preflight EXE {path}: {exc}") from exc
+            if parsed.export_directory_rva or parsed.export_directory_size:
+                raise LimitedReleaseError(
+                    f"EXE export directories are unsupported by {PROFILE_ID}: {path}; "
+                    "packing would discard loader-visible exports"
+                )
         normalized.append((kind, path))
     return normalized
 

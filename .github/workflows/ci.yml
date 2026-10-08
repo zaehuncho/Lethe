@@ -22,7 +22,9 @@ jobs:
       - name: Install locked dependencies
         run: |
           python -m pip install uv==0.11.29
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv sync --frozen --group dev
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Core Python tests
         run: >-
           uv run pytest -q -p no:cacheprovider
@@ -35,11 +37,14 @@ jobs:
       - name: Validate release-candidate preflight
         shell: powershell
         run: |
-          $commit = (git rev-parse HEAD).Trim()
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $commit = $commit.Trim()
           .\.venv\Scripts\python.exe .\tools\promote_stub.py `
             --source-commit $commit `
-            --shuffle-seed 00112233445566778899aabbccddeeff `
+            --shuffle-seed 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff `
             --dry-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Unicorn-backed lifter tests
         # Unicorn uses handled Windows access violations internally. Pytest's
         # faulthandler turns those into megabytes of false-fatal diagnostics.
@@ -64,17 +69,21 @@ jobs:
       - name: Install locked dependencies
         run: |
           python -m pip install uv==0.11.29
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv sync --frozen --group dev
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native stub without modifying tracked prebuilt files
         shell: powershell
         run: >-
           .\stub\build_stub.ps1 -Clean -Config Release
-          -ShuffleSeed 00112233445566778899aabbccddeeff
+          -ShuffleSeed 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
       - name: Build shard bootstrap
         shell: powershell
         run: |
           cmake -S bootstrap -B bootstrap/build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build bootstrap/build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native fixtures
         shell: powershell
         run: .\tests\build_samples.ps1

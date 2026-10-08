@@ -131,6 +131,12 @@ hash, and must contain a complete non-skipped pytest pass.
 
 ## 5. Experimental feature containment
 
+- The constrained `lethe-limited-v1` helper rejects EXEs with export directories.
+  The current EXE assembler omits the outer export directory; a structurally
+  valid container does not prove export or application compatibility. Do not
+  distribute exported-EXE outputs produced by earlier versions of that helper
+  without separately verified export-preservation and real-host runtime evidence.
+
 - Confirm the release command does not use `--enable-experimental-dll`,
   `--enable-experimental-server-shard`, `--memory-guard`, or
   `--anti-debug on`.
@@ -162,6 +168,12 @@ hash, and must contain a complete non-skipped pytest pass.
 - Pack the application, then Authenticode-sign the packed output and launcher.
 - Verify signatures and timestamp chains on a clean machine.
 - Run current Windows Defender scans and launch/runtime smoke tests on a clean VM.
+- Record Defender service/antivirus state and signature version/update time before
+  scanning. A silent `MpCmdRun` process with exit code zero is not sufficient
+  scanner evidence, especially when the service is disabled or definitions are
+  absent. Retain the actual per-file scan result and scan-tool output; do not
+  infer a clean verdict from process status alone. See Microsoft's
+  [MpCmdRun reference](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus).
 - Canary the exact signed hashes before wider distribution.
 
 Create the production bundle only from the intact candidate directory and an
