@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import struct
 from types import SimpleNamespace
 
@@ -63,7 +64,55 @@ def test_dll_export_snapshot_preserves_only_declared_export_span() -> None:
     assert set(snapshot) == {0x2000}
     assert snapshot[0x2000][0x40:0xC0] == source[0x40:0xC0]
     assert snapshot[0x2000][:0x40] == b"\0" * 0x40
-    assert snapshot[0x2000][0xC0:] == b"\0" * 0x140
+    assert len(snapshot[0x2000]) == 0xC0
+
+
+def test_export_snapshot_omits_large_zero_tail_without_changing_geometry(tmp_path):
+    parsed, orig, original = _fixture()
+    owner, code = parsed.sections[:2]
+    owner.raw = original + b"\xA5" * (0x100000 - len(original))
+    owner.virtual_size = len(owner.raw)
+    parsed.sections = [code, owner]
+    parsed.size_of_image = owner.rva + owner.virtual_size
+    before = hashlib.sha256(owner.raw).digest()
+
+    snapshot = assemble._dll_export_snapshot(parsed, orig)[owner.rva]
+
+    # The clear placeholder needs only its prefix through the authenticated
+    # export span. The full source remains available to encrypted payload code.
+    assert len(snapshot) == 0xC0
+    assert snapshot[:0x40] == bytes(0x40)
+    assert snapshot[0x40:0xC0] == owner.raw[0x40:0xC0]
+    assert hashlib.sha256(snapshot[0x40:0xC0]).digest() == hashlib.sha256(
+        owner.raw[0x40:0xC0]).digest()
+    assert hashlib.sha256(owner.raw).digest() == before
+    assert owner.virtual_size == 0x100000
+    assert (orig.export_rva, orig.export_size) == (0x2040, 0x80)
+
+    output = tmp_path / "snapshot_geometry.exe"
+    assemble._serialize(
+        str(output), [
+            assemble._OutSection(code.name, code.rva, code.virtual_size,
+                                 code.characteristics, code.raw),
+            assemble._OutSection(owner.name, owner.rva, owner.virtual_size,
+                                 0xC0000040, snapshot),
+        ],
+        0x140000000, 0x1000, 0x200, orig, False,
+        entry_rva=code.rva, base_of_code=code.rva, import_dir=(0, 0),
+        reloc_dir=(0, 0), iat_dir=(0, 0), rsrc_dir=(0, 0),
+        export_dir=(orig.export_rva, orig.export_size), tls_dir=(0, 0),
+    )
+    image = assemble._StubImage(output.read_bytes())
+    preserved = image.section_containing(owner.rva)
+    assert preserved is not None
+    assert preserved.vsize == 0x100000
+    assert preserved.raw_size == 0x200
+    assert preserved.content[:0xC0] == snapshot
+    assert image.dir(assemble.DIR_EXPORT) == (0x2040, 0x80)
+    header = output.read_bytes()
+    optional = struct.unpack_from("<I", header, 0x3C)[0] + 24
+    assert struct.unpack_from("<I", header, optional + 0x38)[0] == parsed.size_of_image
+    assert output.stat().st_size == 0x600
 
 
 def test_dll_export_snapshot_rejects_reference_outside_declared_span() -> None:

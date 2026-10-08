@@ -30,6 +30,16 @@ The destination must not already exist. Both files are staged and structurally
 validated before the directory is published. A failure leaves no partial output.
 `lethe-limited-release.json` records source hashes, packed hashes, sizes, build
 IDs, the exact candidate hash and source commit, and the disabled features.
+The helper reserves its manifest filename (case-insensitively), binds all source
+files before packing, and rechecks every source and validated output before
+publication. Missing, replaced, linked or changed files abort the transaction;
+concurrent source edits are preserved, never rolled back by the helper. These
+checks detect drift at their checkpoints, not arbitrary writes after publication.
+
+Export snapshots retain their original mapped size and RVA but omit trailing
+zero-only file padding beyond the export span. This reduces file overhead without
+changing the authenticated export bytes or the restored source payload. Small
+inputs may still grow because they must include the runtime.
 
 Before distribution:
 

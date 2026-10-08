@@ -1573,8 +1573,13 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
             raise AssembleError(
                 f"export direct target[{index}] does not name a mapped source section")
 
-    sparse = bytearray(len(owner_raw))
     start = export_rva - owner_rva
+    # Only the prefix through the authenticated export span needs file backing.
+    # The section retains its original mapped extent through VirtualSize in the
+    # caller; bytes after this prefix were already zero in the placeholder and
+    # the loader supplies that zero-fill without storing it in the packed file.
+    # Do not strip zeros inside the declared span or mutate the source payload.
+    sparse = bytearray(start + export_size)
     sparse[start:start + export_size] = owner_raw[start:start + export_size]
     return {owner_rva: bytes(sparse)}
 

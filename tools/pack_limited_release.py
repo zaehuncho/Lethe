@@ -16,9 +16,11 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -47,6 +49,47 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    sha256: str
+
+
+def _snapshot(path: Path, label: str) -> _FileSnapshot:
+    """Bind a regular, unlinked file's identity and bytes at a checkpoint."""
+    def identity(value: os.stat_result) -> tuple[int, int, int, int]:
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+    try:
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise LimitedReleaseError(f"{label} changed or is not a regular file: {path}")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+                raise LimitedReleaseError(f"{label} changed while opening: {path}")
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after_read = os.fstat(stream.fileno())
+        after = path.lstat()
+        if (path.is_symlink() or not stat.S_ISREG(after.st_mode)
+                or identity(after_read) != identity(before)
+                or identity(after) != identity(before)):
+            raise LimitedReleaseError(f"{label} changed while hashing: {path}")
+    except OSError as exc:
+        raise LimitedReleaseError(f"{label} changed or became inaccessible: {path}: {exc}") from exc
+    return _FileSnapshot(*identity(before), digest.hexdigest())
+
+
+def _require_snapshot(path: Path, expected: _FileSnapshot, label: str) -> None:
+    if _snapshot(path, label) != expected:
+        raise LimitedReleaseError(f"{label} changed before publication: {path}")
 
 
 def _canonical_json(payload: dict[str, Any]) -> bytes:
@@ -92,6 +135,8 @@ def _inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
             raise LimitedReleaseError(f"input is repeated: {path}")
         identities.add(identity)
         folded_name = path.name.casefold()
+        if folded_name == MANIFEST_NAME.casefold():
+            raise LimitedReleaseError(f"input filename is reserved for the bundle manifest: {path.name}")
         if folded_name in output_names:
             raise LimitedReleaseError(
                 f"output filename collision for {path.name!r}; rename one input first"
@@ -140,6 +185,9 @@ def build_bundle(args: argparse.Namespace) -> Path:
     candidate_manifest_path = release_attestation.candidate_manifest_path(stub_path)
     candidate_manifest_sha256 = _sha256(candidate_manifest_path)
     inputs = _inputs(args)
+    source_snapshots = {
+        source: _snapshot(source, "source") for _kind, source in inputs
+    }
 
     destination_parent = destination.parent.resolve()
     destination_parent.mkdir(parents=True, exist_ok=True)
@@ -147,11 +195,14 @@ def build_bundle(args: argparse.Namespace) -> Path:
     stage.mkdir()
 
     artifacts: list[dict[str, Any]] = []
+    output_snapshots: dict[Path, _FileSnapshot] = {}
     try:
         for kind, source in inputs:
             packed = stage / source.name
-            source_sha256 = _sha256(source)
-            source_size = source.stat().st_size
+            original = source_snapshots[source]
+            _require_snapshot(source, original, "source")
+            source_sha256 = original.sha256
+            source_size = original.size
             options = orchestrator.PackOptions(
                 anti_debug=False,
                 memory_guard=False,
@@ -170,21 +221,23 @@ def build_bundle(args: argparse.Namespace) -> Path:
                 )
             if not packed.is_file():
                 raise LimitedReleaseError(f"packer reported success without output: {packed}")
-            if source.stat().st_size != source_size or _sha256(source) != source_sha256:
-                raise LimitedReleaseError(f"source changed while it was being packed: {source}")
+            _require_snapshot(source, original, "source")
+            packed_snapshot = _snapshot(packed, "output")
             validation = report.validate_packed(str(packed))
             if not validation.ok:
                 raise LimitedReleaseError(
                     f"structural validation failed for {packed.name}: "
                     f"{validation.reason or 'unspecified failure'}"
                 )
+            _require_snapshot(packed, packed_snapshot, "output")
+            output_snapshots[packed] = packed_snapshot
             artifacts.append(
                 {
                     "build_id": result.build_id,
                     "kind": kind,
                     "output": packed.name,
-                    "packed_sha256": _sha256(packed),
-                    "packed_size": packed.stat().st_size,
+                    "packed_sha256": packed_snapshot.sha256,
+                    "packed_size": packed_snapshot.size,
                     "source_name": source.name,
                     "source_sha256": source_sha256,
                     "source_size": source_size,
@@ -199,6 +252,13 @@ def build_bundle(args: argparse.Namespace) -> Path:
                 or _sha256(stub_path) != candidate_stub_sha256
                 or _sha256(candidate_manifest_path) != candidate_manifest_sha256):
             raise LimitedReleaseError("candidate bundle changed during packing")
+
+        # Recheck the whole transaction, not just the file most recently packed.
+        # A later build step can otherwise invalidate an earlier source/output.
+        for source, expected in source_snapshots.items():
+            _require_snapshot(source, expected, "source")
+        for packed, expected in output_snapshots.items():
+            _require_snapshot(packed, expected, "output")
 
         manifest = {
             "artifacts": artifacts,
