@@ -144,8 +144,8 @@ def test_direct_native_call_marshalling_matches_unicorn(monkeypatch=None) -> Non
     ))
 
     callee = _asm(
-        "mov rax, rcx; mov r10, rdx; shl r10, 16; xor rax, r10; "
-        "mov r10, r8; shl r10, 32; xor rax, r10; "
+        "mov rax, rcx; mov r10, rdx; shl r10, 0x10; xor rax, r10; "
+        "mov r10, r8; shl r10, 0x20; xor rax, r10; "
         "mov r11, rcx; add r11, rdx; add r11, r8; mov [r9], r11; ret",
         rva=callee_va,
     )
@@ -276,8 +276,8 @@ def test_cfg_dispatch_marshalling_and_target_match_unicorn() -> None:
     thunk = _asm("jmp rax", rva=thunk_va)          # CFG dispatch thunk
     callee = _asm(
         "mov rax, rcx; shl rax, 0; add rax, rcx; "  # rax = 2*rcx placeholder
-        "mov rax, rcx; mov r10, rdx; shl r10, 8; add rax, r10; "
-        "mov r10, r8; shl r10, 20; add rax, r10; "   # rax = fingerprint
+        "mov rax, rcx; mov r10, rdx; shl r10, 0x8; add rax, r10; "
+        "mov r10, r8; shl r10, 0x14; add rax, r10; "  # rax = fingerprint
         "mov r11, rcx; xor r11, rdx; xor r11, r8; mov [r9], r11; ret",
         rva=callee_va,
     )

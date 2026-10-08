@@ -58,8 +58,13 @@ FA_RVA = 0x2710
 FA_SIZE = 0x8A
 
 pytestmark = pytest.mark.skipif(
-    os.name != "nt" or not SECURITY_CORE.is_file(),
-    reason="requires the installed Venice SecurityCore.dll on Windows",
+    os.environ.get("LETHE_RUN_INSTALLED_PRODUCT_E2E") != "1"
+    or os.name != "nt"
+    or not SECURITY_CORE.is_file(),
+    reason=(
+        "explicit external-product evidence only: set "
+        "LETHE_RUN_INSTALLED_PRODUCT_E2E=1 with the pinned Venice binaries"
+    ),
 )
 
 

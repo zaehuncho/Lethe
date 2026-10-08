@@ -55,8 +55,13 @@ INIT_GUARD_RVA = 0x30090      # 0 => 0x19F4C takes the self-contained init path
 FN_SHA256 = "9eac3534f876f8e092c1cfc25c6fcb997441dccb80f97d42154ea084b3d37a78"
 
 pytestmark = pytest.mark.skipif(
-    os.name != "nt" or not SECURITY_CORE.is_file(),
-    reason="requires the installed Venice SecurityCore.dll on Windows",
+    os.environ.get("LETHE_RUN_INSTALLED_PRODUCT_E2E") != "1"
+    or os.name != "nt"
+    or not SECURITY_CORE.is_file(),
+    reason=(
+        "explicit external-product evidence only: set "
+        "LETHE_RUN_INSTALLED_PRODUCT_E2E=1 with the pinned Venice binaries"
+    ),
 )
 
 

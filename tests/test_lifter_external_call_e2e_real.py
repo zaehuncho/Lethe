@@ -53,8 +53,13 @@ TR_RVA = 0x1800
 TR_SIZE = 45
 
 pytestmark = pytest.mark.skipif(
-    os.name != "nt" or not ORION_COMMON.is_file(),
-    reason="requires the installed Venice OrionCommon.dll on Windows",
+    os.environ.get("LETHE_RUN_INSTALLED_PRODUCT_E2E") != "1"
+    or os.name != "nt"
+    or not ORION_COMMON.is_file(),
+    reason=(
+        "explicit external-product evidence only: set "
+        "LETHE_RUN_INSTALLED_PRODUCT_E2E=1 with the pinned Venice binaries"
+    ),
 )
 
 

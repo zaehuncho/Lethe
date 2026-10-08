@@ -195,8 +195,8 @@ def test_oracle_lifted_snippets_match_unicorn(seed, level, monkeypatch):
     # mutated + assembled program, and asserts they agree on regs/flags/memory.
     original_lift = L.lift_function
 
-    def mutated_lift(code, base=0x1000, optimize_flags=True):
-        asm = original_lift(code, base=base, optimize_flags=optimize_flags)
+    def mutated_lift(code, base=0x1000, optimize_flags=True, **kwargs):
+        asm = original_lift(code, base=base, **kwargs)
         out = MU.mutate_source(asm, seed=seed, level=level)
         assert _peak_depth(out) <= CEILING, "mutated lift exceeded stack ceiling"
         return out
@@ -217,8 +217,8 @@ def test_oracle_lifted_memory_ops_match_unicorn(monkeypatch):
 
     original_lift = L.lift_function
 
-    def mutated_lift(code, base=0x1000, optimize_flags=True):
-        asm = original_lift(code, base=base, optimize_flags=optimize_flags)
+    def mutated_lift(code, base=0x1000, optimize_flags=True, **kwargs):
+        asm = original_lift(code, base=base, **kwargs)
         return MU.mutate_source(asm, seed=b"mem-seed", level=3)
 
     monkeypatch.setattr(oracle.L, "lift_function", mutated_lift)
