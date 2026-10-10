@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .pe_content_id import pe_content_id, snapshot_file
+from .strict_json import StrictJSONError, load_json_object_bytes
 
 
 SCHEMA = "lethe.virtualization-selection"
@@ -96,6 +97,14 @@ def _parse_canonical(raw: bytes) -> dict[str, Any]:
             "selection manifest is empty or exceeds the 1 MiB limit")
     try:
         text = raw.decode("ascii")
+        # The byte cap alone does not bound decoded nesting or node count.
+        # Reuse the shared evidence boundary before custom integer parsing and
+        # canonical serialization. It never changes the accepted encoding.
+        try:
+            load_json_object_bytes(
+                raw, what="selection manifest", max_bytes=MAX_MANIFEST_BYTES)
+        except StrictJSONError as exc:
+            raise VirtualizationSelectionError(str(exc)) from exc
         def parse_integer(token: str) -> int:
             if len(token.lstrip("-")) > 20:
                 raise VirtualizationSelectionError(

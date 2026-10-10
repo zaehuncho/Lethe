@@ -5,8 +5,9 @@
 .DESCRIPTION
     Produces a standalone, one-file Lethe.exe -- the clickable internal build
     tool. It embeds the packer library, its PE/crypto dependencies (LIEF +
-    cryptography), the PySide6 runtime, and the prebuilt native stub as bundled
-    data. Lethe produces protected first-party binaries and is never shipped
+    cryptography), the PySide6 runtime, and a complete approved release bundle
+    with its public trust/matrix/evidence resources as exact bundled data.
+    Lethe produces protected first-party binaries and is never shipped
     to customers, so freezing it is fine.
 
     Uses the project's Nuitka standalone build shape -- the same
@@ -26,7 +27,8 @@
             --include-package=packer ^
             --include-package=lief ^
             --include-package=cryptography ^
-            --include-data-files=<repo>/stub/prebuilt/lethe_stub_x64.dll=stub/prebuilt/lethe_stub_x64.dll ^
+            --include-module=tools.production_gate ^
+            --include-data-files=<private-stage>/<resource>=<resource> ^
             --output-filename=Lethe.exe ^
             --output-dir=<packer>/build ^
             --remove-output ^
@@ -70,7 +72,8 @@
     Where Lethe.exe is written. Default: <packer>/build.
 
 .PARAMETER StubPath
-    Path to the prebuilt native stub to bundle.
+    Path to the canonical lethe_stub_x64.dll in a complete approved release
+    bundle. Raw builds and unsigned candidates do not satisfy this contract.
     Default: <packer>/stub/prebuilt/lethe_stub_x64.dll.
 
 .PARAMETER NoOnefile
@@ -78,8 +81,8 @@
     iterate; useful for debugging what got bundled).
 
 .PARAMETER SkipStubCheck
-    Build even if the prebuilt stub is missing (the resulting exe cannot pack
-    until the stub is present -- for smoke-testing the freeze only).
+    Build the UI only if the prebuilt stub is missing. This never relaxes
+    verification for an existing stub; the UI-only build cannot pack.
 
 .NOTES
     Toolchain (validate this exact combination before each release):
@@ -114,9 +117,29 @@ $ErrorActionPreference = "Stop"
 $GuiDir     = $PSScriptRoot                              # gui
 $PackerRoot = Split-Path $GuiDir -Parent                 # Lethe
 $Entry      = Join-Path $GuiDir "app.py"
+$InvocationRoot = (Get-Location).ProviderPath
+
+function Get-InvocationPath([string]$Value) {
+    if ($Value -match '^[A-Za-z]:(?![\\/])') {
+        throw "Drive-relative paths are ambiguous: $Value"
+    }
+    if ($Value -match '^[\\/](?![\\/])') {
+        return [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetPathRoot($InvocationRoot)) $Value.TrimStart([char[]]'\/')))
+    }
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return [System.IO.Path]::GetFullPath($Value)
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $InvocationRoot $Value))
+}
 
 if (-not $OutputDir) { $OutputDir = Join-Path $PackerRoot "build" }
 if (-not $StubPath)  { $StubPath  = Join-Path $PackerRoot "stub\prebuilt\lethe_stub_x64.dll" }
+$OutputDir = Get-InvocationPath $OutputDir
+$StubPath = Get-InvocationPath $StubPath
+# Preserve PATH-based names such as python/python.exe; anchor explicit paths.
+if ($PythonExe -match '[\\/]' -or [System.IO.Path]::IsPathRooted($PythonExe)) {
+    $PythonExe = Get-InvocationPath $PythonExe
+}
 
 if (-not (Test-Path $Entry)) {
     throw "GUI entry script not found: $Entry"
@@ -134,14 +157,33 @@ if (-not (Test-Path $StubPath)) {
 Prebuilt native stub not found:
     $StubPath
 
-Build it first (produces stub/prebuilt/lethe_stub_x64.dll), e.g.:
-    stub/build_stub.ps1
+Supply the canonical DLL in a complete, independently approved release bundle.
+An ordinary native build or unsigned validation candidate is not sufficient.
 
 Or re-run with -SkipStubCheck to freeze the UI without packing capability.
 "@
     }
 }
 
+# Preflight with the existing release verifier, then consume only retained,
+# hash-pinned data. No directory wildcard includes or key/signing discovery.
+$BundleHelper = Join-Path $PackerRoot 'tools\gui_bundle.py'
+$ResourcePlan = $null
+if ($IncludeStub) {
+    $ResourceStage = Join-Path ([System.IO.Path]::GetTempPath()) ("lethe-gui-bundle-" + [guid]::NewGuid().ToString('N'))
+    $PlanOutput = & $PythonExe -B $BundleHelper prepare --stub-path $StubPath --output-dir $ResourceStage
+    if ($LASTEXITCODE -ne 0) { throw 'GUI release resource preflight failed; compiler was not started.' }
+    $ResourcePlan = ($PlanOutput -join "`n") | ConvertFrom-Json
+}
+
+function Assert-ResourcePlan {
+    if ($null -ne $ResourcePlan) {
+        & $PythonExe -B $BundleHelper validate --plan $ResourcePlan.plan_path --plan-sha256 $ResourcePlan.plan_sha256 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'GUI release resources changed or no longer verify.' }
+    }
+}
+
+Assert-ResourcePlan
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 # --- assemble the Nuitka command -------------------------------------------
@@ -156,6 +198,7 @@ $NuitkaArgs = @(
     "--include-package=packer",         # force the lazily-imported core in
     "--include-package=lief",           # PE analysis (compiled extension)
     "--include-package=cryptography",   # AES-256-GCM / SHA-256 (compiled backend)
+    "--include-module=tools.production_gate", # runtime release-evidence replay
     "--company-name=Orion",
     "--product-name=Lethe",
     "--file-description=Lethe x64 PE packer (internal build tool)",
@@ -171,8 +214,12 @@ if (-not $NoOnefile) {
 }
 
 if ($IncludeStub) {
-    # single argv token: "--include-data-files=<abs src>=stub/prebuilt/lethe_stub_x64.dll"
-    $NuitkaArgs += "--include-data-files=$StubPath=stub/prebuilt/lethe_stub_x64.dll"
+    # Explicit per-file mapping preserves original .py evidence as DATA too.
+    # The helper rejects pattern/separator characters and destination collisions.
+    foreach ($Resource in $ResourcePlan.resources) {
+        $DataSource = Join-Path $ResourcePlan.staged_root $Resource.destination
+        $NuitkaArgs += "--include-data-files=$DataSource=$($Resource.destination)"
+    }
 }
 
 $NuitkaArgs += $Entry
@@ -190,13 +237,16 @@ Write-Host ""
 
 Push-Location $PackerRoot
 try {
+    Assert-ResourcePlan
     & $PythonExe @NuitkaArgs
+    $NuitkaExitCode = $LASTEXITCODE
+    Assert-ResourcePlan
 } finally {
     Pop-Location
 }
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Nuitka build failed with exit code $LASTEXITCODE"
+if ($NuitkaExitCode -ne 0) {
+    throw "Nuitka build failed with exit code $NuitkaExitCode"
 }
 
 $ExePath = Join-Path $OutputDir "Lethe.exe"
