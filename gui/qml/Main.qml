@@ -18,6 +18,15 @@ ApplicationWindow {
 
     readonly property color accentRgb: Theme.accent
 
+    onClosing: function(close) {
+        close.accepted = venice.requestClose()
+    }
+
+    Connections {
+        target: venice
+        function onCloseReady() { window.close() }
+    }
+
     component SectionLabel: Text {
         property string label: ""
         text: label.toUpperCase()
@@ -749,8 +758,8 @@ ApplicationWindow {
                     Layout.alignment: Qt.AlignVCenter
                     accent: !venice.isPacking
                     glyph: venice.isPacking ? "" : "▶"
-                    text: venice.isPacking ? "Cancel" : "Pack"
-                    enabled: venice.isPacking || fileList.count > 0
+                    text: venice.closePending ? "Closing…" : (venice.isPacking ? "Cancel" : "Pack")
+                    enabled: !venice.closePending && (venice.isPacking || fileList.count > 0)
                     onClicked: venice.isPacking ? venice.cancelPacking() : venice.packAll()
 
                     font.pixelSize: 14

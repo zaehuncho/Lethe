@@ -123,6 +123,12 @@ hash, and must contain a complete non-skipped pytest pass.
   the active `pack_file` transaction. Repeat closing must not destroy a running
   child QThread or start another batch. A successful UI-only Nuitka compilation
   proves the compiler recipe, not the signed resource closure or product runtime.
+- Repeat the close/cancel check with Venice's actual QML window. Its close event
+  must wait for worker cleanup without blocking the event loop. With post-pack
+  validation enabled, a validator exception, absent output path, malformed result,
+  or structural rejection must count as a failed/unverified file, never success.
+  Validation selection is captured for the batch; changing a preset mid-pack must
+  not weaken the current batch's check. Structural validation is not runtime proof.
 - Pack the intended unmanaged x64 EXE with the freshly built stub via
   `--stub-path`. Candidate status never authorizes implicit/default stub use.
 - Exercise startup, shutdown, worker threads, exceptions, resources, updates,

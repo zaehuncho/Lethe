@@ -42,6 +42,7 @@ from PySide6.QtCore import (
     QObject,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
     Slot,
@@ -452,6 +453,8 @@ class VeniceBackend(QObject):
     compressionLevelChanged = Signal()
     outputDirectoryChanged = Signal()
     isPackingChanged = Signal()
+    closePendingChanged = Signal()
+    closeReady = Signal()
     validateAfterPackChanged = Signal()
     presetsChanged = Signal()
     logTextChanged = Signal()
@@ -471,6 +474,8 @@ class VeniceBackend(QObject):
         self._file_model = FileListModel(self)
         self._log_lines: List[str] = []
         self._worker: Optional[PackWorker] = None
+        self._close_pending = False
+        self._active_validate_after_pack: Optional[bool] = None
         self._done_count = 0
         self._fail_count = 0
         self._total_jobs = 0
@@ -579,6 +584,24 @@ class VeniceBackend(QObject):
 
     isPacking = Property(bool, _get_is_packing, notify=isPackingChanged)
 
+    def _get_close_pending(self) -> bool:
+        return self._close_pending
+
+    closePending = Property(bool, _get_close_pending, notify=closePendingChanged)
+
+    @Slot(result=bool)
+    def requestClose(self) -> bool:
+        """Defer window destruction until the current file and worker finish."""
+        if self._worker is None and not self._is_packing:
+            return True
+        if self._worker is not None:
+            self._worker.cancel()
+        if not self._close_pending:
+            self._close_pending = True
+            self.closePendingChanged.emit()
+            self._append_log("Closing after the current file finishes; queued files cancelled.")
+        return False
+
     # -- fileModel (read-only) --------------------------------------------
     def _get_file_model(self) -> QObject:
         return self._file_model
@@ -623,20 +646,22 @@ class VeniceBackend(QObject):
     # -- packing lifecycle -------------------------------------------------
     @Slot()
     def packAll(self) -> None:
-        if self._is_packing:
+        if self._is_packing or self._close_pending:
             return
         jobs = self._file_model.jobs()
         if not jobs:
             self._append_log("no files queued")
             return
 
+        # UI/preset changes during a batch apply only to the next batch. They
+        # must not disable validation already requested for an in-flight job.
+        self._active_validate_after_pack = self._validate_after_pack
+        self._set_is_packing(True)
         self._file_model.reset_statuses()
         self._done_count = 0
         self._fail_count = 0
         self._total_jobs = len(jobs)
         self.statsChanged.emit()
-        self._set_is_packing(True)
-
         options = {
             "anti_debug": self._anti_debug,
             "memory_guard": self._memory_guard,
@@ -659,7 +684,9 @@ class VeniceBackend(QObject):
         self._worker.progressLine.connect(self._on_progress_line)
         self._worker.fileFinished.connect(self._on_file_finished)
         self._worker.fileError.connect(self._on_file_error)
-        self._worker.allFinished.connect(self._on_all_finished)
+        self._worker.finished.connect(self._on_all_finished)
+        if self._close_pending:
+            self._worker.cancel()
         self._worker.start()
 
     @Slot()
@@ -690,21 +717,27 @@ class VeniceBackend(QObject):
             # Optional structural round-trip: parse the packed output back and
             # confirm the Lethe container is well-formed. Never executes it.
             valid = True
-            if self._validate_after_pack and output_path:
+            validate_after_pack = (self._active_validate_after_pack
+                                   if self._active_validate_after_pack is not None
+                                   else self._validate_after_pack)
+            if validate_after_pack:
+                valid = False
                 try:
+                    if not output_path:
+                        raise ValueError("packed output path is missing")
                     from packer.report import validate_packed
                     vr = validate_packed(output_path)
-                except Exception as exc:  # noqa: BLE001
-                    self._append_log(f"[{name}] validation error: {exc}")
-                else:
-                    if vr.ok:
+                    if vr.ok is True:
                         status_text += " · validated"
                         self._append_log(f"[{name}] validation OK — {vr.summary()}")
+                        valid = True
                     else:
-                        valid = False
                         status_text = f"Packed but INVALID — {vr.reason}"
                         self._append_log(
                             f"[{name}] VALIDATION FAILED — {vr.summary()}")
+                except Exception as exc:  # noqa: BLE001
+                    status_text = f"Packed but UNVERIFIED — validation error: {exc}"
+                    self._append_log(f"[{name}] VALIDATION ERROR: {exc}")
 
             if valid:
                 self._file_model.set_result(
@@ -736,12 +769,18 @@ class VeniceBackend(QObject):
     @Slot()
     def _on_all_finished(self) -> None:
         worker = self._worker
+        if worker is None:
+            return
+        if not worker.wait(0):
+            QTimer.singleShot(10, self._on_all_finished)
+            return
         self._worker = None
-        if worker is not None:
-            worker.wait()
-            worker.deleteLater()
-        self._set_is_packing(False)
+        self._active_validate_after_pack = None
+        worker.deleteLater()
         self._append_log("finished")
+        self._set_is_packing(False)
+        if self._close_pending:
+            self.closeReady.emit()
 
     # -- file / folder dialogs --------------------------------------------
     @Slot()
