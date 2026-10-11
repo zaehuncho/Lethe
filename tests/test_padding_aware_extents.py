@@ -115,7 +115,7 @@ def test_discovery_reports_two_lengths_but_keeps_selection_v1_equal_extent() -> 
     report = function_discovery.discover_functions(_parsed(source), exports=())
     candidate = report.candidates[0]
 
-    assert report.version == 2
+    assert report.version == 3  # shared-gap report schema, not selection version
     assert candidate.source_extent_size == len(source)
     assert candidate.lifted_body_size == len(body)
     assert candidate.liftable is True

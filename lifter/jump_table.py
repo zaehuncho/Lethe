@@ -259,11 +259,12 @@ def decode_function_body(
 ) -> DecodedFunctionBody:
     """Decode one runtime-function extent, excising proven jump tables.
 
-    Fast path: if the extent decodes cleanly end-to-end (the overwhelming
-    common case), it is returned unchanged with no data ranges -- behavior is
-    identical to a plain linear sweep, so non-switch functions are unaffected.
+    A clean linear decode is not sufficient evidence of code: table RVAs can
+    themselves be valid x64 opcodes. Forward table references preceding an
+    indirect branch therefore use the same table proof even without a fault.
+    Clean extents without that shape retain the linear fast path.
 
-    Otherwise the decode fault is examined for a compiler jump-table shape. On
+    A decode fault is also examined for a compiler jump-table shape. On
     success the code instructions are returned with the table byte ranges
     proven as data. On any doubt, :class:`JumpTableUnresolved` is raised.
     """
@@ -275,7 +276,24 @@ def decode_function_body(
         raise JumpTableError("code length does not match the extent")
 
     prefix, landed = _decode_span(code, begin_rva, begin_rva, end_rva)
-    if landed:
+    has_indirect_branch = any(
+        instruction.flow_control == FlowControl.INDIRECT_BRANCH
+        for instruction in prefix
+    )
+    refs = (
+        _scaled_index_table_refs(prefix, begin_rva, end_rva)
+        if not landed or has_indirect_branch else []
+    )
+    referenced_dispatch = False
+    if refs:
+        first_reference = min(ref[0] for ref in refs)
+        first_table = min(ref[1] for ref in refs)
+        referenced_dispatch = any(
+            first_reference < instruction.ip < first_table
+            and instruction.flow_control == FlowControl.INDIRECT_BRANCH
+            for instruction in prefix
+        )
+    if landed and not referenced_dispatch:
         starts = frozenset(instruction.ip for instruction in prefix)
         has_indirect = any(
             instruction.flow_control
@@ -292,8 +310,7 @@ def decode_function_body(
             has_indirect_dispatch=has_indirect,
         )
 
-    # Decode faulted -- look for a jump table the dispatch code references.
-    refs = _scaled_index_table_refs(prefix, begin_rva, end_rva)
+    # A fault or a referenced dispatch requires proof, not a successful sweep.
     if not refs:
         raise JumpTableUnresolved(
             f"decode fault in 0x{begin_rva:X}..0x{end_rva:X} with no in-extent "
@@ -319,6 +336,8 @@ def decode_function_body(
 
     all_instrs = tuple(sorted(
         (*code_instrs, *resumed), key=lambda instruction: instruction.ip))
+    _validate_data_reachability(
+        all_instrs, begin_rva, end_rva, data_ranges, switch_targets)
     starts = frozenset(instruction.ip for instruction in all_instrs)
     has_indirect = any(
         instruction.flow_control
@@ -334,6 +353,63 @@ def decode_function_body(
         switch_target_rvas=switch_targets,
         has_indirect_dispatch=has_indirect,
     )
+
+
+def _validate_data_reachability(instructions, begin, end, data_ranges, targets):
+    """Never excise bytes reached by a direct edge or reachable fallthrough.
+
+    Case targets are extra roots; indirect dispatches reach their proven case
+    targets. This is not an indirect-target closure proof or permission to
+    virtualize a switch function. Unreachable alignment after a terminating
+    instruction remains permitted.
+    """
+    by_rva = {instruction.ip: instruction for instruction in instructions}
+    near = {OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH64}
+
+    def is_data(rva):
+        return any(start <= rva < finish for start, finish in data_ranges)
+
+    direct_flows = {
+        FlowControl.CALL, FlowControl.UNCONDITIONAL_BRANCH,
+        FlowControl.CONDITIONAL_BRANCH,
+    }
+    for instruction in instructions:
+        if (instruction.flow_control in direct_flows
+                and instruction.op_count and instruction.op_kind(0) in near
+                and is_data(int(instruction.near_branch_target))):
+            raise JumpTableUnresolved(
+                f"direct edge at 0x{instruction.ip:X} enters jump-table data")
+
+    pending = [begin, *targets]
+    visited = set()
+    fallthrough_flows = {
+        FlowControl.NEXT, FlowControl.CALL, FlowControl.INDIRECT_CALL,
+        FlowControl.CONDITIONAL_BRANCH,
+    }
+    while pending:
+        rva = pending.pop()
+        if not begin <= rva < end or rva in visited:
+            continue
+        if is_data(rva):
+            raise JumpTableUnresolved(
+                f"reachable fallthrough enters jump-table data at 0x{rva:X}")
+        instruction = by_rva.get(rva)
+        if instruction is None:
+            raise JumpTableUnresolved(
+                f"table proof reaches non-instruction RVA 0x{rva:X}")
+        visited.add(rva)
+        flow = instruction.flow_control
+        if flow in direct_flows:
+            if not instruction.op_count or instruction.op_kind(0) not in near:
+                raise JumpTableUnresolved("table proof uses a non-near direct edge")
+            pending.append(int(instruction.near_branch_target))
+        if flow in fallthrough_flows:
+            pending.append(instruction.ip + instruction.len)
+        elif flow not in {
+                FlowControl.UNCONDITIONAL_BRANCH, FlowControl.INDIRECT_BRANCH,
+                FlowControl.RETURN, FlowControl.INTERRUPT, FlowControl.EXCEPTION}:
+            raise JumpTableUnresolved(
+                f"table proof uses unsupported control flow at 0x{rva:X}")
 
 
 __all__ = [

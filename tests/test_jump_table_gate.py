@@ -121,6 +121,109 @@ def test_clean_function_uses_fast_path() -> None:
     assert not body.has_indirect_dispatch
 
 
+@pytest.mark.parametrize("case_low", [0x30, 0x31, 0x74])
+def test_table_with_fully_valid_x64_bytes_still_gets_excised(case_low) -> None:
+    blob, base, end, table, cases, _default = _build_switch(
+        ncases=1, invalid_low=case_low)
+    _linear, landed = jt._decode_span(blob, base, base, end)
+    assert landed, "regression must exercise the successful linear-decode path"
+    body = jt.decode_function_body(blob, base, end)
+    assert body.data_ranges == ((table, end),)
+    assert body.switch_target_rvas == cases
+    assert all(instruction.ip < table for instruction in body.instructions)
+
+
+def test_table_detection_does_not_depend_on_case_address_low_byte() -> None:
+    successful_linear_sweeps = 0
+    for low in range(256):
+        blob, base, end, table, cases, _default = _build_switch(
+            ncases=1, invalid_low=low)
+        _linear, landed = jt._decode_span(blob, base, base, end)
+        successful_linear_sweeps += int(landed)
+        body = jt.decode_function_body(blob, base, end)
+        assert body.data_ranges == ((table, end),)
+        assert body.switch_target_rvas == cases
+    assert successful_linear_sweeps > 0
+
+
+def test_two_level_byte_and_dword_tables_with_valid_opcodes_are_both_excised() -> None:
+    base = 0x4000
+    prefix = bytearray.fromhex(
+        "83f908 0f8700000000 488d1500000000 "
+        "0fb6840a00000000 8b848200000000 4801d0 ffe0")
+    assert len(prefix) == 36
+    case = base + 0x30
+    blob = prefix + b"\xCC"*(case-base-len(prefix)) + _clean(case)
+    default = base+len(blob)
+    blob += bytes.fromhex("31c0c3")
+    while (base+len(blob)) % 4:
+        blob += b"\xCC"
+    table = base+len(blob)
+    blob += struct.pack("<I", case) + bytes(9)
+    blob[5:9] = struct.pack("<i", default-(base+9))
+    blob[12:16] = struct.pack("<i", -(base+16))
+    blob[20:24] = struct.pack("<I", table+4)
+    blob[27:31] = struct.pack("<I", table)
+    end = base+len(blob)
+    _linear, landed = jt._decode_span(bytes(blob), base, base, end)
+    assert landed
+    body = jt.decode_function_body(bytes(blob), base, end)
+    assert body.data_ranges == ((table, end),)
+    assert body.switch_target_rvas == (case,)
+    assert all(instruction.ip < table for instruction in body.instructions)
+
+
+def test_clean_forward_index_reference_without_dispatch_keeps_linear_code() -> None:
+    blob, base, end, table, _cases, _default = _build_switch(
+        ncases=1, invalid_low=0x30)
+    changed = bytearray(blob)
+    changed[26:28] = b"\x90\x90"  # replace the indirect dispatch, not the lookup
+    body = jt.decode_function_body(bytes(changed), base, end)
+    assert body.data_ranges == ()
+    assert table in body.instruction_starts
+
+
+def test_clean_table_with_non_instruction_entry_is_not_silently_accepted() -> None:
+    blob, base, end, table, cases, _default = _build_switch(
+        ncases=1, invalid_low=0x30)
+    changed = bytearray(blob)
+    changed[table-base:table-base+4] = struct.pack("<I", cases[0]+1)
+    with pytest.raises(jt.JumpTableUnresolved, match="not an instruction start"):
+        jt.decode_function_body(bytes(changed), base, end)
+
+
+def test_direct_edge_into_proposed_table_is_rejected_before_bytes_are_excised() -> None:
+    blob, base, end, table, _cases, _default = _build_switch(
+        ncases=1, invalid_low=0x30)
+    changed = bytearray(blob)
+    changed[5:9] = struct.pack("<i", table-(base+9))
+    with pytest.raises(jt.JumpTableUnresolved, match="direct edge.*jump-table data"):
+        jt.decode_function_body(bytes(changed), base, end)
+
+
+def test_reachable_fallthrough_into_proposed_table_is_rejected() -> None:
+    blob, base, end, table, _cases, default = _build_switch(
+        ncases=1, invalid_low=0x30)
+    changed = bytearray(blob)
+    changed[default-base+2:table-base] = b"\x90"*(table-default-2)
+    with pytest.raises(jt.JumpTableUnresolved, match="fallthrough.*jump-table data"):
+        jt.decode_function_body(bytes(changed), base, end)
+
+
+@pytest.mark.parametrize("case_low", [0x30, 0x31, 0x74])
+def test_strict_gate_accepts_clean_neighbor_not_the_switch_as_lifted_code(case_low) -> None:
+    blob, base, _end, _table, _cases, _default = _build_switch(
+        ncases=1, invalid_low=case_low)
+    clean = _clean(0x1000)
+    parsed = _dcf_parsed([(0x1000, clean), (base, blob)])
+    proof = flow.analyze_direct_control_flow(
+        parsed, [_spec("clean", 0x1000, clean)], production=False)
+    assert [row.rva for row in proof.selected_functions] == [0x1000]
+    report = fd.discover_functions(_fd_parsed([(0x1000, clean), (base, blob)]), exports=())
+    assert report.direct_control_analysis_status == "passed"
+    assert not next(row for row in report.candidates if row.rva == base).liftable
+
+
 def test_unprovable_data_in_code_bails() -> None:
     base = 0x1000
     code = _unresolved(base)

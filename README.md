@@ -166,6 +166,13 @@ function. Candidate liftability, rejection verdicts and gap contents are unchang
 The standalone `FunctionCandidate.to_dict()` API still includes its full gap list.
 This report version is separate from the selection-manifest versions below.
 
+Inline switch-table bytes may also decode as valid x64 instructions. A clean
+linear sweep alone does not establish that they are code: referenced indirect
+dispatches still require table delimitation and instruction-boundary checks.
+Direct edges or reachable fallthrough into proposed table data reject the table
+proof. Recognizing a table does not make its switch function liftable or prove
+indirect-target closure.
+
 The report tool's selection manifest binds the full source SHA-256, its
 signing-stable PE content identity, PE kind, AMD64 machine, image base,
 `SizeOfImage`, and every selected function's complete runtime-function extent,
