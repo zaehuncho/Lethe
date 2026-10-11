@@ -25,6 +25,11 @@ experimental.
   interpreter fail before any build starts.
 - Keep builder tokens and PEM material in the shell's secret source. Do not put
   real values in `.env.example`, command history, manifests, or logs.
+- The limited bundle helper requires ordinary, single-link input, output, stub,
+  and manifest files. Source, candidate and destination paths must not traverse
+  symlinks or junctions. Use independent copies instead of aliases. It pins the
+  candidate's filesystem identity as well as its bytes across packing and never
+  replaces an existing output directory on the supported Windows host.
 
 ## 2. Run automated tests
 

@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from packer import orchestrator, pe_analyze, release_attestation, report  # noqa: E402
+from packer import pe_content_id  # noqa: E402
 
 
 PROFILE_ID = "lethe-limited-v1"
@@ -57,32 +58,49 @@ class _FileSnapshot:
     inode: int
     size: int
     modified_ns: int
+    link_count: int
     sha256: str
+
+
+def _plain_path(path: Path, label: str) -> Path:
+    """Check the supplied spelling before resolve() can erase an alias."""
+    path = path.absolute()
+    try:
+        pe_content_id._reject_linklike_ancestors(path, label)
+    except (OSError, ValueError) as exc:
+        raise LimitedReleaseError(f"{label} changed or traverses a link: {path}: {exc}") from exc
+    return path
 
 
 def _snapshot(path: Path, label: str) -> _FileSnapshot:
     """Bind a regular, unlinked file's identity and bytes at a checkpoint."""
-    def identity(value: os.stat_result) -> tuple[int, int, int, int]:
-        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_nlink
 
     try:
+        path = _plain_path(path, label)
         before = path.lstat()
         if path.is_symlink() or not stat.S_ISREG(before.st_mode):
             raise LimitedReleaseError(f"{label} changed or is not a regular file: {path}")
+        if before.st_nlink != 1:
+            raise LimitedReleaseError(f"{label} must not be hard-linked: {path}")
         digest = hashlib.sha256()
-        with path.open("rb") as stream:
+        # Windows holds a read-only sharing handle; POSIX uses O_NOFOLLOW.
+        # Do not grow a whole-file buffer just to compute a checkpoint digest.
+        with pe_content_id._open_snapshot_stream(path, label) as stream:
             opened = os.fstat(stream.fileno())
             if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
                 raise LimitedReleaseError(f"{label} changed while opening: {path}")
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
             after_read = os.fstat(stream.fileno())
+        _plain_path(path, label)
         after = path.lstat()
         if (path.is_symlink() or not stat.S_ISREG(after.st_mode)
                 or identity(after_read) != identity(before)
                 or identity(after) != identity(before)):
             raise LimitedReleaseError(f"{label} changed while hashing: {path}")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise LimitedReleaseError(f"{label} changed or became inaccessible: {path}: {exc}") from exc
     return _FileSnapshot(*identity(before), digest.hexdigest())
 
@@ -125,7 +143,7 @@ def _inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
     output_names: set[str] = set()
     identities: set[tuple[int, int]] = set()
     for kind, raw_path in rows:
-        absolute = raw_path.expanduser().absolute()
+        absolute = _plain_path(raw_path.expanduser(), f"{kind.upper()} input")
         if absolute.is_symlink() or not absolute.is_file():
             raise LimitedReleaseError(f"{kind.upper()} input is missing or linked: {absolute}")
         path = absolute.resolve()
@@ -165,7 +183,7 @@ def _inputs(args: argparse.Namespace) -> list[tuple[str, Path]]:
 
 
 def _candidate(stub_path: Path) -> tuple[Path, dict[str, Any]]:
-    raw = stub_path.expanduser().absolute()
+    raw = _plain_path(stub_path.expanduser(), "candidate stub")
     if raw.is_symlink() or not raw.is_file():
         raise LimitedReleaseError(f"candidate stub is missing or linked: {raw}")
     path = raw.resolve()
@@ -177,13 +195,15 @@ def _candidate(stub_path: Path) -> tuple[Path, dict[str, Any]]:
 
 
 def build_bundle(args: argparse.Namespace) -> Path:
-    destination = Path(args.output_dir).expanduser().absolute()
+    destination = _plain_path(Path(args.output_dir).expanduser(), "output directory")
     if destination.exists() or destination.is_symlink():
         raise LimitedReleaseError(f"output directory already exists: {destination}")
     stub_path, candidate_manifest = _candidate(Path(args.stub_path))
-    candidate_stub_sha256 = _sha256(stub_path)
+    candidate_snapshot = _snapshot(stub_path, "candidate stub")
+    candidate_stub_sha256 = candidate_snapshot.sha256
     candidate_manifest_path = release_attestation.candidate_manifest_path(stub_path)
-    candidate_manifest_sha256 = _sha256(candidate_manifest_path)
+    candidate_manifest_snapshot = _snapshot(candidate_manifest_path, "candidate manifest")
+    candidate_manifest_sha256 = candidate_manifest_snapshot.sha256
     inputs = _inputs(args)
     source_snapshots = {
         source: _snapshot(source, "source") for _kind, source in inputs
@@ -253,6 +273,8 @@ def build_bundle(args: argparse.Namespace) -> Path:
                 or _sha256(stub_path) != candidate_stub_sha256
                 or _sha256(candidate_manifest_path) != candidate_manifest_sha256):
             raise LimitedReleaseError("candidate bundle changed during packing")
+        _require_snapshot(stub_path, candidate_snapshot, "candidate stub")
+        _require_snapshot(candidate_manifest_path, candidate_manifest_snapshot, "candidate manifest")
 
         # Recheck the whole transaction, not just the file most recently packed.
         # A later build step can otherwise invalidate an earlier source/output.
@@ -289,10 +311,24 @@ def build_bundle(args: argparse.Namespace) -> Path:
         }
         manifest_path = stage / MANIFEST_NAME
         manifest_path.write_bytes(_canonical_json(manifest))
-        os.replace(stage, destination)
+        _plain_path(stage, "staging directory")
+        _plain_path(destination, "output directory")
+        if destination.exists():
+            raise LimitedReleaseError(f"output directory already exists: {destination}")
+        # On Windows rename never replaces a concurrently created destination.
+        try:
+            os.rename(stage, destination)
+        except OSError as exc:
+            raise LimitedReleaseError(f"bundle publication failed: {destination}: {exc}") from exc
         return destination / MANIFEST_NAME
     except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
+        # Never follow a replaced parent/junction during recursive cleanup.
+        try:
+            _plain_path(stage, "staging directory")
+            if stage.resolve().parent == destination_parent:
+                shutil.rmtree(stage, ignore_errors=True)
+        except (OSError, LimitedReleaseError):
+            pass
         raise
 
 

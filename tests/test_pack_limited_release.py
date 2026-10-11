@@ -431,3 +431,221 @@ def test_bundle_binds_structural_validation_to_output_bytes(monkeypatch, tmp_pat
     assert exe.read_bytes() == b"exe-source"
     assert dll.read_bytes() == b"dll-source"
     _assert_unpublished(tmp_path)
+
+
+def test_snapshot_rejects_hard_link_without_mutating_either_name(tmp_path):
+    source = tmp_path / "source.exe"
+    alias = tmp_path / "alias.exe"
+    source.write_bytes(b"unchanged input")
+    os.link(source, alias)
+    assert source.stat().st_nlink == 2
+    with pytest.raises(limited.LimitedReleaseError, match="hard-linked"):
+        limited._snapshot(alias, "source")
+    assert source.read_bytes() == alias.read_bytes() == b"unchanged input"
+
+
+def test_snapshot_rejects_link_added_after_checkpoint(tmp_path):
+    source = tmp_path / "source.exe"
+    source.write_bytes(b"unchanged input")
+    checkpoint = limited._snapshot(source, "source")
+    os.link(source, tmp_path / "later-alias.exe")
+    with pytest.raises(limited.LimitedReleaseError, match="hard-linked"):
+        limited._require_snapshot(source, checkpoint, "source")
+
+
+@pytest.mark.parametrize("role", ["snapshot", "input", "candidate", "destination"])
+def test_parent_alias_is_rejected_before_resolving_or_packing(monkeypatch, tmp_path, role):
+    target = tmp_path / "actual"
+    target.mkdir()
+    source = target / "product.exe"
+    source.write_bytes(b"never executed")
+    alias = tmp_path / "alias"
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(alias))
+        assert alias.is_junction()
+    else:
+        alias.symlink_to(target, target_is_directory=True)
+    try:
+        def unexpected(*_args, **_kwargs):
+            pytest.fail("linked parent reached PE inspection, candidate loading or packing")
+        monkeypatch.setattr(limited.orchestrator, "detect_is_dll", unexpected)
+        monkeypatch.setattr(limited.orchestrator, "pack_file", unexpected)
+        monkeypatch.setattr(limited.release_attestation, "validate_candidate_identity", unexpected)
+        with pytest.raises(limited.LimitedReleaseError, match="traverses a link"):
+            if role == "snapshot":
+                limited._snapshot(alias / source.name, "source")
+            elif role == "input":
+                limited._inputs(SimpleNamespace(exe=[str(alias / source.name)], dll=[]))
+            elif role == "candidate":
+                limited._candidate(alias / source.name)
+            else:
+                limited.build_bundle(SimpleNamespace(output_dir=str(alias / "dist")))
+        assert source.read_bytes() == b"never executed"
+        assert list(target.iterdir()) == [source]
+    finally:
+        # Remove only the alias itself, never recursively traverse its target.
+        if os.name == "nt":
+            assert alias.is_junction()
+            alias.rmdir()
+        else:
+            assert alias.is_symlink()
+            alias.unlink()
+
+
+def test_bundle_rejects_hard_linked_output_and_preserves_external_file(monkeypatch, tmp_path):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"never executed")
+    def linked_pack(_source, options):
+        os.link(external, options.output_path)
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", linked_pack)
+    with pytest.raises(limited.LimitedReleaseError, match="hard-linked"):
+        limited.build_bundle(args)
+    assert external.read_bytes() == b"never executed"
+    assert external.stat().st_nlink == 1
+    _assert_unpublished(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["lethe_stub_x64.dll", "lethe_stub_x64.manifest.json"])
+def test_bundle_rejects_hard_linked_candidate_before_packing(monkeypatch, tmp_path, name):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    source = tmp_path / "candidate" / name
+    os.link(source, tmp_path / "external-alias.bin")
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("hard-linked candidate reached packing")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", unexpected)
+    with pytest.raises(limited.LimitedReleaseError, match="hard-linked"):
+        limited.build_bundle(args)
+    _assert_unpublished(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["lethe_stub_x64.dll", "lethe_stub_x64.manifest.json"])
+def test_bundle_rejects_candidate_identity_replacement_with_identical_bytes(monkeypatch, tmp_path, name):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    source = tmp_path / "candidate" / name
+    replaced = False
+    def replacing_pack(_source, options):
+        nonlocal replaced
+        Path(options.output_path).write_bytes(b"packed-fixture")
+        if not replaced:
+            replacement = tmp_path / "replacement.bin"
+            replacement.write_bytes(source.read_bytes())
+            info = source.stat()
+            os.utime(replacement, ns=(info.st_atime_ns, info.st_mtime_ns))
+            assert replacement.stat().st_ino != info.st_ino
+            replacement.replace(source)
+            replaced = True
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", replacing_pack)
+    with pytest.raises(limited.LimitedReleaseError, match="candidate .*changed"):
+        limited.build_bundle(args)
+    _assert_unpublished(tmp_path)
+
+
+def test_bundle_preserves_destination_created_during_packing(monkeypatch, tmp_path):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    destination = Path(args.output_dir)
+    def competing_pack(_source, options):
+        Path(options.output_path).write_bytes(b"packed-fixture")
+        if not destination.exists():
+            destination.mkdir()
+            (destination / "keep.txt").write_bytes(b"other transaction")
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", competing_pack)
+    with pytest.raises(limited.LimitedReleaseError, match="already exists"):
+        limited.build_bundle(args)
+    assert (destination / "keep.txt").read_bytes() == b"other transaction"
+    assert list(tmp_path.glob(".dist.stage-*")) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows read-sharing semantics")
+def test_snapshot_holds_write_excluding_handle_while_hashing(monkeypatch, tmp_path):
+    path = tmp_path / "source.exe"
+    path.write_bytes(b"held input")
+    open_stream = limited.pe_content_id._open_snapshot_stream
+    attempts = []
+    class CheckingStream:
+        def __init__(self, stream):
+            self.stream = stream
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            self.stream.close()
+        def fileno(self):
+            return self.stream.fileno()
+        def read(self, size):
+            if not attempts:
+                with pytest.raises(PermissionError):
+                    with path.open("wb"):
+                        pytest.fail("writer acquired the held snapshot file")
+                attempts.append("writer denied")
+            return self.stream.read(size)
+    monkeypatch.setattr(limited.pe_content_id, "_open_snapshot_stream",
+                        lambda path, label: CheckingStream(open_stream(path, label)))
+    snapshot = limited._snapshot(path, "source")
+    assert attempts == ["writer denied"]
+    assert snapshot.sha256 == hashlib.sha256(b"held input").hexdigest()
+    assert path.read_bytes() == b"held input"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-replace directory rename")
+def test_publication_race_does_not_replace_empty_directory(monkeypatch, tmp_path):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    destination = Path(args.output_dir)
+    original_rename = limited.os.rename
+    def competing_rename(source, target):
+        assert Path(target) == destination
+        destination.mkdir()
+        return original_rename(source, target)
+    def fake_pack(_source, options):
+        Path(options.output_path).write_bytes(b"packed-fixture")
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", fake_pack)
+    monkeypatch.setattr(limited.os, "rename", competing_rename)
+    with pytest.raises(limited.LimitedReleaseError, match="publication failed"):
+        limited.build_bundle(args)
+    assert destination.is_dir() and list(destination.iterdir()) == []
+    assert list(tmp_path.glob(".dist.stage-*")) == []
+
+
+def test_cleanup_does_not_traverse_replaced_stage_alias(monkeypatch, tmp_path):
+    args, _exe, _dll = _integrity_fixture(monkeypatch, tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_bytes(b"untouched")
+    stages = []
+    def replace_stage(_source, options):
+        stage = Path(options.output_path).parent
+        assert stage.parent == tmp_path and stage.name.startswith(".dist.stage-")
+        stage.rename(tmp_path / "retained-stage")
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(external), str(stage))
+        else:
+            stage.symlink_to(external, target_is_directory=True)
+        stages.append(stage)
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    cleanup_calls = []
+    original_rmtree = limited.shutil.rmtree
+    def guarded_rmtree(path, *args, **kwargs):
+        cleanup_calls.append(path)
+        return original_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr(limited.orchestrator, "pack_file", replace_stage)
+    monkeypatch.setattr(limited.shutil, "rmtree", guarded_rmtree)
+    try:
+        with pytest.raises(limited.LimitedReleaseError, match="without output"):
+            limited.build_bundle(args)
+        assert cleanup_calls == []
+        assert marker.read_bytes() == b"untouched"
+        assert not Path(args.output_dir).exists()
+    finally:
+        for stage in stages:
+            if os.name == "nt":
+                assert stage.is_junction()
+                stage.rmdir()
+            else:
+                assert stage.is_symlink()
+                stage.unlink()
