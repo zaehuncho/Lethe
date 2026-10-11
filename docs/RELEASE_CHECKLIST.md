@@ -117,6 +117,12 @@ hash, and must contain a complete non-skipped pytest pass.
 
 ## 4. Validate the real application
 
+- Exercise closing the GUI while a file is still packing. Closing must remain
+  responsive, cancel later queued files, and defer window destruction until the
+  current pack and native worker cleanup finish. Cancellation does not interrupt
+  the active `pack_file` transaction. Repeat closing must not destroy a running
+  child QThread or start another batch. A successful UI-only Nuitka compilation
+  proves the compiler recipe, not the signed resource closure or product runtime.
 - Pack the intended unmanaged x64 EXE with the freshly built stub via
   `--stub-path`. Candidate status never authorizes implicit/default stub use.
 - Exercise startup, shutdown, worker threads, exceptions, resources, updates,

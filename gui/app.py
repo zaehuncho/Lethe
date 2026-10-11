@@ -46,7 +46,7 @@ if _PACKER_ROOT not in sys.path:
 
 # --- PySide6 import guard --------------------------------------------------
 try:
-    from PySide6.QtCore import Qt, QThread, Signal
+    from PySide6.QtCore import Qt, QThread, QTimer, Signal
     from PySide6.QtGui import (
         QColor, QFont, QGuiApplication, QPainter, QPalette,
     )
@@ -408,6 +408,7 @@ class MainWindow(QMainWindow):
 
         self._paths: set[str] = set()   # dedupe by absolute path
         self._worker: "PackWorker | None" = None
+        self._close_pending = False
 
         self._build_ui()
         self._refresh_states()
@@ -705,7 +706,9 @@ class MainWindow(QMainWindow):
         self._worker.fileFinished.connect(self._on_file_finished)
         self._worker.fileError.connect(self._on_file_error)
         self._worker.countChanged.connect(self._on_count_changed)
-        self._worker.allFinished.connect(self._on_all_finished)
+        # allFinished is emitted inside run(), before thread teardown. Only
+        # QThread.finished may trigger ownership cleanup and a deferred close.
+        self._worker.finished.connect(self._on_all_finished)
         self._set_running(True)
         self._worker.start()
 
@@ -744,13 +747,20 @@ class MainWindow(QMainWindow):
 
     def _on_all_finished(self) -> None:
         worker = self._worker
+        if worker is None:
+            return
+        # finished can precede native thread-local cleanup. Join non-blockingly
+        # and retain the parent/worker until all thread effects have completed.
+        if not worker.wait(0):
+            QTimer.singleShot(10, self._on_all_finished)
+            return
         self._worker = None
-        if worker is not None:
-            worker.wait()
-            worker.deleteLater()
+        worker.deleteLater()
         self._set_running(False)
         self.summary_label.setText("done")
         self.log_line("finished")
+        if self._close_pending:
+            self.close()
 
     # -------------------------------------------------------------- state
     def _set_running(self, running: bool) -> None:
@@ -816,7 +826,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):  # noqa: N802
         if self._worker is not None:
             self._worker.cancel()
-            self._worker.wait(3000)
+            if not self._close_pending:
+                self._close_pending = True
+                self.log_line("Closing after the current file finishes; queued files cancelled.")
+            self.pack_btn.setText("Closing…")
+            self.pack_btn.setEnabled(False)
+            # Cancellation is between files, not inside pack_file. Never accept
+            # window destruction while its child QThread still owns work.
+            event.ignore()
+            return
         super().closeEvent(event)
 
 
