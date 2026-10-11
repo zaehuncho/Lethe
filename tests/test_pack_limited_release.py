@@ -95,9 +95,16 @@ def test_bundle_packs_exe_and_dll_transactionally(monkeypatch, tmp_path):
         assert options.anti_debug is False
         assert options.memory_guard is False
         assert options.process_hardening is False
+        assert options.tamper_monitor is False
         assert options.server_shard is False
         assert options.virtualization_specs == ()
         assert options.stub_path == str(stub)
+    assert "tamper-monitor" in payload["disabled_features"]
+    steps = payload["required_before_distribution"]
+    assert steps.index("Authenticode-sign and timestamp after packing") < steps.index(
+        "regenerate and sign product integrity manifests over final distributed bytes")
+    assert steps.index("regenerate and sign product integrity manifests over final distributed bytes") < steps.index(
+        "run product-specific EXE and DLL-host workflows with integrity verification enabled")
     assert "LETHE_ENABLE_EXPERIMENTAL_DLL" not in os.environ
 
 
@@ -269,6 +276,23 @@ def _integrity_fixture(monkeypatch, tmp_path, *, exe_name="product.exe"):
 def _assert_unpublished(tmp_path):
     assert not (tmp_path / "dist").exists()
     assert list(tmp_path.glob(".dist.stage-*")) == []
+
+
+def test_profile_explicitly_disables_tamper_monitor_if_core_default_changes(monkeypatch, tmp_path):
+    args, exe, dll = _integrity_fixture(monkeypatch, tmp_path)
+    original_options = limited.orchestrator.PackOptions
+    def future_options(**kwargs):
+        kwargs.setdefault("tamper_monitor", True)
+        return original_options(**kwargs)
+    monkeypatch.setattr(limited.orchestrator, "PackOptions", future_options)
+    observed = []
+    def fake_pack(source, options):
+        observed.append(options.tamper_monitor)
+        Path(options.output_path).write_bytes(b"packed-fixture")
+        return SimpleNamespace(ok=True, error=None, build_id="fixture")
+    monkeypatch.setattr(limited.orchestrator, "pack_file", fake_pack)
+    limited.build_bundle(args)
+    assert observed == [False, False]
 
 
 @pytest.mark.parametrize("name", [limited.MANIFEST_NAME, limited.MANIFEST_NAME.upper()])

@@ -15,7 +15,7 @@ separate characterization test. DLL exports remain in the
 declared DLL fixture envelope; name/ordinal parity alone is not runtime proof.
 The profile uses compression, authenticated encrypted sections, relocation,
 TLS, resource, import, EXE/DLL-export, and unwind handling from the base packer. It keeps
-anti-debug, memory guard, process hardening, server shards, and selected-function
+anti-debug, memory guard, process hardening, tamper monitoring, server shards, and selected-function
 virtualization disabled.
 
 ```powershell
@@ -43,13 +43,18 @@ inputs may still grow because they must include the runtime.
 
 Before distribution:
 
-1. Run the packed EXE through the product's startup, shutdown, update, and core
-   workflows.
-2. Load the packed DLL through the real host and exercise attach, exported APIs,
+1. Authenticode-sign and timestamp after packing, then verify those signatures.
+2. Regenerate and sign any application integrity/release manifests over the final
+   distributed bytes, after packing and PE signing have finished. Use the existing
+   product manifest pipeline; do not disable integrity checks or patch signature
+   verification to accommodate stale hashes. Both packing and PE signing change
+   file hashes, so an unchanged pre-pack product manifest is not runtime acceptance.
+3. Run the packed EXE through startup, shutdown, update, and core workflows with
+   the product's integrity verification enabled.
+4. Load the packed DLL through the real host and exercise attach, exported APIs,
    worker threads, detach, unload, and reload paths used by the product.
-3. Scan the exact packed files.
-4. Authenticode-sign and timestamp after packing, then verify those signatures.
-5. Canary the exact signed hashes and retain the unpacked symbolized build.
+5. Scan the exact final package.
+6. Canary the exact signed hashes and retain the unpacked symbolized build.
 
 This profile is suitable only for inputs whose own workflows pass. Unsupported
 PE shapes still fail closed during packing; a successful structural validation

@@ -266,7 +266,8 @@ def test_json_table_and_starter_selection_are_deterministic():
     encoded = json.loads(report.to_json())
     assert encoded["schema"] == discovery.REPORT_SCHEMA
     assert encoded["version"] == discovery.REPORT_VERSION
-    assert "executable_coverage_gaps" in encoded["candidates"][0]
+    reference = encoded["candidates"][0]["executable_coverage_gap_set"]
+    assert reference in encoded["coverage_gap_sets"]
     selection = report.starter_selection_manifest()
     assert selection["schema"] == discovery.SELECTION_SCHEMA
     assert selection["functions"] == [

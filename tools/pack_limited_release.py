@@ -3,7 +3,7 @@
 
 This profile is intentionally narrower than the full public-release gate.  It
 packs unmanaged AMD64 EXEs and DLLs with the stable base container while keeping
-anti-debug, memory guard, process hardening, server shards, and selected-function
+anti-debug, memory guard, process hardening, tamper monitoring, server shards, and selected-function
 virtualization disabled.  The output is a transactional directory containing
 the packed files and a hash manifest.  Product-specific runtime testing and
 Authenticode signing still happen after packing. Exported EXEs require a
@@ -207,6 +207,7 @@ def build_bundle(args: argparse.Namespace) -> Path:
                 anti_debug=False,
                 memory_guard=False,
                 process_hardening=False,
+                tamper_monitor=False,
                 compression_level=args.compression_level,
                 output_path=str(packed),
                 is_dll=(kind == "dll"),
@@ -271,14 +272,16 @@ def build_bundle(args: argparse.Namespace) -> Path:
                 "anti-debug",
                 "memory-guard",
                 "process-hardening",
+                "tamper-monitor",
                 "selected-function-virtualization",
                 "server-shard",
             ],
             "profile": PROFILE_ID,
             "required_before_distribution": [
-                "run product-specific EXE and DLL-host workflows",
-                "scan the exact packed files",
                 "Authenticode-sign and timestamp after packing",
+                "regenerate and sign product integrity manifests over final distributed bytes",
+                "run product-specific EXE and DLL-host workflows with integrity verification enabled",
+                "scan the exact final package",
                 "canary the exact signed hashes before broad rollout",
             ],
             "schema": 1,
@@ -327,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     print("limited release: PACKED")
     print(f"  profile : {PROFILE_ID}")
     print(f"  manifest: {manifest_path}")
-    print("  next    : product smoke tests, scanning, then Authenticode signing")
+    print("  next    : final signing/manifest regeneration, product smoke tests, scanning")
     return EXIT_OK
 
 

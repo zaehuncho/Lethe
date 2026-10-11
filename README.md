@@ -157,6 +157,15 @@ detach, unload, and reload lifecycles, but is not release-approved until every
 required DLL compatibility row is proven. Experimental behavior must not be used
 for release artifacts.
 
+The human discovery report JSON uses `lethe.virtualization-report` version 3.
+`coverage_gap_sets` stores each distinct ordered gap list once; both the report
+and every candidate name their list with `executable_coverage_gap_set`. Consumers
+must check the report version and resolve every reference, never interpret a
+missing/unresolved list as empty. This avoids repeating whole-image gaps for each
+function. Candidate liftability, rejection verdicts and gap contents are unchanged.
+The standalone `FunctionCandidate.to_dict()` API still includes its full gap list.
+This report version is separate from the selection-manifest versions below.
+
 The report tool's selection manifest binds the full source SHA-256, its
 signing-stable PE content identity, PE kind, AMD64 machine, image base,
 `SizeOfImage`, and every selected function's complete runtime-function extent,

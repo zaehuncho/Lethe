@@ -34,7 +34,7 @@ except ImportError:  # standalone tests
 
 
 REPORT_SCHEMA = "lethe.virtualization-report"
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 SELECTION_SCHEMA = "lethe.virtualization-selection"
 SELECTION_VERSION = 1
 DEFAULT_LEAF_CAP = 64
@@ -124,15 +124,12 @@ class FunctionCandidate:
     def body_size(self) -> int:
         return self.size if self.lifted_body_size is None else self.lifted_body_size
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, coverage_gap_set: str | None = None) -> dict[str, Any]:
+        result = {
             "direct_control_proof_status": self.direct_control_proof_status,
             "direct_control_rejection_reason": self.direct_control_rejection_reason,
             "direct_reference_gate_passed": self.direct_reference_gate_passed,
             "exact_extent": self.exact_extent,
-            "executable_coverage_gaps": [
-                gap.to_dict() for gap in self.executable_coverage_gaps
-            ],
             "extent_kind": self.extent_kind,
             "first_unsupported_instruction": (
                 self.first_unsupported_instruction.to_dict()
@@ -156,6 +153,13 @@ class FunctionCandidate:
             "unwind_flag_names": list(self.unwind_flag_names),
             "unwind_flags": self.unwind_flags,
         }
+        if coverage_gap_set is None:
+            result["executable_coverage_gaps"] = [
+                gap.to_dict() for gap in self.executable_coverage_gaps
+            ]
+        else:
+            result["executable_coverage_gap_set"] = coverage_gap_set
+        return result
 
 
 @dataclass(frozen=True)
@@ -172,13 +176,34 @@ class FunctionDiscoveryReport:
     version: int = REPORT_VERSION
 
     def to_dict(self) -> dict[str, Any]:
+        if self.version != REPORT_VERSION or self.schema != REPORT_SCHEMA:
+            raise FunctionDiscoveryError("unsupported virtualization report schema/version")
+        # Exact candidates share the whole-image tuple. Cache by tuple identity
+        # first: repeatedly hashing that tuple would itself cost O(functions*gaps).
+        gap_sets = {"image": self.executable_coverage_gaps}
+        by_identity = {id(self.executable_coverage_gaps): "image"}
+        by_value = {self.executable_coverage_gaps: "image"}
+        candidates = []
+        for candidate in self.candidates:
+            gaps = candidate.executable_coverage_gaps
+            reference = by_identity.get(id(gaps))
+            if reference is None:
+                reference = by_value.get(gaps)
+                if reference is None:
+                    reference = f"candidate-{len(gap_sets)}"
+                    gap_sets[reference] = gaps
+                    by_value[gaps] = reference
+                by_identity[id(gaps)] = reference
+            candidates.append(candidate.to_dict(coverage_gap_set=reference))
         return {
-            "candidates": [candidate.to_dict() for candidate in self.candidates],
+            "candidates": candidates,
             "direct_control_analysis_error": self.direct_control_analysis_error,
             "direct_control_analysis_status": self.direct_control_analysis_status,
-            "executable_coverage_gaps": [
-                gap.to_dict() for gap in self.executable_coverage_gaps
-            ],
+            "executable_coverage_gap_set": "image",
+            "coverage_gap_sets": {
+                name: [gap.to_dict() for gap in gaps]
+                for name, gaps in gap_sets.items()
+            },
             "image": {
                 "image_base": self.image_base,
                 "path": self.image_path,
