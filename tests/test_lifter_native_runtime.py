@@ -128,6 +128,8 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
         "adc rax, rbx; sbb r8, r9",
         "shl eax, 0; sar r8b, 0; rol r9w, 0",
         "setc al; setp r9b; cmovl r10, r11; cmovg r12, r13",
+        "pcmpeqb xmm0, xmm15; pcmpeqw xmm1, xmm14; pcmpeqd xmm2, xmm13; "
+        "pcmpgtb xmm3, xmm12; pcmpgtw xmm4, xmm11; pcmpgtd xmm5, xmm10",
     )):
         code = _asm(assembly)
         plain = daedalus_asm.assemble(lifter.lift_function(code, base=oracle.BASE))
@@ -147,7 +149,7 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
                 f"flag_rolling_{index}, sizeof(flag_rolling_{index}), "
                 f"UINT64_C(0x{bits:X}), {{ {{ {_c_u64s(regs)} }}, "
                 f"UINT64_C(0x{_flag_mask(out_flags):X}), {{ {_c_xmms(xmms)} }} }} }}")
-    assert len(flag_expectations) == 128
+    assert len(flag_expectations) == 160
     flag_declarations = "\n".join(flag_programs)
     flag_rows = ",\n".join(flag_expectations)
 
@@ -305,7 +307,7 @@ int main(void)
         return 62;
     if (memcmp(&context, &snapshot, sizeof(context)) != 0)
         return 63;
-    puts("NATIVE_INCOMING_FLAGS cases=128 modes=2 passes=256");
+    puts("NATIVE_INCOMING_FLAGS cases=160 modes=2 passes=320");
     return 0;
 }}
 """
@@ -356,5 +358,5 @@ target_link_libraries(dvm_x64_frame PRIVATE bcrypt)
     (tmp_path / "harness-stdout.txt").write_text(ran.stdout, encoding="utf-8")
     (tmp_path / "harness-stderr.txt").write_text(ran.stderr, encoding="utf-8")
     assert ran.returncode == 0, f"native harness returned {ran.returncode}: {ran.stdout} {ran.stderr}"
-    assert ran.stdout.strip() == "NATIVE_INCOMING_FLAGS cases=128 modes=2 passes=256"
+    assert ran.stdout.strip() == "NATIVE_INCOMING_FLAGS cases=160 modes=2 passes=320"
     assert ran.stderr == ""

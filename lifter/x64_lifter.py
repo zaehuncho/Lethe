@@ -26,7 +26,10 @@ stack effects and use shadow-validated VM returns. Direct RIP-relative import
 calls (`call qword ptr [rip+disp32]`) are bridged through the Win64 native-call
 trampoline: the slot pointer is resolved at runtime and the already-lifted
 register/stack arguments are marshalled into the call. Legacy XMM moves and
-bitwise XOR/AND/OR operate on a captured 16-register, two-lane state. MOVD/MOVQ
+bitwise XOR/AND/OR operate on a captured 16-register, two-lane state. Legacy
+SSE2 PCMPEQB/PCMPEQW/PCMPEQD and PCMPGTB/PCMPGTW/PCMPGTD
+comparisons operate on exact packed integer elements without changing flags.
+The comparisons admit XMM register or aligned 128-bit memory sources. MOVD/MOVQ
 and legacy MOVSS/MOVSD scalar transfers plus aligned MOVAPS/MOVDQA and
 unaligned MOVUPS/MOVDQU 128-bit memory transfers are supported. Legacy
 MOVLPS/MOVLPD and MOVHPS/MOVHPD memory transfers preserve the untouched
@@ -148,6 +151,14 @@ _XMM_LOGICAL = {
     Mnemonic.POR: ("por", "or", False),
     Mnemonic.ORPS: ("orps", "or", False),
     Mnemonic.ORPD: ("orpd", "or", False),
+}
+_XMM_INTEGER_COMPARE = {
+    Mnemonic.PCMPEQB: ("pcmpeqb", 8, False),
+    Mnemonic.PCMPEQW: ("pcmpeqw", 16, False),
+    Mnemonic.PCMPEQD: ("pcmpeqd", 32, False),
+    Mnemonic.PCMPGTB: ("pcmpgtb", 8, True),
+    Mnemonic.PCMPGTW: ("pcmpgtw", 16, True),
+    Mnemonic.PCMPGTD: ("pcmpgtd", 32, True),
 }
 
 MASK64 = (1 << 64) - 1
@@ -589,6 +600,49 @@ class _Lifter:
             self.a("not")
         self.rd_local(T1); self.a(operation); self.wr_local(T1)
         self._write_xmm_from_temps(destination)
+
+    def _xmm_integer_compare(self, instr, mnemonic: str, width: int,
+                             signed_greater: bool) -> None:
+        """Produce all-one/zero element masks with unchanged architectural flags.
+
+        Capture both operands before writeback, including self-aliases. Sign-bit
+        bias maps each signed element onto unsigned order, avoiding subtraction
+        overflow and using only the existing canonical VM instruction surface.
+        """
+        self._require_legacy_binary(instr, mnemonic)
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported(f"{mnemonic} destination must be an XMM register")
+        destination = self._xmm_offset(instr.op_register(0))
+        if instr.op_kind(1) == OpKind.REGISTER:
+            source = self._xmm_offset(instr.op_register(1))
+            self.rd_local(source); self.wr_local(T0)
+            self.rd_local(source + 8); self.wr_local(T1)
+        elif instr.op_kind(1) == OpKind.MEMORY:
+            self._require_xmm_memory_size(instr, mnemonic)
+            self._emit_effective_address(instr); self.wr_local(T5)
+            self.rd_local(T5); self.a("load128a")
+            self.wr_local(T1); self.wr_local(T0)
+        else:
+            raise LiftUnsupported(f"{mnemonic} source must be XMM or 128-bit memory")
+        self.rd_local(destination); self.wr_local(T2)
+        self.rd_local(destination + 8); self.wr_local(T3)
+        element_mask = (1 << width) - 1
+        for lane, left, right in ((0, T2, T0), (8, T3, T1)):
+            self.push_imm(0); self.wr_local(T4)
+            for shift in range(0, 64, width):
+                for operand in (left, right):
+                    self.rd_local(operand)
+                    if shift:
+                        self.push_imm(shift); self.a("shr")
+                    self.push_imm(element_mask); self.a("and")
+                    if signed_greater:
+                        self.push_imm(1 << (width - 1)); self.a("xor")
+                self.a("cmp_gt" if signed_greater else "cmp_eq")
+                self.a("neg"); self.push_imm(element_mask); self.a("and")
+                if shift:
+                    self.push_imm(shift); self.a("shl")
+                self.rd_local(T4); self.a("or"); self.wr_local(T4)
+            self.rd_local(T4); self.wr_local(destination + lane)
 
     def _movd_movq(self, instr, *, width: int) -> None:
         mnemonic = "movd" if width == 32 else "movq"
@@ -2088,6 +2142,9 @@ class _Lifter:
                 self._xmm_logical(
                     instr, mnemonic, operation, invert_destination
                 )
+            elif m in _XMM_INTEGER_COMPARE:
+                mnemonic, width, signed_greater = _XMM_INTEGER_COMPARE[m]
+                self._xmm_integer_compare(instr, mnemonic, width, signed_greater)
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:

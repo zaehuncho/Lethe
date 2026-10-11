@@ -279,7 +279,9 @@ Concrete, honest limitations of the offline layer:
   left native, and the MSVC CFG-dispatch idiom cross the Win64 native-call
   bridge. The bounded legacy XMM transport subset includes whole-register,
   scalar MOVSS/MOVSD, low/high 64-bit lane moves, and immediate whole-register
-  byte shifts; other indirect calls, SIMD/FP arithmetic, exception-bearing
+  byte shifts. Legacy SSE2 PCMPEQB/PCMPEQW/PCMPEQD and
+  PCMPGTB/PCMPGTW/PCMPGTD support XMM or aligned 128-bit memory sources and
+  preserve flags. Other indirect calls, SIMD/FP arithmetic, exception-bearing
   selected bodies, and general indirect-target closure remain unsupported.
 
 ## AV / Authenticode

@@ -52,7 +52,7 @@ The isolated scalar oracle covers every combination of incoming CF/PF/ZF/SF/OF
 through register, XMM, memory, complete-function and relocated-data boundaries.
 Its keyword-only `initial_flags` argument accepts only those arithmetic RFLAGS
 bits; the default remains zero. The native frame harness independently replays
-128 seeded cases in plain and rolling modes (256 executions), compares all GPRs,
+160 seeded cases in plain and rolling modes (320 executions), compares all GPRs,
 XMM lanes and modeled flags, and checks preservation of unmodeled flag bits.
 This is instruction/frame evidence, not real-application or general ISA approval.
 
@@ -130,7 +130,7 @@ hash, and must contain a complete non-skipped pytest pass.
 
 ### Replay the integer corpus against the verified candidate
 
-After staging, run the five-function integer corpus with the intact candidate
+After staging, run the six-function integer/SSE2 corpus with the intact candidate
 bundle. This mode verifies the complete candidate before building or executing
 the generated fixture, rechecks its artifact/manifest binding before packing,
 and never enables the unverified-stub test override:
@@ -143,12 +143,18 @@ $env:LETHE_NATIVE_CORPUS_STUB_PATH = "C:\path\to\candidate\lethe_stub_x64.dll"
 ```
 
 The run exercises narrow extensions, SET/CMOV selection, ADC/SBB carry,
-BSWAP/XCHG memory, and MUL/IMUL wide arithmetic with the candidate's own opcode
+BSWAP/XCHG memory, MUL/IMUL wide arithmetic, and the six legacy SSE2 packed
+byte/word/dword equality and signed-greater-than comparisons with the candidate's own opcode
 mapping and rolling configuration. An empty, damaged, changed or unverified
 explicit candidate fails; it never falls back to a freshly built test runtime.
 Unset both variables afterward. With no candidate path, the opt-in test retains
 its self-built non-rolling fixture mode. Fixture-only coverage/indirect-target
 acknowledgements are not product approval or a general indirect-closure proof.
+
+The packed comparisons accept XMM registers and aligned 128-bit memory sources;
+MMX, VEX/EVEX, and the SSE4 quadword forms remain whole-function rejections.
+Element masks and signed comparisons follow the
+[Intel instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf).
 
 ## 4. Validate the real application
 

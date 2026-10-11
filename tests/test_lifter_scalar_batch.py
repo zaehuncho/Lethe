@@ -14,6 +14,7 @@ pytest.importorskip("unicorn")
 from keystone import KS_ARCH_X86, KS_MODE_64, Ks  # noqa: E402
 from lifter import oracle  # noqa: E402
 from lifter import x64_lifter as L  # noqa: E402
+from daedalus_ref import DaedalusError  # noqa: E402
 
 
 _KS = Ks(KS_ARCH_X86, KS_MODE_64)
@@ -576,3 +577,102 @@ def test_noncanonical_narrow_movsxd_encoding_fails_closed() -> None:
     # mainstream assemblers decline to emit the discouraged form.
     with pytest.raises(L.LiftUnsupported, match="64-bit destination"):
         L.lift_function(bytes.fromhex("63c3"), base=oracle.BASE)
+
+
+_PACKED_COMPARE = (("pcmpeqb", 8, False), ("pcmpeqw", 16, False),
+                   ("pcmpeqd", 32, False), ("pcmpgtb", 8, True),
+                   ("pcmpgtw", 16, True), ("pcmpgtd", 32, True))
+
+
+def _packed_compare_expected(left, right, width, greater):
+    result, mask = 0, (1 << width) - 1
+    for shift in range(0, 128, width):
+        a, b = (left >> shift) & mask, (right >> shift) & mask
+        if greater:
+            # Independent signed conversion, rather than the lifter's bias.
+            a = a - (1 << width) if a >> (width - 1) else a
+            b = b - (1 << width) if b >> (width - 1) else b
+        if a > b if greater else a == b:
+            result |= mask << shift
+    return result
+
+
+@pytest.mark.parametrize("mnemonic,width,greater", _PACKED_COMPARE)
+@pytest.mark.parametrize("destination,source", [(0, 15), (15, 0), (8, 9), (15, 15)])
+def test_packed_integer_comparisons_register_edges_aliases_and_flags(
+        mnemonic, width, greater, destination, source):
+    rng = random.Random(0xC0A0 + width + destination)
+    mask = (1 << width) - 1
+    edge = (0, 1, mask, 1 << (width - 1), (1 << (width - 1)) - 1)
+    repeat = lambda value: sum(value << shift for shift in range(0, 128, width))
+    cases = [(repeat(a), repeat(b)) for a in edge for b in edge]
+    cases += [(rng.getrandbits(128), rng.getrandbits(128)) for _ in range(32)]
+    code = _asm(f"{mnemonic} xmm{destination}, xmm{source}")
+    for index, (left, right) in enumerate(cases):
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        xmms[destination] = left
+        if source != destination:
+            xmms[source] = right
+        bits, flags = _incoming_flags(index % 32)
+        expected = _packed_compare_expected(xmms[destination], xmms[source], width, greater)
+        native, _ = oracle.check_xmm(code, xmm_init=xmms, initial_flags=bits)
+        assert native[2][destination] == expected and native[1] == flags
+        assert all(native[2][reg] == xmms[reg] for reg in range(16) if reg != destination)
+
+
+@pytest.mark.parametrize("mnemonic,width,greater", _PACKED_COMPARE)
+def test_packed_integer_comparisons_aligned_memory_and_fault_guard(mnemonic, width, greater):
+    rng = random.Random(0xA11C + width)
+    code = _asm(f"{mnemonic} xmm15, xmmword ptr [rbx+16]")
+    for index in range(32):
+        left, right = rng.getrandbits(128), rng.getrandbits(128)
+        xmms = [0] * 16; xmms[15] = left
+        memory = bytes(16) + right.to_bytes(16, "little") + bytes(16)
+        bits, flags = _incoming_flags(index)
+        native, _ = oracle.check_xmm(code, init=_init(rbx=oracle.MEM_BASE),
+            xmm_init=xmms, mem=memory, initial_flags=bits)
+        assert native[2][15] == _packed_compare_expected(left, right, width, greater)
+        assert native[1] == flags
+    assert "load128a" in L.lift_function(code, base=oracle.BASE)
+    # Unicorn does not reliably enforce legacy alignment exceptions. Assert
+    # the VM's existing checked-load contract instead of inventing oracle parity.
+    with pytest.raises(DaedalusError, match="align"):
+        oracle.run_daedalus_xmm(code, init=_init(rbx=oracle.MEM_BASE+1),
+                               mem=bytes(64), initial_flags=bits)
+
+
+@pytest.mark.parametrize("source", [
+    "pcmpeqb mm0, mm1", "pcmpgtw mm2, mm3",
+    "vpcmpeqb xmm0, xmm1, xmm2", "vpcmpgtd ymm0, ymm1, ymm2",
+    "pcmpeqq xmm0, xmm1", "pcmpgtq xmm0, xmm1",
+])
+def test_packed_comparison_non_sse2_surfaces_stay_closed(source):
+    with pytest.raises(L.LiftUnsupported):
+        L.lift_function(_asm(source), base=oracle.BASE)
+
+
+@pytest.mark.parametrize("mnemonic,width,greater", _PACKED_COMPARE)
+def test_packed_integer_compare_rip_data_relocates_and_bounds_full_operand(mnemonic, width, greater):
+    code_rva, data_rva, image_base = 0x1000, 0x3000, 0x180000000
+    placeholder = _asm(f"{mnemonic} xmm15, xmmword ptr [rip]")
+    raw, _ = _KS.asm(f"{mnemonic} xmm15, xmmword ptr [rip+{data_rva-code_rva-len(placeholder)}]",
+                     addr=code_rva)
+    code = bytes(raw)
+    left = int.from_bytes(bytes.fromhex("80ff7f000180ff7f10203040a0b0c0d0"), "little")
+    right_bytes = bytes.fromhex("7fff8000017fff80102031409fb0c1d0")
+    right = int.from_bytes(right_bytes, "little")
+    text = oracle._OracleSection(".text", code_rva, len(code), code, 0x60000020)
+    data = oracle._OracleSection(".rdata", data_rva, 16, right_bytes, 0x40000040)
+    xmms = [0]*16; xmms[15] = left
+    bits, flags = _incoming_flags(31)
+    native, _ = oracle.check_xmm(code, xmm_init=xmms, mem=right_bytes,
+        mem_base=image_base+data_rva, code_base=image_base+code_rva,
+        lift_base=code_rva, image_base=image_base, image_sections=(text, data),
+        selected_extents=((code_rva, len(code)),), initial_flags=bits)
+    assert native[1] == flags
+    assert native[2][15] == _packed_compare_expected(left, right, width, greater)
+    for size, characteristics in ((15, 0x40000040), (16, 0x60000020), (16, 0x42000040)):
+        bad = oracle._OracleSection(".bad", data_rva, size, right_bytes[:size], characteristics)
+        with pytest.raises(L.LiftUnsupported):
+            L.lift_function(code, base=code_rva, image_sections=(text, bad),
+                            selected_extents=((code_rva, len(code)),))

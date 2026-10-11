@@ -34,7 +34,7 @@ _SHUFFLE_SEED = "5a" * 32
 _EXPECTED_STDOUT = (
     b"narrow=1122334455666634 select=20/29 "
     b"carry=0000000000000000 bswap=04030201 "
-    b"wide=ce8ece0ece8ecfad\r\n"
+    b"wide=ce8ece0ece8ecfad compare=passed\r\n"
 )
 
 
@@ -148,13 +148,48 @@ uint32_t vm_select(int32_t x, int32_t y);
 uint64_t vm_carry(uint64_t x, uint64_t y, uint64_t carry, uint64_t sub);
 uint32_t vm_bswap_mem(const uint32_t *value, uint32_t mix);
 uint64_t vm_wide_mul(uint64_t x, uint64_t y);
+void vm_compare(const uint8_t *left, const uint8_t *right, uint8_t *output);
+
+static int check_comparisons(void)
+{
+    __declspec(align(16)) static const uint8_t left[16] = {
+        0x80,0x7f,0xff,0,1,2,3,4,5,6,7,8,9,0x80,0xff,0 };
+    __declspec(align(16)) static const uint8_t right[16] = {
+        0x7f,0x80,0xff,1,0,2,4,3,5,7,6,8,0x80,9,0,0xff };
+    __declspec(align(16)) uint8_t output[96];
+    unsigned int operation, offset, byte_index;
+    vm_compare(left, right, output);
+    for (operation = 0; operation < 6; operation++) {
+        const unsigned int bytes = 1U << (operation % 3U);
+        const unsigned int width = bytes * 8U;
+        for (offset = 0; offset < 16; offset += bytes) {
+            uint32_t a_bits = 0, b_bits = 0;
+            int64_t a, b;
+            uint8_t expected;
+            for (byte_index = 0; byte_index < bytes; byte_index++) {
+                a_bits |= (uint32_t)left[offset+byte_index] << (byte_index*8U);
+                b_bits |= (uint32_t)right[offset+byte_index] << (byte_index*8U);
+            }
+            a = (a_bits & (1U << (width-1U)))
+                ? (int64_t)a_bits - (INT64_C(1) << width) : (int64_t)a_bits;
+            b = (b_bits & (1U << (width-1U)))
+                ? (int64_t)b_bits - (INT64_C(1) << width) : (int64_t)b_bits;
+            expected = (operation < 3U ? a_bits == b_bits : a > b) ? 0xffU : 0U;
+            for (byte_index = 0; byte_index < bytes; byte_index++) {
+                if (output[operation*16U+offset+byte_index] != expected)
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
 
 __declspec(noreturn) void corpus_entry(void)
 {
     static const char ok[] =
         "narrow=1122334455666634 select=20/29 "
         "carry=0000000000000000 bswap=04030201 "
-        "wide=ce8ece0ece8ecfad\r\n";
+        "wide=ce8ece0ece8ecfad compare=passed\r\n";
     static const char mismatch[] = "corpus-mismatch\r\n";
     const uint32_t memory_value = 0x01020304UL;
     const uint64_t narrow = vm_narrow(0x80ULL, 0x1234ULL);
@@ -170,7 +205,7 @@ __declspec(noreturn) void corpus_entry(void)
         && select_high == 29UL
         && carry == 0ULL
         && swapped == 0x04030201UL
-        && wide == 0xce8ece0ece8ecfadULL;
+        && wide == 0xce8ece0ece8ecfadULL && check_comparisons();
     const char *message = valid ? ok : mismatch;
     const DWORD size = valid ? (DWORD)(sizeof(ok) - 1) : (DWORD)(sizeof(mismatch) - 1);
     DWORD written = 0;
@@ -280,6 +315,33 @@ vm_wide_mul PROC FRAME
     ret
 vm_wide_mul ENDP
 
+PUBLIC vm_compare
+vm_compare PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpeqb xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8], xmm0
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpeqw xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8+16], xmm0
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpeqd xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8+32], xmm0
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpgtb xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8+48], xmm0
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpgtw xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8+64], xmm0
+    movdqu xmm0, xmmword ptr [rcx]
+    pcmpgtd xmm0, xmmword ptr [rdx]
+    movdqu xmmword ptr [r8+80], xmm0
+    add rsp, 28h
+    ret
+vm_compare ENDP
+
 END
 """.lstrip(),
         encoding="ascii",
@@ -295,7 +357,7 @@ target_link_options(vm_corpus PRIVATE
     /INCREMENTAL:NO /OPT:NOICF /FIXED /NXCOMPAT
     /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:corpus_entry /SUBSYSTEM:CONSOLE
     /EXPORT:vm_narrow /EXPORT:vm_select /EXPORT:vm_carry
-    /EXPORT:vm_bswap_mem /EXPORT:vm_wide_mul)
+    /EXPORT:vm_bswap_mem /EXPORT:vm_wide_mul /EXPORT:vm_compare)
 target_link_libraries(vm_corpus PRIVATE kernel32.lib)
 """.lstrip(),
         encoding="ascii",
@@ -374,7 +436,7 @@ def _function_specs(
     image = assemble._StubImage(executable.read_bytes())
     specs = []
     for name in (
-        "vm_narrow", "vm_select", "vm_carry", "vm_bswap_mem", "vm_wide_mul"
+        "vm_narrow", "vm_select", "vm_carry", "vm_bswap_mem", "vm_wide_mul", "vm_compare"
     ):
         export_rva = image.find_export_rva(name)
         assert export_rva is not None, f"missing fixture export {name}"
@@ -445,6 +507,8 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
         assert {Mnemonic.ADC, Mnemonic.SBB} <= by_name["vm_carry"]
         assert {Mnemonic.BSWAP, Mnemonic.XCHG} <= by_name["vm_bswap_mem"]
         assert {Mnemonic.MUL, Mnemonic.IMUL} <= by_name["vm_wide_mul"]
+        assert {Mnemonic.PCMPEQB, Mnemonic.PCMPEQW, Mnemonic.PCMPEQD,
+                Mnemonic.PCMPGTB, Mnemonic.PCMPGTW, Mnemonic.PCMPGTD} <= by_name["vm_compare"]
 
         proof = direct_control_flow.analyze_direct_control_flow(
             parsed, specs, production=False
@@ -516,7 +580,7 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
         assert result.ok, result.error
         assert packed.is_file()
         assert len(captured["result"].manifest.functions) == len(specs)
-        assert any("virtualized 5 selected function" in line for line in progress)
+        assert any("virtualized 6 selected function" in line for line in progress)
 
         packed_run = _run(packed)
         assert packed_run.returncode == original_run.returncode
