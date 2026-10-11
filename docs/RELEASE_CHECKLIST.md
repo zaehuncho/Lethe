@@ -115,6 +115,28 @@ Failed local gates or policy drift leave diagnostics but no verified manifest.
 `evidence/runtime-hardening.json` is mandatory, must name the candidate artifact
 hash, and must contain a complete non-skipped pytest pass.
 
+### Replay the integer corpus against the verified candidate
+
+After staging, run the five-function integer corpus with the intact candidate
+bundle. This mode verifies the complete candidate before building or executing
+the generated fixture, rechecks its artifact/manifest binding before packing,
+and never enables the unverified-stub test override:
+
+```powershell
+$env:LETHE_RUN_NATIVE_VM_CORPUS = "1"
+$env:LETHE_NATIVE_CORPUS_STUB_PATH = "C:\path\to\candidate\lethe_stub_x64.dll"
+.\.venv\Scripts\python.exe -m pytest tests/test_native_virtualization_corpus.py `
+  -q -p no:cacheprovider
+```
+
+The run exercises narrow extensions, SET/CMOV selection, ADC/SBB carry,
+BSWAP/XCHG memory, and MUL/IMUL wide arithmetic with the candidate's own opcode
+mapping and rolling configuration. An empty, damaged, changed or unverified
+explicit candidate fails; it never falls back to a freshly built test runtime.
+Unset both variables afterward. With no candidate path, the opt-in test retains
+its self-built non-rolling fixture mode. Fixture-only coverage/indirect-target
+acknowledgements are not product approval or a general indirect-closure proof.
+
 ## 4. Validate the real application
 
 - Exercise closing the GUI while a file is still packing. Closing must remain

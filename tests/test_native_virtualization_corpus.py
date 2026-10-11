@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -21,10 +22,13 @@ from daedalus import shuffle_opcodes
 from iced_x86 import Decoder, Mnemonic
 from lifter import direct_control_flow, virtualization_plan, x64_lifter
 from packer import assemble, orchestrator, pe_analyze, virtualize
+from packer.release_attestation import sha256_file
+from tools.promote_stub import validate_candidate_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
 _RUN_GATE = "LETHE_RUN_NATIVE_VM_CORPUS"
+_CANDIDATE_GATE = "LETHE_NATIVE_CORPUS_STUB_PATH"
 _VIRTUALIZATION_GATE = "LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION"
 _SHUFFLE_SEED = "5a" * 32
 _EXPECTED_STDOUT = (
@@ -32,6 +36,63 @@ _EXPECTED_STDOUT = (
     b"carry=0000000000000000 bswap=04030201 "
     b"wide=ce8ece0ece8ecfad\r\n"
 )
+
+
+@dataclass(frozen=True)
+class _CorpusRuntime:
+    stub: Path
+    sha256: str
+    opcode_table: object
+    handler_variant_sha256: str
+    rolling: bool
+    allow_unverified_stub_for_tests: bool
+    manifest_sha256: str | None = None
+
+
+def _load_corpus_runtime(stub: Path, *, allow_unverified: bool) -> _CorpusRuntime:
+    _blob, sha256, opcodes, handler_sha256, rolling = (
+        orchestrator._load_virtualization_build(
+            str(stub), allow_unverified_stub_for_tests=allow_unverified))
+    return _CorpusRuntime(stub, sha256, opcodes, handler_sha256, rolling,
+                          allow_unverified)
+
+
+def _candidate_runtime_from_environment() -> _CorpusRuntime | None:
+    """An explicit candidate must verify before any fixture build/execution.
+
+    Absence preserves the self-built test-only runtime. Empty, invalid or
+    changed explicit candidates never fall back to that test-only path.
+    """
+    raw = os.environ.get(_CANDIDATE_GATE)
+    if raw is None:
+        return None
+    if not raw or not raw.strip() or "\0" in raw:
+        raise ValueError(f"{_CANDIDATE_GATE} must name an intact candidate")
+    stub = Path(raw).absolute()
+    manifest_path = stub.with_suffix(".manifest.json")
+    manifest_hash = sha256_file(manifest_path)
+    manifest = validate_candidate_bundle(stub, manifest_path)
+    runtime = _load_corpus_runtime(stub, allow_unverified=False)
+    if runtime.sha256 != manifest["sha256"]:
+        raise ValueError("candidate artifact changed during corpus preflight")
+    if sha256_file(manifest_path) != manifest_hash:
+        raise ValueError("candidate manifest changed during corpus preflight")
+    return replace(runtime, manifest_sha256=manifest_hash)
+
+
+def _reload_candidate_runtime(candidate: _CorpusRuntime) -> _CorpusRuntime:
+    """Pin the same candidate after compilation and before packed execution."""
+    if candidate.allow_unverified_stub_for_tests or candidate.manifest_sha256 is None:
+        raise ValueError("candidate reload requires the verified preflight profile")
+    manifest_path = candidate.stub.with_suffix(".manifest.json")
+    if sha256_file(manifest_path) != candidate.manifest_sha256:
+        raise ValueError("candidate manifest changed after corpus preflight")
+    runtime = _load_corpus_runtime(candidate.stub, allow_unverified=False)
+    if runtime.sha256 != candidate.sha256:
+        raise ValueError("candidate artifact changed after corpus preflight")
+    if sha256_file(manifest_path) != candidate.manifest_sha256:
+        raise ValueError("candidate manifest changed during corpus reload")
+    return replace(runtime, manifest_sha256=candidate.manifest_sha256)
 
 
 def _visual_studio_available() -> bool:
@@ -365,6 +426,7 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
         pytest.skip(f"set {_RUN_GATE}=1 to run the native virtualization corpus")
     pytest.importorskip("lief")
     pytest.importorskip("iced_x86")
+    candidate = _candidate_runtime_from_environment()
     if not shutil.which("cmake") or not _visual_studio_available():
         pytest.skip("CMake + the Visual Studio C/ML64 x64 toolchain are required")
 
@@ -407,16 +469,18 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
         assert original_run.stdout == _EXPECTED_STDOUT
         assert original_run.stderr == b""
 
-        stub = _build_stub(work)
-        (_stub_bytes, _stub_sha256, opcode_table,
-         handler_variant_sha256, rolling) = (
-            orchestrator._load_virtualization_build(
-                str(stub), allow_unverified_stub_for_tests=True)
-        )
-        shuffled = shuffle_opcodes.generate_shuffle(bytes.fromhex(_SHUFFLE_SEED))
-        assert not opcode_table.is_canonical
-        assert handler_variant_sha256 == shuffled["handler_variant_sha256"]
-        assert rolling is False
+        if candidate is None:
+            runtime = _load_corpus_runtime(_build_stub(work), allow_unverified=True)
+            shuffled = shuffle_opcodes.generate_shuffle(bytes.fromhex(_SHUFFLE_SEED))
+            assert runtime.handler_variant_sha256 == shuffled["handler_variant_sha256"]
+            assert runtime.rolling is False
+        else:
+            runtime = _reload_candidate_runtime(candidate)
+            assert runtime.allow_unverified_stub_for_tests is False
+            assert runtime.handler_variant_sha256 == candidate.handler_variant_sha256
+            assert runtime.rolling is candidate.rolling
+        assert not runtime.opcode_table.is_canonical
+        stub = runtime.stub
         captured = {}
         materialize = virtualize.materialize_selected_functions
 
@@ -445,7 +509,7 @@ def test_native_selected_function_corpus_matches_original(monkeypatch) -> None:
                 ),
                 virtualization_gap_acknowledgements=gap_acknowledgements,
                 acknowledge_unproven_indirect_targets=True,
-                _allow_unverified_stub_for_tests=True,
+                _allow_unverified_stub_for_tests=runtime.allow_unverified_stub_for_tests,
             ),
             progress.append,
         )
