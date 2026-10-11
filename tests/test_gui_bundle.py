@@ -334,13 +334,15 @@ def test_recipe_source_contract_modes_explicit_ui_only_and_preflight_order():
     assert "--include-data-dir" not in executable
     prepare = executable.index("$BundleHelper prepare")
     first_validate = executable.index("\nAssert-ResourcePlan\n")
-    mkdir = executable.index("New-Item -ItemType Directory -Force -Path $OutputDir")
+    mkdir = executable.index("$OutputHelper prepare --output-dir $OutputDir")
     compile_at = executable.index("& $PythonExe @NuitkaArgs")
     assert prepare < first_validate < mkdir < compile_at
     assert "Assert-ResourcePlan" in executable[mkdir:compile_at]
     assert "Assert-ResourcePlan" in executable[compile_at:]
     assert "$OutputDir = Get-InvocationPath $OutputDir" in executable
     assert "$StubPath = Get-InvocationPath $StubPath" in executable
+    assert "$OutputHelper verify --output-dir $OutputDir" in executable[compile_at:]
+    assert "Write-Warning \"Nuitka reported success" not in executable
 
 
 @pytest.mark.parametrize("onefile", [False, True])

@@ -334,6 +334,26 @@ attestation remain forbidden.
 
 ## 7. Release record
 
+### GUI build artifact acceptance
+
+Use a previously nonexistent `-OutputDir` for each `gui/build_gui.ps1` run.
+The build recipe refuses existing directories before starting Nuitka, preserving
+old binaries and standalone dependency trees rather than accepting stale output
+or letting the compiler clean a previous distribution. A failed build retains
+its fresh directory for diagnosis; the next attempt needs another directory.
+
+Successful compilation must produce `Lethe.exe` for onefile mode or
+`app.dist/Lethe.exe` for `-NoOnefile`. The recipe binds the output directory's
+filesystem identity, rejects linked output paths and hardlinked executables,
+and structurally checks a bounded (at most 512 MiB) AMD64 PE32+ Windows GUI EXE
+before reporting its exact size and SHA-256. Missing, malformed, wrong-kind,
+or wrong-architecture outputs fail even if the compiler returns zero.
+These checks are not runtime acceptance, a complete standalone dependency audit,
+or production release authorization. Test the actual compiled GUI and its
+packing workflow with the approved complete release bundle before distribution.
+`-SkipStubCheck` with a missing stub remains a UI-only build and supplies no
+packing or release evidence.
+
 Record source commit, lockfile hash, toolchain versions, shuffle seed, native
 manifest, unsigned and signed artifact hashes, signing identity/timestamp,
 automated test logs, functional owner approval, Defender evidence, and rollback

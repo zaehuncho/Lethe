@@ -69,7 +69,9 @@
     Python interpreter to build with. Default: "python".
 
 .PARAMETER OutputDir
-    Where Lethe.exe is written. Default: <packer>/build.
+    New output directory for this build. It must not already exist; previous
+    builds are never cleaned or overwritten. Default: <packer>/build.
+    Onefile output is Lethe.exe; standalone output is app.dist/Lethe.exe.
 
 .PARAMETER StubPath
     Path to the canonical lethe_stub_x64.dll in a complete approved release
@@ -184,7 +186,11 @@ function Assert-ResourcePlan {
 }
 
 Assert-ResourcePlan
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$OutputHelper = Join-Path $PackerRoot 'tools\gui_build_output.py'
+$OutputStateJson = & $PythonExe -B $OutputHelper prepare --output-dir $OutputDir
+if ($LASTEXITCODE -ne 0) { throw 'GUI output directory preflight failed; compiler was not started.' }
+$OutputState = ($OutputStateJson -join "`n") | ConvertFrom-Json
+if (-not $OutputState.identity) { throw 'GUI output directory identity was not returned.' }
 
 # --- assemble the Nuitka command -------------------------------------------
 # The DEST of --include-data-files ("stub/prebuilt/lethe_stub_x64.dll") is
@@ -249,10 +255,12 @@ if ($NuitkaExitCode -ne 0) {
     throw "Nuitka build failed with exit code $NuitkaExitCode"
 }
 
-$ExePath = Join-Path $OutputDir "Lethe.exe"
+$Layout = if ($NoOnefile) { 'standalone' } else { 'onefile' }
+$BuildResultJson = & $PythonExe -B $OutputHelper verify --output-dir $OutputDir --identity $OutputState.identity --layout $Layout
+if ($LASTEXITCODE -ne 0) { throw 'GUI build output verification failed; no successful build is reported.' }
+$BuildResult = ($BuildResultJson -join "`n") | ConvertFrom-Json
 Write-Host ""
-if (Test-Path $ExePath) {
-    Write-Host "OK  built: $ExePath" -ForegroundColor Green
-} else {
-    Write-Warning "Nuitka reported success but Lethe.exe was not found in $OutputDir (a --standalone build lands in a .dist/ folder)."
-}
+Write-Host "OK  built: $($BuildResult.executable)" -ForegroundColor Green
+Write-Host "  SHA-256    : $($BuildResult.sha256)"
+Write-Host "  bytes      : $($BuildResult.size)"
+Write-Host "  validation : structural artifact check; runtime acceptance is separate"
