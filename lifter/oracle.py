@@ -42,6 +42,20 @@ _UC_REGS = [UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RBX,
 _UC_XMMS = [getattr(_uc_x86, f"UC_X86_REG_XMM{i}") for i in range(16)]
 FLAG_BIT = {"CF": 0, "PF": 2, "ZF": 6, "SF": 7, "OF": 11}
 _FLAG_LOCAL = {"CF": L.CF, "PF": L.PF, "ZF": L.ZF, "SF": L.SF, "OF": L.OF}
+_MODELED_FLAGS_MASK = sum(1 << bit for bit in FLAG_BIT.values())
+
+
+def _initial_flag_bits(value: int) -> int:
+    """Accept only the five modeled arithmetic flags, not control flags."""
+    if type(value) is not int or value < 0 or value & ~_MODELED_FLAGS_MASK:
+        raise ValueError("initial_flags must contain only modeled CF/PF/ZF/SF/OF bits")
+    return value
+
+
+def _seed_vm_flags(vm, bits: int) -> None:
+    for name, offset in _FLAG_LOCAL.items():
+        value = (bits >> FLAG_BIT[name]) & 1
+        vm.locals[offset:offset + 8] = value.to_bytes(8, "little")
 
 
 def _default_init():
@@ -49,7 +63,8 @@ def _default_init():
 
 
 def _run_unicorn_state(code: bytes, init, mem=None, mem_base=MEM_BASE,
-                       code_base=BASE, xmm_init=None):
+                       code_base=BASE, xmm_init=None, *, initial_flags=0):
+    initial_flags = _initial_flag_bits(initial_flags)
     mu = Uc(UC_ARCH_X86, UC_MODE_64)
     code_page = code_base & ~0xFFF
     code_size = ((code_base - code_page + max(len(code), 1) + 0xFFF) & ~0xFFF)
@@ -64,7 +79,7 @@ def _run_unicorn_state(code: bytes, init, mem=None, mem_base=MEM_BASE,
             mu.mem_map(map_base, map_end - map_base)
         mu.mem_write(mem_base, bytes(mem))
     mu.mem_write(code_base, code)
-    mu.reg_write(UC_X86_REG_EFLAGS, 0x2)   # minimal: modeled arithmetic flags = 0
+    mu.reg_write(UC_X86_REG_EFLAGS, 0x2 | initial_flags)
     for reg, val in zip(_UC_REGS, init):
         mu.reg_write(reg, val & MASK64)
     initial_xmm = list(xmm_init) if xmm_init is not None else [0] * 16
@@ -81,15 +96,16 @@ def _run_unicorn_state(code: bytes, init, mem=None, mem_base=MEM_BASE,
     return regs, flags, out_mem, xmms
 
 
-def run_unicorn(code: bytes, init, mem=None, mem_base=MEM_BASE, code_base=BASE):
+def run_unicorn(code: bytes, init, mem=None, mem_base=MEM_BASE, code_base=BASE,
+                *, initial_flags=0):
     regs, flags, out_mem, _xmms = _run_unicorn_state(
-        code, init, mem, mem_base, code_base
+        code, init, mem, mem_base, code_base, initial_flags=initial_flags
     )
     return regs, flags, out_mem
 
 
 def run_unicorn_xmm(code: bytes, init=None, xmm_init=None, mem=None,
-                    mem_base=MEM_BASE, code_base=BASE):
+                    mem_base=MEM_BASE, code_base=BASE, *, initial_flags=0):
     return _run_unicorn_state(
         code,
         list(init) if init is not None else _default_init(),
@@ -97,12 +113,14 @@ def run_unicorn_xmm(code: bytes, init=None, xmm_init=None, mem=None,
         mem_base,
         code_base,
         xmm_init,
+        initial_flags=initial_flags,
     )
 
 
 def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
                   lift_base=BASE, image_base=0, *, image_sections=None,
-                  selected_extents=()):
+                  selected_extents=(), initial_flags=0):
+    initial_flags = _initial_flag_bits(initial_flags)
     blob = daedalus_asm.assemble(
         L.lift_function(
             code,
@@ -117,6 +135,7 @@ def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
                mem=(bytes(mem) if mem is not None else None), mem_base=mem_base)
     for i in range(16):
         vm.locals[i * 8:i * 8 + 8] = (init[i] & MASK64).to_bytes(8, "little")
+    _seed_vm_flags(vm, initial_flags)
     vm.locals[L.IMAGE_BASE:L.IMAGE_BASE + 8] = (
         image_base & MASK64
     ).to_bytes(8, "little")
@@ -130,7 +149,8 @@ def run_daedalus(code: bytes, init, mem=None, mem_base=MEM_BASE,
 
 def run_daedalus_xmm(code: bytes, init=None, xmm_init=None, mem=None,
                      mem_base=MEM_BASE, lift_base=BASE, image_base=0, *,
-                     image_sections=None, selected_extents=()):
+                     image_sections=None, selected_extents=(), initial_flags=0):
+    initial_flags = _initial_flag_bits(initial_flags)
     init = list(init) if init is not None else _default_init()
     initial_xmm = list(xmm_init) if xmm_init is not None else [0] * 16
     if len(initial_xmm) != 16:
@@ -150,6 +170,7 @@ def run_daedalus_xmm(code: bytes, init=None, xmm_init=None, mem=None,
         value = initial_xmm[i] & ((1 << 128) - 1)
         offset = L.XMM_BASE + i * L.XMM_LANE_SIZE
         vm.locals[offset:offset + 16] = value.to_bytes(16, "little")
+    _seed_vm_flags(vm, initial_flags)
     vm.locals[L.IMAGE_BASE:L.IMAGE_BASE + 8] = (
         image_base & MASK64
     ).to_bytes(8, "little")
@@ -172,13 +193,15 @@ def run_daedalus_xmm(code: bytes, init=None, xmm_init=None, mem=None,
 
 
 def check(code: bytes, init=None, flags=("CF", "PF", "ZF", "SF", "OF"), mem=None,
-          mem_base=MEM_BASE):
+          mem_base=MEM_BASE, *, initial_flags=0):
     """Assert the lifted bytecode matches Unicorn on regs, the given flags, and
     (when `mem` initial bytes are given) the final memory region. Raises
-    AssertionError on any mismatch."""
+    AssertionError on any mismatch. ``initial_flags`` seeds the five modeled
+    arithmetic RFLAGS bits in both engines; its default preserves zero seeding.
+    Control/reserved flags are rejected rather than silently ignored."""
     init = list(init) if init is not None else _default_init()
-    ur, uf, um = run_unicorn(code, init, mem, mem_base)
-    dr, df, dm = run_daedalus(code, init, mem, mem_base)
+    ur, uf, um = run_unicorn(code, init, mem, mem_base, initial_flags=initial_flags)
+    dr, df, dm = run_daedalus(code, init, mem, mem_base, initial_flags=initial_flags)
     for i in range(16):
         assert ur[i] == dr[i], (
             f"reg {L.GPR_NAMES[i]} mismatch: unicorn=0x{ur[i]:016X} "
@@ -194,11 +217,12 @@ def check(code: bytes, init=None, flags=("CF", "PF", "ZF", "SF", "OF"), mem=None
 def check_xmm(code: bytes, init=None, xmm_init=None,
               flags=("CF", "PF", "ZF", "SF", "OF"), *, mem=None,
               mem_base=MEM_BASE, lift_base=BASE, image_base=0,
-              code_base=BASE, image_sections=None, selected_extents=()):
+              code_base=BASE, image_sections=None, selected_extents=(),
+              initial_flags=0):
     init = list(init) if init is not None else _default_init()
     initial_xmm = list(xmm_init) if xmm_init is not None else [0] * 16
     ur, uf, um, ux = run_unicorn_xmm(
-        code, init, initial_xmm, mem, mem_base, code_base
+        code, init, initial_xmm, mem, mem_base, code_base, initial_flags=initial_flags
     )
     dr, df, dm, dx = run_daedalus_xmm(
         code,
@@ -210,6 +234,7 @@ def check_xmm(code: bytes, init=None, xmm_init=None,
         image_base,
         image_sections=image_sections,
         selected_extents=selected_extents,
+        initial_flags=initial_flags,
     )
     assert um == dm
     for index, (native, lifted) in enumerate(zip(ur, dr)):
@@ -231,7 +256,7 @@ def check_xmm(code: bytes, init=None, xmm_init=None,
 
 def check_function(code: bytes, init=None,
                    flags=("CF", "PF", "ZF", "SF", "OF"), *,
-                   code_rva=BASE, runtime_image_base=0):
+                   code_rva=BASE, runtime_image_base=0, initial_flags=0):
     """Differential-check a complete ABI-balanced function ending in RET.
 
     Unicorn executes the outer RET into a synthetic sentinel just beyond the
@@ -250,7 +275,7 @@ def check_function(code: bytes, init=None,
     struct.pack_into("<Q", stack, entry_rsp - stack_base, code_va + len(code))
 
     ur, uf, um = run_unicorn(
-        code, init, stack, stack_base, code_base=code_va
+        code, init, stack, stack_base, code_base=code_va, initial_flags=initial_flags
     )
     if ur[L.GPR_NAMES.index("rsp")] != entry_rsp + 8:
         raise AssertionError(
@@ -261,6 +286,7 @@ def check_function(code: bytes, init=None,
     dr, df, dm = run_daedalus(
         code, init, stack, stack_base,
         lift_base=code_rva, image_base=runtime_image_base,
+        initial_flags=initial_flags,
     )
     for i in range(16):
         assert ur[i] == dr[i], (
@@ -284,6 +310,7 @@ def check_rip_data(
     init=None,
     flags=("CF", "PF", "ZF", "SF", "OF"),
     data_characteristics=L.IMAGE_SCN_MEM_READ | L.IMAGE_SCN_MEM_WRITE,
+    initial_flags=0,
 ):
     """Differential-check RIP data at a deliberately relocated image base."""
     init = list(init) if init is not None else _default_init()
@@ -301,6 +328,7 @@ def check_rip_data(
         data,
         data_va,
         code_base=code_va,
+        initial_flags=initial_flags,
     )
     dr, df, dm = run_daedalus(
         code,
@@ -311,6 +339,7 @@ def check_rip_data(
         image_base=runtime_image_base,
         image_sections=sections,
         selected_extents=((code_rva, len(code)),),
+        initial_flags=initial_flags,
     )
     for index, (native, lifted) in enumerate(zip(ur, dr)):
         assert native == lifted, (

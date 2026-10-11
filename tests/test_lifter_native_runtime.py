@@ -121,9 +121,40 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
         lifter.lift_function(preserve_cf_body, base=oracle.BASE)
     )
 
+    flag_programs = []
+    flag_expectations = []
+    for index, assembly in enumerate((
+        "mov rax, rbx; not r8; pxor xmm0, xmm15",
+        "adc rax, rbx; sbb r8, r9",
+        "shl eax, 0; sar r8b, 0; rol r9w, 0",
+        "setc al; setp r9b; cmovl r10, r11; cmovg r12, r13",
+    )):
+        code = _asm(assembly)
+        plain = daedalus_asm.assemble(lifter.lift_function(code, base=oracle.BASE))
+        rolling = daedalus_rolling.pack_rolling_blob(
+            plain, bytes.fromhex("102132435465768798a9bacbdcedfe0f"))
+        flag_programs.extend((
+            f"static const uint8_t flag_plain_{index}[] = {{ {_c_bytes(plain)} }};",
+            f"static const uint8_t flag_rolling_{index}[] = {{ {_c_bytes(rolling)} }};",
+        ))
+        for pattern in range(32):
+            bits = sum(((pattern >> ordinal) & 1) << bit
+                       for ordinal, bit in enumerate(oracle.FLAG_BIT.values()))
+            regs, out_flags, _, xmms = oracle.run_unicorn_xmm(
+                code, initial, initial_xmm, initial_flags=bits)
+            flag_expectations.append(
+                f"{{ flag_plain_{index}, sizeof(flag_plain_{index}), "
+                f"flag_rolling_{index}, sizeof(flag_rolling_{index}), "
+                f"UINT64_C(0x{bits:X}), {{ {{ {_c_u64s(regs)} }}, "
+                f"UINT64_C(0x{_flag_mask(out_flags):X}), {{ {_c_xmms(xmms)} }} }} }}")
+    assert len(flag_expectations) == 128
+    flag_declarations = "\n".join(flag_programs)
+    flag_rows = ",\n".join(flag_expectations)
+
     harness = f"""
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <windows.h>
 #include <bcrypt.h>
@@ -160,6 +191,16 @@ uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv)
 static const uint8_t lifted_program[] = {{ {_c_bytes(blob)} }};
 static const uint8_t lifted_rolling_program[] = {{ {_c_bytes(rolling_blob)} }};
 static const uint8_t preserve_cf_program[] = {{ {_c_bytes(preserve_cf_blob)} }};
+{flag_declarations}
+typedef struct FlagCase {{
+    const uint8_t *plain;
+    uint32_t plain_size;
+    const uint8_t *rolling;
+    uint32_t rolling_size;
+    uint64_t incoming;
+    DaedalusX64Context expected;
+}} FlagCase;
+static const FlagCase flag_cases[] = {{ {flag_rows} }};
 
 int main(void)
 {{
@@ -215,6 +256,32 @@ int main(void)
             != UINT64_C(0x{_flag_mask(flags):X}))
         return 59;
 
+    for (i = 0; i < sizeof(flag_cases) / sizeof(flag_cases[0]); i++) {{
+        unsigned int mode, reg;
+        const FlagCase *test = &flag_cases[i];
+        for (mode = 0; mode < 2; mode++) {{
+            context = initial;
+            context.rflags |= test->incoming;
+            if (daedalus_vm_exec_x64(mode ? test->rolling : test->plain,
+                    mode ? test->rolling_size : test->plain_size, &context,
+                    (const uint8_t *)(uintptr_t)UINT64_C(0x180000000)) != 0)
+                return 110;
+            for (reg = 0; reg < DVM_X64_GPR_COUNT; reg++) {{
+                if (context.gpr[reg] != test->expected.gpr[reg])
+                    return 111;
+            }}
+            for (reg = 0; reg < DVM_X64_XMM_COUNT; reg++) {{
+                if (context.xmm[reg][0] != test->expected.xmm[reg][0]
+                        || context.xmm[reg][1] != test->expected.xmm[reg][1])
+                    return 112;
+            }}
+            if ((context.rflags & DVM_X64_RFLAGS_MASK) != test->expected.rflags
+                    || (context.rflags & ~DVM_X64_RFLAGS_MASK)
+                        != (initial.rflags & ~DVM_X64_RFLAGS_MASK))
+                return 113;
+        }}
+    }}
+
     context.gpr[DVM_X64_RAX] = 41;
     context.rflags = UINT64_C(0x203);
     if (daedalus_vm_exec_x64(preserve_cf_program,
@@ -238,6 +305,7 @@ int main(void)
         return 62;
     if (memcmp(&context, &snapshot, sizeof(context)) != 0)
         return 63;
+    puts("NATIVE_INCOMING_FLAGS cases=128 modes=2 passes=256");
     return 0;
 }}
 """
@@ -284,5 +352,9 @@ target_link_libraries(dvm_x64_frame PRIVATE bcrypt)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
 
     executable = build / "Release/dvm_x64_frame.exe"
-    ran = subprocess.run([str(executable)], check=False)
-    assert ran.returncode == 0, f"native harness returned {ran.returncode}"
+    ran = subprocess.run([str(executable)], capture_output=True, text=True, check=False)
+    (tmp_path / "harness-stdout.txt").write_text(ran.stdout, encoding="utf-8")
+    (tmp_path / "harness-stderr.txt").write_text(ran.stderr, encoding="utf-8")
+    assert ran.returncode == 0, f"native harness returned {ran.returncode}: {ran.stdout} {ran.stderr}"
+    assert ran.stdout.strip() == "NATIVE_INCOMING_FLAGS cases=128 modes=2 passes=256"
+    assert ran.stderr == ""

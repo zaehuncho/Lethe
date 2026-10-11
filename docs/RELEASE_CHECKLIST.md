@@ -48,6 +48,14 @@ uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
 Record the command output and exact pass/skip counts. A skipped optional
 dependency is not a validated subsystem.
 
+The isolated scalar oracle covers every combination of incoming CF/PF/ZF/SF/OF
+through register, XMM, memory, complete-function and relocated-data boundaries.
+Its keyword-only `initial_flags` argument accepts only those arithmetic RFLAGS
+bits; the default remains zero. The native frame harness independently replays
+128 seeded cases in plain and rolling modes (256 executions), compares all GPRs,
+XMM lanes and modeled flags, and checks preservation of unmodeled flag bits.
+This is instruction/frame evidence, not real-application or general ISA approval.
+
 The publication policy gate validates the tracked default prebuilt, so it is
 expected to remain red while that prebuilt is legacy or candidate-only. Run it
 on the exact release commit; a pass means the candidate manifest and detached

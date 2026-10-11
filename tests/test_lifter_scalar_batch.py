@@ -34,6 +34,98 @@ def _init(**registers: int) -> list[int]:
     return values
 
 
+def _incoming_flags(pattern: int) -> tuple[int, dict[str, int]]:
+    values = {name: (pattern >> index) & 1 for index, name in enumerate(_FLAGS)}
+    mask = sum(values[name] << oracle.FLAG_BIT[name] for name in _FLAGS)
+    return mask, values
+
+
+@pytest.mark.parametrize("pattern", range(32))
+def test_all_incoming_flag_combinations_across_oracle_boundaries(pattern):
+    mask, seeded = _incoming_flags(pattern)
+    initial = _init(rax=0x1122334455667788, rbx=0x7FFFFFFFFFFFFFFF,
+                    rcx=0, rdx=0x8877665544332211,
+                    r8=0x8000000000000080, r9=0xFFFFFFFFFFFFFFFF,
+                    r10=17, r11=19, r12=23, r13=29, r14=31)
+    passive, _ = oracle.check(
+        _asm("mov rax, rbx; not r8; lea r9, [r10+r11*2]"),
+        init=initial, initial_flags=mask)
+    # Independently assert the seed, so a shared all-zero initialization bug
+    # cannot pass merely because the two engines agree with each other.
+    assert passive[1] == seeded
+    for width_regs in (("al", "bl", "r8b", "r9b"),
+                       ("ax", "bx", "r8w", "r9w"),
+                       ("eax", "ebx", "r8d", "r9d"),
+                       ("rax", "rbx", "r8", "r9")):
+        a, b, c, d = width_regs
+        oracle.check(_asm(f"adc {a}, {b}; sbb {c}, {d}"),
+                     init=initial, initial_flags=mask)
+    oracle.check(_asm("inc rax; dec rbx"), init=initial, initial_flags=mask)
+    zero, _ = oracle.check(
+        _asm("shl eax, 0; sar r8b, cl; ror r9w, cl; shld r10d, r11d, 0"),
+        init=initial, initial_flags=mask)
+    assert zero[1] == seeded
+    oracle.check(_asm("rol rax, 1; ror r8b, 1"),
+                 init=initial, initial_flags=mask)
+    selection, _ = oracle.check(
+        _asm("setc al; setp dl; sets r9b; seto r10b; "
+             "cmovl r11, r12; cmovg r13, r14"),
+        init=initial, initial_flags=mask)
+    assert selection[1] == seeded
+    assert selection[0][L.GPR_NAMES.index("rax")] & 0xFF == seeded["CF"]
+    assert selection[0][L.GPR_NAMES.index("rdx")] & 0xFF == seeded["PF"]
+    assert selection[0][L.GPR_NAMES.index("r11")] == (23 if seeded["SF"] != seeded["OF"] else 19)
+    assert selection[0][L.GPR_NAMES.index("r13")] == (31 if not seeded["ZF"] and seeded["SF"] == seeded["OF"] else 29)
+    oracle.check(_asm("adc word ptr [rbx], ax; sbb dword ptr [rbx+4], r8d"),
+                 init=_init(rbx=oracle.MEM_BASE, rax=0xFFFF, r8=0x80000000),
+                 initial_flags=mask, mem=_MEM)
+    function, _ = oracle.check_function(
+        _asm("setc al; ret"), init=_init(rsp=oracle.STACK, rax=0x123400),
+        initial_flags=mask)
+    assert function[1] == seeded and function[0][0] == 0x123400 | seeded["CF"]
+    xmm, _ = oracle.check_xmm(
+        _asm("movdqa xmm0, xmm15; pxor xmm1, xmm1"), init=initial,
+        xmm_init=[(index + 1) << 80 for index in range(16)], initial_flags=mask)
+    assert xmm[1] == seeded and xmm[2][0] == 16 << 80 and xmm[2][1] == 0
+    code_rva, data_rva = 0x1000, 0x3000
+    encoded, _ = _KS.asm(
+        f"mov rax, qword ptr [rip+{data_rva-code_rva-7}]; adc rax, rbx",
+        addr=code_rva)
+    relocated, _ = oracle.check_rip_data(
+        bytes(encoded), struct.pack("<Q", 0xFFFFFFFFFFFFFFFD),
+        code_rva=code_rva, data_rva=data_rva, runtime_image_base=0x180000000,
+        init=_init(rbx=2), initial_flags=mask)
+    assert relocated[0][0] == 0xFFFFFFFFFFFFFFFF + seeded["CF"] & ((1 << 64) - 1)
+
+
+@pytest.mark.parametrize("value", [-1, 2, 0x200, 1 << 64, True, None, "1", 1.0])
+def test_initial_flags_reject_unmodeled_bits_and_non_integer_values(value):
+    code = _asm("nop")
+    initial = _init(rsp=oracle.STACK)
+    calls = (
+        lambda: oracle.run_unicorn(code, initial, initial_flags=value),
+        lambda: oracle.run_daedalus(code, initial, initial_flags=value),
+        lambda: oracle.run_unicorn_xmm(code, initial, initial_flags=value),
+        lambda: oracle.run_daedalus_xmm(code, initial, initial_flags=value),
+        lambda: oracle.check(code, initial, initial_flags=value),
+        lambda: oracle.check_xmm(code, initial, initial_flags=value),
+        lambda: oracle.check_function(_asm("ret"), initial, initial_flags=value),
+        lambda: oracle.check_rip_data(code, b"data", code_rva=0x1000,
+            data_rva=0x3000, runtime_image_base=0x180000000,
+            init=initial, initial_flags=value),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="initial_flags must contain only modeled"):
+            call()
+
+
+def test_default_incoming_flags_remain_explicit_zero():
+    code = _asm("setc al; setp dl")
+    initial = _init(rax=0xFF, rdx=0xFF)
+    assert oracle.check(code, initial) == oracle.check(code, initial, initial_flags=0)
+    assert oracle.check_xmm(code, initial) == oracle.check_xmm(code, initial, initial_flags=0)
+
+
 _LOW8 = (
     ("al", "rax"), ("cl", "rcx"), ("dl", "rdx"), ("bl", "rbx"),
     ("spl", "rsp"), ("bpl", "rbp"), ("sil", "rsi"), ("dil", "rdi"),
