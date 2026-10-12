@@ -26,6 +26,13 @@ else + a **differential oracle** that proves every lift correct.
   MSVC MAP binding, lift diagnostics, direct-reference coverage gaps, and
   deterministic JSON/starter manifests. Export-only leaf sizing is deliberately
   heuristic, capped, labelled, and never selected for production automatically.
+- `pdb_function_inventory.py` and `../tools/pdb_function_dump.cpp` — read-only
+  DIA inventory of exact PDB function extents. The inventory binds the PDB
+  GUID/age to one file-backed PE RSDS record, rejects overlapping or partial
+  PDATA ranges, and retains PE/PDB/helper/DIA hashes. Supplemental ranges are
+  **not** a coverage waiver: they still need strict control-flow decoding and
+  every remaining executable gap must be proven separately before production
+  selection can pass.
 - `../tools/virtualization_report.py` — CLI renderer for that report; it does
   not invoke the packer or mutate the inspected image. Its optional canonical
   source-bound selection manifest binds the exact PE and runtime-function
