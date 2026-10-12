@@ -98,6 +98,15 @@ rejected, not rewritten. Ordinary incoming caller pointers are not relocated.
 The materialized FP EXE/DLL regression also uses an RBP frame and a spilled/reloaded
 source-stack pointer for outgoing stores, and a second virtualized function checks
 an unchanged incoming caller output pointer plus its fifth stack argument.
+Its third selected function executes legacy `CVTDQ2PD` in both self-aliasing
+register and m64 forms. Eight directed signed-int32 pairs execute under 32 MXCSR
+settings covering every rounding mode, FTZ, sticky status and masked/unmasked
+exceptions; exact MXCSR preservation and four output doubles are asserted.
+The eight-byte input ends at a PAGE_NOACCESS boundary, so an accidental m128
+read faults rather than silently passing. The source-level plain/rolling frame
+harness also includes this exact conversion in its all-incoming-flags replay.
+General rounded conversions and floating-point arithmetic remain unsupported;
+the exact int32-to-binary64 lift uses existing integer opcodes, not host FP state.
 This is bounded admission evidence,
 not a claim of arbitrary memory-safety analysis or general ISA support.
 

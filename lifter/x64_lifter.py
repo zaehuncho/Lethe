@@ -42,7 +42,8 @@ realignment. Legacy
 PXOR/XORPS/XORPD,
 PAND/ANDPS/ANDPD, PANDN/ANDNPS/ANDNPD, and POR/ORPS/ORPD accept register
 sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
-supported; memory bit strings remain closed. Floating-point/SIMD arithmetic,
+supported; memory bit strings remain closed. Legacy CVTDQ2PD converts two signed
+int32 values exactly to binary64 without host floating-point state. General FP/SIMD arithmetic,
 VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
 calls, recursive calls, and unmodeled widths remain explicit whole-function
 bailouts.
@@ -697,6 +698,68 @@ class _Lifter:
         if destination_width != width:
             raise LiftUnsupported(f"{mnemonic} GPR destination width mismatch")
         self.rd_local(self._xmm_offset(source)); self.wr_reg(destination)
+
+    def _cvtdq2pd(self, instr) -> None:
+        """Convert two signed int32 lanes exactly, without host FP state.
+
+        Every int32 is exactly representable in binary64. Construct the sign,
+        biased exponent and fraction with existing integer VM operations; no
+        rounding mode, FP exception, new opcode or native ABI is involved.
+        Snapshot the low source qword before writeback, including self-aliases.
+        The legacy memory form reads m64, not m128, and needs no 16-byte alignment.
+        """
+        self._require_legacy_binary(instr, "cvtdq2pd")
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported("cvtdq2pd destination must be an XMM register")
+        destination = self._xmm_offset(instr.op_register(0))
+        if instr.op_kind(1) == OpKind.REGISTER:
+            source = self._xmm_offset(instr.op_register(1))
+            self.rd_local(source)
+        elif instr.op_kind(1) == OpKind.MEMORY:
+            if self._memory_width(instr) != 64:
+                raise LiftUnsupported("cvtdq2pd memory source must be 64 bits")
+            self._emit_effective_address(instr); self.a("load64")
+        else:
+            raise LiftUnsupported("cvtdq2pd source must be XMM or 64-bit memory")
+        self.wr_local(T0)
+        for shift, lane in ((0, 0), (32, 8)):
+            positive, loop, normalized, zero, done = (
+                self._new_label() for _ in range(5)
+            )
+            self.rd_local(T0)
+            if shift:
+                self.push_imm(shift); self.a("shr")
+            self.push_imm(0xFFFFFFFF); self.a("and"); self.wr_local(T1)
+            self.rd_local(T1); self.push_imm(31); self.a("shr")
+            self.push_imm(63); self.a("shl"); self.wr_local(T2)
+            self.rd_local(T2); self.push_imm(0); self.a("cmp_eq")
+            self.a(f"jnz {positive}")
+            self.rd_local(T1); self.a("neg")
+            self.push_imm(0xFFFFFFFF); self.a("and"); self.wr_local(T1)
+            self.a.label(positive)
+            self.rd_local(T1); self.push_imm(0); self.a("cmp_eq")
+            self.a(f"jnz {zero}")
+            self.push_imm(0); self.wr_local(T3)
+            self.rd_local(T1); self.wr_local(T4)
+            # At most 31 iterations for the magnitude of any signed int32.
+            self.a.label(loop)
+            self.rd_local(T4); self.push_imm(1); self.a("cmp_gt")
+            self.push_imm(0); self.a("cmp_eq"); self.a(f"jnz {normalized}")
+            self.rd_local(T4); self.push_imm(1); self.a("shr"); self.wr_local(T4)
+            self.rd_local(T3); self.push_imm(1); self.a("add"); self.wr_local(T3)
+            self.a(f"jmp {loop}")
+            self.a.label(normalized)
+            self.rd_local(T3); self.push_imm(1023); self.a("add")
+            self.push_imm(52); self.a("shl"); self.wr_local(T4)
+            self.rd_local(T1); self.push_imm(52); self.rd_local(T3)
+            self.a("sub"); self.a("shl")
+            self.push_imm((1 << 52) - 1); self.a("and")
+            self.rd_local(T4); self.a("or"); self.rd_local(T2); self.a("or")
+            self.a(f"jmp {done}")
+            self.a.label(zero)
+            self.push_imm(0)
+            self.a.label(done)
+            self.wr_local(destination + lane)
 
     def _xmm_scalar_move(self, instr, mnemonic: str, width: int) -> None:
         """Lift legacy MOVSS/MOVSD with their asymmetric upper-lane rules."""
@@ -2145,6 +2208,8 @@ class _Lifter:
             elif m in _XMM_INTEGER_COMPARE:
                 mnemonic, width, signed_greater = _XMM_INTEGER_COMPARE[m]
                 self._xmm_integer_compare(instr, mnemonic, width, signed_greater)
+            elif m == Mnemonic.CVTDQ2PD:
+                self._cvtdq2pd(instr)
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:

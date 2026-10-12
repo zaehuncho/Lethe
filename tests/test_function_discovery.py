@@ -314,6 +314,19 @@ def test_materialized_stack_preflight_rejects_native_pointer_escape_at_call():
 
 
 @pytest.mark.parametrize("source", [
+    "cvtdq2pd xmm15,xmm15; ret",
+    "cvtdq2pd xmm15,qword ptr [rcx]; ret",
+])
+def test_exact_int32_double_conversion_is_selectable_without_rounded_fp_admission(source):
+    code = _asm(source, 0x1000)
+    report = discovery.discover_functions(_parsed([(0x1000, code, 0)]), exports=())
+    assert report.candidates[0].liftable is True
+    assert report.candidates[0].rejection_reason is None
+    assert report.starter_selection_manifest()["functions"] == [
+        {"name": "sub_00001000", "rva": 0x1000, "size": len(code)}]
+
+
+@pytest.mark.parametrize("source", [
     "sub rsp,0x28; lea r11,[rsp+0x20]; mov [r11],rcx; mov rax,[r11]; add rsp,0x28; ret",
     "push rbp; mov rbp,rsp; sub rsp,0x30; mov [rbp-8],rdx; mov rax,[rbp-8]; leave; ret",
     "push rbp; mov rbp,rsp; sub rsp,0x30; lea r10,[rsp+0x20]; mov [rsp],r10; "

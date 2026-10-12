@@ -97,7 +97,7 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
 
     body = _asm(
         "movd xmm0, ecx; movd xmm15, edx; pxor xmm0, xmm15; "
-        "movd eax, xmm0; imul rax, r8; xor r11d, r11d"
+        "movd eax, xmm0; imul rax, r8; xor r11d, r11d; cvtdq2pd xmm15, xmm15"
     )
     blob = daedalus_asm.assemble(lifter.lift_function(body, base=oracle.BASE))
     rolling_blob = daedalus_rolling.pack_rolling_blob(
@@ -124,7 +124,8 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
     flag_programs = []
     flag_expectations = []
     for index, assembly in enumerate((
-        "mov rax, rbx; not r8; pxor xmm0, xmm15",
+        "mov rax, rbx; not r8; pxor xmm0, xmm15; "
+        "cvtdq2pd xmm0, xmm15; cvtdq2pd xmm15, xmm15",
         "adc rax, rbx; sbb r8, r9",
         "shl eax, 0; sar r8b, 0; rol r9w, 0",
         "setc al; setp r9b; cmovl r10, r11; cmovg r12, r13",

@@ -17,6 +17,7 @@ _ASM = r"""OPTION CASEMAP:NONE
 EXTERN native_mix_slot:QWORD
 PUBLIC vm_fp_call
 PUBLIC vm_alias_pointer
+PUBLIC vm_int_pair
 .code
 vm_fp_call PROC FRAME
  push rbp
@@ -63,26 +64,90 @@ vm_alias_pointer PROC FRAME
  pop rbp
  ret
 vm_alias_pointer ENDP
+vm_int_pair PROC FRAME
+ sub rsp,28h
+ .allocstack 28h
+ .endprolog
+ cvtdq2pd xmm0,qword ptr [rcx]
+ movdqu xmmword ptr [rdx],xmm0
+ movq xmm1,qword ptr [rcx]
+ cvtdq2pd xmm1,xmm1
+ movdqu xmmword ptr [rdx+10h],xmm1
+ add rsp,28h
+ ret
+vm_int_pair ENDP
 END
+"""
+_CONVERSION_CHECK = r"""#include <stdint.h>
+#include <windows.h>
+#include <intrin.h>
+typedef void (*ConversionFn)(const int32_t *,double *);
+static int conversion_check(ConversionFn convert)
+{
+ const int32_t cases[][2]={
+  {0,0},{1,-1},{-1,1},{(-2147483647-1),2147483647},
+  {1073741825,-1073741825},{16777217,-16777217},
+  {305419896,-305419896},{-2147483647,2147483646}
+ };
+ SYSTEM_INFO system;
+ DWORD old_protect=0;
+ unsigned control,index,lane;
+ const unsigned saved=_mm_getcsr();
+ int valid=0;
+ unsigned char *region;
+ int32_t *input;
+ GetSystemInfo(&system);
+ region=(unsigned char *)VirtualAlloc(NULL,(SIZE_T)system.dwPageSize*2,
+                                    MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+ if(!region)return 0;
+ if(!VirtualProtect(region+system.dwPageSize,system.dwPageSize,
+                    PAGE_NOACCESS,&old_protect))goto cleanup;
+ /* The source ends exactly at an inaccessible page: m128 would fault. */
+ input=(int32_t *)(region+system.dwPageSize-8);
+ for(control=0;control<32;control++){
+  const unsigned csr=((control&3U)<<13)|(((control>>2)&1U)<<15)
+                    |((control&8U)?0x3FU:0U)|((control&16U)?0x1F80U:0U)
+                    |(saved&0x40U);
+  for(index=0;index<(unsigned)(sizeof(cases)/sizeof(cases[0]));index++){
+   double output[4]={123.5,123.5,123.5,123.5};
+   const double expected[2]={(double)cases[index][0],(double)cases[index][1]};
+   unsigned after;
+   input[0]=cases[index][0];input[1]=cases[index][1];
+   _mm_setcsr(csr);
+   convert(input,output);
+   after=_mm_getcsr();
+   _mm_setcsr(saved);
+   if(after!=csr)goto cleanup;
+   for(lane=0;lane<4;lane++)if(output[lane]!=expected[lane&1U])goto cleanup;
+  }
+ }
+ valid=1;
+cleanup:
+ _mm_setcsr(saved);
+ if(!VirtualFree(region,0,MEM_RELEASE))valid=0;
+ return valid;
+}
 """
 _COMMON = r"""#include <stdint.h>
 #include <windows.h>
 int _fltused=0;
 double vm_fp_call(double,uint64_t,double,uint64_t,double,uint64_t,double,uint64_t);
 uint64_t vm_alias_pointer(uint64_t*,uint64_t,uint64_t,uint64_t,uint64_t);
+void vm_int_pair(const int32_t*,double*);
 __declspec(noinline) double native_mix(double a,uint64_t b,double c,uint64_t d,
  double e,uint64_t f,double g,uint64_t h)
 { return a+(double)b+c+(double)d+e+(double)f+g+(double)h; }
 double (*const native_mix_slot)(double,uint64_t,double,uint64_t,double,uint64_t,double,uint64_t)=native_mix;
 """
-_EXE = _COMMON + r"""__declspec(noreturn) void fixture_entry(void)
+_EXE = _COMMON + _CONVERSION_CHECK + r"""__declspec(noreturn) void fixture_entry(void)
 {
  const double answer=vm_fp_call(1.25,7,-3.5,11,5.75,13,-0.5,17);
  uint64_t output=0;
  const uint64_t alias=vm_alias_pointer(&output,7,11,13,17);
- static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 passed=true\r\n";
+ const int conversion=conversion_check(vm_int_pair);
+ static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 conversion=1 passed=true\r\n";
  static const char bad[]="FP_FRAME_E2E mismatch\r\n";
- const int valid=answer==51.0 && alias==48 && output==48;
+ const int valid=answer==51.0 && alias==48 && output==48 && conversion;
  const char *message=valid?ok:bad;
  DWORD written=0;
  WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),message,
@@ -99,6 +164,7 @@ _DLL = _COMMON + r"""BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID re
 _HOST = r"""#include <windows.h>
 #include <cstdint>
 #include <cstdio>
+""" + _CONVERSION_CHECK + r"""
 using Fn=double (*)(double,uint64_t,double,uint64_t,double,uint64_t,double,uint64_t);
 using AliasFn=uint64_t (*)(uint64_t*,uint64_t,uint64_t,uint64_t,uint64_t);
 int wmain(int argc,wchar_t **argv)
@@ -111,12 +177,15 @@ int wmain(int argc,wchar_t **argv)
  auto fn=reinterpret_cast<Fn>(address);
  auto alias_fn=reinterpret_cast<AliasFn>(GetProcAddress(module,"vm_alias_pointer"));
  if(!alias_fn){FreeLibrary(module);return 95;}
+ auto convert=reinterpret_cast<ConversionFn>(GetProcAddress(module,"vm_int_pair"));
+ if(!convert){FreeLibrary(module);return 96;}
  double value=fn(1.25,7,-3.5,11,5.75,13,-0.5,17);
  uint64_t output=0;
  const uint64_t alias=alias_fn(&output,7,11,13,17);
- const bool valid=value==51.0 && alias==48 && output==48;
- std::printf("FP_FRAME_DLL result=%.1f alias=%llu passed=%s\n",value,
-             static_cast<unsigned long long>(alias),valid?"true":"false");
+ const int conversion=conversion_check(convert);
+ const bool valid=value==51.0 && alias==48 && output==48 && conversion;
+ std::printf("FP_FRAME_DLL result=%.1f alias=%llu conversion=%d passed=%s\n",value,
+             static_cast<unsigned long long>(alias),conversion,valid?"true":"false");
  if(!FreeLibrary(module))return 93;
  return valid?0:94;
 }
@@ -136,9 +205,9 @@ add_library(fp_dll SHARED dll.c frame.asm)
 add_executable(fp_host host.cpp)
 set_source_files_properties(exe.c dll.c PROPERTIES COMPILE_OPTIONS "/W4;/WX;/O2;/GS-;/fp:strict")
 target_link_options(fp_exe PRIVATE /INCREMENTAL:NO /OPT:NOICF /FIXED /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair)
 target_link_options(fp_dll PRIVATE /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair)
 target_link_libraries(fp_exe PRIVATE kernel32.lib)
 target_link_libraries(fp_dll PRIVATE kernel32.lib)
 """, encoding="ascii")
@@ -171,7 +240,7 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
         image = assemble._StubImage(source.read_bytes())
         parsed = pe_analyze.analyze_pe(str(source))
         specs = []
-        for name in ("vm_fp_call", "vm_alias_pointer"):
+        for name in ("vm_fp_call", "vm_alias_pointer", "vm_int_pair"):
             rva = image.find_export_rva(name)
             assert rva is not None
             records = [record for record in parsed.runtime_functions
@@ -209,7 +278,7 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
                 _allow_unverified_stub_for_tests=True))
         assert result.ok, result.error
         assert {fn.name for fn in captured["result"].manifest.functions} == {
-            "vm_fp_call", "vm_alias_pointer"}
+            "vm_fp_call", "vm_alias_pointer", "vm_int_pair"}
         after = _run(packed_cmd)
         assert (after.returncode, after.stdout, after.stderr) == (
             before.returncode, before.stdout, before.stderr)

@@ -98,7 +98,14 @@ else + a **differential oracle** that proves every lift correct.
   aligned 128-bit memory sources while preserving architectural alignment
   faults. Low/high 64-bit lane transfers and register shuffles plus immediate
   `pslldq`/`psrldq` byte shifts extend compiler-generated transport coverage.
-  Other SIMD/FP arithmetic and VEX/EVEX encodings remain fail-closed.
+  Legacy `cvtdq2pd` additionally converts the low two signed int32 elements of
+  an XMM register or exactly eight memory bytes to two exact binary64 values.
+  The lift constructs IEEE-754 bits with bounded integer operations, preserves
+  GPRs and arithmetic flags, snapshots self-aliasing sources, and does not read
+  or change MXCSR. All int32 values fit exactly in binary64; rounded conversions,
+  general SIMD/FP arithmetic and VEX/EVEX encodings remain fail-closed. Native
+  EXE/DLL regressions test an m64 source ending at a PAGE_NOACCESS boundary,
+  all four rounding modes, masked/unmasked exceptions, FTZ and sticky status.
 - **Cut 13** — bounded RIP-relative scalar data addressing. Iced decodes every
   source at its 32-bit RVA; the lift computes each effective address as runtime
   image base local `504` plus the decoded target RVA, so ASLR never bakes a

@@ -54,6 +54,126 @@ def _xmms(**values: int) -> list[int]:
     return result
 
 
+def _int32_pair_as_double_bits(low: int, high: int) -> int:
+    """Independent exact binary64 expectation, not a copy of the VM algorithm."""
+    return int.from_bytes(struct.pack("<dd", float(low), float(high)), "little")
+
+
+@pytest.mark.parametrize("destination,source", [(0, 15), (15, 0), (7, 7)])
+@pytest.mark.parametrize("low,high", [
+    (0, 0), (1, -1), (-1, 1), (-(1 << 31), (1 << 31) - 1),
+    ((1 << 30) + 1, -(1 << 30) - 1), (16777217, -16777217),
+    (0x12345678, -0x12345678), (-2147483647, 2147483646),
+])
+def test_cvtdq2pd_exact_signed_lanes_and_self_alias(destination, source, low, high):
+    xmms = [((index + 1) << 112) | 0xA5A5A5A5A5A5A5A5 for index in range(16)]
+    xmms[source] = (0xFFEEDDCCBBAA9988 << 64) | ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+    regs = [(index + 1) * 0x1020304050607 for index in range(16)]
+    native, lifted = oracle.check_xmm(
+        _asm(f"cvtdq2pd xmm{destination}, xmm{source}"), init=regs, xmm_init=xmms)
+    assert native[2][destination] == lifted[2][destination] == _int32_pair_as_double_bits(low, high)
+    assert native[0] == lifted[0] == regs
+    assert all(lifted[2][index] == value for index, value in enumerate(xmms)
+               if index != destination)
+
+
+@pytest.mark.parametrize("pattern", range(32))
+def test_cvtdq2pd_keeps_all_incoming_integer_flags(pattern):
+    names = ("CF", "PF", "ZF", "SF", "OF")
+    expected = {name: (pattern >> ordinal) & 1 for ordinal, name in enumerate(names)}
+    mask = sum(value << oracle.FLAG_BIT[name] for name, value in expected.items())
+    native, lifted = oracle.check_xmm(
+        _asm("cvtdq2pd xmm15, xmm15"),
+        xmm_init=_xmms(xmm15=0x7FFFFFFF80000000), initial_flags=mask)
+    assert native[1] == lifted[1] == expected
+    assert lifted[2][15] == _int32_pair_as_double_bits(-(1 << 31), (1 << 31) - 1)
+
+
+@pytest.mark.parametrize("exponent", range(32))
+def test_cvtdq2pd_every_normalization_boundary(exponent):
+    for magnitude in ((1 << exponent) - 1, 1 << exponent, (1 << exponent) + 1):
+        for low in (magnitude, -magnitude):
+            if not -(1 << 31) <= low < (1 << 31):
+                continue
+            high = -low - 1
+            source = ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+            native, lifted = oracle.check_xmm(
+                _asm("cvtdq2pd xmm15, xmm15"), xmm_init=_xmms(xmm15=source))
+            assert native[2][15] == lifted[2][15] == _int32_pair_as_double_bits(low, high)
+
+
+@pytest.mark.parametrize("offset", [0, 1, 3, 7, 8])
+def test_cvtdq2pd_m64_has_no_128_bit_alignment_or_overread(offset):
+    memory = bytes([0xA5] * offset) + struct.pack("<ii", -(1 << 31), 16777217)
+    native, lifted = oracle.check_xmm(
+        _asm(f"cvtdq2pd xmm15, qword ptr [rax+{offset}]"),
+        init=_gprs(rax=oracle.MEM_BASE), xmm_init=_xmms(xmm15=(1 << 128) - 1), mem=memory)
+    assert native[2][15] == lifted[2][15] == _int32_pair_as_double_bits(-(1 << 31), 16777217)
+
+
+def test_cvtdq2pd_seeded_random_register_and_memory_forms():
+    rng = random.Random(0xC7D03264)
+    for index in range(128):
+        low = rng.randrange(-(1 << 31), 1 << 31)
+        high = rng.randrange(-(1 << 31), 1 << 31)
+        xmms = [rng.getrandbits(128) for _ in range(16)]
+        destination, source = rng.randrange(16), rng.randrange(16)
+        offset = rng.randrange(16)
+        if index % 2:
+            xmms[source] = (rng.getrandbits(64) << 64) | ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+            instruction, memory = f"cvtdq2pd xmm{destination}, xmm{source}", None
+        else:
+            instruction = f"cvtdq2pd xmm{destination}, qword ptr [rax+{offset}]"
+            memory = bytes(rng.getrandbits(8) for _ in range(offset)) + struct.pack("<ii", low, high)
+        native, lifted = oracle.check_xmm(
+            _asm(instruction), init=_gprs(rax=oracle.MEM_BASE), xmm_init=xmms, mem=memory)
+        assert native[2][destination] == lifted[2][destination] == _int32_pair_as_double_bits(low, high)
+
+
+def test_cvtdq2pd_faulting_m64_read_precedes_any_destination_write():
+    assembly = lifter.lift_function(_asm("cvtdq2pd xmm15, qword ptr [rax]"))
+    assert "load128" not in assembly
+    blob = daedalus_asm.assemble(assembly)
+    size = struct.unpack_from("<H", blob)[0]
+    vm = RefVM(blob[2 + size:], blob[2:2 + size],
+               mem=bytes(7), mem_base=oracle.MEM_BASE)
+    vm.locals[:8] = oracle.MEM_BASE.to_bytes(8, "little")
+    offset = lifter.XMM_OFF[lifter.Register.XMM15]
+    sentinel = bytes.fromhex("00112233445566778899aabbccddeeff")
+    vm.locals[offset:offset + 16] = sentinel
+    with pytest.raises(DaedalusError):
+        vm.run()
+    assert vm.locals[offset:offset + 16] == sentinel
+
+
+@pytest.mark.parametrize("image_base", [0, 0x180000000])
+def test_cvtdq2pd_rip_relative_m64_rebases_and_keeps_exact_width(image_base):
+    code_rva, data_rva = 0x1000, 0x3000
+    probe = _asm("cvtdq2pd xmm15, qword ptr [rip]")
+    displacement = data_rva - code_rva - len(probe)
+    code = bytes(_KS.asm(f"cvtdq2pd xmm15, qword ptr [rip+{displacement}]", addr=code_rva)[0])
+    data = struct.pack("<ii", -16777217, (1 << 31) - 1)
+    sections = (
+        oracle._OracleSection(".text", code_rva, len(code), code, 0x60000020),
+        oracle._OracleSection(".data", data_rva, len(data), data, 0xC0000040),
+    )
+    native, lifted = oracle.check_xmm(
+        code, mem=data, mem_base=image_base + data_rva, lift_base=code_rva,
+        image_base=image_base, code_base=image_base + code_rva,
+        image_sections=sections, selected_extents=((code_rva, len(code)),))
+    assert native[2][15] == lifted[2][15] == _int32_pair_as_double_bits(-16777217, (1 << 31) - 1)
+
+
+@pytest.mark.parametrize("instruction", [
+    "vcvtdq2pd xmm0, xmm1", "vcvtdq2pd ymm0, xmm1",
+    "cvtdq2pd xmm0, qword ptr gs:[rax]", "cvtdq2pd xmm0, qword ptr [eax]",
+    "cvtsi2sd xmm0, rax", "cvtdq2ps xmm0, xmm1", "addsd xmm0, xmm1",
+])
+def test_cvtdq2pd_does_not_admit_unmodeled_encodings_or_rounded_fp(instruction):
+    with pytest.raises(lifter.LiftUnsupported):
+        lifter.lift_function(_asm(instruction))
+
+
 @pytest.mark.parametrize(
     "instruction",
     [
