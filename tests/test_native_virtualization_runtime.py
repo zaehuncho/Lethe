@@ -616,7 +616,7 @@ def test_packed_executable_calls_virtualized_leaf(
         thunk = _slice(
             materialized.parsed, generated.rva, win64_thunk.THUNK_CODE_SIZE
         )
-        assert thunk[5] == 0xE8
+        assert thunk[win64_thunk.THUNK_COMMON_REL32_OFFSET - 1] == 0xE8
         common_displacement, = struct.unpack(
             "<i",
             thunk[
