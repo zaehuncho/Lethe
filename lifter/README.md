@@ -29,7 +29,14 @@ else + a **differential oracle** that proves every lift correct.
 - `pdb_function_inventory.py` and `../tools/pdb_function_dump.cpp` — read-only
   DIA inventory of exact PDB function extents. The inventory binds the PDB
   GUID/age to one file-backed PE RSDS record, rejects overlapping or partial
-  PDATA ranges, and retains PE/PDB/helper/DIA hashes. Supplemental ranges are
+  PDATA ranges, and retains PE/PDB/helper/DIA hashes. The analyzer and DIA
+  helper read private byte-exact snapshots, not mutable original paths.
+  Windows deny-write/delete handles seal all four snapshots and prevent their
+  private directory from being renamed for the complete analysis/helper run;
+  original-file postchecks still reject persistent changes. Pre/post hashes
+  alone do not prevent a transient replace-and-restore from changing what DIA
+  reads. Snapshot handles and files are released on success and failure.
+  Supplemental ranges are
   **not** a coverage waiver: they still need strict control-flow decoding and
   every remaining executable gap must be proven separately before production
   selection can pass.

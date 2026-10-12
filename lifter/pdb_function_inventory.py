@@ -6,13 +6,16 @@ to decode every supplemental body and prove all residual executable bytes.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from hashlib import sha256
+import os
 from pathlib import Path
 import re
 import struct
 import subprocess
-from typing import Any
+import tempfile
+from typing import Any, Iterator, Sequence
 from uuid import UUID
 
 from . import direct_control_flow
@@ -234,45 +237,98 @@ def bind_inventory(
     )
 
 
+@contextmanager
+def _seal_snapshot_paths(paths: Sequence[Path]) -> Iterator[None]:
+    """Keep Windows readers open while denying writes, deletion and renames.
+
+    A read-only attribute or pre/post hash alone does not prevent an ABA swap
+    while DIA is running. File share modes enforce the snapshot's lifetime;
+    a directory handle also prevents renaming its private parent directory.
+    """
+    if os.name != "nt":
+        raise PdbInventoryError("DIA snapshot sealing requires Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    invalid = ctypes.c_void_p(-1).value
+    parents = {path.parent for path in paths}
+    if len(parents) != 1:
+        raise PdbInventoryError("DIA snapshots must share one private directory")
+    # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING. Deny write/delete on files.
+    requests = [(path, 1, 0x80) for path in paths]
+    # FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_FLAG_BACKUP_SEMANTICS for parent.
+    # Directory contents remain writable for readers' incidental files, but
+    # FILE_SHARE_DELETE is absent so the snapshot directory cannot be renamed.
+    requests.append((next(iter(parents)), 3, 0x02000000))
+    with ExitStack() as stack:
+        for path, sharing, flags in requests:
+            handle = create(str(path), 0x80000000, sharing, None, 3, flags, None)
+            if handle == invalid:
+                raise PdbInventoryError("could not seal DIA snapshot") from ctypes.WinError(
+                    ctypes.get_last_error()
+                )
+            stack.callback(close, handle)
+        yield
+
+
 def run_bound_inventory(
     parsed: Any, image_path: Path, pdb_path: Path, helper_path: Path, msdia_path: Path
 ) -> BoundPdbInventory:
-    """Run the DIA extractor on one immutable snapshot of each source file."""
+    """Run DIA only on exact, mutation-locked private snapshots of all inputs."""
     if not hasattr(parsed, "path") or Path(parsed.path).resolve() != image_path.resolve():
         raise PdbInventoryError("parsed PE path does not match inventory image")
-    image = image_path.read_bytes()
+    originals = (image_path, pdb_path, helper_path, msdia_path)
+    contents = tuple(path.read_bytes() for path in originals)
+    digests = tuple(sha256(data).hexdigest() for data in contents)
+    image = contents[0]
     from packer.pe_analyze import analyze_pe
 
-    fresh = analyze_pe(str(image_path))
-    if (
-        parsed.size_of_image != fresh.size_of_image
-        or parsed.sections != fresh.sections
-        or parsed.runtime_functions != fresh.runtime_functions
-    ):
-        raise PdbInventoryError("parsed PE inventory differs from current image")
-    pdb_digest = sha256(pdb_path.read_bytes()).hexdigest()
-    helper_digest = sha256(helper_path.read_bytes()).hexdigest()
-    msdia_digest = sha256(msdia_path.read_bytes()).hexdigest()
-    command = [str(helper_path), str(msdia_path), str(pdb_path)]
-    try:
-        result = subprocess.run(command, capture_output=True, timeout=300, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise PdbInventoryError("DIA helper did not complete") from exc
-    if result.returncode or result.stderr or len(result.stdout) > 16_000_000:
-        raise PdbInventoryError("DIA helper failed or emitted diagnostics")
-    if sha256(image_path.read_bytes()).digest() != sha256(image).digest():
-        raise PdbInventoryError("PE changed during PDB inventory")
-    if sha256(pdb_path.read_bytes()).hexdigest() != pdb_digest:
-        raise PdbInventoryError("PDB changed during inventory")
-    if sha256(helper_path.read_bytes()).hexdigest() != helper_digest:
-        raise PdbInventoryError("DIA helper changed during inventory")
-    if sha256(msdia_path.read_bytes()).hexdigest() != msdia_digest:
-        raise PdbInventoryError("DIA runtime changed during inventory")
-    try:
-        output = result.stdout.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise PdbInventoryError("DIA helper output is not ASCII") from exc
-    return replace(
-        bind_inventory(parsed, image, pdb_digest, helper_digest, output),
-        msdia_sha256=msdia_digest,
-    )
+    with tempfile.TemporaryDirectory(prefix="lethe-dia-") as directory:
+        root = Path(directory)
+        snapshots = tuple(root / name for name in (
+            "image.bin", "input.pdb", "pdb_function_dump.exe", "msdia140.dll"
+        ))
+        for path, data in zip(snapshots, contents):
+            path.write_bytes(data)
+        with _seal_snapshot_paths(snapshots):
+            if any(sha256(path.read_bytes()).hexdigest() != expected
+                   for path, expected in zip(snapshots, digests)):
+                raise PdbInventoryError("DIA snapshot differs from pinned input")
+            fresh = analyze_pe(str(snapshots[0]))
+            if (
+                parsed.size_of_image != fresh.size_of_image
+                or parsed.sections != fresh.sections
+                or parsed.runtime_functions != fresh.runtime_functions
+            ):
+                raise PdbInventoryError("parsed PE inventory differs from current image")
+            command = [str(snapshots[index]) for index in (2, 3, 1)]
+            try:
+                result = subprocess.run(command, capture_output=True, timeout=300, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise PdbInventoryError("DIA helper did not complete") from exc
+            if result.returncode or result.stderr or len(result.stdout) > 16_000_000:
+                raise PdbInventoryError("DIA helper failed or emitted diagnostics")
+            for path, expected, diagnostic in zip(originals, digests, (
+                "PE changed during PDB inventory", "PDB changed during inventory",
+                "DIA helper changed during inventory", "DIA runtime changed during inventory",
+            )):
+                if sha256(path.read_bytes()).hexdigest() != expected:
+                    raise PdbInventoryError(diagnostic)
+            try:
+                output = result.stdout.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise PdbInventoryError("DIA helper output is not ASCII") from exc
+            return replace(
+                bind_inventory(parsed, image, digests[1], digests[2], output),
+                msdia_sha256=digests[3],
+            )
