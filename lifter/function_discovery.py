@@ -18,8 +18,9 @@ from typing import Any, Sequence
 from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
 try:
-    from . import win64_thunk, x64_lifter
+    from . import native_tail_calls, win64_thunk, x64_lifter
 except ImportError:  # standalone tools/tests
+    import native_tail_calls  # type: ignore
     import win64_thunk  # type: ignore
     import x64_lifter  # type: ignore
 
@@ -655,7 +656,8 @@ def _lift_status(
     # lie OUTSIDE this candidate's own extent. A direct near ``call`` to such a
     # target is a direct-call-to-native the lifter bridges to the untouched
     # callee (Cut 17); a ``call`` INTO this extent stays a Cut 9 internal call,
-    # and a ``call`` to anything not a proven pdata entry still fails closed.
+    # Canonical bounded state-neutral tail aliases are proven separately before
+    # this check. Other out-of-extent targets still fail closed.
     if extent.unresolved_reason:
         return False, extent.unresolved_reason, None, ()
     if padding_rejection is not None:
@@ -1105,6 +1107,9 @@ def discover_functions(
     # instead of bailing on an out-of-extent call. pdata ranges never overlap, so
     # the only begin inside a candidate is the candidate's own entry.
     pdata_begins = frozenset(item.begin for item in runtime)
+    import_iat_rvas = frozenset(function.iat_rva
+                                for dll in getattr(parsed, "imports", ())
+                                for function in dll.funcs)
     global_gaps = _coverage_gaps(sections, runtime_pairs)
     direct_error = None
     direct_transfers = ()
@@ -1130,6 +1135,16 @@ def discover_functions(
             for begin in pdata_begins
             if not (extent.rva <= begin < extent.rva + extent.size)
         )
+        if not extent.unwind_flags and not extent.unresolved_reason and padding_rejection is None:
+            try:
+                candidate_body = _read_executable(sections, extent.rva, extent.lifted_body_size, "candidate")
+            except FunctionDiscoveryError:
+                pass  # _lift_status retains the original extent/read diagnostic.
+            else:
+                native_call_targets |= native_tail_calls.proven_tail_call_targets(
+                    candidate_body, base=extent.rva, sections=sections,
+                    retained_entries=native_call_targets, runtime_ranges=runtime_pairs,
+                    selected_extents=((extent.rva, extent.size),), import_iat_rvas=import_iat_rvas)
         liftable, rejection, first, rip_references = _lift_status(
             extent,
             sections,

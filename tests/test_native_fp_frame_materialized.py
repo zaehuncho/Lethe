@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 
 import pytest
+from iced_x86 import Decoder, Mnemonic
 
 from lifter import direct_control_flow, virtualization_plan
 from packer import assemble, orchestrator, pe_analyze, virtualize
@@ -21,6 +22,9 @@ PUBLIC vm_alias_pointer
 PUBLIC vm_int_pair
 PUBLIC vm_alias_choose
 PUBLIC vm_alias_choose_spill
+PUBLIC vm_tail_native_call
+PUBLIC vm_tail_import_call
+EXTERN __imp_GetCurrentProcess:QWORD
 .code
 vm_fp_call PROC FRAME
  push rbp
@@ -122,6 +126,58 @@ vm_alias_choose_spill PROC FRAME
  pop rbp
  ret
 vm_alias_choose_spill ENDP
+
+vm_tail_native_call PROC FRAME
+ sub rsp,48h
+ .allocstack 48h
+ .endprolog
+ mov ecx,11
+ mov edx,13
+ mov r8d,17
+ mov r9d,19
+ mov qword ptr [rsp+20h],23
+ call native_alias_a
+ add rsp,48h
+ ret
+vm_tail_native_call ENDP
+vm_tail_import_call PROC FRAME
+ sub rsp,48h
+ .allocstack 48h
+ .endprolog
+ call import_alias_a
+ add rsp,48h
+ ret
+vm_tail_import_call ENDP
+native_alias_a PROC
+ db 0E9h
+ dd native_alias_b-($+4)
+native_alias_a ENDP
+native_alias_b PROC
+ db 0E9h
+ dd native_tail_leaf-($+4)
+native_alias_b ENDP
+import_alias_a PROC
+ db 0E9h
+ dd import_alias_b-($+4)
+import_alias_a ENDP
+import_alias_b PROC
+ db 0E9h
+ dd import_alias_iat-($+4)
+import_alias_b ENDP
+import_alias_iat PROC
+ jmp qword ptr [__imp_GetCurrentProcess]
+import_alias_iat ENDP
+native_tail_leaf PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rax,[rsp+30h]
+ add rsp,8
+ ret
+native_tail_leaf ENDP
 END
 """
 _CONVERSION_CHECK = r"""#include <stdint.h>
@@ -200,6 +256,8 @@ uint64_t vm_alias_pointer(uint64_t*,uint64_t,uint64_t,uint64_t,uint64_t);
 void vm_int_pair(const int32_t*,double*);
 uint64_t vm_alias_choose(uint64_t*,int,uint64_t,uint64_t,uint64_t);
 uint64_t vm_alias_choose_spill(uint64_t*,int,uint64_t,uint64_t,uint64_t);
+uint64_t vm_tail_native_call(void);
+uint64_t vm_tail_import_call(void);
 const uint64_t native_alias_constant=17U;
 __declspec(noinline) double native_mix(double a,uint64_t b,double c,uint64_t d,
  double e,uint64_t f,double g,uint64_t h)
@@ -213,9 +271,10 @@ _EXE = _COMMON + _CONVERSION_CHECK + _CONDITIONAL_ALIAS_CHECK + r"""__declspec(n
  const uint64_t alias=vm_alias_pointer(&output,7,11,13,17);
  const int conversion=conversion_check(vm_int_pair);
  const int conditional=conditional_alias_check(vm_alias_choose,vm_alias_choose_spill);
- static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 conversion=1 conditional=1 passed=true\r\n";
+ const int tails=vm_tail_native_call()==83U && vm_tail_import_call()==UINT64_MAX;
+ static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 conversion=1 conditional=1 tails=1 passed=true\r\n";
  static const char bad[]="FP_FRAME_E2E mismatch\r\n";
- const int valid=answer==51.0 && alias==48 && output==48 && conversion && conditional;
+ const int valid=answer==51.0 && alias==48 && output==48 && conversion && conditional && tails;
  const char *message=valid?ok:bad;
  DWORD written=0;
  WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),message,
@@ -251,14 +310,19 @@ int wmain(int argc,wchar_t **argv)
  if(!choose){FreeLibrary(module);return 97;}
  auto choose_spill=reinterpret_cast<ConditionalAliasFn>(GetProcAddress(module,"vm_alias_choose_spill"));
  if(!choose_spill){FreeLibrary(module);return 98;}
+ using TailFn=uint64_t (*)();
+ auto tail_native=reinterpret_cast<TailFn>(GetProcAddress(module,"vm_tail_native_call"));
+ auto tail_import=reinterpret_cast<TailFn>(GetProcAddress(module,"vm_tail_import_call"));
+ if(!tail_native || !tail_import){FreeLibrary(module);return 99;}
  double value=fn(1.25,7,-3.5,11,5.75,13,-0.5,17);
  uint64_t output=0;
  const uint64_t alias=alias_fn(&output,7,11,13,17);
  const int conversion=conversion_check(convert);
  const int conditional=conditional_alias_check(choose,choose_spill);
- const bool valid=value==51.0 && alias==48 && output==48 && conversion && conditional;
- std::printf("FP_FRAME_DLL result=%.1f alias=%llu conversion=%d conditional=%d passed=%s\n",value,
-             static_cast<unsigned long long>(alias),conversion,conditional,valid?"true":"false");
+ const int tails=tail_native()==83U && tail_import()==UINT64_MAX;
+ const bool valid=value==51.0 && alias==48 && output==48 && conversion && conditional && tails;
+ std::printf("FP_FRAME_DLL result=%.1f alias=%llu conversion=%d conditional=%d tails=%d passed=%s\n",value,
+             static_cast<unsigned long long>(alias),conversion,conditional,tails,valid?"true":"false");
  if(!FreeLibrary(module))return 93;
  return valid?0:94;
 }
@@ -278,9 +342,9 @@ add_library(fp_dll SHARED dll.c frame.asm)
 add_executable(fp_host host.cpp)
 set_source_files_properties(exe.c dll.c PROPERTIES COMPILE_OPTIONS "/W4;/WX;/O2;/GS-;/fp:strict")
 target_link_options(fp_exe PRIVATE /INCREMENTAL:NO /OPT:NOICF /FIXED /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call)
 target_link_options(fp_dll PRIVATE /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call)
 target_link_libraries(fp_exe PRIVATE kernel32.lib)
 target_link_libraries(fp_dll PRIVATE kernel32.lib)
 """, encoding="ascii")
@@ -289,6 +353,29 @@ target_link_libraries(fp_dll PRIVATE kernel32.lib)
     runtime._run_checked(["cmake", "--build", str(build), "--config", "Release"], cwd=work)
     return (build / "Release/fp_exe.exe", build / "Release/fp_dll.dll",
             build / "Release/fp_host.exe")
+
+
+def _assert_tail_fixture(image, parsed) -> None:
+    entries = {record.begin_rva for record in parsed.runtime_functions}
+    slots = {function.iat_rva for dll in parsed.imports for function in dll.funcs}
+    for name, kind in (("vm_tail_native_call", "pdata"), ("vm_tail_import_call", "iat")):
+        rva = image.find_export_rva(name)
+        record, = (record for record in parsed.runtime_functions if record.begin_rva == rva)
+        calls = [instruction for instruction in Decoder(64, image.read_at_rva(rva, record.end_rva-rva), ip=rva)
+                 if instruction.mnemonic == Mnemonic.CALL]
+        assert len(calls) == 1 and calls[0].len == 5
+        target = calls[0].near_branch_target
+        for _ in range(2):
+            raw = image.read_at_rva(target, 5)
+            assert raw[0] == 0xE9
+            assert not any(record.begin_rva <= target < record.end_rva for record in parsed.runtime_functions)
+            target += 5 + int.from_bytes(raw[1:], "little", signed=True)
+        if kind == "pdata":
+            assert target in entries
+        else:
+            raw = image.read_at_rva(target, 6)
+            assert raw[:2] == b"\xFF\x25"
+            assert target + 6 + int.from_bytes(raw[2:], "little", signed=True) in slots
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -312,9 +399,10 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
     for source, is_dll in ((exe, False), (dll, True)):
         image = assemble._StubImage(source.read_bytes())
         parsed = pe_analyze.analyze_pe(str(source))
+        _assert_tail_fixture(image, parsed)
         specs = []
         for name in ("vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-                     "vm_alias_choose", "vm_alias_choose_spill"):
+                     "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call"):
             rva = image.find_export_rva(name)
             assert rva is not None
             records = [record for record in parsed.runtime_functions
@@ -353,7 +441,7 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
         assert result.ok, result.error
         assert {fn.name for fn in captured["result"].manifest.functions} == {
             "vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-            "vm_alias_choose", "vm_alias_choose_spill"}
+            "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call"}
         after = _run(packed_cmd)
         assert (after.returncode, after.stdout, after.stderr) == (
             before.returncode, before.stdout, before.stderr)

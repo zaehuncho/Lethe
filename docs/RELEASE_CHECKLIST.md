@@ -129,6 +129,25 @@ selection. Dynamic/oversized frames, unbalanced returns, out-of-window aliases
 and unsupported native pointer escapes therefore appear as explicit lift
 rejections rather than a starter selection that fails later during packing.
 Instruction-specific failures retain their original diagnostic precedence.
+Canonical state-neutral native tail thunks may now serve as external call
+entries: at most sixteen unprefixed `E9 rel32`/terminal `FF25` instructions must
+resolve to a retained PDATA entry or an exact normal-import IAT slot. Every
+thunk byte stays outside selected extents and runtime bodies, in file-backed,
+non-discardable executable storage. Import slots require all eight bytes in
+non-executable, non-discardable storage and complete normal-import metadata.
+The original thunks/slots remain native; no guard, dispatch or call target is
+substituted. Cycles, excessive depth, prefixes, short/register jumps, arbitrary
+leaf code, malformed IAT metadata and unsupported source-pointer escapes still
+fail closed. This is not general indirect-target closure or exception bridging.
+The mandatory materialized node retains its original five functions and adds
+two callers for seven selected EXE/DLL functions. Both execute two neutral
+direct-jump thunks, one ending at a retained framed native five-argument sum,
+the other at an exact `GetCurrentProcess` import thunk. Their original/packed
+results must be 83 and the unchanged pseudo-handle -1. Fixture checks require
+the actual E9/E9 and FF25 encodings and absence of unwind records on the neutral
+thunks; source-call pointer escapes and the existing frame/alias/conversion
+assertions remain mandatory. This is generated fixture evidence, not an
+installed product, universal thunk form or clean-VM enforcement claim.
 Passing this preflight still does not prove indirect-target closure, whole-image
 executable coverage, native application behavior or release readiness.
 

@@ -565,6 +565,8 @@ def _compile_manifest(
         source_exception_metadata=source_exceptions,
         require_source_exception_metadata=True,
         guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+        source_import_iat_rvas=tuple(function.iat_rva
+                                    for dll in parsed.imports for function in dll.funcs),
         program_sealer=seal_program,
     )
     try:

@@ -7,6 +7,11 @@ it is built the safe way: a supported subset + a **hard bail-out** on anything
 else + a **differential oracle** that proves every lift correct.
 
 ## Files
+- `native_tail_calls.py` — bounded proof of unchanged state-neutral tail-call
+  chains: canonical E9 links ending at retained PDATA entries or exact normal-
+  import FF25 IAT jumps. All thunk bytes remain outside selected extents/runtime
+  bodies; unsupported native leaves, prefixes, cycles, excessive depth and
+  source-pointer escapes are not admitted. Planner and discovery share the proof.
 - `x64_lifter.py` — decode (iced-x86) → lift to Daedalus asm. `lift_function(code,
   base)` returns `.vasm` text or raises `LiftUnsupported`.
 - `oracle.py` — `check(code, init, flags)`: run the x64 in **Unicorn** and the

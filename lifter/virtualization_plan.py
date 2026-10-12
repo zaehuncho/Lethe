@@ -19,8 +19,9 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from iced_x86 import Decoder, Mnemonic, OpKind
 
 try:  # package import
-    from . import win64_thunk, x64_lifter
+    from . import native_tail_calls, win64_thunk, x64_lifter
 except ImportError:  # standalone tests/tools
+    import native_tail_calls  # type: ignore
     import win64_thunk  # type: ignore
     import x64_lifter  # type: ignore
 
@@ -1036,6 +1037,8 @@ def _compile_one(
     selected_extents: Sequence[tuple[int, int]],
     native_call_targets=frozenset(),
     guard_cf_dispatch_rva: int | None = None,
+    native_runtime_ranges: Sequence[tuple[int, int]] = (),
+    source_import_iat_rvas: frozenset[int] = frozenset(),
     mutate_level: int = 0,
     mutate_master: bytes | None = None,
 ) -> _Compiled:
@@ -1067,6 +1070,11 @@ def _compile_one(
                 "INT3/NOP padding suffix",
             )
     _decode_exact(spec, lifted_body)
+    if image_sections is not None:
+        native_call_targets |= native_tail_calls.proven_tail_call_targets(
+            lifted_body, base=spec.rva, sections=image_sections,
+            retained_entries=native_call_targets, runtime_ranges=native_runtime_ranges,
+            selected_extents=selected_extents, import_iat_rvas=source_import_iat_rvas)
     try:
         call_analysis = x64_lifter.analyze_internal_calls(
             lifted_body,
@@ -1175,6 +1183,7 @@ def compile_virtualization_manifest(
     require_source_exception_metadata: bool = False,
     guard_cf_dispatch_rva: int | None = None,
     program_sealer: Callable[[FunctionSpec, bytes], tuple[bytes, bytes]] | None = None,
+    source_import_iat_rvas: tuple[int, ...] = (),
     mutate_level: int = 0,
     mutate_master: bytes | None = None,
 ) -> VirtualizationManifest:
@@ -1257,6 +1266,15 @@ def compile_virtualization_manifest(
 
     image_sections = getattr(reader, "sections", None)
     selected_extents = tuple((spec.rva, spec.size) for spec in ordered)
+    if not isinstance(source_import_iat_rvas, tuple):
+        raise VirtualizationPlanError("source import IAT entries must be an immutable tuple")
+    if any(type(rva) is not int or not 0 < rva < _RVA_LIMIT - 7
+           for rva in source_import_iat_rvas):
+        raise VirtualizationPlanError("source import IAT entries must be valid eight-byte RVAs")
+    ordered_imports = sorted(source_import_iat_rvas)
+    if any(right < left + 8 for left, right in zip(ordered_imports, ordered_imports[1:])):
+        raise VirtualizationPlanError("source import IAT entries overlap")
+    import_iat_rvas = frozenset(source_import_iat_rvas)
 
     # A direct near call may be bridged to a first-party callee left native only
     # when its target is a proven function entry outside every selected extent.
@@ -1276,6 +1294,9 @@ def compile_virtualization_manifest(
         guard_cf_dispatch_rva = int(guard_cf_dispatch_rva)
         _validate_rva_range(guard_cf_dispatch_rva, 1, "GuardCF dispatch pointer")
 
+    runtime_ranges = tuple((record.begin_rva, record.end_rva)
+                           for record in source_exception_metadata.records) if source_exception_metadata else ()
+
     compiled = tuple(
         _compile_one(
             spec,
@@ -1287,6 +1308,8 @@ def compile_virtualization_manifest(
             selected_extents=selected_extents,
             native_call_targets=native_call_targets,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+            native_runtime_ranges=runtime_ranges,
+            source_import_iat_rvas=import_iat_rvas,
             mutate_level=mutate_level,
             mutate_master=mutate_master,
         )
