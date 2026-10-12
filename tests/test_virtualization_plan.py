@@ -129,6 +129,119 @@ def test_materialized_stack_keeps_fixed_arguments_and_nonstack_indexing(
     assert len(_compile(code).functions) == 1
 
 
+@pytest.mark.parametrize("source", [
+    "mov rbp, rsp; mov rax, [rbp-0x220]; ret",
+    "mov r10, rsp; mov [r10+rcx*8], rax; ret",
+    "lea rdx, [rsp-0x200]; sub rdx, 0x20; mov [rdx], rax; ret",
+    "mov r10, rsp; mov r11, r10; mov rax, [r11-0x208]; ret",
+    "mov r10, rsp; sub r10, rcx; mov [r10], rax; ret",
+    "mov r10, rsp; lea r11, [r10+rcx]; ret",
+    "mov r10, rsp; mov rax, [r10d]; ret",
+    "mov r10, rsp; mov eax, r10d; ret",
+    "mov r10, rsp; mov r10b, 1; ret",
+    "mov r10, rsp; movq xmm0, r10; movq r11, xmm0; ret",
+    "mov r10, rsp; mov rax, gs:[r10]; ret",
+    "mov r10, rsp; cmovz rax, r10; ret",
+    "mov r10, rsp; mov [rcx], r10; ret",
+    "sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; "
+    "mov r11, [rsp+8]; mov rax, [r11-0x208]; add rsp, 0x28; ret",
+    "sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; "
+    "mov byte ptr [rsp+8], 1; add rsp, 0x28; ret",
+    "sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; "
+    "movq xmm0, [rsp+8]; add rsp, 0x28; ret",
+    "mov r10, rsp; push r10; pop r11; mov rax, [r11-0x208]; ret",
+    "mov r10, rsp; test rcx, rcx; je good; sub r10, 0x208; "
+    "good: mov rax, [r10]; ret",
+    "mov r10, rsp; call inner; ret; inner: mov rax, [r10-0x208]; ret",
+    "call inner; mov rax, [r10-0x208]; ret; inner: mov r10, rsp; ret",
+    "mov r10, rsp; again: sub r10, 8; test rcx, rcx; jne again; ret",
+    "sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; mov [rcx], rax; "
+    "mov r11, [rsp+8]; mov rax, [r11]; add rsp, 0x28; ret",
+])
+def test_materialized_stack_rejects_unbounded_or_unmodeled_derived_pointers(source):
+    code = _asm(source)
+    with pytest.raises(x64_lifter.LiftUnsupported, match="source stack"):
+        x64_lifter.validate_materialized_stack_window(
+            code, window_size=win64_thunk.STACK_WINDOW_SIZE
+        )
+    with pytest.raises(plan.FunctionRejected, match="source stack"):
+        _compile(code)
+
+
+@pytest.mark.parametrize(("source", "maximum"), [
+    ("mov r10, rsp; mov rax, [r10+0x28]; ret", 0),
+    ("sub rsp, 0x40; mov r10, rsp; mov [r10], rax; add rsp, 0x40; ret", 0x40),
+    ("mov r10, rsp; sub r10, 0x100; add r10, 0x20; mov rax, [r10]; ret", 0),
+    ("mov r10, rsp; mov r11, r10; lea rax, [r11-0x200]; ret", 0),
+    ("push rbp; mov rbp, rsp; sub rsp, 0x40; mov [rbp-0x20], rax; "
+     "mov rsp, rbp; pop rbp; ret", 0x48),
+    ("push rbp; mov rbp, rsp; sub rsp, 0x40; mov rax, [rbp+0x30]; leave; ret", 0x48),
+    ("sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; mov r11, [rsp+8]; "
+     "mov rax, [r11]; add rsp, 0x28; ret", 0x28),
+    ("mov r10, rsp; push r10; pop r11; mov rax, [r11+0x28]; ret", 8),
+    ("sub rsp, 0x28; mov r10, rsp; push r10; pop qword ptr [rsp+8]; "
+     "mov r11, [rsp+8]; mov rax, [r11]; add rsp, 0x28; ret", 0x30),
+    ("mov r10, rsp; mov eax, 1; xchg r10, rax; mov rdx, [rax+0x28]; ret", 0),
+    ("mov r10, rsp; mov r10d, 1; add r10d, 2; ret", 0),
+    ("mov r10, rsp; xor r10d, r10d; ret", 0),
+    ("mov r10, rsp; mov r10, rcx; mov rax, [r10+rdx*8]; ret", 0),
+    ("mov r10, rsp; test rcx, rcx; je done; lea r10, [rsp-0x20]; "
+     "done: mov rax, [r10]; ret", 0),
+    ("mov r10, rsp; call inner; mov rax, [r10+0x28]; ret; "
+     "inner: push r10; pop r11; mov rax, [r11+0x28]; ret", 0x10),
+    ("sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; "
+     "mov qword ptr [rsp+8], 1; mov rax, [rsp+8]; add rsp, 0x28; ret", 0x28),
+    ("mov rax, rcx; mov [rax+rdx*8], r8; ret", 0),
+    ("push rbp; mov rbp, rsp; sub rsp, 0x28; mov [rsp+8], rbp; "
+     "mov rsp, [rsp+8]; pop rbp; ret", 0x30),
+])
+def test_materialized_stack_tracks_bounded_aliases_and_preserves_opaque_inputs(source, maximum):
+    code = _asm(source)
+    assert x64_lifter.validate_materialized_stack_window(
+        code, window_size=win64_thunk.STACK_WINDOW_SIZE
+    ) == maximum
+    assert len(_compile(code).functions) == 1
+
+
+@pytest.mark.parametrize("source", [
+    "mov rcx, rsp; call 0x4000; ret",
+    "mov r11, rsp; call 0x4000; ret",
+    "sub rsp, 0x38; mov r10, rsp; mov [rsp+0x20], r10; call 0x4000; add rsp, 0x38; ret",
+])
+def test_materialized_stack_rejects_opaque_native_pointer_escape(source):
+    with pytest.raises(x64_lifter.LiftUnsupported, match="native source stack pointer escape"):
+        x64_lifter.validate_materialized_stack_window(
+            _asm(source), window_size=win64_thunk.STACK_WINDOW_SIZE,
+            native_call_targets={0x4000},
+        )
+
+
+def test_materialized_stack_keeps_nonargument_alias_spills_across_native_call():
+    code = _asm("sub rsp, 0x58; mov r10, rsp; mov [rsp+0x48], r10; "
+                "mov r10d, 0; call 0x4000; mov r11, [rsp+0x48]; "
+                "mov rax, [r11]; add rsp, 0x58; ret")
+    assert x64_lifter.validate_materialized_stack_window(
+        code, window_size=win64_thunk.STACK_WINDOW_SIZE,
+        native_call_targets={0x4000},
+    ) == 0x58
+
+
+@pytest.mark.parametrize("source", ["push word ptr [rsp]; ret", "push ax; ret"])
+def test_materialized_stack_rejects_unmodeled_push_width(source):
+    with pytest.raises(x64_lifter.LiftUnsupported, match="source stack PUSH width"):
+        x64_lifter.validate_materialized_stack_window(
+            _asm(source), window_size=win64_thunk.STACK_WINDOW_SIZE
+        )
+
+
+def test_materialized_stack_rejects_implicit_alias_pointer_adjustment():
+    with pytest.raises(x64_lifter.LiftUnsupported, match="source stack pointer transfer"):
+        x64_lifter.validate_materialized_stack_window(
+            _asm("mov rsi, rsp; mov rdi, rcx; movsq; ret"),
+            window_size=win64_thunk.STACK_WINDOW_SIZE,
+        )
+
+
 def _asm(source: str, *, rva: int = 0x1000) -> bytes:
     encoded, _ = _KS.asm(source, addr=rva)
     return bytes(encoded)

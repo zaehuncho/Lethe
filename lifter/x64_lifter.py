@@ -2687,7 +2687,7 @@ def validate_materialized_stack_window(
     window_size: int,
     native_call_targets=frozenset(),
 ) -> int:
-    """Prove every reachable source RSP stays inside the shim's private window.
+    """Prove source stack allocation/derived accesses avoid shim control state.
 
     The tracked depth is relative to the original function-entry RSP.  A
     source CALL/RET pair includes its architectural eight-byte return slot;
@@ -2695,7 +2695,10 @@ def validate_materialized_stack_window(
     frames, unbalanced returns and cyclic growth are rejected, rather than
     relying on an empirical stack cushion.  Direct stack-address operands must
     use unindexed, full-width RSP: an unconstrained index or truncated stack
-    base cannot be bounded by the displacement alone.
+    base cannot be bounded by the displacement alone. Full-width register
+    copies, constant pointer adjustments and qword stack spills retain their
+    entry-relative provenance across branches and internal calls. Unmodeled
+    pointer transfers/escapes fail closed rather than losing that provenance.
     """
     if window_size <= 0 or window_size % 16:
         raise ValueError("stack window must be a positive 16-byte multiple")
@@ -2708,6 +2711,13 @@ def validate_materialized_stack_window(
     rsp_aliases = {Register.RSP, Register.ESP, Register.SP, Register.SPL}
     writes = {OpAccess.WRITE, OpAccess.COND_WRITE, OpAccess.READ_WRITE,
               OpAccess.READ_COND_WRITE}
+    reads = {OpAccess.READ, OpAccess.COND_READ, OpAccess.READ_WRITE,
+             OpAccess.READ_COND_WRITE}
+    parents = {reg: index for regs in (_R64, _R32, _R16, _R8)
+               for index, reg in enumerate(regs)}
+    parents.update({reg: offset // 8 for reg, offset in _HIGH8_OFF.items()})
+    unknown = "unproven"
+    volatile = (0, 1, 2, 8, 9, 10, 11)
 
     def target(item) -> int:
         if item.op_kind(0) != OpKind.NEAR_BRANCH64:
@@ -2725,32 +2735,91 @@ def validate_materialized_stack_window(
             return item.immediate8to64
         if kind == OpKind.IMMEDIATE32TO64:
             return item.immediate32to64
-        raise LiftUnsupported(f"dynamic RSP adjustment at 0x{item.ip:X}")
+        raise LiftUnsupported(f"dynamic source stack pointer adjustment at 0x{item.ip:X}")
 
     def signed64(value: int) -> int:
         return value if value < (1 << 63) else value - (1 << 64)
 
-    def check_stack_address(base_register, index_register, displacement,
-                            *, depth: int, ip: int, label: str) -> None:
-        if base_register not in rsp_aliases and index_register not in rsp_aliases:
-            return
-        if base_register != Register.RSP or index_register != Register.NONE:
-            raise LiftUnsupported(
-                f"unbounded source stack {label} at 0x{ip:X}: "
-                "requires unindexed 64-bit RSP"
-            )
-        offset = -depth + signed64(displacement)
+    def pointer(register, aliases, depth):
+        index = parents.get(register)
+        return -depth if index == 4 else aliases[index] if index is not None else None
+
+    def bounded(offset, ip: int, label: str) -> int:
+        if offset == unknown:
+            raise LiftUnsupported(f"unproven source stack {label} at 0x{ip:X}")
+        if not -(1 << 63) <= offset < (1 << 63):
+            raise LiftUnsupported(f"source stack pointer arithmetic wraps at 0x{ip:X}")
         if offset < -window_size:
             raise LiftUnsupported(
                 f"source stack {label} at 0x{ip:X} exceeds {window_size}-byte window"
             )
+        return offset
 
-    pending = [(base, (), 0)]
+    def check_stack_address(base_register, index_register, displacement,
+                            *, aliases, depth: int, ip: int, label: str):
+        base_pointer = pointer(base_register, aliases, depth)
+        index_pointer = pointer(index_register, aliases, depth)
+        if base_pointer is None and index_pointer is None:
+            return None
+        if base_register not in _R64 or index_register != Register.NONE:
+            raise LiftUnsupported(
+                f"unbounded source stack {label} at 0x{ip:X}: "
+                "requires unindexed 64-bit RSP or proven stack alias"
+            )
+        if base_pointer == unknown:
+            raise LiftUnsupported(f"unproven source stack {label} at 0x{ip:X}")
+        return bounded(base_pointer + signed64(displacement), ip, label)
+
+    def overlaps(offset, size, slot):
+        return offset < slot + 8 and slot < offset + size
+
+    def store(spills, offset, size, value, *, ip, overwrite=True):
+        if offset is None:
+            if value is not None:
+                raise LiftUnsupported(f"source stack pointer escape at 0x{ip:X}")
+            # An opaque write may alias a previously spilled pointer. Do not
+            # subsequently reload the old exact value as if it were unchanged.
+            spills.update((slot, unknown) for slot in spills)
+            return
+        for slot in tuple(spills):
+            if not overlaps(offset, size, slot):
+                continue
+            if not overwrite or not (offset <= slot and slot + 8 <= offset + size):
+                raise LiftUnsupported(f"unmodeled source stack pointer spill write at 0x{ip:X}")
+            del spills[slot]
+        if value is not None:
+            if size != 8:
+                raise LiftUnsupported(f"unmodeled source stack pointer spill width at 0x{ip:X}")
+            spills[offset] = value
+
+    def assign(register, value, aliases, depth, *, ip):
+        index = parents.get(register)
+        if value is not None and register not in _R64:
+            raise LiftUnsupported(f"unmodeled source stack pointer transfer at 0x{ip:X}")
+        if index == 4:
+            if register != Register.RSP or value is None or value == unknown:
+                raise LiftUnsupported(f"dynamic RSP write at 0x{ip:X}")
+            return -value
+        if index is None:
+            if value is not None:
+                raise LiftUnsupported(f"unmodeled source stack pointer transfer at 0x{ip:X}")
+        elif register not in _R64 and register not in _R32 and aliases[index] is not None:
+            raise LiftUnsupported(f"partial source stack pointer write at 0x{ip:X}")
+        else:
+            aliases[index] = value
+        return depth
+
+    def memory_offset(item, aliases, depth, ip, label="address"):
+        return check_stack_address(item.memory_base, item.memory_index,
+                                   item.memory_displacement, aliases=aliases,
+                                   depth=depth, ip=ip, label=label)
+
+    pending = [(base, (), 0, (None,) * 16, ())]
     visited = set()
     maximum = 0
     while pending:
-        ip, returns, depth = pending.pop()
-        state = (ip, returns, depth)
+        ip, returns, depth, alias_state, spill_state = pending.pop()
+        state = (ip, returns, depth, alias_state, spill_state)
         if state in visited:
             continue
         visited.add(state)
@@ -2766,46 +2835,163 @@ def validate_materialized_stack_window(
         next_ip = ip + item.len
         mnemonic = item.mnemonic
         info = info_factory.info(item)
-        for memory in info.used_memory():
-            check_stack_address(
-                memory.base, memory.index, memory.displacement,
-                depth=depth, ip=ip, label="access",
+        aliases, spills = list(alias_state), dict(spill_state)
+        memory = list(info.used_memory())
+        if item.segment_prefix != Register.NONE and (
+            any(pointer(access.base, aliases, depth) is not None or
+                pointer(access.index, aliases, depth) is not None for access in memory) or
+            (mnemonic == Mnemonic.LEA and
+             (pointer(item.memory_base, aliases, depth) is not None or
+              pointer(item.memory_index, aliases, depth) is not None))
+        ):
+            raise LiftUnsupported(f"segment-overridden source stack address at 0x{ip:X}")
+        for access in memory:
+            offset = check_stack_address(
+                access.base, access.index, access.displacement,
+                aliases=aliases, depth=depth, ip=ip, label="access",
             )
-        if mnemonic == Mnemonic.LEA:
-            check_stack_address(
-                item.memory_base, item.memory_index, item.memory_displacement,
-                depth=depth, ip=ip, label="address",
-            )
-        if mnemonic == Mnemonic.PUSH:
+            touched = [slot for slot in spills if offset is not None and
+                       overlaps(offset, MemorySizeExt.size(access.memory_size), slot)]
+            if access.access in reads and touched:
+                modeled = (MemorySizeExt.size(access.memory_size) == 8 and
+                           touched == [offset] and
+                           (mnemonic in (Mnemonic.POP, Mnemonic.LEAVE, Mnemonic.PUSH) or
+                            (mnemonic == Mnemonic.MOV and item.op_kind(0) == OpKind.REGISTER
+                             and item.op_register(0) in _R64)))
+                if not modeled:
+                    raise LiftUnsupported(f"unmodeled source stack pointer reload at 0x{ip:X}")
+
+        if mnemonic == Mnemonic.MOV:
+            value = None
+            if item.op_kind(1) == OpKind.REGISTER:
+                source = item.op_register(1)
+                value = pointer(source, aliases, depth)
+                if value is not None and source not in _R64:
+                    raise LiftUnsupported(f"unmodeled source stack pointer transfer at 0x{ip:X}")
+            elif item.op_kind(1) == OpKind.MEMORY:
+                offset = memory_offset(item, aliases, depth, ip)
+                value = spills.get(offset)
+            if item.op_kind(0) == OpKind.REGISTER:
+                depth = assign(item.op_register(0), value, aliases, depth, ip=ip)
+            else:
+                store(spills, memory_offset(item, aliases, depth, ip),
+                      MemorySizeExt.size(item.memory_size), value, ip=ip)
+        elif mnemonic == Mnemonic.LEA:
+            value = memory_offset(item, aliases, depth, ip)
+            depth = assign(item.op_register(0), value, aliases, depth, ip=ip)
+        elif mnemonic == Mnemonic.PUSH:
+            if any(access.access in writes and MemorySizeExt.size(access.memory_size) != 8
+                   for access in memory):
+                raise LiftUnsupported(f"unmodeled source stack PUSH width at 0x{ip:X}")
+            value = None
+            if item.op_kind(0) == OpKind.REGISTER:
+                source = item.op_register(0)
+                value = pointer(source, aliases, depth)
+                if source not in _R64:
+                    raise LiftUnsupported(f"unmodeled source PUSH width at 0x{ip:X}")
+            elif item.op_kind(0) == OpKind.MEMORY:
+                value = spills.get(memory_offset(item, aliases, depth, ip))
             depth += 8
+            store(spills, -depth, 8, value, ip=ip)
         elif mnemonic == Mnemonic.POP:
-            if item.op_kind(0) == OpKind.REGISTER and item.op_register(0) in rsp_aliases:
-                raise LiftUnsupported(f"dynamic POP RSP at 0x{ip:X}")
+            value = spills.get(-depth)
             depth -= 8
-        elif mnemonic in (Mnemonic.ADD, Mnemonic.SUB) and item.op_kind(0) == OpKind.REGISTER and item.op_register(0) == Register.RSP:
+            if item.op_kind(0) == OpKind.REGISTER and item.op_register(0) in _R64:
+                if item.op_register(0) == Register.RSP:
+                    raise LiftUnsupported(f"dynamic POP RSP at 0x{ip:X}")
+                assign(item.op_register(0), value, aliases, depth, ip=ip)
+            elif item.op_kind(0) == OpKind.MEMORY and MemorySizeExt.size(item.memory_size) == 8:
+                # A POP destination observes the incremented source RSP.
+                store(spills, memory_offset(item, aliases, depth, ip), 8, value, ip=ip)
+            else:
+                raise LiftUnsupported(f"unmodeled source POP at 0x{ip:X}")
+        elif mnemonic == Mnemonic.LEAVE:
+            if any(MemorySizeExt.size(access.memory_size) != 8 for access in memory):
+                raise LiftUnsupported(f"unmodeled source stack LEAVE width at 0x{ip:X}")
+            frame = pointer(Register.RBP, aliases, depth)
+            if frame is None or frame == unknown:
+                raise LiftUnsupported(f"dynamic LEAVE frame at 0x{ip:X}")
+            depth = -frame
+            aliases[5] = spills.get(frame)
+            depth -= 8
+        elif mnemonic in (Mnemonic.ADD, Mnemonic.SUB) and item.op_kind(0) == OpKind.REGISTER and pointer(item.op_register(0), aliases, depth) is not None:
+            register = item.op_register(0)
+            value = pointer(register, aliases, depth)
+            if register not in _R64 or value == unknown:
+                raise LiftUnsupported(f"unproven source stack pointer adjustment at 0x{ip:X}")
             amount = immediate(item)
-            depth += amount if mnemonic == Mnemonic.SUB else -amount
+            value += amount if mnemonic == Mnemonic.ADD else -amount
+            if register != Register.RSP:
+                value = bounded(value, ip, "address")
+            depth = assign(register, value, aliases, depth, ip=ip)
+        elif mnemonic == Mnemonic.XCHG and all(item.op_kind(n) == OpKind.REGISTER for n in (0, 1)):
+            left, right = item.op_register(0), item.op_register(1)
+            a, b = pointer(left, aliases, depth), pointer(right, aliases, depth)
+            if a is not None or b is not None:
+                if left not in _R64 or right not in _R64 or Register.RSP in (left, right):
+                    raise LiftUnsupported(f"unmodeled source stack pointer exchange at 0x{ip:X}")
+                assign(left, b, aliases, depth, ip=ip)
+                assign(right, a, aliases, depth, ip=ip)
         elif mnemonic not in (Mnemonic.CALL, Mnemonic.RET):
             if any(reg.register in rsp_aliases and reg.access in writes
                    for reg in info.used_registers()):
                 raise LiftUnsupported(f"dynamic RSP write at 0x{ip:X}")
+            address_registers = {parents.get(reg) for access in memory
+                                 for reg in (access.base, access.index)}
+            source_pointer = any(
+                pointer(reg.register, aliases, depth) is not None and
+                reg.access in reads and parents.get(reg.register) not in address_registers
+                for reg in info.used_registers()
+            ) or any(
+                item.op_kind(n) == OpKind.REGISTER and info.op_access(n) in reads and
+                pointer(item.op_register(n), aliases, depth) is not None
+                for n in range(item.op_count)
+            ) or any(
+                reg.access in reads and reg.access in writes and
+                pointer(reg.register, aliases, depth) is not None
+                for reg in info.used_registers()
+            )
+            destinations = [reg for reg in info.used_registers() if reg.access in writes]
+            if source_pointer and (destinations or any(m.access in writes for m in memory)):
+                raise LiftUnsupported(f"unmodeled source stack pointer transfer at 0x{ip:X}")
+            for reg in destinations:
+                depth = assign(reg.register, None, aliases, depth, ip=ip)
+            for access in memory:
+                if access.access in writes:
+                    store(spills, check_stack_address(
+                        access.base, access.index, access.displacement, aliases=aliases,
+                        depth=depth, ip=ip, label="access"),
+                        MemorySizeExt.size(access.memory_size), None, ip=ip, overwrite=False)
+
         if depth < 0 or depth > window_size:
             raise LiftUnsupported(
                 f"source stack depth {depth} at 0x{ip:X} exceeds {window_size}-byte window"
             )
         maximum = max(maximum, depth)
+
+        def enqueue(address, frames=returns, current_depth=depth):
+            pending.append((address, frames, current_depth, tuple(aliases),
+                            tuple(sorted(spills.items()))))
+
         if mnemonic == Mnemonic.CALL:
             direct = _direct_near_call_target(item)
             external = _is_rip_import_call(item) or direct in native_call_targets
             if external:
-                pending.append((next_ip, returns, depth))
+                if any(aliases[index] is not None for index in volatile) or any(
+                    overlaps(-depth + 0x20, 32, slot) for slot in spills
+                ):
+                    raise LiftUnsupported(f"unmodeled native source stack pointer escape at 0x{ip:X}")
+                for index in volatile:
+                    aliases[index] = None
+                enqueue(next_ip)
             else:
                 callee = target(item)
                 if callee == base or any(frame[0] == callee for frame in returns):
                     raise LiftUnsupported(f"recursive internal call at 0x{ip:X}")
                 if depth + 8 > window_size:
                     raise LiftUnsupported("internal CALL return slot exceeds stack window")
-                pending.append((callee, returns + ((callee, next_ip, depth),), depth + 8))
+                store(spills, -depth - 8, 8, None, ip=ip)
+                enqueue(callee, returns + ((callee, next_ip, depth),), depth + 8)
         elif mnemonic == Mnemonic.RET:
             if item.op_count:
                 raise LiftUnsupported("ret imm16 stack cleanup is not modeled")
@@ -2813,16 +2999,16 @@ def validate_materialized_stack_window(
                 _callee, resume, caller_depth = returns[-1]
                 if depth != caller_depth + 8:
                     raise LiftUnsupported(f"unbalanced internal RET at 0x{ip:X}")
-                pending.append((resume, returns[:-1], caller_depth))
+                enqueue(resume, returns[:-1], caller_depth)
             elif depth:
                 raise LiftUnsupported(f"unbalanced top-level RET at 0x{ip:X}")
         elif mnemonic == Mnemonic.JMP:
-            pending.append((target(item), returns, depth))
+            enqueue(target(item))
         elif mnemonic in _CC:
-            pending.append((target(item), returns, depth))
-            pending.append((next_ip, returns, depth))
+            enqueue(target(item))
+            enqueue(next_ip)
         elif item.flow_control == FlowControl.NEXT:
-            pending.append((next_ip, returns, depth))
+            enqueue(next_ip)
         else:
             raise LiftUnsupported(f"unsupported control flow at 0x{ip:X}")
     return maximum

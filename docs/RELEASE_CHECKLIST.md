@@ -88,6 +88,19 @@ scalar-only `n_call_ptr` out of newly lifted call paths. Rebuild/stage a fresh
 candidate after this ISA change and retain its new opcode fingerprint. Do not
 reuse an older runtime mapping or infer product acceptance from these fixtures.
 
+The stack-window proof tracks full-width register copies, constant adjustments,
+fixed frame-pointer addresses and qword stack spills/reloads across control flow.
+Indexed/truncated aliases, partial pointer spills, opaque pointer escapes and
+other unmodeled pointer transfers fail closed. Source-derived pointers in the
+captured volatile native-call registers or four outgoing stack positions require
+a native-call pointer summary that is not yet implemented; those functions are
+rejected, not rewritten. Ordinary incoming caller pointers are not relocated.
+The materialized FP EXE/DLL regression also uses an RBP frame and a spilled/reloaded
+source-stack pointer for outgoing stores, and a second virtualized function checks
+an unchanged incoming caller output pointer plus its fifth stack argument.
+This is bounded admission evidence,
+not a claim of arbitrary memory-safety analysis or general ISA support.
+
 ## 3. Preflight the native candidate
 
 Choose and record an exact 64-lowercase-hex-character opcode-shuffle seed so the candidate can be
