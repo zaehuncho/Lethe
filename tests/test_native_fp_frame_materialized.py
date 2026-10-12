@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -178,8 +179,294 @@ native_tail_leaf PROC FRAME
  add rsp,8
  ret
 native_tail_leaf ENDP
+PUBLIC vm_arity_4
+vm_arity_4 PROC FRAME
+ sub rsp,28h
+ .allocstack 28h
+ .endprolog
+ mov ecx,1
+ mov edx,2
+ mov r8d,3
+ mov r9d,4
+ call native_arity_4
+ add rsp,28h
+ ret
+vm_arity_4 ENDP
+native_arity_4 PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rsp,8
+ ret
+native_arity_4 ENDP
+PUBLIC vm_arity_8
+vm_arity_8 PROC FRAME
+ sub rsp,48h
+ .allocstack 48h
+ .endprolog
+ mov ecx,1
+ mov edx,2
+ mov r8d,3
+ mov r9d,4
+ mov qword ptr [rsp+20h],5
+ mov qword ptr [rsp+28h],6
+ mov qword ptr [rsp+30h],7
+ mov qword ptr [rsp+38h],8
+ call native_arity_8
+ add rsp,48h
+ ret
+vm_arity_8 ENDP
+native_arity_8 PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rax,[rsp+30h]
+ add rax,[rsp+38h]
+ add rax,[rsp+40h]
+ add rax,[rsp+48h]
+ add rsp,8
+ ret
+native_arity_8 ENDP
+PUBLIC vm_arity_9
+vm_arity_9 PROC FRAME
+ sub rsp,48h
+ .allocstack 48h
+ .endprolog
+ mov ecx,1
+ mov edx,2
+ mov r8d,3
+ mov r9d,4
+ mov qword ptr [rsp+20h],5
+ mov qword ptr [rsp+28h],6
+ mov qword ptr [rsp+30h],7
+ mov qword ptr [rsp+38h],8
+ mov qword ptr [rsp+40h],9
+ call native_arity_9
+ add rsp,48h
+ ret
+vm_arity_9 ENDP
+native_arity_9 PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rax,[rsp+30h]
+ add rax,[rsp+38h]
+ add rax,[rsp+40h]
+ add rax,[rsp+48h]
+ add rax,[rsp+50h]
+ add rsp,8
+ ret
+native_arity_9 ENDP
+PUBLIC vm_arity_16
+vm_arity_16 PROC FRAME
+ sub rsp,88h
+ .allocstack 88h
+ .endprolog
+ mov ecx,1
+ mov edx,2
+ mov r8d,3
+ mov r9d,4
+ mov qword ptr [rsp+20h],5
+ mov qword ptr [rsp+28h],6
+ mov qword ptr [rsp+30h],7
+ mov qword ptr [rsp+38h],8
+ mov qword ptr [rsp+40h],9
+ mov qword ptr [rsp+48h],10
+ mov qword ptr [rsp+50h],11
+ mov qword ptr [rsp+58h],12
+ mov qword ptr [rsp+60h],13
+ mov qword ptr [rsp+68h],14
+ mov qword ptr [rsp+70h],15
+ mov qword ptr [rsp+78h],16
+ call native_arity_16
+ add rsp,88h
+ ret
+vm_arity_16 ENDP
+native_arity_16 PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rax,[rsp+30h]
+ add rax,[rsp+38h]
+ add rax,[rsp+40h]
+ add rax,[rsp+48h]
+ add rax,[rsp+50h]
+ add rax,[rsp+58h]
+ add rax,[rsp+60h]
+ add rax,[rsp+68h]
+ add rax,[rsp+70h]
+ add rax,[rsp+78h]
+ add rax,[rsp+80h]
+ add rax,[rsp+88h]
+ add rsp,8
+ ret
+native_arity_16 ENDP
+PUBLIC vm_arity_63
+vm_arity_63 PROC FRAME
+ sub rsp,1F8h
+ .allocstack 1F8h
+ .endprolog
+ mov ecx,1
+ mov edx,2
+ mov r8d,3
+ mov r9d,4
+ mov qword ptr [rsp+20h],5
+ mov qword ptr [rsp+28h],6
+ mov qword ptr [rsp+30h],7
+ mov qword ptr [rsp+38h],8
+ mov qword ptr [rsp+40h],9
+ mov qword ptr [rsp+48h],10
+ mov qword ptr [rsp+50h],11
+ mov qword ptr [rsp+58h],12
+ mov qword ptr [rsp+60h],13
+ mov qword ptr [rsp+68h],14
+ mov qword ptr [rsp+70h],15
+ mov qword ptr [rsp+78h],16
+ mov qword ptr [rsp+80h],17
+ mov qword ptr [rsp+88h],18
+ mov qword ptr [rsp+90h],19
+ mov qword ptr [rsp+98h],20
+ mov qword ptr [rsp+0A0h],21
+ mov qword ptr [rsp+0A8h],22
+ mov qword ptr [rsp+0B0h],23
+ mov qword ptr [rsp+0B8h],24
+ mov qword ptr [rsp+0C0h],25
+ mov qword ptr [rsp+0C8h],26
+ mov qword ptr [rsp+0D0h],27
+ mov qword ptr [rsp+0D8h],28
+ mov qword ptr [rsp+0E0h],29
+ mov qword ptr [rsp+0E8h],30
+ mov qword ptr [rsp+0F0h],31
+ mov qword ptr [rsp+0F8h],32
+ mov qword ptr [rsp+100h],33
+ mov qword ptr [rsp+108h],34
+ mov qword ptr [rsp+110h],35
+ mov qword ptr [rsp+118h],36
+ mov qword ptr [rsp+120h],37
+ mov qword ptr [rsp+128h],38
+ mov qword ptr [rsp+130h],39
+ mov qword ptr [rsp+138h],40
+ mov qword ptr [rsp+140h],41
+ mov qword ptr [rsp+148h],42
+ mov qword ptr [rsp+150h],43
+ mov qword ptr [rsp+158h],44
+ mov qword ptr [rsp+160h],45
+ mov qword ptr [rsp+168h],46
+ mov qword ptr [rsp+170h],47
+ mov qword ptr [rsp+178h],48
+ mov qword ptr [rsp+180h],49
+ mov qword ptr [rsp+188h],50
+ mov qword ptr [rsp+190h],51
+ mov qword ptr [rsp+198h],52
+ mov qword ptr [rsp+1A0h],53
+ mov qword ptr [rsp+1A8h],54
+ mov qword ptr [rsp+1B0h],55
+ mov qword ptr [rsp+1B8h],56
+ mov qword ptr [rsp+1C0h],57
+ mov qword ptr [rsp+1C8h],58
+ mov qword ptr [rsp+1D0h],59
+ mov qword ptr [rsp+1D8h],60
+ mov qword ptr [rsp+1E0h],61
+ mov qword ptr [rsp+1E8h],62
+ mov qword ptr [rsp+1F0h],63
+ call native_arity_63
+ add rsp,1F8h
+ ret
+vm_arity_63 ENDP
+native_arity_63 PROC FRAME
+ sub rsp,8
+ .allocstack 8
+ .endprolog
+ lea rax,[rcx+rdx]
+ add rax,r8
+ add rax,r9
+ add rax,[rsp+30h]
+ add rax,[rsp+38h]
+ add rax,[rsp+40h]
+ add rax,[rsp+48h]
+ add rax,[rsp+50h]
+ add rax,[rsp+58h]
+ add rax,[rsp+60h]
+ add rax,[rsp+68h]
+ add rax,[rsp+70h]
+ add rax,[rsp+78h]
+ add rax,[rsp+80h]
+ add rax,[rsp+88h]
+ add rax,[rsp+90h]
+ add rax,[rsp+98h]
+ add rax,[rsp+0A0h]
+ add rax,[rsp+0A8h]
+ add rax,[rsp+0B0h]
+ add rax,[rsp+0B8h]
+ add rax,[rsp+0C0h]
+ add rax,[rsp+0C8h]
+ add rax,[rsp+0D0h]
+ add rax,[rsp+0D8h]
+ add rax,[rsp+0E0h]
+ add rax,[rsp+0E8h]
+ add rax,[rsp+0F0h]
+ add rax,[rsp+0F8h]
+ add rax,[rsp+100h]
+ add rax,[rsp+108h]
+ add rax,[rsp+110h]
+ add rax,[rsp+118h]
+ add rax,[rsp+120h]
+ add rax,[rsp+128h]
+ add rax,[rsp+130h]
+ add rax,[rsp+138h]
+ add rax,[rsp+140h]
+ add rax,[rsp+148h]
+ add rax,[rsp+150h]
+ add rax,[rsp+158h]
+ add rax,[rsp+160h]
+ add rax,[rsp+168h]
+ add rax,[rsp+170h]
+ add rax,[rsp+178h]
+ add rax,[rsp+180h]
+ add rax,[rsp+188h]
+ add rax,[rsp+190h]
+ add rax,[rsp+198h]
+ add rax,[rsp+1A0h]
+ add rax,[rsp+1A8h]
+ add rax,[rsp+1B0h]
+ add rax,[rsp+1B8h]
+ add rax,[rsp+1C0h]
+ add rax,[rsp+1C8h]
+ add rax,[rsp+1D0h]
+ add rax,[rsp+1D8h]
+ add rax,[rsp+1E0h]
+ add rax,[rsp+1E8h]
+ add rax,[rsp+1F0h]
+ add rax,[rsp+1F8h]
+ add rax,[rsp+200h]
+ add rsp,8
+ ret
+native_arity_63 ENDP
 END
 """
+# Preserve the original source-stack-pointer-spill caller as an explicit
+# negative control. An unknown native prototype may consume any forwarded slot;
+# the old eight-argument assumption did not justify treating +0x48 as a local.
+_ASM_WITH_OPAQUE_SPILL = _ASM
+assert _ASM.count(" mov r11d,0\n call qword ptr [native_mix_slot]")==1
+# This separate positive control erases only that dead spill, after the original
+# alias store/reload and outgoing argument writes, before exposing the whole
+# outgoing area to an unknown prototype. Do not change the nine-argument case.
+_ASM = _ASM.replace(" mov r11d,0\n call qword ptr [native_mix_slot]",
+    " mov r11d,0\n mov qword ptr [rsp+48h],0\n call qword ptr [native_mix_slot]")
+
 _CONVERSION_CHECK = r"""#include <stdint.h>
 #include <windows.h>
 #include <intrin.h>
@@ -258,6 +545,12 @@ uint64_t vm_alias_choose(uint64_t*,int,uint64_t,uint64_t,uint64_t);
 uint64_t vm_alias_choose_spill(uint64_t*,int,uint64_t,uint64_t,uint64_t);
 uint64_t vm_tail_native_call(void);
 uint64_t vm_tail_import_call(void);
+uint64_t vm_arity_4(void);
+uint64_t vm_arity_8(void);
+uint64_t vm_arity_9(void);
+uint64_t vm_arity_16(void);
+uint64_t vm_arity_63(void);
+int native_arity_check(void) { return vm_arity_4()==10U && vm_arity_8()==36U && vm_arity_9()==45U && vm_arity_16()==136U && vm_arity_63()==2016U; }
 const uint64_t native_alias_constant=17U;
 __declspec(noinline) double native_mix(double a,uint64_t b,double c,uint64_t d,
  double e,uint64_t f,double g,uint64_t h)
@@ -272,9 +565,10 @@ _EXE = _COMMON + _CONVERSION_CHECK + _CONDITIONAL_ALIAS_CHECK + r"""__declspec(n
  const int conversion=conversion_check(vm_int_pair);
  const int conditional=conditional_alias_check(vm_alias_choose,vm_alias_choose_spill);
  const int tails=vm_tail_native_call()==83U && vm_tail_import_call()==UINT64_MAX;
- static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 conversion=1 conditional=1 tails=1 passed=true\r\n";
+ static const char ok[]="FP_FRAME_E2E result=51.0 alias=48 conversion=1 conditional=1 tails=1 arity=1 passed=true\r\n";
  static const char bad[]="FP_FRAME_E2E mismatch\r\n";
- const int valid=answer==51.0 && alias==48 && output==48 && conversion && conditional && tails;
+ const int arity=native_arity_check();
+ const int valid=arity && answer==51.0 && alias==48 && output==48 && conversion && conditional && tails;
  const char *message=valid?ok:bad;
  DWORD written=0;
  WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),message,
@@ -320,19 +614,26 @@ int wmain(int argc,wchar_t **argv)
  const int conversion=conversion_check(convert);
  const int conditional=conditional_alias_check(choose,choose_spill);
  const int tails=tail_native()==83U && tail_import()==UINT64_MAX;
- const bool valid=value==51.0 && alias==48 && output==48 && conversion && conditional && tails;
- std::printf("FP_FRAME_DLL result=%.1f alias=%llu conversion=%d conditional=%d tails=%d passed=%s\n",value,
-             static_cast<unsigned long long>(alias),conversion,conditional,tails,valid?"true":"false");
+ int arity=1;
+ const char *arity_names[]={"vm_arity_4","vm_arity_8","vm_arity_9","vm_arity_16","vm_arity_63"};
+ const uint64_t arity_values[]={10,36,45,136,2016};
+ for(int i=0;i<5;++i) {
+  auto arity_fn=reinterpret_cast<TailFn>(GetProcAddress(module,arity_names[i]));
+  if(!arity_fn || arity_fn()!=arity_values[i])arity=0;
+ }
+ const bool valid=arity && value==51.0 && alias==48 && output==48 && conversion && conditional && tails;
+ std::printf("FP_FRAME_DLL result=%.1f alias=%llu conversion=%d conditional=%d tails=%d arity=%d passed=%s\n",value,
+             static_cast<unsigned long long>(alias),conversion,conditional,tails,arity,valid?"true":"false");
  if(!FreeLibrary(module))return 93;
  return valid?0:94;
 }
 """
 
 
-def _build(work: Path) -> tuple[Path, Path, Path]:
+def _build(work: Path, *, asm: str = _ASM) -> tuple[Path, Path, Path]:
     source, build = work / "fp_source", work / "fp_build"
     source.mkdir()
-    for name, content in (("frame.asm", _ASM), ("exe.c", _EXE),
+    for name, content in (("frame.asm", asm), ("exe.c", _EXE),
                           ("dll.c", _DLL), ("host.cpp", _HOST)):
         (source / name).write_text(content, encoding="ascii")
     (source / "CMakeLists.txt").write_text("""cmake_minimum_required(VERSION 3.20)
@@ -342,9 +643,9 @@ add_library(fp_dll SHARED dll.c frame.asm)
 add_executable(fp_host host.cpp)
 set_source_files_properties(exe.c dll.c PROPERTIES COMPILE_OPTIONS "/W4;/WX;/O2;/GS-;/fp:strict")
 target_link_options(fp_exe PRIVATE /INCREMENTAL:NO /OPT:NOICF /FIXED /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:fixture_entry /SUBSYSTEM:CONSOLE /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call /EXPORT:vm_arity_4 /EXPORT:vm_arity_8 /EXPORT:vm_arity_9 /EXPORT:vm_arity_16 /EXPORT:vm_arity_63)
 target_link_options(fp_dll PRIVATE /INCREMENTAL:NO /DYNAMICBASE /NXCOMPAT
- /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call)
+ /CETCOMPAT:NO /NODEFAULTLIB /ENTRY:DllMain /MANIFEST:NO /EXPORT:vm_fp_call /EXPORT:vm_alias_pointer /EXPORT:vm_int_pair /EXPORT:vm_alias_choose /EXPORT:vm_alias_choose_spill /EXPORT:vm_tail_native_call /EXPORT:vm_tail_import_call /EXPORT:vm_arity_4 /EXPORT:vm_arity_8 /EXPORT:vm_arity_9 /EXPORT:vm_arity_16 /EXPORT:vm_arity_63)
 target_link_libraries(fp_exe PRIVATE kernel32.lib)
 target_link_libraries(fp_dll PRIVATE kernel32.lib)
 """, encoding="ascii")
@@ -396,13 +697,41 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
     stub_pin = hashlib.sha256(stub.read_bytes()).hexdigest()
     monkeypatch.setenv(runtime._VIRTUALIZATION_GATE, "1")
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+    negative_work=tmp_path/"original-opaque-spill"
+    negative_work.mkdir()
+    negative_exe,negative_dll,negative_host=_build(negative_work,asm=_ASM_WITH_OPAQUE_SPILL)
+    negative_records=[]
+    for source,is_dll in ((negative_exe,False),(negative_dll,True)):
+        before=_run([str(negative_host),str(source)] if is_dll else [str(source)])
+        assert before.returncode==0,(before.stdout,before.stderr)
+        image=assemble._StubImage(source.read_bytes())
+        parsed=pe_analyze.analyze_pe(str(source))
+        rva=image.find_export_rva("vm_fp_call")
+        record,=(r for r in parsed.runtime_functions if r.begin_rva==rva)
+        spec=virtualization_plan.FunctionSpec("vm_fp_call",rva,record.end_rva-rva)
+        proof=direct_control_flow.analyze_direct_control_flow(parsed,(spec,),production=False)
+        gaps=tuple(orchestrator.VirtualizationGapAcknowledgement(
+            item.rva,item.size,"exact generated original opaque-spill negative control")
+            for item in proof.coverage_gaps)
+        output=negative_work/("must-not-exist.dll" if is_dll else "must-not-exist.exe")
+        result=orchestrator.pack_file(str(source),orchestrator.PackOptions(
+            output_path=str(output),is_dll=is_dll,stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(spec.name,spec.rva,spec.size),),
+            virtualization_gap_acknowledgements=gaps,
+            acknowledge_unproven_indirect_targets=True,_allow_unverified_stub_for_tests=True))
+        assert not result.ok and "native source stack pointer escape" in result.error
+        assert not output.exists()
+        negative_records.append(dict(is_dll=is_dll,input_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            original_exit=before.returncode,original_stdout=before.stdout.decode("ascii"),
+            pack_ok=result.ok,diagnostic=result.error,output_exists=output.exists()))
+    (tmp_path/"original-opaque-spill-rejections.json").write_text(json.dumps(negative_records,indent=2))
     for source, is_dll in ((exe, False), (dll, True)):
         image = assemble._StubImage(source.read_bytes())
         parsed = pe_analyze.analyze_pe(str(source))
         _assert_tail_fixture(image, parsed)
         specs = []
         for name in ("vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-                     "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call"):
+                     "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call", "vm_arity_4", "vm_arity_8", "vm_arity_9", "vm_arity_16", "vm_arity_63"):
             rva = image.find_export_rva(name)
             assert rva is not None
             records = [record for record in parsed.runtime_functions
@@ -441,7 +770,7 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
         assert result.ok, result.error
         assert {fn.name for fn in captured["result"].manifest.functions} == {
             "vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-            "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call"}
+            "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call", "vm_arity_4", "vm_arity_8", "vm_arity_9", "vm_arity_16", "vm_arity_63"}
         after = _run(packed_cmd)
         assert (after.returncode, after.stdout, after.stderr) == (
             before.returncode, before.stdout, before.stderr)

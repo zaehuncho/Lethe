@@ -78,6 +78,7 @@ OPCODE_TABLE = {
     0x39: ('load128a',       0, 'none'),
     0x3A: ('store128a',      0, 'none'),
     0x3B: ('n_call_frame', 0, 'none'),
+    0x3C: ('n_call_frame_span', 0, 'none'),
 }
 
 

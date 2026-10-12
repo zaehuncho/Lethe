@@ -333,4 +333,4 @@ def test_frame_opcode_wire_metadata_and_native_canonical_fingerprint_agree():
     assert dict(CANONICAL_OPCODES)==daedalus_asm.OPCODES
     digest=opcode_mapping_sha256({n:v[0] for n,v in CANONICAL_OPCODES.items()})
     assert digest in (ROOT/"stub/src/daedalus_vm.c").read_text(encoding="utf-8")
-    assert "return op <= DVM_N_CALL_FRAME;" in (ROOT/"stub/src/daedalus_rolling.c").read_text(encoding="utf-8")
+    assert "return op <= DVM_N_CALL_FRAME_SPAN;" in (ROOT/"stub/src/daedalus_rolling.c").read_text(encoding="utf-8")

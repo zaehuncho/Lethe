@@ -43,6 +43,12 @@ extern "C" {
 #define DVM_LOCAL_SIZE  1024
 #define DVM_RET_STACK_SIZE 32
 
+/* The materialized source window is 512 bytes: 32 bytes of Win64 shadow
+ * space plus at most 480 bytes of positional stack arguments. The span ABI
+ * uses three VM operands, not 64 pushed arguments. */
+#define DVM_NATIVE_FRAME_MAX_STACK_BYTES 480u
+#define DVM_NATIVE_FRAME_MAX_ARGS 64u
+
 /* Per-run dispatch watchdog: a program that executes more than DVM_MAX_STEPS
  * instructions (a self-loop, a corrupted jump, a decode that never reaches
  * HALT) fails closed. Mirrors daedalus_ref.RefVM.run(max_steps=1_000_000).
@@ -221,7 +227,8 @@ typedef enum VvmOpcode {
     DVM_STORE128    = 0x38, /* pop hi,lo,addr -> one unaligned 16-byte store */
     DVM_LOAD128A    = 0x39, /* pop aligned addr -> push low,high lanes       */
     DVM_STORE128A   = 0x3A, /* pop hi,lo,aligned addr -> one aligned store  */
-    DVM_N_CALL_FRAME = 0x3B /* Win64 argv[8] plus volatile x64 frame state   */
+    DVM_N_CALL_FRAME = 0x3B, /* Legacy fixed-eight captured call           */
+    DVM_N_CALL_FRAME_SPAN = 0x3C /* Proven outgoing bytes + captured state   */
 } VvmOpcode;
 
 /* ---- VM state ----------------------------------------------------------- */

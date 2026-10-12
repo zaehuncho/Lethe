@@ -29,7 +29,7 @@ _KS = Ks(KS_ARCH_X86, KS_MODE_64)
 _SLOT = 0x4000
 
 
-def _program(source: str, *, guard: bool = False) -> bytes:
+def _program(source: str, *, guard: bool = False, span: bool = False) -> bytes:
     first = bytes(_KS.asm(source.format(disp=0), addr=0x1000)[0])
     call = next(i for i in Decoder(64, first, ip=0x1000) if i.mnemonic == Mnemonic.CALL)
     code = bytes(_KS.asm(source.format(disp=hex(_SLOT-call.next_ip)), addr=0x1000)[0])
@@ -38,8 +38,12 @@ def _program(source: str, *, guard: bool = False) -> bytes:
         SimpleNamespace(name=".text", rva=0x1000, raw=code, virtual_size=len(code), characteristics=0x60000020),
         SimpleNamespace(name=".rdata", rva=_SLOT, raw=bytes(8), virtual_size=8, characteristics=0x40000040),
     )
+    spans=None
+    if span:
+        spans={}
+        lifter.validate_materialized_stack_window(code,window_size=512,native_call_stack_bytes=spans)
     return daedalus_asm.assemble(lifter.lift_function(
-        code, base=0x1000, image_sections=sections,
+        code, base=0x1000, image_sections=sections,native_call_stack_bytes=spans,
         selected_extents=((0x1000,len(code)),),
         guard_cf_dispatch_rva=_SLOT if guard else None))
 
@@ -125,6 +129,7 @@ extern void frame_guard_dispatch(void);
 extern void frame_guard_target(void);
 #ifdef DVM_FRAME_CALL_AVAILABLE
 extern void daedalus_trampoline_frame(void);
+extern void daedalus_trampoline_frame_span(void);
 /* RtlVirtualUnwind computes a CONTEXT only; no sentinel address executes. */
 static int check_transient_flag_unwind(void)
 {
@@ -168,6 +173,48 @@ static int check_transient_flag_unwind(void)
        state.R13!=0x99AABBCC||state.R14!=0xDDEEFF00)return 114;
     return 0;
 }
+static int check_span_transient_flag_unwind(void)
+{
+    DWORD64 image_base=0;
+    PRUNTIME_FUNCTION entry=RtlLookupFunctionEntry(
+        (DWORD64)(uintptr_t)&daedalus_trampoline_frame_span,&image_base,NULL);
+    CONTEXT state;
+    PVOID handler_data=NULL;
+    DWORD64 establisher=0;
+    uint64_t stack[128];
+    const uint8_t *code,*unwind;
+    size_t size,i;
+    unsigned int frame_reg;
+    if(!entry)return 110;
+    code=(const uint8_t *)(uintptr_t)(image_base+entry->BeginAddress);
+    unwind=(const uint8_t *)(uintptr_t)(image_base+entry->UnwindData);
+    size=(size_t)(entry->EndAddress-entry->BeginAddress);
+    /* Python independently decodes this byte as the unique PUSHFQ instruction. */
+    for(i=0;i<size&&code[i]!=0x9C;++i){}
+    if(i==size)return 111;
+    memset(stack,0,sizeof(stack));memset(&state,0,sizeof(state));
+    stack[100]=0x56789ABC;
+    state.ContextFlags=CONTEXT_FULL;
+    state.Rip=(DWORD64)(uintptr_t)(code+i+1);
+    frame_reg=unwind[3]&15u;
+    if(frame_reg==5) {
+        stack[99]=0x11223344;stack[98]=0x55667788;
+        stack[97]=0x99AABBCC;stack[96]=0xDDEEFF00;
+        state.Rbp=(DWORD64)(uintptr_t)&stack[31];
+        state.Rsp=(DWORD64)(uintptr_t)&stack[30];
+    } else if(frame_reg==0) {
+        /* Original proposal: three pushes, 64-byte allocation, no frame reg. */
+        stack[99]=0x55667788;stack[98]=0x99AABBCC;stack[97]=0xDDEEFF00;
+        state.Rbp=0x11223344;
+        state.Rsp=(DWORD64)(uintptr_t)&stack[88];
+    } else return 112;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER,image_base,state.Rip,entry,&state,
+                    &handler_data,&establisher,NULL);
+    if(state.Rip!=0x56789ABC||state.Rsp!=(DWORD64)(uintptr_t)&stack[101])return 113;
+    if(state.Rbp!=0x11223344||state.R12!=0x55667788||
+       state.R13!=0x99AABBCC||state.R14!=0xDDEEFF00)return 114;
+    return 0;
+}
 #endif
 static uint64_t bits(double value) { uint64_t u;memcpy(&u,&value,8);return u; }
 static uint32_t bits32(float value) { uint32_t u;memcpy(&u,&value,4);return u; }
@@ -197,7 +244,9 @@ int main(int argc,char **argv)
     if(strcmp(argv[1],"unwind")==0) {
         int result=check_transient_flag_unwind();
         if(result)return result;
-        puts("NATIVE_FRAME_CALL unwind windows_checks=1 passed=true");
+        result=check_span_transient_flag_unwind();
+        if(result)return result;
+        puts("NATIVE_FRAME_CALL unwind windows_checks=2 passed=true");
         return 0;
     }
 #endif
@@ -264,16 +313,17 @@ int main(int argc,char **argv)
           if(memcmp(ctx.xmm[6],before.xmm[6],sizeof(ctx.xmm)-sizeof(frame_output_xmm)))FAIL(68);
         }
       } else if(strcmp(argv[1],"guard")==0) {
-        for(pattern=0;pattern<2;++pattern) {
+        for(pattern=0;pattern<4;++pattern) {
+          const unsigned int denied=pattern&1u;
           memset(&ctx,0,sizeof(ctx));memset(stack,0,sizeof(stack));
           frame_guard_calls=frame_guard_rejected=frame_target_calls=0;
           ctx.gpr[DVM_X64_RSP]=(uint64_t)(uintptr_t)&stack[80];
           frame_guard_allowed=(uint64_t)(uintptr_t)&frame_guard_target;
-          ctx.gpr[DVM_X64_RAX]=pattern?(uint64_t)(uintptr_t)&frame_state_target:frame_guard_allowed;
+          ctx.gpr[DVM_X64_RAX]=denied?(uint64_t)(uintptr_t)&frame_state_target:frame_guard_allowed;
           slot=(uint64_t)(uintptr_t)&frame_guard_dispatch;
-          if(execute(guard_program[mode],guard_size[mode],&ctx,&slot))FAIL(79);
-          if(frame_guard_calls!=1||frame_guard_rejected!=pattern||frame_target_calls!=1-pattern)FAIL(80);
-          if(ctx.gpr[DVM_X64_RAX]!=(pattern?0xBADu:0x3456u))FAIL(81);
+          if(execute(pattern<2?guard_program[mode]:guard_span_program[mode],pattern<2?guard_size[mode]:guard_span_size[mode],&ctx,&slot))FAIL(79);
+          if(frame_guard_calls!=1||frame_guard_rejected!=denied||frame_target_calls!=1-denied)FAIL(80);
+          if(ctx.gpr[DVM_X64_RAX]!=(denied?0xBADu:0x3456u))FAIL(81);
         }
       } else if(strcmp(argv[1],"aligned")==0) {
         memset(&ctx,0,sizeof(ctx));memset(aligned_out,0,sizeof(aligned_out));
@@ -283,9 +333,9 @@ int main(int argc,char **argv)
         if(execute(aligned_program[mode],aligned_size[mode],&ctx,&slot))return 100;
         if(memcmp(aligned_in,aligned_out,sizeof(aligned_in)))return 101;
       } else if(strcmp(argv[1],"invalid")==0) {
-        const uint8_t *bad[5]={mode?bad_7_roll:bad_7,mode?bad_9_roll:bad_9,mode?bad_wide_roll:bad_wide,mode?bad_null_roll:bad_null,mode?bad_underflow_roll:bad_underflow};
-        const uint32_t sizes[5]={mode?sizeof(bad_7_roll):sizeof(bad_7),mode?sizeof(bad_9_roll):sizeof(bad_9),mode?sizeof(bad_wide_roll):sizeof(bad_wide),mode?sizeof(bad_null_roll):sizeof(bad_null),mode?sizeof(bad_underflow_roll):sizeof(bad_underflow)};
-        for(pattern=0;pattern<5;++pattern) {
+        const uint8_t *bad[12]={mode?bad_7_roll:bad_7,mode?bad_9_roll:bad_9,mode?bad_wide_roll:bad_wide,mode?bad_null_roll:bad_null,mode?bad_underflow_roll:bad_underflow,mode?bad_span_size1_roll:bad_span_size1,mode?bad_span_large_roll:bad_span_large,mode?bad_span_wide_roll:bad_span_wide,mode?bad_span_wrapped_roll:bad_span_wrapped,mode?bad_span_null_roll:bad_span_null,mode?bad_span_address0_roll:bad_span_address0,mode?bad_span_underflow_roll:bad_span_underflow};
+        const uint32_t sizes[12]={mode?sizeof(bad_7_roll):sizeof(bad_7),mode?sizeof(bad_9_roll):sizeof(bad_9),mode?sizeof(bad_wide_roll):sizeof(bad_wide),mode?sizeof(bad_null_roll):sizeof(bad_null),mode?sizeof(bad_underflow_roll):sizeof(bad_underflow),mode?sizeof(bad_span_size1_roll):sizeof(bad_span_size1),mode?sizeof(bad_span_large_roll):sizeof(bad_span_large),mode?sizeof(bad_span_wide_roll):sizeof(bad_span_wide),mode?sizeof(bad_span_wrapped_roll):sizeof(bad_span_wrapped),mode?sizeof(bad_span_null_roll):sizeof(bad_span_null),mode?sizeof(bad_span_address0_roll):sizeof(bad_span_address0),mode?sizeof(bad_span_underflow_roll):sizeof(bad_span_underflow)};
+        for(pattern=0;pattern<12;++pattern) {
           memset(&ctx,0,sizeof(ctx));ctx.gpr[0]=0x12345678;ctx.rflags=0x202;
           before=ctx;frame_guard_calls=0;slot=(uint64_t)(uintptr_t)&frame_guard_dispatch;
           if(execute(bad[pattern],sizes[pattern],&ctx,&slot)!=-1)return 90;
@@ -306,13 +356,14 @@ def build_frame_fixture(directory: Path) -> Path:
         ('fp','sub rsp, 0x58; call qword ptr [rip+{disp}]; movq rax, xmm0; add rsp, 0x58; ret',False),
         ('state','call qword ptr [rip+{disp}]; ret',False),
         ('guard','call qword ptr [rip+{disp}]; ret',True),
+        ('guard_span','sub rsp,0x28; call qword ptr [rip+{disp}]; add rsp,0x28; ret',True),
         ('aligned','movdqa xmm0,[rdx]; movdqa [rcx],xmm0; call qword ptr [rip+{disp}]; ret',False),
     ):
         if name=='aligned':
             code=bytes(_KS.asm('movdqa xmm0,[rdx]; movdqa [rcx],xmm0; ret',addr=0x1000)[0])
             plain=daedalus_asm.assemble(lifter.lift_function(code,base=0x1000))
         else:
-            plain=_program(source,guard=guard)
+            plain=_program(source,guard=guard,span=name=='guard_span')
         rolling=daedalus_rolling.pack_rolling_blob(plain,bytes.fromhex('00112233445566778899aabbccddeeff'))
         for suffix,blob in (('plain',plain),('rolling',rolling)):
             arrays.append(f'static const uint8_t {name}_{suffix}[]={{ {_c_bytes(blob)} }};')
@@ -331,6 +382,17 @@ def build_frame_fixture(directory: Path) -> Path:
         for name in ('7','9','wide','null','underflow'):
             arrays.append(f'static const uint8_t bad_{name}[]={{ 0,0,0x3B }};')
             arrays.append(f'static const uint8_t bad_{name}_roll[]={{ 0,0,0x3B }};')
+    for name,address,size,target,operands in (
+        ('size1',8192,1,1,3),('large',8192,488,1,3),
+        ('wide',8192,0xFFFFFFFFFFFFFFF8,1,3),('wrapped',0xFFFFFFFFFFFFFFF8,8,1,3),
+        ('null',8192,8,0,3),('address0',0,8,1,3),('underflow',8192,8,1,2)):
+        source='.code\n'+f'push_imm64 {address}\npush_imm64 {size}\n'
+        if operands==3:source+=f'push_imm64 {target}\n'
+        source+='n_call_frame_span\nhalt\n'
+        blob=daedalus_asm.assemble(source)
+        arrays.append(f'static const uint8_t bad_span_{name}[]={{ {_c_bytes(blob)} }};')
+        roll=daedalus_rolling.pack_rolling_blob(blob,bytes.fromhex('00112233445566778899aabbccddeeff'))
+        arrays.append(f'static const uint8_t bad_span_{name}_roll[]={{ {_c_bytes(roll)} }};')
     (directory/'harness.c').write_text(_C.replace('@ARRAYS@','\n'.join(arrays)),encoding='utf-8')
     (directory/'proof.asm').write_text(_ASM,encoding='utf-8')
     files=['crypto.c','daedalus_vm.c','daedalus_rolling.c','daedalus_store128.asm','daedalus_trampoline.asm']
@@ -378,6 +440,28 @@ target_compile_options(frame_call PRIVATE $<$<COMPILE_LANGUAGE:C>:/W4;/WX;/fp:st
             flag_pushes=[i.ip for i in Decoder(64,code,ip=0)
                          if i.mnemonic==Mnemonic.PUSHFQ]
             assert len(flag_pushes)==1 and code.find(b'\x9c')==flag_pushes[0]
+            # Independently verify the new 520-byte span bridge's emitted unwind
+            # allocation and PUSHFQ location as well as the legacy 72-byte bridge.
+            prefix=bytes.fromhex('55 41 54 41 55 41 56 48 81 EC 08 02 00 00')
+            hits=[]
+            for section in pe.sections:
+                if section.Characteristics&0x20000000:
+                    data=section.get_data();offset=data.find(prefix)
+                    if offset>=0:
+                        assert data.find(prefix,offset+1)<0
+                        hits.append(section.VirtualAddress+offset)
+            assert len(hits)==1
+            records=[entry.struct for entry in pe.DIRECTORY_ENTRY_EXCEPTION
+                     if entry.struct.BeginAddress==hits[0]]
+            assert len(records)==1 and records[0].EndAddress>hits[0]+17
+            assert pe.get_data(records[0].UnwindData,18)==bytes.fromhex(
+                '01 11 07 05 11 53 0E 01 41 00 07 E0 05 D0 03 C0 01 50')
+            code=pe.get_data(records[0].BeginAddress,
+                             records[0].EndAddress-records[0].BeginAddress)
+            flag_pushes=[i.ip for i in Decoder(64,code,ip=0)
+                         if i.mnemonic==Mnemonic.PUSHFQ]
+            assert len(flag_pushes)==1 and code.find(b'\x9c')==flag_pushes[0]
+
         finally:
             pe.close()
     return executable
@@ -396,5 +480,5 @@ def frame_fixture(tmp_path_factory):
 def test_native_frame_call_boundary(frame_fixture,kind):
     p=subprocess.run([str(frame_fixture),kind],capture_output=True,text=True)
     assert p.returncode==0,f'{kind}: exit={p.returncode}\n{p.stdout}\n{p.stderr}'
-    detail='windows_checks=1' if kind=='unwind' else 'modes=2'
+    detail='windows_checks=2' if kind=='unwind' else 'modes=2'
     assert p.stdout.strip()==f'NATIVE_FRAME_CALL {kind} {detail} passed=true'

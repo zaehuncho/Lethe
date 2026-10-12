@@ -112,9 +112,10 @@ CANONICAL_OPCODES = OrderedDict([
     ('load128a',       (0x39, 0, 'none')),
     ('store128a',      (0x3A, 0, 'none')),
     ('n_call_frame',   (0x3B, 0, 'none')),
+    ('n_call_frame_span', (0x3C, 0, 'none')),
 ])
 
-NUM_REAL = len(CANONICAL_OPCODES)       # 60
+NUM_REAL = len(CANONICAL_OPCODES)       # 61
 NUM_DECOYS = 17                         # ~30% of real count
 DECOY_CANONICAL_BASE = 0x80             # canonical IDs 0x80..0x90
 TRAP_CANONICAL = 0xFF                   # unmap value for trap slots

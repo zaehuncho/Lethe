@@ -1083,11 +1083,13 @@ def _compile_one(
             native_call_targets=native_call_targets,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         )
+        native_call_stack_bytes: dict[int, int] = {}
         x64_lifter.validate_materialized_stack_window(
             lifted_body,
             base=spec.rva,
             window_size=win64_thunk.STACK_WINDOW_SIZE,
             native_call_targets=native_call_targets,
+            native_call_stack_bytes=native_call_stack_bytes,
         )
         rip_relative_references = x64_lifter.validate_rip_relative_references(
             lifted_body,
@@ -1103,6 +1105,7 @@ def _compile_one(
             source_extent_size=spec.size,
             native_call_targets=native_call_targets,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+            native_call_stack_bytes=native_call_stack_bytes,
         )
         # OPTIONAL, DEFAULT-OFF metamorphic mutation of the lifted .vasm between
         # lift and assembly. At mutate_level 0 (the default) the lifter/oracle
@@ -1458,7 +1461,8 @@ def compile_virtualization_manifest(
             "guard_cf_dispatch_calls_supported": True,
             "native_call_volatile_frame_round_trip": True,
             "native_call_positional_fp_supported": True,
-            "native_call_bounded_eight_argument_abi": True,
+            "native_call_bounded_eight_argument_abi": False,
+            "native_call_bounded_outgoing_span_abi": True,
             "guard_cf_original_dispatch_invoked": True,
             "external_interior_entries_supported": False,
             "direct_internal_calls_supported": True,

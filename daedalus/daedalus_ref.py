@@ -370,6 +370,20 @@ class RefVM:
                 result = self.native_frame_hook(self, func_ptr, argc, argv) & MASK64
                 self.locals[0:8] = result.to_bytes(8, 'little')
                 self._push(result)
+            elif m == 'n_call_frame_span' and self.native_frame_hook is not None:
+                if len(self.stack) < 3:
+                    raise DaedalusError("n_call_frame_span stack underflow")
+                address, size, func_ptr = self.stack[-3:]
+                if not func_ptr or size > 480 or size % 8 or (size and not address) or address > MASK64-size:
+                    raise DaedalusError("invalid n_call_frame_span contract")
+                argv = [int.from_bytes(self.locals[n:n+8], 'little') for n in (8, 16, 64, 72)]
+                for offset in range(0, size, 8):
+                    buf, idx = self._mem_ref(address+offset, 8)
+                    argv.append(int.from_bytes(buf[idx:idx+8], 'little'))
+                del self.stack[-3:]
+                result = self.native_frame_hook(self, func_ptr, len(argv), argv) & MASK64
+                self.locals[0:8] = result.to_bytes(8, 'little')
+                self._push(result)
             elif m.startswith('n_'):
                 raise NativeOpUnsupported(m)
             else:

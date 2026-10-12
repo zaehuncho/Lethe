@@ -352,7 +352,10 @@ class _Lifter:
         *,
         native_call_targets=frozenset(),
         guard_cf_dispatch_rva: int | None = None,
+        native_call_stack_bytes: dict[int, int] | None = None,
     ) -> None:
+        self.native_call_stack_bytes = (None if native_call_stack_bytes is None
+                                        else dict(native_call_stack_bytes))
         self.code = code
         self.base = base
         self.end = base + len(code)
@@ -1994,19 +1997,23 @@ class _Lifter:
         This is positional Win64 with at most eight arguments, not vectorcall,
         arbitrary arity, source-return-address identity or exception bridging."""
         slot_rva = int(instr.ip_rel_memory_address)
-        self._marshal_win64_argv()
+        self._marshal_win64_argv(instr)
         # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
         # RIP-relative so ASLR never bakes a preferred VA into the bytecode.
         self.rd_local(IMAGE_BASE)
         self.push_imm(slot_rva)
         self.a("add")
         self.a("load64")
-        self.a("n_call_frame")                      # -> trampoline RAX on TOS
+        self.a("n_call_frame_span" if self.native_call_stack_bytes is not None else "n_call_frame")                      # -> trampoline RAX on TOS
         self.wr_reg(Register.RAX)                 # commit the scalar return
 
-    def _marshal_win64_argv(self) -> None:
-        """Push the fixed Win64 pass-through argv the ``n_call_frame`` trampoline
-        consumes: the four register arguments then the first four outgoing stack
+    def _marshal_win64_argv(self, instr) -> None:
+        """Production plans provide a proven per-call outgoing span, emitted as
+        source RSP+32 and its byte count for ``n_call_frame_span``. The byte count
+        covers every allocated positional slot, not an inferred callee arity.
+        Low-level diagnostic callers without that proof retain the legacy ABI.
+
+        Push the fixed Win64 pass-through argv the legacy trampoline consumes: the four register arguments then the first four outgoing stack
         slots at ``[RSP+0x20/0x28/0x30/0x38]``, followed by a fixed argc of 8.
 
         argv is popped in reverse by ``n_call_frame``, so argument 0 is pushed
@@ -2017,6 +2024,15 @@ class _Lifter:
         marshalling Cut 16 proved against a real Win64 callee -- every external
         call bridge (import, GuardCF dispatch, direct first-party) reuses it, so
         only the ``func_ptr`` computation differs between them."""
+        if self.native_call_stack_bytes is not None:
+            size = self.native_call_stack_bytes.get(instr.ip)
+            if type(size) is not int or not 0 <= size <= 480 or size % 8:
+                raise LiftUnsupported(f"missing or invalid native outgoing span at 0x{instr.ip:X}")
+            self.rd_reg(Register.RSP)
+            self.push_imm(0x20)
+            self.a("add")
+            self.push_imm(size)
+            return
         self.rd_reg(Register.RCX)
         self.rd_reg(Register.RDX)
         self.rd_reg(Register.R8)
@@ -2035,11 +2051,11 @@ class _Lifter:
         target in RAX, and captures its return state. The original guard thunk
         performs its check; the lifter never substitutes a direct target call.
         """
-        self._marshal_win64_argv()
+        self._marshal_win64_argv(instr)
         self.rd_local(IMAGE_BASE)
         self.push_imm(int(instr.ip_rel_memory_address))
         self.a("add"); self.a("load64")
-        self.a("n_call_frame")
+        self.a("n_call_frame_span" if self.native_call_stack_bytes is not None else "n_call_frame")
         self.wr_reg(Register.RAX)
 
     def _direct_native_call(self, instr, target_rva: int) -> None:
@@ -2050,11 +2066,11 @@ class _Lifter:
         direct-address variant of Cut 16 that skips the slot dereference. The
         caller's Win64 argument setup is already lifted, so the marshalling is
         identical; the callee runs natively and its RAX return is committed."""
-        self._marshal_win64_argv()
+        self._marshal_win64_argv(instr)
         self.rd_local(IMAGE_BASE)
         self.push_imm(int(target_rva))
         self.a("add")
-        self.a("n_call_frame")
+        self.a("n_call_frame_span" if self.native_call_stack_bytes is not None else "n_call_frame")
         self.wr_reg(Register.RAX)                 # commit the scalar return
 
     def _call(self, instr) -> None:
@@ -2751,6 +2767,7 @@ def validate_materialized_stack_window(
     *,
     window_size: int,
     native_call_targets=frozenset(),
+    native_call_stack_bytes: dict[int, int] | None = None,
 ) -> int:
     """Prove source stack allocation/derived accesses avoid shim control state.
 
@@ -2766,6 +2783,13 @@ def validate_materialized_stack_window(
     conditional moves explore both pointer alternatives, including exact qword
     spills; their memory sources are checked before selection. Unmodeled pointer
     transfers/escapes fail closed rather than losing that provenance.
+
+    When ``native_call_stack_bytes`` is supplied, every native CALL must have
+    at least 32 shadow bytes and Win64 call-site alignment. Record the exact
+    allocated outgoing span below original entry RSP; reject a call reached at
+    differing depths and any source-stack pointer in that entire span. The
+    materializer always requests this stronger contract; bare diagnostic lifting
+    without it is not a production native-call admission proof.
     """
     if window_size <= 0 or window_size % 16:
         raise ValueError("stack window must be a positive 16-byte multiple")
@@ -3072,8 +3096,18 @@ def validate_materialized_stack_window(
             direct = _direct_near_call_target(item)
             external = _is_rip_import_call(item) or direct in native_call_targets
             if external:
+                span_size = 32  # legacy low-level fixed-eight diagnostic contract
+                if native_call_stack_bytes is not None:
+                    if depth < 32 or depth % 16 != 8:
+                        raise LiftUnsupported(f"unproven Win64 native outgoing frame at 0x{ip:X}")
+                    span_size = depth - 32
+                    if span_size > 480:
+                        raise LiftUnsupported(f"native outgoing span exceeds 480 bytes at 0x{ip:X}")
+                    previous = native_call_stack_bytes.setdefault(ip, span_size)
+                    if previous != span_size:
+                        raise LiftUnsupported(f"ambiguous native outgoing frame at 0x{ip:X}")
                 if any(aliases[index] is not None for index in volatile) or any(
-                    overlaps(-depth + 0x20, 32, slot) for slot in spills
+                    overlaps(-depth + 0x20, span_size, slot) for slot in spills
                 ):
                     raise LiftUnsupported(f"unmodeled native source stack pointer escape at 0x{ip:X}")
                 for index in volatile:
@@ -3118,6 +3152,7 @@ def lift_function(
     source_extent_size: int | None = None,
     native_call_targets=frozenset(),
     guard_cf_dispatch_rva: int | None = None,
+    native_call_stack_bytes: dict[int, int] | None = None,
 ) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
@@ -3150,6 +3185,7 @@ def lift_function(
         base,
         native_call_targets=native_call_targets,
         guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+        native_call_stack_bytes=native_call_stack_bytes,
     ).lift()
 
 

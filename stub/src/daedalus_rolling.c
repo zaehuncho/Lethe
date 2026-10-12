@@ -4,8 +4,8 @@
  * daedalus/daedalus_rolling.py.
  *
  * Bit-exact primitives (mirror of the .py):
- *   resync(seed, leader)    = u64le( SHA256(seed16 ‖ 'R' ‖ u32le(leader))[0:8] )
- *   keystream(seed, pc, acc)= SHA256(seed16 ‖ 'K' ‖ u32le(pc) ‖ u64le(acc))
+ *   resync(seed, leader)    = u64le( SHA256(seed16 â€– 'R' â€– u32le(leader))[0:8] )
+ *   keystream(seed, pc, acc)= SHA256(seed16 â€– 'K' â€– u32le(pc) â€– u64le(acc))
  *   fold(acc, plain, pc):
  *       for x in plain: acc = rotl64(acc ^ x, 7) + 0x9E3779B97F4A7C15  (mod 2^64)
  *       acc ^= u32(pc)
@@ -48,7 +48,7 @@ static uint32_t dvm_roll_width(uint8_t canon_op)
 }
 
 /* 1 iff `op` is a defined opcode (canonical byte). Range-based: the ISA is a
- * contiguous 0x00..0x3B today; a byte outside that is a decode fault.
+ * contiguous 0x00..0x3C today; a byte outside that is a decode fault.
  *
  * NOTE (rolling vs decoys): shuffled builds can mint DECOY opcodes that unmap to
  * canonical 0x80..0x90. Those are NOT supported inside a rolling container --
@@ -59,7 +59,7 @@ static uint32_t dvm_roll_width(uint8_t canon_op)
  * encoder optable together. */
 static int dvm_roll_opcode_valid(uint8_t op)
 {
-    return op <= DVM_N_CALL_FRAME;
+    return op <= DVM_N_CALL_FRAME_SPAN;
 }
 
 #ifdef DVM_SHUFFLED

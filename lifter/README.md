@@ -380,3 +380,33 @@ runtime now derives its valid canonical upper bound from the ISA header rather
 than the stale 0x38 limit, which also fixes rolling aligned 128-bit transfers.
 See [Microsoft's x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention)
 and [unwind-aware prologs](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog).
+
+
+### Bounded native outgoing spans
+
+Materialized native calls use `n_call_frame_span` (canonical opcode `0x3C`),
+not the low-level diagnostic fixed-eight-argument bridge. Stack analysis proves
+one exact depth per call, minimum Win64 shadow space and call-site alignment,
+and forwards all allocated qword slots from source RSP+32 to original entry RSP.
+The 512-byte source window permits up to 63 positional arguments at a conforming
+call site; dynamic/ambiguous frames and stack-pointer escapes in the whole
+forwarded span reject. This is not a guessed callee signature or a stack cushion.
+The runtime span cap is 480 bytes (64 arguments), with a separately
+unwind-described 520-byte native bridge (32 shadow + 480 stack + 8 alignment).
+The new opcode is included in the bound opcode-mapping hash; legacy runtime
+tables missing it reject before materialization. Legacy `n_call_frame` remains
+fixed-eight for existing hand-authored and diagnostic VM programs.
+Mandatory generated EXE/DLL coverage includes 4, 8, 9, 16 and 63 arguments;
+the original guard dispatch and both bridge unwind records remain checked.
+This does not add vectorcall, arbitrary stack sizes, source exception-handler
+bridging or production acceptance for a real application.
+
+
+The whole-span contract intentionally rejects opaque stack-pointer spills even
+when an eight-argument callee would ignore them. The original FP caller with a
+dead pointer at RSP+0x48 is retained as a mandatory EXE/DLL negative control;
+its unprotected programs still pass, and packing must reject with no output.
+A distinct positive caller clears that dead pointer only after the original
+alias store/reload and argument setup, before the native call. This is a
+documented coverage tightening, not proof of a callee signature, a pointer
+escape waiver, or a claim that the original protected caller still passes.

@@ -24,7 +24,7 @@
 #include "daedalus_opcodes_shuffled.h"
 #else
 #define DVM_OPCODE_MAPPING_SHA256 \
-    "14864446f306a76e1783f3262e494977ae62bcc86ac1003fc3c31abac3eda470"
+    "1f5f2ffb9d7bddbfaf1b83629de9bd9437cd85ad4cf5bbb6ebc3865bf41965ee"
 #define DVM_HANDLER_VARIANT_SHA256 \
     "41b31ad73ed541bd478cc97567fdee815d4154666608703b7e1ac2ebcc8b873d"
 #define DVM_HANDLER_VARIANT_ADD    0
@@ -54,6 +54,8 @@ __declspec(dllexport) const char daedalus_handler_variant_sha256[] =
 extern uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv);
 extern void daedalus_trampoline_frame(
     void *func, DaedalusX64Context *context, const uint64_t *argv);
+extern void daedalus_trampoline_frame_span(
+    void *func, DaedalusX64Context *context, const uint64_t *argv, uint32_t argc);
 extern void dvm_store128_unaligned(void *destination, uint64_t low, uint64_t high);
 extern void dvm_load128_aligned(
     const void *source, uint64_t *low, uint64_t *high);
@@ -729,8 +731,9 @@ static int dvm_run(DaedalusVM *vm)
         /* The lifted-call ABI carries positional GPR/stack arguments and the
          * captured volatile register file. N_CALL_PTR remains scalar-only for
          * legacy hand-authored VM programs. Reject arity before any call. */
-        case DVM_N_CALL_FRAME: {
-            uint64_t func_ptr, ac, argv_local[8], result;
+        case DVM_N_CALL_FRAME:
+        case DVM_N_CALL_FRAME_SPAN: {
+            uint64_t func_ptr, ac, argv_local[DVM_NATIVE_FRAME_MAX_ARGS], result;
             DaedalusX64Context frame;
             static const uint16_t flag_offsets[5] = {
                 DVM_X64_LOCAL_CF, DVM_X64_LOCAL_PF, DVM_X64_LOCAL_ZF,
@@ -742,12 +745,32 @@ static int dvm_run(DaedalusVM *vm)
                 DVM_X64_R9, DVM_X64_R10, DVM_X64_R11
             };
             int i, lane;
-            if (vm->sp < 10) return -1;
-            func_ptr = vm->stack[vm->sp - 1];
-            ac = vm->stack[vm->sp - 2];
-            if (ac != 8 || func_ptr == 0) return -1;
-            vm->sp -= 2;
-            for (i = 7; i >= 0; --i) argv_local[i] = vm->stack[--vm->sp];
+            if (op == DVM_N_CALL_FRAME_SPAN) {
+                uint64_t bytes, address;
+                if (vm->sp < 3) return -1;
+                func_ptr = vm->stack[vm->sp - 1];
+                bytes = vm->stack[vm->sp - 2];
+                address = vm->stack[vm->sp - 3];
+                /* Validate before changing machine state or reading memory. */
+                if (!func_ptr || bytes > DVM_NATIVE_FRAME_MAX_STACK_BYTES ||
+                    (bytes & 7u) || (bytes && !address) || address > UINT64_MAX - bytes) return -1;
+                ac = 4 + bytes / 8;
+                argv_local[0] = dvm_rd_u64(vm->locals + DVM_X64_RCX * 8);
+                argv_local[1] = dvm_rd_u64(vm->locals + DVM_X64_RDX * 8);
+                argv_local[2] = dvm_rd_u64(vm->locals + DVM_X64_R8 * 8);
+                argv_local[3] = dvm_rd_u64(vm->locals + DVM_X64_R9 * 8);
+                for (i = 4; i < (int)ac; ++i)
+                    argv_local[i] = dvm_rd_u64((const uint8_t *)(uintptr_t)
+                        (address + (uint64_t)(i - 4) * 8));
+                vm->sp -= 3;
+            } else {
+                if (vm->sp < 10) return -1;
+                func_ptr = vm->stack[vm->sp - 1];
+                ac = vm->stack[vm->sp - 2];
+                if (ac != 8 || func_ptr == 0) return -1;
+                vm->sp -= 2;
+                for (i = 7; i >= 0; --i) argv_local[i] = vm->stack[--vm->sp];
+            }
             for (i = 0; i < DVM_X64_GPR_COUNT; ++i)
                 frame.gpr[i] = dvm_rd_u64(vm->locals + i * 8);
             frame.rflags = UINT64_C(2);
@@ -758,8 +781,12 @@ static int dvm_run(DaedalusVM *vm)
                 for (lane = 0; lane < DVM_X64_XMM_LANES; ++lane)
                     frame.xmm[i][lane] = dvm_rd_u64(vm->locals +
                         DVM_X64_LOCAL_XMM_BASE + i * 16 + lane * 8);
-            daedalus_trampoline_frame((void *)(uintptr_t)func_ptr,
-                                     &frame, argv_local);
+            if (op == DVM_N_CALL_FRAME_SPAN)
+                daedalus_trampoline_frame_span((void *)(uintptr_t)func_ptr,
+                                               &frame, argv_local, (uint32_t)ac);
+            else
+                daedalus_trampoline_frame((void *)(uintptr_t)func_ptr,
+                                         &frame, argv_local);
             for (i = 0; i < 7; ++i) {
                 int reg = volatile_gprs[i];
                 dvm_wr_u64(vm->locals + reg * 8, frame.gpr[reg]);
