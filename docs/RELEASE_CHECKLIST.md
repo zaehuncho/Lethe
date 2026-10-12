@@ -138,6 +138,18 @@ These read-only diagnostics do not retry a wait or turn a timeout into a pass.
 Later passing runs do not explain an earlier timeout; rejected stages remain
 rejected until their failure is understood rather than being overwritten.
 
+The no-CRT DLL test host explicitly calls `ExitProcess(host_main())` only after
+its unchanged load/call/unload or host-safe rejection checks. This matches
+normal CRT process termination; returning from a custom PE entrypoint terminates
+only its main thread and can leave other threads keeping the process alive.
+The original twelve control/protected, debugged/nondebugged launches remain,
+and all twelve repeat with a host-owned 60-second worker still outstanding.
+Both groups retain the original 30-second process deadline and three repetitions.
+The protected DLL does not terminate its host, and no process-exit call was added
+to the protected runtime. The returning-entrypoint failure and controlled-worker
+baseline/rollback remain recorded; this test-host correction is not general
+custom-entrypoint DLL-host compatibility or real-product acceptance evidence.
+
 ## 3. Preflight the native candidate
 
 Choose and record an exact 64-lowercase-hex-character opcode-shuffle seed so the candidate can be

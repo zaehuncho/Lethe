@@ -780,8 +780,23 @@ static void emit(const char *message, DWORD size)
                     &written, NULL);
 }
 
-int __cdecl host_entry(void)
+static DWORD WINAPI host_lifetime_worker(LPVOID unused)
 {
+    (void)unused;
+    Sleep(60000u);
+    return 0;
+}
+
+static int host_main(void)
+{
+    char worker_flag[2];
+    if (GetEnvironmentVariableA(
+            "LETHE_TEST_HOST_LIVE_WORKER", worker_flag, 2u) == 1u) {
+        HANDLE worker = CreateThread(
+            NULL, 0, host_lifetime_worker, NULL, 0, NULL);
+        if (!worker) return 93;
+        CloseHandle(worker);
+    }
     static const char loaded[] = "dll-host: LOADED\r\n";
     static const char rejected[] = "dll-host: REJECTED\r\n";
     static const char failed[] = "dll-host: FAILED\r\n";
@@ -807,6 +822,13 @@ int __cdecl host_entry(void)
     }
     emit(loaded, (DWORD)(sizeof(loaded) - 1u));
     return 0;
+}
+
+void __cdecl host_entry(void)
+{
+    /* Match normal CRT main-return process termination. Returning directly
+       from a custom PE entry exits only that thread and can leave workers. */
+    ExitProcess((UINT)host_main());
 }
 '''.lstrip(),
         encoding="ascii",
@@ -1163,26 +1185,32 @@ def test_dll_host_antidebug_rejects_load_without_terminating_host(
         (control, True, b"dll-host: LOADED\r\n"),
         (protected, True, b"dll-host: REJECTED\r\n"),
     )
-    for target, debugged, expected in cases:
-        monkeypatch.setenv("LETHE_DLL_ANTIDEBUG_TARGET", str(target))
-        for launch_index in range(_LAUNCH_REPETITIONS):
-            try:
-                ran = _run_packed_forced_aslr(
-                    host,
-                    memory_guard=False,
-                    process_hardening=False,
-                    debugged=debugged,
+    for live_worker in (False, True):
+        if live_worker:
+            monkeypatch.setenv("LETHE_TEST_HOST_LIVE_WORKER", "1")
+        else:
+            monkeypatch.delenv("LETHE_TEST_HOST_LIVE_WORKER", raising=False)
+        for target, debugged, expected in cases:
+            monkeypatch.setenv("LETHE_DLL_ANTIDEBUG_TARGET", str(target))
+            for launch_index in range(_LAUNCH_REPETITIONS):
+                try:
+                    ran = _run_packed_forced_aslr(
+                        host,
+                        memory_guard=False,
+                        process_hardening=False,
+                        debugged=debugged,
+                    )
+                except AssertionError as error:
+                    raise AssertionError(
+                        f"DLL-host target={target.name} debugged={debugged} "
+                        f"live_worker={live_worker} launch={launch_index}: {error}"
+                    ) from error
+                assert ran.returncode == 0, (
+                    target.name, debugged, live_worker, ran.returncode,
+                    ran.stdout, ran.stderr,
                 )
-            except AssertionError as error:
-                raise AssertionError(
-                    f"DLL-host target={target.name} debugged={debugged} "
-                    f"launch={launch_index}: {error}"
-                ) from error
-            assert ran.returncode == 0, (
-                target.name, debugged, ran.returncode, ran.stdout, ran.stderr
-            )
-            assert ran.stdout == expected
-            assert ran.stderr == b""
+                assert ran.stdout == expected
+                assert ran.stderr == b""
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
