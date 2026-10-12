@@ -141,7 +141,7 @@ def test_materialized_stack_keeps_fixed_arguments_and_nonstack_indexing(
     "mov r10, rsp; mov r10b, 1; ret",
     "mov r10, rsp; movq xmm0, r10; movq r11, xmm0; ret",
     "mov r10, rsp; mov rax, gs:[r10]; ret",
-    "mov r10, rsp; cmovz rax, r10; ret",
+    "mov r10, rsp; cmovz rax, r10; mov rax, [rax-0x208]; ret",
     "mov r10, rsp; mov [rcx], r10; ret",
     "sub rsp, 0x28; mov r10, rsp; mov [rsp+8], r10; "
     "mov r11, [rsp+8]; mov rax, [r11-0x208]; add rsp, 0x28; ret",
@@ -183,6 +183,7 @@ def test_materialized_stack_rejects_unbounded_or_unmodeled_derived_pointers(sour
      "mov r11, [rsp+8]; mov rax, [r11]; add rsp, 0x28; ret", 0x30),
     ("mov r10, rsp; mov eax, 1; xchg r10, rax; mov rdx, [rax+0x28]; ret", 0),
     ("mov r10, rsp; mov r10d, 1; add r10d, 2; ret", 0),
+    ("mov r10, rsp; cmovz rax, r10; ret", 0),
     ("mov r10, rsp; xor r10d, r10d; ret", 0),
     ("mov r10, rsp; mov r10, rcx; mov rax, [r10+rdx*8]; ret", 0),
     ("mov r10, rsp; test rcx, rcx; je done; lea r10, [rsp-0x20]; "

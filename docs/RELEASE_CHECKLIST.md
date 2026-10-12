@@ -90,6 +90,12 @@ reuse an older runtime mapping or infer product acceptance from these fixtures.
 
 The stack-window proof tracks full-width register copies, constant adjustments,
 fixed frame-pointer addresses and qword stack spills/reloads across control flow.
+Full-width `CMOVcc` explores both old/new pointer alternatives, including exact
+qword spill reloads and selections between a stack alias and an ordinary incoming
+pointer. The memory source is checked before predicate selection, even for an
+untaken move. Conditional RSP writes, truncated pointer choices and either
+outcome leaving the proven window remain rejected; the existing 100,000-state
+analysis bound is unchanged.
 Indexed/truncated aliases, partial pointer spills, opaque pointer escapes and
 other unmodeled pointer transfers fail closed. Source-derived pointers in the
 captured volatile native-call registers or four outgoing stack positions require
@@ -107,6 +113,12 @@ read faults rather than silently passing. The source-level plain/rolling frame
 harness also includes this exact conversion in its all-incoming-flags replay.
 General rounded conversions and floating-point arithmetic remain unsupported;
 the exact int32-to-binary64 lift uses existing integer opcodes, not host FP state.
+Fourth and fifth selected functions exercise conditional selection among a
+local stack slot, the caller's fifth argument and RIP-relative constant data.
+One reloads a selected pointer from an exact qword spill. Six signed selectors,
+including both int32 extremes, exercise all choices in the original and packed
+EXE/DLL while preserving the unchanged incoming caller output pointer. The
+original FP-call, alias and conversion assertions remain mandatory.
 This is bounded admission evidence,
 not a claim of arbitrary memory-safety analysis or general ISA support.
 

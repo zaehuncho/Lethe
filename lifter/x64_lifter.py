@@ -2762,8 +2762,10 @@ def validate_materialized_stack_window(
     use unindexed, full-width RSP: an unconstrained index or truncated stack
     base cannot be bounded by the displacement alone. Full-width register
     copies, constant pointer adjustments and qword stack spills retain their
-    entry-relative provenance across branches and internal calls. Unmodeled
-    pointer transfers/escapes fail closed rather than losing that provenance.
+    entry-relative provenance across branches and internal calls. Full-width
+    conditional moves explore both pointer alternatives, including exact qword
+    spills; their memory sources are checked before selection. Unmodeled pointer
+    transfers/escapes fail closed rather than losing that provenance.
     """
     if window_size <= 0 or window_size % 16:
         raise ValueError("stack window must be a positive 16-byte multiple")
@@ -2901,6 +2903,7 @@ def validate_materialized_stack_window(
         mnemonic = item.mnemonic
         info = info_factory.info(item)
         aliases, spills = list(alias_state), dict(spill_state)
+        conditional_alias_states = None
         memory = list(info.used_memory())
         if item.segment_prefix != Register.NONE and (
             any(pointer(access.base, aliases, depth) is not None or
@@ -2921,7 +2924,8 @@ def validate_materialized_stack_window(
                 modeled = (MemorySizeExt.size(access.memory_size) == 8 and
                            touched == [offset] and
                            (mnemonic in (Mnemonic.POP, Mnemonic.LEAVE, Mnemonic.PUSH) or
-                            (mnemonic == Mnemonic.MOV and item.op_kind(0) == OpKind.REGISTER
+                            ((mnemonic == Mnemonic.MOV or mnemonic in _CMOVCC)
+                             and item.op_kind(0) == OpKind.REGISTER
                              and item.op_register(0) in _R64)))
                 if not modeled:
                     raise LiftUnsupported(f"unmodeled source stack pointer reload at 0x{ip:X}")
@@ -2944,6 +2948,31 @@ def validate_materialized_stack_window(
         elif mnemonic == Mnemonic.LEA:
             value = memory_offset(item, aliases, depth, ip)
             depth = assign(item.op_register(0), value, aliases, depth, ip=ip)
+        elif mnemonic in _CMOVCC:
+            destination = item.op_register(0)
+            if destination in rsp_aliases:
+                raise LiftUnsupported(f"dynamic conditional RSP write at 0x{ip:X}")
+            old_value = pointer(destination, aliases, depth)
+            if item.op_kind(1) == OpKind.REGISTER:
+                source = item.op_register(1)
+                value = pointer(source, aliases, depth)
+                if value is not None and source not in _R64:
+                    raise LiftUnsupported(f"unmodeled source stack pointer transfer at 0x{ip:X}")
+            elif item.op_kind(1) == OpKind.MEMORY:
+                value = spills.get(memory_offset(item, aliases, depth, ip))
+            else:
+                raise LiftUnsupported(f"unmodeled conditional source stack transfer at 0x{ip:X}")
+            if (old_value is not None or value is not None) and destination not in _R64:
+                raise LiftUnsupported(f"partial source stack pointer transfer at 0x{ip:X}")
+            alternatives = []
+            for selected_value in (old_value, value):
+                selected_aliases = list(aliases)
+                assign(destination, selected_value, selected_aliases, depth, ip=ip)
+                alternatives.append(tuple(selected_aliases))
+            # Do not choose a predicate or merge a pointer with an opaque input
+            # into "not a pointer": either outcome can govern a later access.
+            # Identical alternatives converge in the existing bounded walk.
+            conditional_alias_states = tuple(dict.fromkeys(alternatives))
         elif mnemonic == Mnemonic.PUSH:
             if any(access.access in writes and MemorySizeExt.size(access.memory_size) != 8
                    for access in memory):
@@ -3035,8 +3064,9 @@ def validate_materialized_stack_window(
         maximum = max(maximum, depth)
 
         def enqueue(address, frames=returns, current_depth=depth):
-            pending.append((address, frames, current_depth, tuple(aliases),
-                            tuple(sorted(spills.items()))))
+            for current_aliases in conditional_alias_states or (tuple(aliases),):
+                pending.append((address, frames, current_depth, current_aliases,
+                                tuple(sorted(spills.items()))))
 
         if mnemonic == Mnemonic.CALL:
             direct = _direct_near_call_target(item)

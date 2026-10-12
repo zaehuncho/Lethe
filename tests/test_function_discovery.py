@@ -314,6 +314,34 @@ def test_materialized_stack_preflight_rejects_native_pointer_escape_at_call():
 
 
 @pytest.mark.parametrize("source", [
+    "sub rsp,0x28; lea r10,[rsp+8]; lea r11,[rsp+0x10]; "
+    "test ecx,ecx; cmovns r10,r11; mov rax,[r10]; add rsp,0x28; ret",
+    "sub rsp,0x28; lea r10,[rsp+8]; lea r11,[rsp+0x10]; mov [rsp+0x18],r11; "
+    "test ecx,ecx; cmovns r10,qword ptr [rsp+0x18]; "
+    "mov rax,[r10]; add rsp,0x28; ret",
+])
+def test_conditional_stack_aliases_are_selectable_after_both_outcomes_are_proven(source):
+    code = _asm(source, 0x1000)
+    report = discovery.discover_functions(_parsed([(0x1000, code, 0)]), exports=())
+    assert report.candidates[0].liftable is True
+    assert report.candidates[0].rejection_reason is None
+    assert report.starter_selection_manifest()["functions"] == [
+        {"name": "sub_00001000", "rva": 0x1000, "size": len(code)}]
+
+
+@pytest.mark.parametrize("setup", [
+    "mov r10,rsp; lea r11,[rsp-8]",
+    "lea r10,[rsp-8]; mov r11,rsp",
+])
+def test_conditional_stack_aliases_do_not_admit_either_out_of_window_outcome(setup):
+    code = _asm(setup + "; cmovns r10,r11; mov rax,[r10-0x1F9]; ret", 0x1000)
+    report = discovery.discover_functions(_parsed([(0x1000, code, 0)]), exports=())
+    assert report.candidates[0].liftable is False
+    assert "exceeds 512-byte window" in report.candidates[0].rejection_reason
+    assert report.starter_selection_manifest()["functions"] == []
+
+
+@pytest.mark.parametrize("source", [
     "cvtdq2pd xmm15,xmm15; ret",
     "cvtdq2pd xmm15,qword ptr [rcx]; ret",
 ])

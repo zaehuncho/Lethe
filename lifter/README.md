@@ -227,6 +227,18 @@ now bridged through the existing `n_call_ptr` Win64 pass-through trampoline
 (Cut 16); register/base-indirect and far calls still stay native. Each
 instruction addition remains oracle-gated.
 
+Materialized source-stack admission retains the original caller's stack and
+pointer addresses and proves a bounded window separately from ISA lifting.
+Full-width `CMOVcc` register sources and exact qword spill reloads retain both
+conditional pointer alternatives in the bounded control-flow walk. Memory
+sources are checked before selection; a false predicate cannot hide an invalid
+access. Identical alternatives converge, and the existing 100,000-state cap
+still fails closed. Partial/truncated pointer choices, conditional RSP writes,
+out-of-window aliases and unsummarized native pointer escapes remain rejected.
+Generated native EXE/DLL regressions cover local/caller-argument/constant-address
+selection and conditional qword pointer reloads without changing the VM ISA,
+native ABI, stack-isolation allocation or unwind/CET implementation.
+
 The oracle models a writable memory region: `oracle.check(code, init, flags,
 mem=<initial bytes>)` maps it in both Unicorn and the reference VM (via the
 additive `RefVM(mem=..., mem_base=...)` param) and compares the final bytes.
