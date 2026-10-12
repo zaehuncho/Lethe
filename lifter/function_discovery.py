@@ -1107,9 +1107,17 @@ def discover_functions(
     # instead of bailing on an out-of-extent call. pdata ranges never overlap, so
     # the only begin inside a candidate is the candidate's own entry.
     pdata_begins = frozenset(item.begin for item in runtime)
-    import_iat_rvas = frozenset(function.iat_rva
-                                for dll in getattr(parsed, "imports", ())
-                                for function in dll.funcs)
+    try:
+        import_entries = tuple(function.iat_rva
+                               for dll in getattr(parsed, "imports", ())
+                               for function in dll.funcs)
+    except (AttributeError, TypeError) as exc:
+        raise FunctionDiscoveryError(
+            "source import IAT inventory must contain DLL/function records") from exc
+    try:
+        import_iat_rvas = native_tail_calls.validated_import_iat_rvas(import_entries)
+    except ValueError as exc:
+        raise FunctionDiscoveryError(str(exc)) from exc
     global_gaps = _coverage_gaps(sections, runtime_pairs)
     direct_error = None
     direct_transfers = ()

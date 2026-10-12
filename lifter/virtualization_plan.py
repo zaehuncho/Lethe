@@ -1266,15 +1266,10 @@ def compile_virtualization_manifest(
 
     image_sections = getattr(reader, "sections", None)
     selected_extents = tuple((spec.rva, spec.size) for spec in ordered)
-    if not isinstance(source_import_iat_rvas, tuple):
-        raise VirtualizationPlanError("source import IAT entries must be an immutable tuple")
-    if any(type(rva) is not int or not 0 < rva < _RVA_LIMIT - 7
-           for rva in source_import_iat_rvas):
-        raise VirtualizationPlanError("source import IAT entries must be valid eight-byte RVAs")
-    ordered_imports = sorted(source_import_iat_rvas)
-    if any(right < left + 8 for left, right in zip(ordered_imports, ordered_imports[1:])):
-        raise VirtualizationPlanError("source import IAT entries overlap")
-    import_iat_rvas = frozenset(source_import_iat_rvas)
+    try:
+        import_iat_rvas = native_tail_calls.validated_import_iat_rvas(source_import_iat_rvas)
+    except ValueError as exc:
+        raise VirtualizationPlanError(str(exc)) from exc
 
     # A direct near call may be bridged to a first-party callee left native only
     # when its target is a proven function entry outside every selected extent.

@@ -363,6 +363,16 @@ that attempt to declare a generated thunk GFID fail before materialization.
 
 ## Frame-call native candidate requirement
 
+Discovery and planning validate the entire normal-import IAT inventory through
+the same builder-side validator before constructing the native-tail proof's
+membership set. Duplicate or overlapping eight-byte slots (including aliases
+across DLL descriptors), non-integer values, and overflowing RVAs fail closed
+with the public API's typed error. Discovery also rejects malformed DLL/function
+records explicitly. The planner's immutable-tuple contract, diagnostic text,
+valid empty/unsorted inventories, and referenced-slot file-backing checks are
+unchanged. This does not broaden supported instructions or native-call targets,
+and an advisory discovery result remains distinct from packer acceptance.
+
 `n_call_frame` is canonical opcode 0x3B and changes the complete opcode mapping
 fingerprint. Newly emitted programs require a freshly rebuilt/staged candidate;
 old runtime mappings must be rejected, never silently substituted. The rolling

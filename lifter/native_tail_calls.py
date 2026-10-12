@@ -16,6 +16,23 @@ _EXECUTE = 0x20000000
 _DISCARDABLE = 0x02000000
 
 
+def validated_import_iat_rvas(entries: tuple[int, ...]) -> frozenset[int]:
+    """Validate the complete source inventory before discarding its ordering.
+
+    Discovery and planning share this contract. In particular, converting to a
+    set before checking would hide duplicate slots, including cross-DLL aliases.
+    Geometry and file backing of a referenced slot are checked by the proof.
+    """
+    if not isinstance(entries, tuple):
+        raise ValueError("source import IAT entries must be an immutable tuple")
+    if any(type(rva) is not int or not 0 < rva < _LIMIT - 7 for rva in entries):
+        raise ValueError("source import IAT entries must be valid eight-byte RVAs")
+    ordered = sorted(entries)
+    if any(right < left + 8 for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("source import IAT entries overlap")
+    return frozenset(entries)
+
+
 def _read(sections: Sequence[Any], rva: int, size: int, *, executable: bool) -> bytes | None:
     if not 0 < rva < rva + size <= _LIMIT:
         return None
