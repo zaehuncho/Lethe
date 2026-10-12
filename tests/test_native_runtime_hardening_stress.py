@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from _native_debugger import DEBUGGER_FAULT_CODE, NativeDebugProtocol, debug_wait_error
 from packer import orchestrator, pe_analyze
 from tools import handler_shape_audit
 
@@ -465,6 +466,24 @@ def _run_packed_forced_aslr(
         ctypes.POINTER(StartupInfoW),
         ctypes.POINTER(ProcessInformation),
     )
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetStdHandle.argtypes = (wintypes.DWORD,)
+    kernel32.GetStdHandle.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.WaitForDebugEvent.argtypes = (
+        ctypes.POINTER(DebugEvent), wintypes.DWORD,
+    )
+    kernel32.WaitForDebugEvent.restype = wintypes.BOOL
+    kernel32.ContinueDebugEvent.argtypes = (
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+    )
+    kernel32.ContinueDebugEvent.restype = wintypes.BOOL
 
     security = SecurityAttributes(
         ctypes.sizeof(SecurityAttributes), None, True
@@ -546,19 +565,24 @@ def _run_packed_forced_aslr(
         kernel32.CloseHandle(stderr_write)
         stderr_write = wintypes.HANDLE()
         if debugged:
+            protocol = NativeDebugProtocol(process.dwProcessId, process.dwThreadId)
             deadline = time.monotonic() + 30.0
             while True:
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
-                assert remaining_ms > 0, "debugged child timed out"
+                assert remaining_ms > 0, (
+                    "debugged child timed out", protocol.snapshot()
+                )
                 event = DebugEvent()
-                assert kernel32.WaitForDebugEvent(
+                if not kernel32.WaitForDebugEvent(
                     ctypes.byref(event), remaining_ms
-                ), ctypes.WinError(ctypes.get_last_error())
+                ):
+                    raise debug_wait_error(kernel32, process, remaining_ms, protocol)
+                continue_status = protocol.continue_status(event)
                 if event.dwDebugEventCode in (3, 6) and event.payload.file:
                     kernel32.CloseHandle(event.payload.file)
                 exited = event.dwDebugEventCode == 5
                 assert kernel32.ContinueDebugEvent(
-                    event.dwProcessId, event.dwThreadId, 0x00010002
+                    event.dwProcessId, event.dwThreadId, continue_status
                 )
                 if exited:
                     break
@@ -571,6 +595,8 @@ def _run_packed_forced_aslr(
         assert kernel32.GetExitCodeProcess(
             process.hProcess, ctypes.byref(exit_code)
         )
+        if debugged:
+            protocol.validate_exit(exit_code.value)
 
         def read_pipe(handle: wintypes.HANDLE) -> bytes:
             chunks: list[bytes] = []
@@ -822,6 +848,63 @@ target_link_libraries(dll_antidebug_host PRIVATE kernel32.lib)
     return dll, host
 
 
+def _build_debugger_exception_fixture(work: Path) -> tuple[Path, Path]:
+    """Unhandled faults must terminate; handled faults must reach their SEH."""
+    source = work / "debugger_exception_source"
+    build = work / "debugger_exception_build"
+    source.mkdir()
+    (source / "fault.c").write_text(
+        r'''
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+int __cdecl fault_entry(void);
+static int (__cdecl *volatile reloc_anchor)(void) = fault_entry;
+int __cdecl fault_entry(void) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    if (reloc_anchor != fault_entry) ExitProcess(74);
+#ifdef LETHE_TEST_HANDLED
+    __try {
+        RaiseException(0xE04C5448u, 0, 0, NULL);
+        ExitProcess(73);
+    } __except (GetExceptionCode() == 0xE04C5448u ?
+                EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        ExitProcess(83);
+    }
+#else
+    RaiseException(0xE04C5448u, 0, 0, NULL);
+    ExitProcess(73); /* The debugger must not consume the exception. */
+#endif
+}
+'''.lstrip(), encoding="utf-8",
+    )
+    (source / "CMakeLists.txt").write_text(
+        """
+cmake_minimum_required(VERSION 3.20)
+project(lethe_debugger_exception C)
+add_executable(debugger_exception fault.c)
+add_executable(debugger_handled_exception fault.c)
+target_compile_definitions(debugger_handled_exception PRIVATE LETHE_TEST_HANDLED=1)
+foreach(target IN ITEMS debugger_exception debugger_handled_exception)
+    target_compile_options(${target} PRIVATE /W4 /WX /O2 /GS-)
+    target_link_options(${target} PRIVATE /INCREMENTAL:NO /DYNAMICBASE
+        /NXCOMPAT /HIGHENTROPYVA /FIXED:NO /NODEFAULTLIB /ENTRY:fault_entry
+        /SUBSYSTEM:CONSOLE)
+    target_link_libraries(${target} PRIVATE kernel32.lib)
+endforeach()
+target_link_libraries(debugger_handled_exception PRIVATE vcruntime.lib)
+""".lstrip(), encoding="utf-8",
+    )
+    _run_checked([
+        "cmake", "-S", str(source), "-B", str(build),
+        "-G", "Visual Studio 17 2022", "-A", "x64",
+    ], cwd=work)
+    _run_checked(["cmake", "--build", str(build), "--config", "Release"], cwd=work)
+    unhandled = build / "Release/debugger_exception.exe"
+    handled = build / "Release/debugger_handled_exception.exe"
+    assert unhandled.is_file() and handled.is_file()
+    return unhandled, handled
+
+
 def _raw_section_range(blob: bytes, name: bytes) -> tuple[int, int]:
     if len(blob) < 0x40 or blob[:2] != b"MZ":
         raise AssertionError("packed fixture has no DOS header")
@@ -1042,6 +1125,19 @@ def test_antidebug_detects_positive_debug_process_launch(
     assert b"runtime-hardening:" not in protected_run.stdout
     assert protected_run.stderr == b""
 
+    # Validate the debugger itself, not an anti-debug implementation: a normal
+    # Windows continuable exception with no handler must terminate the child.
+    # DBG_CONTINUE for every event would instead reach the sentinel exit 73.
+    unhandled, handled = _build_debugger_exception_fixture(tmp_path)
+    for fault_source, expected_exit in ((unhandled, DEBUGGER_FAULT_CODE), (handled, 83)):
+        fault_run = _run_packed_forced_aslr(
+            fault_source, memory_guard=False, process_hardening=False, debugged=True,
+        )
+        assert fault_run.returncode == expected_exit, (
+            "debugger swallowed an application exception or bypassed SEH", fault_run
+        )
+        assert fault_run.stdout == b"" and fault_run.stderr == b""
+
 
 @pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
 def test_dll_host_antidebug_rejects_load_without_terminating_host(
@@ -1069,13 +1165,19 @@ def test_dll_host_antidebug_rejects_load_without_terminating_host(
     )
     for target, debugged, expected in cases:
         monkeypatch.setenv("LETHE_DLL_ANTIDEBUG_TARGET", str(target))
-        for _ in range(_LAUNCH_REPETITIONS):
-            ran = _run_packed_forced_aslr(
-                host,
-                memory_guard=False,
-                process_hardening=False,
-                debugged=debugged,
-            )
+        for launch_index in range(_LAUNCH_REPETITIONS):
+            try:
+                ran = _run_packed_forced_aslr(
+                    host,
+                    memory_guard=False,
+                    process_hardening=False,
+                    debugged=debugged,
+                )
+            except AssertionError as error:
+                raise AssertionError(
+                    f"DLL-host target={target.name} debugged={debugged} "
+                    f"launch={launch_index}: {error}"
+                ) from error
             assert ran.returncode == 0, (
                 target.name, debugged, ran.returncode, ran.stdout, ran.stderr
             )

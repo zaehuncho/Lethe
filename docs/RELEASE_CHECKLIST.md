@@ -120,6 +120,24 @@ Instruction-specific failures retain their original diagnostic precedence.
 Passing this preflight still does not prove indirect-target closure, whole-image
 executable coverage, native application behavior or release readiness.
 
+### Native debugger verdicts
+
+The mandatory positive-debugger EXE node also checks its own debugger with a
+benign unhandled continuable exception (`0xE04C5448`). The initial primary-thread
+loader breakpoint alone is consumed. Application first- and second-chance
+exceptions receive `DBG_EXCEPTION_NOT_HANDLED`, preserving Windows exception
+dispatch; the unhandled fault oracle must exit with the exception code, and the
+handled oracle must reach its SEH handler and exit 83, never sentinel 73.
+Events from another PID, missing loader-breakpoint evidence, and a zero exit
+after a second-chance exception fail validation.
+
+The original 30-second deadline and three DLL-host repetitions stay unchanged.
+A failed wait records the original Win32 error, owned-child process/main-thread
+status, debugger presence and the last 32 events, even if status probes fail.
+These read-only diagnostics do not retry a wait or turn a timeout into a pass.
+Later passing runs do not explain an earlier timeout; rejected stages remain
+rejected until their failure is understood rather than being overwritten.
+
 ## 3. Preflight the native candidate
 
 Choose and record an exact 64-lowercase-hex-character opcode-shuffle seed so the candidate can be
