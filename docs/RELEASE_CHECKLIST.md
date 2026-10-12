@@ -151,6 +151,15 @@ installed product, universal thunk form or clean-VM enforcement claim.
 Passing this preflight still does not prove indirect-target closure, whole-image
 executable coverage, native application behavior or release readiness.
 
+An optional exact-PDB path now proves direct-reference executable coverage for
+one explicitly selected image by binding the PE RSDS GUID/age to DIA function
+extents and strictly decoding every remaining byte as a narrow canonical
+residual form. It requires an explicit PDB, the tracked DIA helper, and the DIA
+runtime; it never accepts a handwritten gap waiver in the same run. Passing
+this gate still leaves indirect/address-taken closure acknowledged rather than
+proved, and it does not replace materialized application/host tests, clean-VM
+checks, signing, or the all-scope production gate.
+
 ### Native debugger verdicts
 
 The mandatory positive-debugger EXE node also checks its own debugger with a

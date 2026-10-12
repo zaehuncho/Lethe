@@ -10,6 +10,7 @@ exact range and records a rationale.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -200,6 +201,7 @@ class DirectControlFlowProof:
     indirect_target_closure_proven: bool
     limitations: tuple[str, ...]
     isolated_runtime_functions: tuple[IsolatedRuntimeFunction, ...] = ()
+    decoded_supplemental_ranges: tuple[DecodedRuntimeFunction, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -848,6 +850,8 @@ def _validate_direct_targets(
         for decoded in decodes
         for instruction in decoded.instructions
     }
+    ordered = tuple(sorted(decodes, key=lambda item: item.begin_rva))
+    begins = tuple(item.begin_rva for item in ordered)
     for decoded in decodes:
         for instruction in decoded.instructions:
             kind = _direct_kind(instruction)
@@ -878,13 +882,11 @@ def _validate_direct_targets(
                     f"direct {kind} at RVA 0x{instruction.ip:X} enters selected "
                     f"function {target_selected.name!r} at interior RVA 0x{target:X}"
                 )
-            target_runtime = next(
-                (
-                    item
-                    for item in decodes
-                    if item.begin_rva <= target < item.end_rva
-                ),
-                None,
+            index = bisect_right(begins, target) - 1
+            target_runtime = (
+                ordered[index]
+                if index >= 0 and target < ordered[index].end_rva
+                else None
             )
             if target_runtime is not None and target not in all_instruction_starts:
                 raise DirectControlFlowError(
@@ -900,6 +902,7 @@ def analyze_direct_control_flow(
     tail_exit_policy: TailExitPolicy = TailExitPolicy(),
     coverage_acknowledgements: Sequence[CoverageGapAcknowledgement] = (),
     production: bool = True,
+    _supplemental_code_ranges: tuple[tuple[int, int], ...] = (),
 ) -> DirectControlFlowProof:
     """Analyze direct x64 transfers that could bypass selected entry patches.
 
@@ -976,8 +979,53 @@ def analyze_direct_control_flow(
         _decode_runtime(sections, begin, end)
         for begin, end in extra_selected_ranges
     )
+    # Internal entry point for exact-PDB-bound and byte-classified residual
+    # coverage. Public callers never receive a raw range waiver. Every added
+    # extent is still strictly decoded and participates in direct-edge checks.
+    if not isinstance(_supplemental_code_ranges, tuple) or len(_supplemental_code_ranges) > 100_000:
+        raise DirectControlFlowError("supplemental code ranges must be a bounded tuple")
+    supplemental = []
+    for item in _supplemental_code_ranges:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise DirectControlFlowError("invalid supplemental code range")
+        begin, end = item
+        if type(begin) is not int or type(end) is not int:
+            raise DirectControlFlowError("invalid supplemental code range")
+        _validate_range(begin, end - begin, "supplemental code")
+        supplemental.append((begin, end))
+    supplemental.sort()
+    if any(right[0] < left[1] for left, right in zip(supplemental, supplemental[1:])):
+        raise DirectControlFlowError("supplemental code ranges overlap")
+    occupied = sorted((*runtime_ranges, *extra_selected_ranges))
+    merged_occupied = []
+    for begin, end in occupied:
+        if merged_occupied and begin <= merged_occupied[-1][1]:
+            merged_occupied[-1] = (
+                merged_occupied[-1][0], max(merged_occupied[-1][1], end)
+            )
+        else:
+            merged_occupied.append((begin, end))
+    occupied_index = 0
+    for begin, end in supplemental:
+        while (
+            occupied_index < len(merged_occupied)
+            and merged_occupied[occupied_index][1] <= begin
+        ):
+            occupied_index += 1
+        if (
+            occupied_index < len(merged_occupied)
+            and merged_occupied[occupied_index][0] < end
+        ):
+            raise DirectControlFlowError("supplemental code overlaps a known function")
+    supplemental_decodes = tuple(
+        _decode_runtime(sections, begin, end)
+        for begin, end in supplemental
+    )
     decodes = tuple(
-        sorted((*runtime_decodes, *selected_decodes), key=lambda item: item.begin_rva)
+        sorted(
+            (*runtime_decodes, *selected_decodes, *supplemental_decodes),
+            key=lambda item: item.begin_rva,
+        )
     )
     _validate_direct_targets(decodes, selected)
     decoded_by_begin = {item.begin_rva: item for item in decodes}
@@ -1112,6 +1160,12 @@ def analyze_direct_control_flow(
         indirect_target_closure_proven=False,
         limitations=tuple(limitations),
         isolated_runtime_functions=isolated_runtime,
+        decoded_supplemental_ranges=tuple(
+            DecodedRuntimeFunction(
+                item.begin_rva, item.end_rva, len(item.instructions)
+            )
+            for item in supplemental_decodes
+        ),
     )
 
 

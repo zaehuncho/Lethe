@@ -346,6 +346,18 @@ def build_parser() -> argparse.ArgumentParser:
               "tools/virtualization_report.py"),
     )
     parser.add_argument(
+        "--virtualization-pdb", metavar="PATH", default=None,
+        help="exact source PDB for RSDS-bound executable coverage proof",
+    )
+    parser.add_argument(
+        "--virtualization-dia-helper", metavar="PATH", default=None,
+        help="tracked pdb_function_dump.exe DIA inventory helper",
+    )
+    parser.add_argument(
+        "--virtualization-msdia", metavar="PATH", default=None,
+        help="DIA runtime DLL used by the inventory helper",
+    )
+    parser.add_argument(
         "--enable-experimental-virtualization",
         action="store_true",
         help=("acknowledge the experimental explicit-function virtualization "
@@ -471,6 +483,21 @@ def main(
         print("error: selected-function virtualization requires an explicit fresh "
               "--stub-path", file=sys.stderr)
         return EXIT_USAGE
+    pdb_coverage_args = (
+        args.virtualization_pdb,
+        args.virtualization_dia_helper,
+        args.virtualization_msdia,
+    )
+    if any(item is not None for item in pdb_coverage_args) and (
+            not all(pdb_coverage_args)
+            or not args.virtualize_function
+            or args.virtualization_selection_manifest
+            or args.virtualization_gap):
+        print("error: PDB coverage requires --virtualization-pdb, "
+              "--virtualization-dia-helper, --virtualization-msdia, explicit "
+              "--virtualize-function, and no manual gap or selection manifest",
+              file=sys.stderr)
+        return EXIT_USAGE
     if args.virtualization_selection_manifest and (
             args.virtualize_function or args.virtualization_gap
             or args.virtualization_tail_exit
@@ -534,6 +561,9 @@ def main(
         stub_path=args.stub_path,
         virtualization_selection_manifest=(
             args.virtualization_selection_manifest),
+        virtualization_pdb_path=args.virtualization_pdb,
+        virtualization_dia_helper_path=args.virtualization_dia_helper,
+        virtualization_msdia_path=args.virtualization_msdia,
         virtualization_specs=tuple(
             VirtualizationSpec(name, rva, size)
             for name, rva, size in virtualization_specs

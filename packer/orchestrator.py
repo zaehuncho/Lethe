@@ -125,6 +125,9 @@ class PackOptions:
     # Internal harness capability. The public CLI never exposes or derives it.
     _allow_unverified_stub_for_tests: bool = False
     virtualization_selection_manifest: Optional[str] = None
+    virtualization_pdb_path: Optional[str] = None
+    virtualization_dia_helper_path: Optional[str] = None
+    virtualization_msdia_path: Optional[str] = None
 
 
 @dataclass
@@ -716,6 +719,23 @@ def pack_file(input_path: str, options: PackOptions,
                 "function/proof options")
         has_virtualization_selection = bool(
             virtualization_specs or selection_manifest)
+        pdb_inputs = (
+            getattr(options, "virtualization_pdb_path", None),
+            getattr(options, "virtualization_dia_helper_path", None),
+            getattr(options, "virtualization_msdia_path", None),
+        )
+        if any(item is not None for item in pdb_inputs):
+            if (
+                not all(isinstance(item, str) and item and "\0" not in item
+                        for item in pdb_inputs)
+                or not virtualization_specs
+                or selection_manifest
+                or getattr(options, "virtualization_gap_acknowledgements", ())
+            ):
+                raise ValueError(
+                    "PDB coverage requires three nonempty paths, explicit selected "
+                    "functions, and no manual gap or selection manifest"
+                )
         virtualization_enabled = os.environ.get(_VIRTUALIZATION_GATE) == "1"
         if has_virtualization_selection and not virtualization_enabled:
             raise ValueError(
@@ -779,6 +799,18 @@ def pack_file(input_path: str, options: PackOptions,
             raise ValueError(
                 "input and output resolve to the same file; refusing to overwrite "
                 "the source binary")
+        if all(pdb_inputs):
+            for path, label in zip(
+                pdb_inputs, ("PDB", "DIA helper", "DIA runtime")
+            ):
+                if _same_file_or_path(path, input_path) or _same_file_or_path(path, output_path):
+                    raise ValueError(f"{label} must not alias input or output")
+            if (
+                _same_file_or_path(pdb_inputs[0], pdb_inputs[1])
+                or _same_file_or_path(pdb_inputs[0], pdb_inputs[2])
+                or _same_file_or_path(pdb_inputs[1], pdb_inputs[2])
+            ):
+                raise ValueError("PDB coverage inputs must be distinct files")
         out_dir = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(out_dir, exist_ok=True)
 
@@ -889,38 +921,72 @@ def pack_file(input_path: str, options: PackOptions,
                 )
                 for spec in virtualization_specs
             )
-            proof = direct_control_flow.analyze_direct_control_flow(
-                parsed,
-                function_specs,
-                tail_exit_policy=direct_control_flow.TailExitPolicy(tuple(
-                    direct_control_flow.TailExitApproval(
-                        approval.function_rva,
-                        approval.instruction_rva,
-                        approval.target_rva,
-                        approval.rationale,
-                    )
-                    for approval in virtualization_tail_exit_approvals
-                )),
-                coverage_acknowledgements=tuple(
-                    direct_control_flow.CoverageGapAcknowledgement(
-                        acknowledgement.rva,
-                        acknowledgement.size,
-                        acknowledgement.rationale,
-                    )
-                    for acknowledgement in virtualization_gap_acknowledgements
-                ),
-                production=True,
-            )
-            _emit(
-                progress,
-                "virtualization control-flow proof: "
-                f"{len(proof.direct_transfers)} direct transfer(s), "
-                f"{len(proof.coverage_gaps)} coverage gap(s) "
-                f"({len(proof.acknowledged_coverage_gaps)} acknowledged, "
-                "not proven), "
-                f"{len(proof.indirect_transfers)} indirect transfer(s) "
-                "(closure unproven, acknowledged)",
-            )
+            tail_policy = direct_control_flow.TailExitPolicy(tuple(
+                direct_control_flow.TailExitApproval(
+                    approval.function_rva,
+                    approval.instruction_rva,
+                    approval.target_rva,
+                    approval.rationale,
+                )
+                for approval in virtualization_tail_exit_approvals
+            ))
+            if all(pdb_inputs):
+                from pathlib import Path
+                from lifter import pdb_coverage
+
+                coverage = pdb_coverage.prove_pdb_executable_coverage(
+                    parsed,
+                    Path(source_snapshot_path),
+                    Path(pdb_inputs[0]),
+                    Path(pdb_inputs[1]),
+                    Path(pdb_inputs[2]),
+                    function_specs,
+                    tail_exit_policy=tail_policy,
+                )
+                proof = coverage.direct_flow
+                _emit(
+                    progress,
+                    "PDB coverage source pins: "
+                    f"image={coverage.inventory.image_sha256} "
+                    f"pdb={coverage.inventory.pdb_sha256} "
+                    f"helper={coverage.inventory.helper_sha256} "
+                    f"dia={coverage.inventory.msdia_sha256}",
+                )
+                _emit(
+                    progress,
+                    "PDB-bound virtualization control-flow proof: "
+                    f"{len(coverage.inventory.supplemental_ranges)} exact "
+                    "PDB function(s), "
+                    f"{len(coverage.residual_ranges)} fully classified "
+                    "residual range(s), "
+                    f"{len(proof.direct_transfers)} direct transfer(s); "
+                    "indirect closure remains unproven",
+                )
+            else:
+                proof = direct_control_flow.analyze_direct_control_flow(
+                    parsed,
+                    function_specs,
+                    tail_exit_policy=tail_policy,
+                    coverage_acknowledgements=tuple(
+                        direct_control_flow.CoverageGapAcknowledgement(
+                            acknowledgement.rva,
+                            acknowledgement.size,
+                            acknowledgement.rationale,
+                        )
+                        for acknowledgement in virtualization_gap_acknowledgements
+                    ),
+                    production=True,
+                )
+                _emit(
+                    progress,
+                    "virtualization control-flow proof: "
+                    f"{len(proof.direct_transfers)} direct transfer(s), "
+                    f"{len(proof.coverage_gaps)} coverage gap(s) "
+                    f"({len(proof.acknowledged_coverage_gaps)} acknowledged, "
+                    "not proven), "
+                    f"{len(proof.indirect_transfers)} indirect transfer(s) "
+                    "(closure unproven, acknowledged)",
+                )
             _emit(
                 progress,
                 f"virtualizing {len(virtualization_specs)} explicitly selected "
@@ -947,9 +1013,10 @@ def pack_file(input_path: str, options: PackOptions,
                 opcode_table=opcode_table,
                 expected_handler_variant_sha256=handler_variant_sha256,
                 page_master_key=pack_master_key,
-                # Temporary materializer compatibility gate. The proof above
-                # covers decoded direct transfers only; executable gaps were
-                # explicitly acknowledged and indirect closure remains unproven.
+                # Temporary materializer compatibility gate. The legacy path
+                # can retain acknowledged gaps; the PDB path strictly decodes
+                # every admitted executable byte. Neither proves indirect or
+                # address-taken target closure.
                 acknowledge_no_interior_entries=True,
                 rolling=False,
                 rolling_seed=None,

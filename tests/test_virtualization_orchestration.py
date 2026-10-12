@@ -52,6 +52,134 @@ def test_candidate_manifest_uses_dll_adjacent_name_not_promoted_stem(tmp_path):
     assert rolling is True
 
 
+def test_explicit_pdb_coverage_branch_is_bound_to_private_source_snapshot(
+        monkeypatch, tmp_path):
+    from lifter import pdb_coverage
+
+    source = tmp_path / "app.exe"
+    output = tmp_path / "app.packed.exe"
+    source.write_bytes(b"source")
+    stub, _stub_bytes, _manifest = _write_candidate(tmp_path)
+    pdb = tmp_path / "app.pdb"
+    helper = tmp_path / "pdb_function_dump.exe"
+    msdia = tmp_path / "msdia140.dll"
+    for path in (pdb, helper, msdia):
+        path.write_bytes(b"fixture")
+    source_parsed = SimpleNamespace(is_dll=False)
+    materialized_parsed = SimpleNamespace(is_dll=False, materialized=True)
+    captures = {}
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+    monkeypatch.setattr(pe_analyze, "analyze_pe", lambda _path: source_parsed)
+
+    def fake_coverage(parsed, image, actual_pdb, actual_helper, actual_msdia,
+                      specs, **kwargs):
+        captures.update(parsed=parsed, image=image, pdb=actual_pdb,
+                        helper=actual_helper, msdia=actual_msdia,
+                        specs=specs, tail_policy=kwargs["tail_exit_policy"])
+        return SimpleNamespace(
+            inventory=SimpleNamespace(
+                supplemental_ranges=((0x2000, 0x2010),),
+                image_sha256="a" * 64, pdb_sha256="b" * 64,
+                helper_sha256="c" * 64, msdia_sha256="d" * 64,
+            ),
+            residual_ranges=(object(),),
+            direct_flow=SimpleNamespace(
+                direct_transfers=(object(),), coverage_gaps=(),
+                acknowledged_coverage_gaps=(), indirect_transfers=(),
+                direct_reference_gate_passed=True,
+                indirect_target_closure_proven=False,
+            ),
+        )
+
+    monkeypatch.setattr(pdb_coverage, "prove_pdb_executable_coverage", fake_coverage)
+    monkeypatch.setattr(
+        direct_control_flow, "analyze_direct_control_flow",
+        lambda *_args, **_kwargs: pytest.fail("legacy proof used in PDB mode"),
+    )
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions",
+        lambda _parsed, _specs, **_kwargs: SimpleNamespace(
+            parsed=materialized_parsed,
+            manifest=SimpleNamespace(functions=(object(),)),
+        ),
+    )
+    _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
+    progress = []
+    result = orchestrator.pack_file(
+        str(source),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=False, stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec("Init", 0x1000, 16),),
+            virtualization_pdb_path=str(pdb),
+            virtualization_dia_helper_path=str(helper),
+            virtualization_msdia_path=str(msdia),
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ),
+        progress.append,
+    )
+    assert result.ok, result.error
+    assert output.read_bytes() == b"candidate"
+    assert captures["parsed"] is source_parsed
+    assert captures["image"] != source and captures["image"].name.startswith(".")
+    assert (captures["pdb"], captures["helper"], captures["msdia"]) == (
+        pdb, helper, msdia)
+    assert captures["specs"] == (virtualization_plan.FunctionSpec("Init", 0x1000, 16),)
+    assert any("PDB-bound virtualization control-flow proof" in x for x in progress)
+
+
+@pytest.mark.parametrize("field,value,match", [
+    ("virtualization_dia_helper_path", None, "three nonempty paths"),
+    ("virtualization_gap_acknowledgements",
+     (orchestrator.VirtualizationGapAcknowledgement(0x2000, 16, "manual"),),
+     "no manual gap"),
+])
+def test_pdb_proof_option_misconfiguration_fails_before_pe_analysis(
+        monkeypatch, tmp_path, field, value, match):
+    source = tmp_path / "app.exe"
+    source.write_bytes(b"fixture")
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+    paths = {"virtualization_pdb_path": str(tmp_path / "app.pdb"),
+             "virtualization_dia_helper_path": str(tmp_path / "helper.exe"),
+             "virtualization_msdia_path": str(tmp_path / "msdia.dll")}
+    paths[field] = value
+    result = orchestrator.pack_file(
+        str(source),
+        orchestrator.PackOptions(
+            output_path=str(tmp_path / "out.exe"), stub_path="stub.dll",
+            virtualization_specs=(orchestrator.VirtualizationSpec("Init", 0x1000, 16),),
+            acknowledge_unproven_indirect_targets=True,
+            **paths,
+        ),
+    )
+    assert not result.ok and match in result.error
+    assert source.read_bytes() == b"fixture"
+
+
+def test_pdb_proof_cannot_alias_output_or_executable_input(monkeypatch, tmp_path):
+    source = tmp_path / "app.exe"
+    output = tmp_path / "packed.exe"
+    source.write_bytes(b"source")
+    output.write_bytes(b"existing output")
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+    options = orchestrator.PackOptions(
+        output_path=str(output), stub_path="stub.dll",
+        virtualization_specs=(orchestrator.VirtualizationSpec("Init", 0x1000, 16),),
+        virtualization_pdb_path=str(output),
+        virtualization_dia_helper_path=str(tmp_path / "helper.exe"),
+        virtualization_msdia_path=str(tmp_path / "msdia.dll"),
+        acknowledge_unproven_indirect_targets=True,
+    )
+    result = orchestrator.pack_file(str(source), options)
+    assert not result.ok and "PDB must not alias input or output" in result.error
+    assert output.read_bytes() == b"existing output"
+    options.virtualization_pdb_path = str(tmp_path / "source.pdb")
+    options.virtualization_dia_helper_path = str(source)
+    result = orchestrator.pack_file(str(source), options)
+    assert not result.ok and "DIA helper must not alias input or output" in result.error
+    assert source.read_bytes() == b"source"
+
+
 def test_promoted_stem_manifest_is_not_silently_used_for_candidate(tmp_path):
     stub = tmp_path / "lethe_stub_x64.dll"
     stub.write_bytes(b"stub")

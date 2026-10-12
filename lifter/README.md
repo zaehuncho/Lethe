@@ -33,6 +33,16 @@ else + a **differential oracle** that proves every lift correct.
   **not** a coverage waiver: they still need strict control-flow decoding and
   every remaining executable gap must be proven separately before production
   selection can pass.
+- `pdb_coverage.py` — optional exact-PDB coverage path for explicit function
+  selections. It strictly decodes supplemental PDB functions and admits only
+  fully byte-classified retained residual spans (INT3 padding, one canonical
+  NOP10, exact normal-import FF25, or a fixed this-adjustor E9 to a function
+  entry). The direct-flow pass inspects all admitted transfers without labeling
+  the supplemental spans as PDATA. CLI inputs are `--virtualization-pdb`,
+  `--virtualization-dia-helper`, and `--virtualization-msdia`; all three are
+  required, and handwritten gap waivers cannot be mixed with this path.
+  Indirect target closure, liftability and real product behavior remain
+  independent gates.
 - `../tools/virtualization_report.py` — CLI renderer for that report; it does
   not invoke the packer or mutate the inspected image. Its optional canonical
   source-bound selection manifest binds the exact PE and runtime-function

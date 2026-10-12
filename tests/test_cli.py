@@ -94,6 +94,57 @@ def test_virtualization_specs_accept_decimal_and_hex():
     ]
 
 
+def test_cli_routes_exact_pdb_coverage_paths_to_packer(monkeypatch, tmp_path):
+    input_path = tmp_path / "app.exe"
+    input_path.write_bytes(b"fixture")
+    captured = {}
+
+    def fake_pack(_path, options, progress=None):
+        captured["options"] = options
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    rc = lethe.main([
+        str(input_path), "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll", "--virtualize-function", "Init:0x1000:16",
+        "--acknowledge-unproven-indirect-targets",
+        "--virtualization-pdb", "source.pdb",
+        "--virtualization-dia-helper", "pdb_function_dump.exe",
+        "--virtualization-msdia", "msdia140.dll",
+    ])
+    assert rc == lethe.EXIT_OK
+    options = captured["options"]
+    assert (options.virtualization_pdb_path,
+            options.virtualization_dia_helper_path,
+            options.virtualization_msdia_path) == (
+                "source.pdb", "pdb_function_dump.exe", "msdia140.dll")
+    assert options.virtualization_gap_acknowledgements == ()
+
+
+@pytest.mark.parametrize("extra", [
+    ["--virtualization-pdb", "source.pdb"],
+    ["--virtualization-pdb", "source.pdb",
+     "--virtualization-dia-helper", "helper.exe"],
+    ["--virtualization-pdb", "source.pdb",
+     "--virtualization-dia-helper", "helper.exe",
+     "--virtualization-msdia", "msdia.dll",
+     "--virtualization-gap", "0x2000:16:manual"],
+])
+def test_cli_rejects_incomplete_or_manual_pdb_coverage(
+        monkeypatch, tmp_path, capsys, extra):
+    input_path = tmp_path / "app.exe"
+    input_path.write_bytes(b"fixture")
+    monkeypatch.setattr(orchestrator, "pack_file", lambda *_args, **_kwargs:
+                        pytest.fail("packer reached after invalid CLI PDB options"))
+    rc = lethe.main([
+        str(input_path), "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll", "--virtualize-function", "Init:0x1000:16",
+        "--acknowledge-unproven-indirect-targets", *extra,
+    ])
+    assert rc == lethe.EXIT_USAGE
+    assert "PDB coverage requires" in capsys.readouterr().err
+
+
 def test_virtualization_proof_options_accept_decimal_hex_and_colon_rationales():
     args = lethe.build_parser().parse_args([
         "input.exe",
