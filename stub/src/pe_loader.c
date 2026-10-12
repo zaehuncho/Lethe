@@ -759,10 +759,14 @@ static int register_load_config_targets(uint8_t *base,
 {
     typedef BOOL (WINAPI *SetValidTargetsFn)(
         HANDLE, PVOID, SIZE_T, ULONG, PCFG_CALL_TARGET_INFO);
+    typedef BOOL (WINAPI *GetMitigationPolicyFn)(
+        HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
     const uint8_t *recipe;
     const uint8_t *targets;
     void *kernelbase;
     SetValidTargetsFn set_valid_targets;
+    GetMitigationPolicyFn get_mitigation_policy;
+    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg_policy;
     uint32_t slot_count;
     uint32_t target_count;
     uint32_t relocation_count;
@@ -777,24 +781,46 @@ static int register_load_config_targets(uint8_t *base,
         return 0x1001;
     (void)relocation_count;
     (void)recipe_size;
+    targets = recipe + LCFG_RUNTIME_HDR_SIZE +
+              (uint64_t)slot_count * LCFG_RUNTIME_ENTRY_SIZE;
+    /* Validate the entire authenticated GFID inventory before consulting the
+       host policy. CFG-disabled hosts still reject malformed target records. */
+    for (i = 0; i < target_count; ++i) {
+        const uint8_t *entry = targets + i * LCFG_RUNTIME_TARGET_SIZE;
+        uint32_t target_rva = *(const uint32_t *)(const void *)entry;
+        uint8_t metadata_flags = entry[4];
+        if (target_rva == 0 || target_rva >= pi->original_size_of_image ||
+            (metadata_flags & 0xF4u) != 0)
+            return 0x2000 | (int)(i & 0x0FFFu);
+    }
+    if (target_count == 0)
+        return 0;
     kernelbase = find_module_by_hash(0xBD6D247Au); /* hash("kernelbase.dll") */
     if (!kernelbase)
         return 0x1002;
+    get_mitigation_policy = (GetMitigationPolicyFn)(uintptr_t)GetProcAddress(
+        (HMODULE)kernelbase, "GetProcessMitigationPolicy");
+    if (!get_mitigation_policy)
+        return 0x1004;
+    cfg_policy.Flags = 0;
+    if (!get_mitigation_policy(GetCurrentProcess(),
+                               ProcessControlFlowGuardPolicy, &cfg_policy,
+                               sizeof(cfg_policy)))
+        return 0x1005;
+    /* SetProcessValidCallTargets rejects these calls in a CFG-disabled host.
+       With CFG off, the validated GFIDs need no process target registration. */
+    if (!cfg_policy.EnableControlFlowGuard)
+        return 0;
     set_valid_targets = (SetValidTargetsFn)(uintptr_t)GetProcAddress(
         (HMODULE)kernelbase, "SetProcessValidCallTargets");
     if (!set_valid_targets)
         return 0x1003;
-    targets = recipe + LCFG_RUNTIME_HDR_SIZE +
-              (uint64_t)slot_count * LCFG_RUNTIME_ENTRY_SIZE;
     for (i = 0; i < target_count; ++i) {
         const uint8_t *entry = targets + i * LCFG_RUNTIME_TARGET_SIZE;
         uint32_t target_rva = *(const uint32_t *)(const void *)entry;
         uint8_t metadata_flags = entry[4];
         uintptr_t page_rva;
         CFG_CALL_TARGET_INFO info;
-        if (target_rva == 0 || target_rva >= pi->original_size_of_image ||
-            (metadata_flags & 0xF4u) != 0)
-            return 0x2000 | (int)(i & 0x0FFFu);
         /* Suppressed and export-suppressed GFIDs were installed from the
            byte-exact outer table by the Windows image loader. Re-registering
            either as VALID would silently destroy that policy. */

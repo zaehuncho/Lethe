@@ -847,6 +847,9 @@ target_link_options(real_xfg_dll PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCO
 add_executable(real_xfg_dll_host "{host_source.as_posix()}")
 target_compile_options(real_xfg_dll_host PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg)
 target_link_options(real_xfg_dll_host PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO)
+add_executable(real_xfg_dll_host_no_cfg "{host_source.as_posix()}")
+target_compile_options(real_xfg_dll_host_no_cfg PRIVATE /W4 /WX /O2)
+target_link_options(real_xfg_dll_host_no_cfg PRIVATE /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO)
 """.lstrip()
     (work / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")
     build = work / "build"
@@ -876,12 +879,15 @@ target_link_options(real_xfg_dll_host PRIVATE /guard:cf /guard:xfg /DYNAMICBASE 
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     dll = build / "Release/real_xfg_dll.dll"
     host = build / "Release/real_xfg_dll_host.exe"
-    assert dll.is_file() and host.is_file()
-    executed = subprocess.run(
-        [str(host), str(dll)], capture_output=True, text=True, check=False
-    )
-    assert executed.returncode == 0, executed.stdout + executed.stderr
-    return SimpleNamespace(dll=dll, host=host)
+    host_no_cfg = build / "Release/real_xfg_dll_host_no_cfg.exe"
+    assert dll.is_file() and host.is_file() and host_no_cfg.is_file()
+    for current_host in (host, host_no_cfg):
+        executed = subprocess.run(
+            [str(current_host), str(dll)],
+            capture_output=True, text=True, check=False,
+        )
+        assert executed.returncode == 0, executed.stdout + executed.stderr
+    return SimpleNamespace(dll=dll, host=host, host_no_cfg=host_no_cfg)
 
 
 @pytest.fixture(scope="module")
@@ -961,6 +967,39 @@ def xfg_virtualization_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
         encoding="ascii",
     )
     return stub
+
+
+def test_real_xfg_dll_cfg_disabled_host_loads_without_virtualization(
+    real_msvc_xfg_dll_bundle: SimpleNamespace,
+    xfg_virtualization_stub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dll = real_msvc_xfg_dll_bundle.dll
+    parsed = pe_analyze.analyze_pe(str(dll))
+    assert parsed.is_dll and parsed.load_config is not None
+    assert parsed.load_config.guard_cf_targets
+    monkeypatch.setenv(_DLL_GATE, "1")
+    packed = tmp_path / "real_xfg_dll.no_vm.packed.dll"
+    result = orchestrator.pack_file(
+        str(dll), orchestrator.PackOptions(
+            output_path=str(packed), is_dll=True,
+            stub_path=str(xfg_virtualization_stub),
+            _allow_unverified_stub_for_tests=True,
+        ),
+    )
+    assert result.ok, result.error
+    for host in (
+        real_msvc_xfg_dll_bundle.host,
+        real_msvc_xfg_dll_bundle.host_no_cfg,
+    ):
+        executed = subprocess.run(
+            [str(host), str(packed)], capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+        assert executed.returncode == 0, (
+            f"host={host}: {executed.stdout}{executed.stderr}"
+        )
 
 
 def test_real_xfg_direct_only_plan_preserves_source_gfid_identity(
@@ -1432,14 +1471,17 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         ),
     )
     assert result.ok, result.error
-    executed = subprocess.run(
-        [str(host), str(packed)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    assert executed.returncode == 0, executed.stdout + executed.stderr
+    for current_host in (host, real_msvc_xfg_dll_bundle.host_no_cfg):
+        executed = subprocess.run(
+            [str(current_host), str(packed)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert executed.returncode == 0, (
+            f"host={current_host}: {executed.stdout}{executed.stderr}"
+        )
 
     materialized = captured["result"]
     assert materialized.parsed.load_config == parsed.load_config
