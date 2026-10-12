@@ -257,12 +257,12 @@ manifest = compile_virtualization_manifest(
     ),
     require_source_exception_metadata=True,
     runtime_common_rva=(
-        stub_graft_delta + stub_export_rvas["daedalus_x64_enter_common"]
+        stub_graft_delta + stub_export_rvas["daedalus_x64_enter_common_stack512"]
     ),
 )
 ```
 
-The stub exports `daedalus_x64_enter_common`, `daedalus_opcode_mapping_sha256`,
+The stub exports `daedalus_x64_enter_common_stack512`, `daedalus_opcode_mapping_sha256`,
 and `daedalus_handler_variant_sha256`; these survive stripping. Production
 materialization requires both hashes, the authenticated-paging capability, and
 the numeric post-graft common-entry RVA to match the exact fresh build. Missing

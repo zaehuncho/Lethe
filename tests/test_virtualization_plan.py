@@ -21,6 +21,7 @@ pytest.importorskip("keystone")
 
 import virtualization_plan as plan  # noqa: E402
 import win64_thunk  # noqa: E402
+import x64_lifter  # noqa: E402
 import daedalus_asm  # noqa: E402
 import daedalus_ref  # noqa: E402
 import daedalus_rolling  # noqa: E402
@@ -30,6 +31,50 @@ from keystone import KS_ARCH_X86, KS_MODE_64, Ks  # noqa: E402
 
 _KS = Ks(KS_ARCH_X86, KS_MODE_64)
 _EXEC = 0x60000020
+
+
+@pytest.mark.parametrize(
+    ("source", "maximum"),
+    [
+        ("sub rsp, 0x58; mov qword ptr [rsp+0x28], 13; add rsp, 0x58; ret", 0x58),
+        ("sub rsp, 0x200; mov qword ptr [rsp], 1; add rsp, 0x200; ret", 0x200),
+        ("push rbp; mov rbp, rsp; sub rsp, 0x58; add rsp, 0x58; pop rbp; ret", 0x60),
+    ],
+)
+def test_materialized_source_stack_window_proves_bounded_frames(
+    source: str, maximum: int
+) -> None:
+    code = _asm(source)
+    assert x64_lifter.validate_materialized_stack_window(
+        code, window_size=win64_thunk.STACK_WINDOW_SIZE
+    ) == maximum
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "sub rsp, 0x208; add rsp, 0x208; ret",
+        "mov rax, [rsp-0x220]; ret",
+        "lea rax, [rsp-0x220]; ret",
+        "mov rsp, rax; ret",
+        "and rsp, -16; ret",
+        "sub rsp, 0x58; ret",
+    ],
+)
+def test_materialized_source_stack_window_rejects_unproven_frames(
+    source: str,
+) -> None:
+    with pytest.raises(x64_lifter.LiftUnsupported):
+        x64_lifter.validate_materialized_stack_window(
+            _asm(source), window_size=win64_thunk.STACK_WINDOW_SIZE
+        )
+
+
+def test_selected_function_plan_rejects_stack_window_overflow() -> None:
+    source = _asm("sub rsp, 0x208; mov qword ptr [rsp], 13; "
+                  "add rsp, 0x208; ret")
+    with pytest.raises(plan.FunctionRejected, match="source stack depth"):
+        _compile(source)
 
 
 def _asm(source: str, *, rva: int = 0x1000) -> bytes:
@@ -186,7 +231,7 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         ("DIR64", function.descriptor_rva + 8),
         ("DIR64", function.descriptor_rva + 16),
     ]
-    assert relocations[0].target_symbol == "daedalus_x64_enter_common"
+    assert relocations[0].target_symbol == "daedalus_x64_enter_common_stack512"
     assert relocations[1].target_rva == function.descriptor_rva
     assert relocations[2].target_rva == function.program_rva
     assert relocations[3].target_rva == 0

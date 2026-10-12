@@ -2,13 +2,14 @@
 ;
 ; Generated shim contract (see lifter/win64_thunk.py):
 ;   pushfq
-;   sub  rsp, 32                 ; aligned call + Win64 shadow space
-;   call daedalus_x64_enter_common
+;   sub  rsp, 544                ; bounded 512-byte source stack window + shadow
+;   call daedalus_x64_enter_common_stack512
 ;   jmp  SHORT resume            ; exact two-byte instruction
 ;   dq   OFFSET descriptor       ; read through return_address + 2
 ;
-; At common entry the original target-function RSP is [rsp + 48]:
-; return-to-shim (8) + shadow (32) + saved RFLAGS (8). The bridge captures all
+; At common entry the original target-function RSP is [rsp + 560]:
+; return-to-shim (8) + reserved source window/shadow (544) + saved RFLAGS (8).
+; The bridge captures all
 ; GPRs before using a scratch register and stores that original RSP in the VM
 ; context, so [rsp+40] stack arguments and RSP-relative loads retain x64 entry
 ; semantics. Legacy XMM0-XMM15 state is captured before the C runtime can use it.
@@ -26,7 +27,7 @@ EXTERN daedalus_vm_exec_x64_paged:PROC
 IFDEF DVM_PLAIN_DESCRIPTOR_TEST_ONLY
 EXTERN daedalus_vm_exec_x64:PROC
 ENDIF
-PUBLIC daedalus_x64_enter_common
+PUBLIC daedalus_x64_enter_common_stack512
 
 DVM_DESCRIPTOR_VERSION_PLAIN EQU 3
 DVM_DESCRIPTOR_VERSION_PAGED EQU 4
@@ -90,12 +91,12 @@ SAVE_XMM15          EQU 640
 
 COMMON_RETURN       EQU FRAME_SIZE
 SHIM_STATUS         EQU FRAME_SIZE + 8
-SHIM_SAVED_RFLAGS   EQU FRAME_SIZE + 40
-ORIGINAL_ENTRY_RSP  EQU FRAME_SIZE + 48
+SHIM_SAVED_RFLAGS   EQU FRAME_SIZE + 552
+ORIGINAL_ENTRY_RSP  EQU FRAME_SIZE + 560
 
 .code
 
-daedalus_x64_enter_common PROC FRAME
+daedalus_x64_enter_common_stack512 PROC FRAME
     sub     rsp, FRAME_SIZE
     .allocstack FRAME_SIZE
     .endprolog
@@ -246,6 +247,6 @@ dvm_restore_context:
     mov     r11, [rsp + CTX_R11]
     add     rsp, FRAME_SIZE
     ret
-daedalus_x64_enter_common ENDP
+daedalus_x64_enter_common_stack512 ENDP
 
 END

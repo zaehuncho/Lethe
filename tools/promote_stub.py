@@ -60,6 +60,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_xfg_virtualization_preflight.py",
     "test_native_exe_exports.py",
     "test_lifter_frame_call_native.py",
+    "test_native_fp_frame_materialized.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_runtime_hardening_stress.py::"
@@ -118,6 +119,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_native_frame_call_boundary[aligned]",
     "tests/test_lifter_frame_call_native.py::"
     "test_native_frame_call_boundary[unwind]",
+    "tests/test_native_fp_frame_materialized.py::"
+    "test_materialized_fp_stack_frame_exe_and_dll_parity",
 
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)

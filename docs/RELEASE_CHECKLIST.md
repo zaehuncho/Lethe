@@ -75,9 +75,11 @@ arguments, FP returns, the emitted bridge unwind record and Windows RtlVirtualUn
 at a transient flag push,
 volatile GPR/XMM/flag state, all 32 incoming flag patterns, dispatch admission
 and denial, malformed call rejection, and rolling aligned 128-bit transfers.
-The five frame-call nodes are mandatory source-compiled native primitive proof,
+The six frame-call nodes are mandatory source-compiled native primitive proof,
 not executions of the candidate DLL. Other candidate-bound lanes retain their
-artifact binding. The dispatch sentinel is not Windows CFG matrix evidence. No installed product
+artifact binding. The mandatory materialized FP-frame node packs and executes
+generated EXE and DLL fixtures with eight mixed FP/integer positions and checks
+original parity. The dispatch sentinel is not Windows CFG matrix evidence. No installed product
 runs in this test. The lifter uses the new `n_call_frame` opcode; keep the
 scalar-only `n_call_ptr` out of newly lifted call paths. Rebuild/stage a fresh
 candidate after this ISA change and retain its new opcode fingerprint. Do not
@@ -99,7 +101,7 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-frozen twenty-eight-node native hardening, selected-function, captured-call
+frozen twenty-nine-node native hardening, selected-function, captured-call
 frame, 128-bit memory, XFG,
 and post-startup EXE export
 replay, the complete nineteen-check EXE/DLL round trip, and native production
@@ -367,14 +369,14 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of twenty-eight
+The candidate-bound native runtime record must name the frozen list of twenty-nine
 node IDs spanning hardening stress, selected-function virtualization E2E,
 plain and shuffled-rolling STORE128 atomic-fault checks, captured frame calls
 and unwind recovery, XFG preflight, and post-startup EXE exports (one positive plus five directory/snapshot mutations).
 The count-zero mutation may be rejected by Windows before the stub executes;
 it is not proof that the stub's own verifier ran. The optional early-attach
 characterization is excluded and does not establish support. The mandatory
-terminal pytest summary must report exactly twenty-eight passes
+terminal pytest summary must report exactly twenty-nine passes
 with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.

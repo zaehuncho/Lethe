@@ -97,7 +97,7 @@ target_link_options(lethe_stub_x64 PRIVATE
     /CETCOMPAT
     /EXPORT:StubExeEntry
     /EXPORT:StubDllMain
-    /EXPORT:daedalus_x64_enter_common
+    /EXPORT:daedalus_x64_enter_common_stack512
 )
 
 # Key-binding integrity: the builder hashes .text to derive the AES key.

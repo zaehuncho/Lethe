@@ -2680,6 +2680,140 @@ def analyze_internal_calls(
     )
 
 
+def validate_materialized_stack_window(
+    code: bytes,
+    base: int = 0x1000,
+    *,
+    window_size: int,
+    native_call_targets=frozenset(),
+) -> int:
+    """Prove every reachable source RSP stays inside the shim's private window.
+
+    The tracked depth is relative to the original function-entry RSP.  A
+    source CALL/RET pair includes its architectural eight-byte return slot;
+    native bridge calls are net-zero.  Unknown RSP writes, variable-sized
+    frames, unbalanced returns and cyclic growth are rejected, rather than
+    relying on an empirical stack cushion.
+    """
+    if window_size <= 0 or window_size % 16:
+        raise ValueError("stack window must be a positive 16-byte multiple")
+    instructions = _decode_exact(code, base)
+    end = base + len(code)
+    by_ip = {item.ip: item for item in instructions}
+    starts = frozenset(by_ip)
+    native_call_targets = frozenset(int(t) for t in native_call_targets)
+    info_factory = InstructionInfoFactory()
+    rsp_aliases = {Register.RSP, Register.ESP, Register.SP, Register.SPL}
+    writes = {OpAccess.WRITE, OpAccess.COND_WRITE, OpAccess.READ_WRITE,
+              OpAccess.READ_COND_WRITE}
+
+    def target(item) -> int:
+        if item.op_kind(0) != OpKind.NEAR_BRANCH64:
+            raise LiftUnsupported(f"indirect branch at 0x{item.ip:X}")
+        address = item.near_branch_target
+        if address not in starts:
+            raise LiftUnsupported(f"branch target 0x{address:X} is not an instruction boundary")
+        return address
+
+    def immediate(item) -> int:
+        kind = item.op_kind(1)
+        if kind == OpKind.IMMEDIATE8:
+            return item.immediate8
+        if kind == OpKind.IMMEDIATE8TO64:
+            return item.immediate8to64
+        if kind == OpKind.IMMEDIATE32TO64:
+            return item.immediate32to64
+        raise LiftUnsupported(f"dynamic RSP adjustment at 0x{item.ip:X}")
+
+    def signed64(value: int) -> int:
+        return value if value < (1 << 63) else value - (1 << 64)
+
+    pending = [(base, (), 0)]
+    visited = set()
+    maximum = 0
+    while pending:
+        ip, returns, depth = pending.pop()
+        state = (ip, returns, depth)
+        if state in visited:
+            continue
+        visited.add(state)
+        if len(visited) > 100_000:
+            raise LiftUnsupported("materialized stack proof exceeded its state bound")
+        if ip == end:
+            if returns or depth:
+                raise LiftUnsupported("unbalanced source stack at function end")
+            continue
+        item = by_ip.get(ip)
+        if item is None:
+            raise LiftUnsupported(f"stack proof reaches non-instruction 0x{ip:X}")
+        next_ip = ip + item.len
+        mnemonic = item.mnemonic
+        info = info_factory.info(item)
+        for memory in info.used_memory():
+            if memory.base == Register.RSP:
+                offset = -depth + signed64(memory.displacement)
+                if offset < -window_size:
+                    raise LiftUnsupported(
+                        f"source stack access at 0x{ip:X} exceeds {window_size}-byte window"
+                    )
+        if mnemonic == Mnemonic.LEA and item.memory_base == Register.RSP:
+            offset = -depth + signed64(item.memory_displacement)
+            if offset < -window_size:
+                raise LiftUnsupported(
+                    f"source stack address at 0x{ip:X} exceeds {window_size}-byte window"
+                )
+        if mnemonic == Mnemonic.PUSH:
+            depth += 8
+        elif mnemonic == Mnemonic.POP:
+            if item.op_kind(0) == OpKind.REGISTER and item.op_register(0) in rsp_aliases:
+                raise LiftUnsupported(f"dynamic POP RSP at 0x{ip:X}")
+            depth -= 8
+        elif mnemonic in (Mnemonic.ADD, Mnemonic.SUB) and item.op_kind(0) == OpKind.REGISTER and item.op_register(0) == Register.RSP:
+            amount = immediate(item)
+            depth += amount if mnemonic == Mnemonic.SUB else -amount
+        elif mnemonic not in (Mnemonic.CALL, Mnemonic.RET):
+            if any(reg.register in rsp_aliases and reg.access in writes
+                   for reg in info.used_registers()):
+                raise LiftUnsupported(f"dynamic RSP write at 0x{ip:X}")
+        if depth < 0 or depth > window_size:
+            raise LiftUnsupported(
+                f"source stack depth {depth} at 0x{ip:X} exceeds {window_size}-byte window"
+            )
+        maximum = max(maximum, depth)
+        if mnemonic == Mnemonic.CALL:
+            direct = _direct_near_call_target(item)
+            external = _is_rip_import_call(item) or direct in native_call_targets
+            if external:
+                pending.append((next_ip, returns, depth))
+            else:
+                callee = target(item)
+                if callee == base or any(frame[0] == callee for frame in returns):
+                    raise LiftUnsupported(f"recursive internal call at 0x{ip:X}")
+                if depth + 8 > window_size:
+                    raise LiftUnsupported("internal CALL return slot exceeds stack window")
+                pending.append((callee, returns + ((callee, next_ip, depth),), depth + 8))
+        elif mnemonic == Mnemonic.RET:
+            if item.op_count:
+                raise LiftUnsupported("ret imm16 stack cleanup is not modeled")
+            if returns:
+                _callee, resume, caller_depth = returns[-1]
+                if depth != caller_depth + 8:
+                    raise LiftUnsupported(f"unbalanced internal RET at 0x{ip:X}")
+                pending.append((resume, returns[:-1], caller_depth))
+            elif depth:
+                raise LiftUnsupported(f"unbalanced top-level RET at 0x{ip:X}")
+        elif mnemonic == Mnemonic.JMP:
+            pending.append((target(item), returns, depth))
+        elif mnemonic in _CC:
+            pending.append((target(item), returns, depth))
+            pending.append((next_ip, returns, depth))
+        elif item.flow_control == FlowControl.NEXT:
+            pending.append((next_ip, returns, depth))
+        else:
+            raise LiftUnsupported(f"unsupported control flow at 0x{ip:X}")
+    return maximum
+
+
 def lift_function(
     code: bytes,
     base: int = 0x1000,

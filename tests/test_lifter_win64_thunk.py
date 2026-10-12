@@ -69,11 +69,11 @@ def _visual_studio_available() -> bool:
 def test_generated_thunk_has_fixed_descriptor_and_cet_return_shape() -> None:
     source = win64_thunk.render_entry_thunk("virtual_leaf", "virtual_descriptor")
     assert "pushfq\n    .allocstack 8" in source
-    assert "sub     rsp, 32\n    .allocstack 32" in source
-    assert "call    daedalus_x64_enter_common" in source
+    assert "sub     rsp, 544\n    .allocstack 544" in source
+    assert "call    daedalus_x64_enter_common_stack512" in source
     assert "jmp     SHORT virtual_leaf_resume" in source
     assert "dq      OFFSET virtual_descriptor" in source
-    assert "add     rsp, 40\n    ret" in source
+    assert "add     rsp, 552\n    ret" in source
     assert "mov     ecx, 7" in source
     assert "int     29h" in source
     assert "popfq" not in source
@@ -127,7 +127,7 @@ def test_fresh_stub_exports_common_entry_and_opcode_provenance(
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
 
     image = _StubImage((build / "Release/lethe_stub_x64.dll").read_bytes())
-    common_rva = image.find_export_rva("daedalus_x64_enter_common")
+    common_rva = image.find_export_rva("daedalus_x64_enter_common_stack512")
     provenance_rva = image.find_export_rva("daedalus_opcode_mapping_sha256")
     handler_rva = image.find_export_rva("daedalus_handler_variant_sha256")
     assert common_rva is not None and common_rva > 0
@@ -314,7 +314,7 @@ uint64_t virtual_failure(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e);
 uint64_t virtual_zero_base(uint64_t a, uint64_t b, uint64_t c,
                            uint64_t d, uint64_t e);
-void daedalus_x64_enter_common(void);
+void daedalus_x64_enter_common_stack512(void);
 int verify_virtual_nonvolatiles(void);
 
 static uint64_t native_leaf(uint64_t a, uint64_t b, uint64_t c,
@@ -340,10 +340,10 @@ static int verify_thunk_unwind(PRUNTIME_FUNCTION runtime, DWORD64 image_base)
     static const struct {{ DWORD offset; LONG64 rsp_delta; }} points[] = {{
         {{ 0, 0 }},       /* before pushfq */
         {{ 1, -8 }},      /* after pushfq */
-        {{ 5, -40 }},     /* body, after complete prolog */
-        {{ 20, -40 }},    /* resume body */
-        {{ 26, -40 }},    /* add rsp,40 epilog instruction */
-        {{ 30, 0 }},      /* ret epilog instruction */
+        {{ 8, -552 }},    /* body, after complete prolog */
+        {{ 23, -552 }},   /* resume body */
+        {{ 29, -552 }},   /* add rsp,552 epilog instruction */
+        {{ 36, 0 }},      /* ret epilog instruction */
     }};
     DWORD64 stack[32] = {{0}};
     DWORD64 entry_rsp = (DWORD64)(uintptr_t)&stack[16];
@@ -388,7 +388,8 @@ int main(int argc, char **argv)
         {_c_bytes(win64_thunk.THUNK_TEMPLATE)}
     }};
     static const uint8_t expected_unwind[] = {{
-        0x01, 0x05, 0x02, 0x00, 0x05, 0x32, 0x01, 0x02
+        0x01, 0x08, 0x03, 0x00, 0x08, 0x01, 0x44, 0x00,
+        0x01, 0x02, 0x00, 0x00
     }};
     (void)argv;
     virtual_rip_descriptor.image_base =
@@ -411,7 +412,7 @@ int main(int argc, char **argv)
         (DWORD64)(uintptr_t)&virtual_leaf, &image_base, NULL);
     if (!thunk_runtime)
         return 1;
-    if (thunk_runtime->EndAddress - thunk_runtime->BeginAddress != 40)
+    if (thunk_runtime->EndAddress - thunk_runtime->BeginAddress != {win64_thunk.THUNK_CODE_SIZE})
         return 3;
     if (memcmp((const void *)(uintptr_t)(image_base + thunk_runtime->UnwindData),
                expected_unwind, sizeof(expected_unwind)) != 0)
@@ -419,7 +420,7 @@ int main(int argc, char **argv)
     if (verify_thunk_unwind(thunk_runtime, image_base) != 0)
         return 6;
     if (!RtlLookupFunctionEntry(
-            (DWORD64)(uintptr_t)&daedalus_x64_enter_common,
+            (DWORD64)(uintptr_t)&daedalus_x64_enter_common_stack512,
             &image_base, NULL))
         return 2;
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {{

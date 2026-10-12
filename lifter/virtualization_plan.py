@@ -44,7 +44,7 @@ EXTERNAL_ENTRY_ASSUMPTION = (
     "after its first byte; every external caller or branch must enter at the "
     "declared target RVA so the five-byte entry JMP cannot be bypassed."
 )
-STUB_COMMON_ENTRY_EXPORT = "daedalus_x64_enter_common"
+STUB_COMMON_ENTRY_EXPORT = "daedalus_x64_enter_common_stack512"
 STUB_OPCODE_HASH_EXPORT = "daedalus_opcode_mapping_sha256"
 STUB_HANDLER_VARIANT_HASH_EXPORT = "daedalus_handler_variant_sha256"
 TARGET_TOMBSTONE_POLICY = (
@@ -1074,6 +1074,12 @@ def _compile_one(
             source_extent_size=spec.size,
             native_call_targets=native_call_targets,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+        )
+        x64_lifter.validate_materialized_stack_window(
+            lifted_body,
+            base=spec.rva,
+            window_size=win64_thunk.STACK_WINDOW_SIZE,
+            native_call_targets=native_call_targets,
         )
         rip_relative_references = x64_lifter.validate_rip_relative_references(
             lifted_body,

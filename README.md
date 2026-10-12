@@ -36,7 +36,7 @@ turn on debugger-sensitive poison behavior.
 Candidate promotion and release replay run the exact rolling-capable DLL through
 the native selected-function paged-v1 E2E gate in both eager and memory-guard
 modes and through the source-bound schema-v3 padded-DLL E2E gate. Any skip,
-output mismatch, non-paged program, or test count other than twenty-eight rejects the
+output mismatch, non-paged program, or test count other than twenty-nine rejects the
 candidate/release replay. Six mandatory frame-call cases are source-compiled
 native primitive proof, not candidate-DLL executions; the artifact-bound lanes
 retain their separate candidate binding.
