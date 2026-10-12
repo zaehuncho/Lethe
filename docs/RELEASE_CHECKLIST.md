@@ -79,7 +79,10 @@ The six frame-call nodes are mandatory source-compiled native primitive proof,
 not executions of the candidate DLL. Other candidate-bound lanes retain their
 artifact binding. The mandatory materialized FP-frame node packs and executes
 generated EXE and DLL fixtures with eight mixed FP/integer positions and checks
-original parity. The dispatch sentinel is not Windows CFG matrix evidence. No installed product
+original parity. Materialization rejects indexed or truncated RSP-based source
+addresses: the static displacement alone does not bound a dynamic index. Fixed
+stack offsets, incoming stack arguments and non-stack indexed addresses retain
+their existing validation paths. The dispatch sentinel is not Windows CFG matrix evidence. No installed product
 runs in this test. The lifter uses the new `n_call_frame` opcode; keep the
 scalar-only `n_call_ptr` out of newly lifted call paths. Rebuild/stage a fresh
 candidate after this ISA change and retain its new opcode fingerprint. Do not

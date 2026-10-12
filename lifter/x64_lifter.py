@@ -2693,7 +2693,9 @@ def validate_materialized_stack_window(
     source CALL/RET pair includes its architectural eight-byte return slot;
     native bridge calls are net-zero.  Unknown RSP writes, variable-sized
     frames, unbalanced returns and cyclic growth are rejected, rather than
-    relying on an empirical stack cushion.
+    relying on an empirical stack cushion.  Direct stack-address operands must
+    use unindexed, full-width RSP: an unconstrained index or truncated stack
+    base cannot be bounded by the displacement alone.
     """
     if window_size <= 0 or window_size % 16:
         raise ValueError("stack window must be a positive 16-byte multiple")
@@ -2728,6 +2730,21 @@ def validate_materialized_stack_window(
     def signed64(value: int) -> int:
         return value if value < (1 << 63) else value - (1 << 64)
 
+    def check_stack_address(base_register, index_register, displacement,
+                            *, depth: int, ip: int, label: str) -> None:
+        if base_register not in rsp_aliases and index_register not in rsp_aliases:
+            return
+        if base_register != Register.RSP or index_register != Register.NONE:
+            raise LiftUnsupported(
+                f"unbounded source stack {label} at 0x{ip:X}: "
+                "requires unindexed 64-bit RSP"
+            )
+        offset = -depth + signed64(displacement)
+        if offset < -window_size:
+            raise LiftUnsupported(
+                f"source stack {label} at 0x{ip:X} exceeds {window_size}-byte window"
+            )
+
     pending = [(base, (), 0)]
     visited = set()
     maximum = 0
@@ -2750,18 +2767,15 @@ def validate_materialized_stack_window(
         mnemonic = item.mnemonic
         info = info_factory.info(item)
         for memory in info.used_memory():
-            if memory.base == Register.RSP:
-                offset = -depth + signed64(memory.displacement)
-                if offset < -window_size:
-                    raise LiftUnsupported(
-                        f"source stack access at 0x{ip:X} exceeds {window_size}-byte window"
-                    )
-        if mnemonic == Mnemonic.LEA and item.memory_base == Register.RSP:
-            offset = -depth + signed64(item.memory_displacement)
-            if offset < -window_size:
-                raise LiftUnsupported(
-                    f"source stack address at 0x{ip:X} exceeds {window_size}-byte window"
-                )
+            check_stack_address(
+                memory.base, memory.index, memory.displacement,
+                depth=depth, ip=ip, label="access",
+            )
+        if mnemonic == Mnemonic.LEA:
+            check_stack_address(
+                item.memory_base, item.memory_index, item.memory_displacement,
+                depth=depth, ip=ip, label="address",
+            )
         if mnemonic == Mnemonic.PUSH:
             depth += 8
         elif mnemonic == Mnemonic.POP:

@@ -77,6 +77,58 @@ def test_selected_function_plan_rejects_stack_window_overflow() -> None:
         _compile(source)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "mov rax, [rsp+rcx*8]; ret",
+        "mov [rsp+rcx*8], rax; ret",
+        "lea rax, [rsp+rcx*8]; ret",
+        "mov [rsp+rcx], rax; ret",
+        "sub rsp, 0x40; mov rax, [rsp+rcx*8+0x20]; add rsp, 0x40; ret",
+        "test rdx, rdx; je done; mov [rsp+rcx*8], rax; done: ret",
+        "call inner; ret; inner: mov rax, [rsp+rcx*8]; ret",
+    ],
+)
+def test_materialized_stack_rejects_unbounded_index_in_validator_and_plan(
+    source: str,
+) -> None:
+    code = _asm(source)
+    with pytest.raises(x64_lifter.LiftUnsupported, match="unbounded source stack"):
+        x64_lifter.validate_materialized_stack_window(
+            code, window_size=win64_thunk.STACK_WINDOW_SIZE
+        )
+    with pytest.raises(plan.FunctionRejected, match="unbounded source stack"):
+        _compile(code)
+
+
+@pytest.mark.parametrize("source", [
+    "mov eax, [esp]; ret",
+    "lea eax, [esp-0x20]; ret",
+])
+def test_materialized_stack_rejects_truncated_stack_address(source: str) -> None:
+    with pytest.raises(x64_lifter.LiftUnsupported, match="unindexed 64-bit RSP"):
+        x64_lifter.validate_materialized_stack_window(
+            _asm(source), window_size=win64_thunk.STACK_WINDOW_SIZE
+        )
+
+
+@pytest.mark.parametrize(("source", "maximum"), [
+    ("mov rax, [rsp+0x28]; ret", 0),
+    ("mov rax, [rsp-0x200]; ret", 0),
+    ("sub rsp, 0x40; lea rcx, [rsp+0x20]; add rsp, 0x40; ret", 0x40),
+    ("mov rax, [rcx+rdx*8]; ret", 0),
+    ("lea rax, [rcx+rdx*8]; ret", 0),
+])
+def test_materialized_stack_keeps_fixed_arguments_and_nonstack_indexing(
+    source: str, maximum: int,
+) -> None:
+    code = _asm(source)
+    assert x64_lifter.validate_materialized_stack_window(
+        code, window_size=win64_thunk.STACK_WINDOW_SIZE
+    ) == maximum
+    assert len(_compile(code).functions) == 1
+
+
 def _asm(source: str, *, rva: int = 0x1000) -> bytes:
     encoded, _ = _KS.asm(source, addr=rva)
     return bytes(encoded)
