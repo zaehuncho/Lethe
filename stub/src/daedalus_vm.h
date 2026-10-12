@@ -220,7 +220,8 @@ typedef enum VvmOpcode {
     DVM_PICK        = 0x37, /* 1 byte n: copy stack[sp-1-n] to top (0=DUP)  */
     DVM_STORE128    = 0x38, /* pop hi,lo,addr -> one unaligned 16-byte store */
     DVM_LOAD128A    = 0x39, /* pop aligned addr -> push low,high lanes       */
-    DVM_STORE128A   = 0x3A  /* pop hi,lo,aligned addr -> one aligned store  */
+    DVM_STORE128A   = 0x3A, /* pop hi,lo,aligned addr -> one aligned store  */
+    DVM_N_CALL_FRAME = 0x3B /* Win64 argv[8] plus volatile x64 frame state   */
 } VvmOpcode;
 
 /* ---- VM state ----------------------------------------------------------- */

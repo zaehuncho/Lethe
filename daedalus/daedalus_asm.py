@@ -93,6 +93,7 @@ OPCODES = {
     'store128':       (0x38, 0, 'none'),
     'load128a':       (0x39, 0, 'none'),
     'store128a':      (0x3A, 0, 'none'),
+    'n_call_frame':   (0x3B, 0, 'none'),
 }
 
 

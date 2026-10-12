@@ -209,7 +209,7 @@ def test_bridged_caller_dual_runs_byte_identical_to_native(a: int, b: int) -> No
         source_extent_size=len(caller),
         native_call_targets=native_call_targets,
     )
-    assert vasm.count("n_call_ptr") == 1
+    assert vasm.count("n_call_frame") == 1
     program = daedalus_asm.assemble(vasm)
 
     captured = {}
@@ -225,7 +225,7 @@ def test_bridged_caller_dual_runs_byte_identical_to_native(a: int, b: int) -> No
     stack_base = 0x50000000
     stack_mem = bytearray(0x4000)
     vm = daedalus_ref.RefVM(
-        code_bytes, data, native_call_hook=bridge,
+        code_bytes, data, native_frame_hook=bridge,
         mem=stack_mem, mem_base=stack_base)
 
     def _set(reg, val):

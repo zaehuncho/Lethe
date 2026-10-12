@@ -24,7 +24,7 @@
 #include "daedalus_opcodes_shuffled.h"
 #else
 #define DVM_OPCODE_MAPPING_SHA256 \
-    "bc43af12ba3d0bdc0fd00f5bd9c84602f54b26a61c22ddbcf7af35de1aebc01f"
+    "14864446f306a76e1783f3262e494977ae62bcc86ac1003fc3c31abac3eda470"
 #define DVM_HANDLER_VARIANT_SHA256 \
     "41b31ad73ed541bd478cc97567fdee815d4154666608703b7e1ac2ebcc8b873d"
 #define DVM_HANDLER_VARIANT_ADD    0
@@ -52,6 +52,8 @@ __declspec(dllexport) const char daedalus_handler_variant_sha256[] =
 
 /* Forward-declare the MASM trampoline for N_CALL_PTR (daedalus_trampoline.asm). */
 extern uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv);
+extern void daedalus_trampoline_frame(
+    void *func, DaedalusX64Context *context, const uint64_t *argv);
 extern void dvm_store128_unaligned(void *destination, uint64_t low, uint64_t high);
 extern void dvm_load128_aligned(
     const void *source, uint64_t *low, uint64_t *high);
@@ -83,6 +85,12 @@ static __forceinline int dvm_pop(DaedalusVM *vm, uint64_t *out)
 static __forceinline int dvm_have(const DaedalusVM *vm, uint32_t total_len)
 {
     return ((uint64_t)vm->pc + total_len) <= (uint64_t)vm->code_size;
+}
+
+static __forceinline void dvm_wr_u64(uint8_t *p, uint64_t value)
+{
+    int i;
+    for (i = 0; i < 8; ++i) p[i] = (uint8_t)(value >> (i * 8));
 }
 
 static __forceinline uint16_t dvm_rd_u16(const uint8_t *p)
@@ -713,6 +721,62 @@ static int dvm_run(DaedalusVM *vm)
             }
             result = daedalus_trampoline_call((void *)(uintptr_t)func_ptr,
                                             argc, argv_local);
+            if (dvm_push(vm, result)) return -1;
+            vm->pc += 1;
+            break;
+        }
+
+        /* The lifted-call ABI carries positional GPR/stack arguments and the
+         * captured volatile register file. N_CALL_PTR remains scalar-only for
+         * legacy hand-authored VM programs. Reject arity before any call. */
+        case DVM_N_CALL_FRAME: {
+            uint64_t func_ptr, ac, argv_local[8], result;
+            DaedalusX64Context frame;
+            static const uint16_t flag_offsets[5] = {
+                DVM_X64_LOCAL_CF, DVM_X64_LOCAL_PF, DVM_X64_LOCAL_ZF,
+                DVM_X64_LOCAL_SF, DVM_X64_LOCAL_OF
+            };
+            static const uint8_t flag_bits[5] = {0, 2, 6, 7, 11};
+            static const uint8_t volatile_gprs[7] = {
+                DVM_X64_RAX, DVM_X64_RCX, DVM_X64_RDX, DVM_X64_R8,
+                DVM_X64_R9, DVM_X64_R10, DVM_X64_R11
+            };
+            int i, lane;
+            if (vm->sp < 10) return -1;
+            func_ptr = vm->stack[vm->sp - 1];
+            ac = vm->stack[vm->sp - 2];
+            if (ac != 8 || func_ptr == 0) return -1;
+            vm->sp -= 2;
+            for (i = 7; i >= 0; --i) argv_local[i] = vm->stack[--vm->sp];
+            for (i = 0; i < DVM_X64_GPR_COUNT; ++i)
+                frame.gpr[i] = dvm_rd_u64(vm->locals + i * 8);
+            frame.rflags = UINT64_C(2);
+            for (i = 0; i < 5; ++i)
+                frame.rflags |= (dvm_rd_u64(vm->locals + flag_offsets[i]) & 1)
+                                << flag_bits[i];
+            for (i = 0; i < DVM_X64_XMM_COUNT; ++i)
+                for (lane = 0; lane < DVM_X64_XMM_LANES; ++lane)
+                    frame.xmm[i][lane] = dvm_rd_u64(vm->locals +
+                        DVM_X64_LOCAL_XMM_BASE + i * 16 + lane * 8);
+            daedalus_trampoline_frame((void *)(uintptr_t)func_ptr,
+                                     &frame, argv_local);
+            for (i = 0; i < 7; ++i) {
+                int reg = volatile_gprs[i];
+                dvm_wr_u64(vm->locals + reg * 8, frame.gpr[reg]);
+            }
+            for (i = 0; i < 5; ++i)
+                dvm_wr_u64(vm->locals + flag_offsets[i],
+                           (frame.rflags >> flag_bits[i]) & 1);
+            for (i = 0; i < 6; ++i)
+                for (lane = 0; lane < DVM_X64_XMM_LANES; ++lane)
+                    dvm_wr_u64(vm->locals + DVM_X64_LOCAL_XMM_BASE +
+                               i * 16 + lane * 8, frame.xmm[i][lane]);
+            result = frame.gpr[DVM_X64_RAX];
+            /* frame/argv contain transient captured application state. */
+            { volatile uint8_t *p = (volatile uint8_t *)&frame;
+              uint32_t n; for (n = 0; n < (uint32_t)sizeof(frame); ++n) p[n] = 0; }
+            { volatile uint8_t *p = (volatile uint8_t *)argv_local;
+              uint32_t n; for (n = 0; n < (uint32_t)sizeof(argv_local); ++n) p[n] = 0; }
             if (dvm_push(vm, result)) return -1;
             vm->pc += 1;
             break;

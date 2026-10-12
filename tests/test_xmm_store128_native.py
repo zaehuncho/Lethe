@@ -511,6 +511,7 @@ add_executable(store128_rolling
     "{(stub_source / 'daedalus_vm.c').as_posix()}"
     "{(stub_source / 'daedalus_rolling.c').as_posix()}"
     "{(stub_source / 'daedalus_store128.asm').as_posix()}"
+    "{(stub_source / 'daedalus_call_frame.asm').as_posix()}"
     "{(stub_source / 'daedalus_trampoline.asm').as_posix()}"
     "{(stub_source / 'key_scatter.c').as_posix()}"
     "{(stub_source / 'crypto.c').as_posix()}")

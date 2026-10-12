@@ -8,8 +8,8 @@ Three new supported shapes, each fail-closed and oracle-proven:
   (the callee is left native), instead of being rejected as out-of-extent.
 * **Control-Flow-Guard dispatched indirect call** -- the MSVC
   ``mov rax, <target>; call qword ptr [__guard_dispatch_icall_fptr]`` idiom is
-  bridged with the real target taken from RAX, rather than mis-read as a plain
-  import call (which would jump to the dispatch thunk with RAX unmarshalled).
+  bridged by invoking the actual dispatch slot with its real target in RAX.
+  The frame ABI preserves the dispatch input rather than bypassing the guard.
 * **Multi-fragment (multi-range) function** -- a function the linker split into
   a hot body plus a contiguous cold return tail lifts as one body with the
   cross-fragment ``jcc`` resolved, including the cold return path.
@@ -94,11 +94,11 @@ def test_direct_native_call_lifts_to_bridge_at_image_base_plus_rva() -> None:
         selected_extents=((_CODE_RVA, len(code)),),
         native_call_targets=frozenset({target_rva}),
     )
-    assert vasm.count("n_call_ptr") == 1
+    assert vasm.count("n_call_frame") == 1
     # func_ptr = runtime image base + the target RVA (no slot dereference).
     assert f"local_addr {lifter.IMAGE_BASE}" in vasm
     assert f"push_imm64 0x{target_rva:016X}" in vasm
-    assert "load64\n  n_call_ptr" not in vasm  # direct address, not a slot load
+    assert "load64\n  n_call_frame" not in vasm  # direct address, not a slot load
     assert daedalus_asm.assemble(vasm)
 
 
@@ -181,7 +181,7 @@ def test_direct_native_call_marshalling_matches_unicorn(monkeypatch=None) -> Non
     data, code_bytes = program[2:2 + ds], program[2 + ds:]
     mem = bytearray(mem_size)
     vm = daedalus_ref.RefVM(code_bytes, data, mem=mem, mem_base=mem_base,
-                            native_call_hook=mock_callee)
+                            native_frame_hook=mock_callee)
 
     def _set(reg, val):
         off = lifter.GPR_NAMES.index(reg) * 8
@@ -209,7 +209,7 @@ def test_direct_native_call_marshalling_matches_unicorn(monkeypatch=None) -> Non
 _GUARD_SLOT_RVA = 0x4008
 
 
-def test_cfg_dispatch_call_bridges_via_rax_not_slot_load() -> None:
+def test_cfg_dispatch_call_invokes_slot_with_captured_rax() -> None:
     code = _call_to_slot(
         "sub rsp,0x28; call qword ptr [rip+{disp}]; add rsp,0x28; ret",
         slot_rva=_GUARD_SLOT_RVA,
@@ -220,18 +220,15 @@ def test_cfg_dispatch_call_bridges_via_rax_not_slot_load() -> None:
         selected_extents=((_CODE_RVA, len(code)),),
     )
     assert "load64" in as_import  # slot dereference
-    # With the guard RVA it becomes a dispatch bridge: func_ptr = RAX.
+    # The actual dispatch pointer is invoked with captured target RAX intact.
     as_cfg = lifter.lift_function(
         code, base=_CODE_RVA, image_sections=_rdata_sections(code),
         selected_extents=((_CODE_RVA, len(code)),),
         guard_cf_dispatch_rva=_GUARD_SLOT_RVA,
     )
-    assert as_cfg.count("n_call_ptr") == 1
-    # Both forms load the four outgoing stack args; only the import form does an
-    # EXTRA load64 to dereference the slot. The dispatch form reads RAX instead,
-    # so it has exactly one fewer load64 and never touches the slot RVA.
-    assert as_import.count("load64") == as_cfg.count("load64") + 1
-    assert f"push_imm64 0x{_GUARD_SLOT_RVA:016X}" not in as_cfg
+    assert as_cfg.count("n_call_frame") == 1
+    assert as_import.count("load64") == as_cfg.count("load64")
+    assert f"push_imm64 0x{_GUARD_SLOT_RVA:016X}" in as_cfg
     assert daedalus_asm.assemble(as_cfg)
 
 
@@ -307,6 +304,7 @@ def test_cfg_dispatch_marshalling_and_target_match_unicorn() -> None:
 
     def mock_callee(vm, func_ptr, argc, argv):
         captured["func_ptr"] = func_ptr
+        captured["rax_target"] = int.from_bytes(vm.locals[0:8], "little")
         x, y, z, out_ptr = argv[0], argv[1], argv[2], argv[3]
         buf, idx = vm._mem_ref(out_ptr, 8)
         buf[idx:idx + 8] = out_value(x, y, z).to_bytes(8, "little")
@@ -315,8 +313,9 @@ def test_cfg_dispatch_marshalling_and_target_match_unicorn() -> None:
     ds = int.from_bytes(program[:2], "little")
     data, code_bytes = program[2:2 + ds], program[2 + ds:]
     mem = bytearray(mem_size)
+    mem[slot_off:slot_off + 8] = thunk_va.to_bytes(8, "little")
     vm = daedalus_ref.RefVM(code_bytes, data, mem=mem, mem_base=mem_base,
-                            native_call_hook=mock_callee)
+                            native_frame_hook=mock_callee)
 
     def _set(reg, val):
         off = lifter.GPR_NAMES.index(reg) * 8
@@ -332,8 +331,9 @@ def test_cfg_dispatch_marshalling_and_target_match_unicorn() -> None:
         vm.locals[lifter.GPR_NAMES.index("rax") * 8:
                   lifter.GPR_NAMES.index("rax") * 8 + 8], "little")
     ref_out = int.from_bytes(vm.mem[out_off:out_off + 8], "little")
-    # The bridge forwarded RAX (the CFG target), never the dispatch thunk slot.
-    assert captured["func_ptr"] == callee_va
+    # Dispatch itself is called; its target remains in the captured RAX.
+    assert captured["func_ptr"] == thunk_va
+    assert captured["rax_target"] == callee_va
     assert ref_rax == unicorn_rax
     assert ref_out == unicorn_out
 

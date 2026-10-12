@@ -256,6 +256,7 @@ add_executable(bytecode_pages_test
     "{(source_dir / 'crypto.c').as_posix()}"
     "{(source_dir / 'daedalus_vm.c').as_posix()}"
     "{(source_dir / 'daedalus_store128.asm').as_posix()}"
+    "{(source_dir / 'daedalus_call_frame.asm').as_posix()}"
 )
 target_include_directories(bytecode_pages_test PRIVATE "{source_dir.as_posix()}")
 target_compile_definitions(bytecode_pages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -336,6 +337,7 @@ add_executable(daedalus_paged_vm_test
     "{(source_dir / 'crypto.c').as_posix()}"
     "{(source_dir / 'daedalus_vm.c').as_posix()}"
     "{(source_dir / 'daedalus_store128.asm').as_posix()}"
+    "{(source_dir / 'daedalus_call_frame.asm').as_posix()}"
     "{(source_dir / 'key_scatter.c').as_posix()}"
 )
 target_include_directories(daedalus_paged_vm_test PRIVATE "{source_dir.as_posix()}")

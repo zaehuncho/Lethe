@@ -127,33 +127,25 @@ else + a **differential oracle** that proves every lift correct.
   one MASM `movdqu` memory store; a native guard-page test proves a cross-page
   fault leaves the first lane unchanged. This cut does not add
   floating-point/SIMD arithmetic or VEX/AVX encodings.
-- **Cut 16** - the external-call ABI bridge: the standard MSVC
-  `call qword ptr [rip+disp32]` import form (an IAT slot or a RIP-relative
-  global function pointer). Because the lifted body is the caller, the Win64
-  argument setup (RCX/RDX/R8/R9, the `[RSP+0x20+]` outgoing slots, the shadow
-  reservation) is already lifted as ordinary register/memory writes, so the
-  bridge only resolves the live target pointer from the slot, marshals the four
-  register arguments plus the first four outgoing stack slots into the existing
-  `n_call_ptr` trampoline (a full Win64 pass-through: sets the argument
-  registers, provides 32-byte shadow space, forwards up to four stack
-  arguments, returns RAX), and commits the returned RAX. The call target RVA is
-  decoded RIP-relative and validated as mapped, readable, non-executable,
-  non-discardable image data outside every selected extent, so ASLR never bakes
-  a preferred VA into bytecode and a slot pointing at code is rejected. A
-  near call/RET pair is architecturally RSP-neutral for the caller, so the VM
-  RSP local is left unchanged; volatile registers (RCX/RDX/R8-R11) and RFLAGS
-  are ABI-scratch across a call and are intentionally not reproduced, while
-  nonvolatile registers are preserved by the callee and by the trampoline and
-  output-parameter memory is written by the real callee through the
-  caller-supplied pointers. A native runtime differential test executes the
-  bridge against a real deterministic callee (four register + two stack
-  arguments + an output pointer) and a real Win32 API, asserting the return
-  value, output memory, and preserved nonvolatiles/RSP match a direct native
-  call; a Unicorn/reference-VM oracle test proves the register marshalling and
-  slot resolution against a mock callee both sides invoke identically.
-  Register-indirect (`call reg`), base/index-indirect (`call [reg]`,
-  `call [reg+idx*s+disp]`), far, and segment-overridden calls stay native, and a
-  callee taking more than eight arguments is out of the trampoline's envelope.
+- **Cut 16 / frame-call correction** - RIP-relative import/global pointer
+  calls marshal four GPR and four stack positions through `n_call_frame`.
+  The native MASM boundary additionally forwards XMM0..5, RAX/R10/R11 and the
+  five modeled arithmetic flags, then captures all seven volatile GPRs,
+  XMM0..5 and returned arithmetic flags. Floating-point returns remain in
+  XMM0; scalar returns also appear on the VM stack. Nonvolatiles and virtual
+  RSP remain unchanged under the standard Win64 callee contract.
+  RIP slots still require readable, file-backed, non-executable,
+  non-discardable data outside every selected range. All four outgoing stack
+  slots must be backed, even when a callee ignores surplus arguments.
+  The original `n_call_ptr` scalar opcode remains available to hand-authored
+  programs; the lifter does not use it as a frame-call fallback.
+  The envelope is positional Win64 with at most eight arguments, not
+  vectorcall, arbitrary arity, source-return-address identity or exception
+  bridging. Register/base-indirect, far and segment-overridden calls still bail.
+  The generated C/MASM native fixture covers mixed register/stack FP and
+  integer arguments, FP returns, all 32 incoming arithmetic-flag states,
+  volatile state, nonvolatile preservation and strict malformed-call rejection
+  in plain/rolling modes. It runs no installed product.
 - **Cut 17** — the extent/call-graph capabilities a real MSVC verifier needs
   (proven end-to-end on SecurityCore's `ed25519Verify`, a 5-fragment function).
   (a) **Multi-range (multi-fragment) extent**: a function the linker split into
@@ -171,15 +163,12 @@ else + a **differential oracle** that proves every lift correct.
   trampoline (callee left native), a direct-address variant that skips the slot
   load. Any out-of-extent direct call to a non-proven target still bails.
   (c) **Control-Flow-Guard dispatched indirect call**: the MSVC
-  `mov rax,<t>; call qword ptr [__guard_dispatch_icall_fptr]` idiom is
-  recognized by the load-config dispatch-pointer RVA and bridged with the target
-  taken from RAX (the native CFG bitmap check — a hardening step, not part of the
-  callee's result — is not reproduced), instead of being mis-read as a plain
-  import that would jump to the dispatch thunk with RAX unmarshalled. All three
-  are differential-checked (Unicorn vs the reference VM) and proven on the real
-  DLL: the lifted `ed25519Verify` returns byte-identical results to native for a
-  valid RFC 8032 signature (true), a tampered signature (false), and a
-  wrong-length key (false, via the out-of-extent cold epilogue).
+  `mov rax,<t>; call qword ptr [__guard_dispatch_icall_fptr]` idiom invokes
+  the actual dispatch pointer with the captured target in RAX. The frame
+  bridge does not replace it with a direct target call. The generated dispatch
+  sentinel proves that both admission and denial execute the dispatcher;
+  that sentinel is not the Windows CFG negative matrix or product acceptance.
+  Earlier installed-product results do not validate this revised native ABI.
 - **Cut 18** — aligned 128-bit `movaps`/`movdqa` memory loads and stores.
   Dedicated `load128a`/`store128a` VM operations cross MASM boundaries whose
   sole memory transfer is `movdqa`, so an unaligned address raises the native
@@ -347,3 +336,13 @@ that attempt to declare a generated thunk GFID fail before materialization.
 ## Dependencies (builder-side, test-only here)
 `iced-x86` (decode), `unicorn` + `keystone` (oracle/tests). The tests
 `importorskip` them, so the suite still runs where they're absent.
+
+## Frame-call native candidate requirement
+
+`n_call_frame` is canonical opcode 0x3B and changes the complete opcode mapping
+fingerprint. Newly emitted programs require a freshly rebuilt/staged candidate;
+old runtime mappings must be rejected, never silently substituted. The rolling
+runtime now derives its valid canonical upper bound from the ISA header rather
+than the stale 0x38 limit, which also fixes rolling aligned 128-bit transfers.
+See [Microsoft's x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention)
+and [unwind-aware prologs](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog).

@@ -25,7 +25,10 @@ instruction boundaries inside the same selected extent preserve architectural
 stack effects and use shadow-validated VM returns. Direct RIP-relative import
 calls (`call qword ptr [rip+disp32]`) are bridged through the Win64 native-call
 trampoline: the slot pointer is resolved at runtime and the already-lifted
-register/stack arguments are marshalled into the call. Legacy XMM moves and
+register/stack arguments and volatile XMM state are marshalled into the call.
+The frame bridge captures volatile GPR/XMM returns and arithmetic flags; GuardCF
+dispatch calls invoke the original dispatch pointer with the target in RAX.
+Legacy XMM moves and
 bitwise XOR/AND/OR operate on a captured 16-register, two-lane state. Legacy
 SSE2 PCMPEQB/PCMPEQW/PCMPEQD and PCMPGTB/PCMPGTW/PCMPGTD
 comparisons operate on exact packed integer elements without changing flags.
@@ -1908,7 +1911,7 @@ class _Lifter:
 
     def _import_call(self, instr) -> None:
         """Bridge a direct RIP-relative import call through the Win64 native-
-        call trampoline (the DVM ``n_call_ptr`` path).
+        call trampoline (the DVM ``n_call_frame`` path).
 
         Because the lifted body IS the caller, the Win64 argument setup (the
         movs into RCX/RDX/R8/R9 and the ``[RSP+0x20+]`` outgoing stack slots,
@@ -1920,12 +1923,13 @@ class _Lifter:
         The bridge only has to: resolve the live target pointer from the slot,
         marshal the four register arguments plus the first four outgoing stack
         slots into the trampoline's argv, invoke it, and store the returned RAX
-        back. A near call/RET pair is architecturally RSP-neutral for the
-        caller, so the VM RSP local is intentionally left unchanged. Volatile
-        registers (RCX/RDX/R8-R11) and RFLAGS are ABI-scratch across a call and
-        are not reproduced; nonvolatile registers are preserved by the callee
-        and by the trampoline, and any output-parameter memory is written by the
-        real callee through the caller-supplied pointers."""
+        back. N_CALL_FRAME also forwards XMM0..5 and incoming RAX/R10/R11,
+        then commits all volatile GPR/XMM returns and modeled arithmetic flags.
+        A near call/RET pair is RSP-neutral for the caller, so the VM RSP local
+        remains unchanged. Nonvolatiles follow the normal Win64 callee contract;
+        output-parameter memory is written by the real callee through its inputs.
+        This is positional Win64 with at most eight arguments, not vectorcall,
+        arbitrary arity, source-return-address identity or exception bridging."""
         slot_rva = int(instr.ip_rel_memory_address)
         self._marshal_win64_argv()
         # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
@@ -1934,18 +1938,19 @@ class _Lifter:
         self.push_imm(slot_rva)
         self.a("add")
         self.a("load64")
-        self.a("n_call_ptr")                      # -> trampoline RAX on TOS
+        self.a("n_call_frame")                      # -> trampoline RAX on TOS
         self.wr_reg(Register.RAX)                 # commit the scalar return
 
     def _marshal_win64_argv(self) -> None:
-        """Push the fixed Win64 pass-through argv the ``n_call_ptr`` trampoline
+        """Push the fixed Win64 pass-through argv the ``n_call_frame`` trampoline
         consumes: the four register arguments then the first four outgoing stack
         slots at ``[RSP+0x20/0x28/0x30/0x38]``, followed by a fixed argc of 8.
 
-        argv is popped in reverse by ``n_call_ptr``, so argument 0 is pushed
+        argv is popped in reverse by ``n_call_frame``, so argument 0 is pushed
         first (deepest) and the ``func_ptr`` is pushed last (TOS) by the caller.
-        A callee taking fewer arguments ignores the surplus; the stack reads stay
-        inside the mapped caller frame, so they never fault. This is the exact
+        A callee taking fewer arguments ignores the surplus. The bounded caller
+        frame must back all four outgoing stack slots; these are real reads.
+        This is the exact
         marshalling Cut 16 proved against a real Win64 callee -- every external
         call bridge (import, GuardCF dispatch, direct first-party) reuses it, so
         only the ``func_ptr`` computation differs between them."""
@@ -1961,23 +1966,18 @@ class _Lifter:
         self.push_imm(8)                          # argc
 
     def _cfg_dispatch_call(self, instr) -> None:
-        """Bridge a Control-Flow-Guard dispatched indirect call (``call qword ptr
-        [__guard_dispatch_icall_fptr]``) through the Win64 trampoline.
+        """Invoke the actual GuardCF dispatch slot with captured RAX intact.
 
-        The guarded idiom loads the real target into RAX, then calls the dispatch
-        slot; the slot's thunk validates RAX against the CFG bitmap and transfers
-        to it. Functionally the callee is the value in RAX, so the bridge forwards
-        the current VM RAX as ``func_ptr`` (identical marshalling to Cut 16) and
-        commits the returned RAX. RAX is read as the target BEFORE it is
-        overwritten by the return; the four argument reads do not touch it. The
-        native CFG bitmap check is a hardening step, not part of the callee's
-        result, and is intentionally not reproduced -- the virtualized body's
-        control flow is already interpreter-mediated rather than x86-CFG-guarded.
-        Volatile registers/RFLAGS are ABI-scratch and are not reproduced."""
+        N_CALL_FRAME reloads volatile GPR/XMM state, including the dispatch
+        target in RAX, and captures its return state. The original guard thunk
+        performs its check; the lifter never substitutes a direct target call.
+        """
         self._marshal_win64_argv()
-        self.rd_reg(Register.RAX)                 # func_ptr = CFG dispatch target
-        self.a("n_call_ptr")
-        self.wr_reg(Register.RAX)                 # commit the scalar return
+        self.rd_local(IMAGE_BASE)
+        self.push_imm(int(instr.ip_rel_memory_address))
+        self.a("add"); self.a("load64")
+        self.a("n_call_frame")
+        self.wr_reg(Register.RAX)
 
     def _direct_native_call(self, instr, target_rva: int) -> None:
         """Bridge a direct near ``call`` to a first-party callee left native.
@@ -1991,7 +1991,7 @@ class _Lifter:
         self.rd_local(IMAGE_BASE)
         self.push_imm(int(target_rva))
         self.a("add")
-        self.a("n_call_ptr")
+        self.a("n_call_frame")
         self.wr_reg(Register.RAX)                 # commit the scalar return
 
     def _call(self, instr) -> None:

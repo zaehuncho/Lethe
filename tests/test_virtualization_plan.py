@@ -200,6 +200,10 @@ def test_valid_local_branch_leaf_emits_complete_manifest() -> None:
         "direct_native_calls_supported": True,
         "rip_relative_import_calls_supported": True,
         "guard_cf_dispatch_calls_supported": True,
+        "native_call_volatile_frame_round_trip": True,
+        "native_call_positional_fp_supported": True,
+        "native_call_bounded_eight_argument_abi": True,
+        "guard_cf_original_dispatch_invoked": True,
         "external_interior_entries_supported": False,
         "direct_internal_calls_supported": True,
         "leaf_only": True,
@@ -911,3 +915,10 @@ def test_rip_reference_cannot_address_another_selected_extent() -> None:
             generated_text_rva=0x5000,
             generated_data_rva=0x7000,
         )
+
+
+def test_pre_frame_runtime_mapping_is_rejected_instead_of_scalar_fallback():
+    old=dict(daedalus_asm.OPCODES)
+    old.pop("n_call_frame")
+    with pytest.raises(plan.VirtualizationPlanError,match="incomplete; missing n_call_frame"):
+        plan.OpcodeTable.from_mapping(old,identity="pre-frame-runtime")

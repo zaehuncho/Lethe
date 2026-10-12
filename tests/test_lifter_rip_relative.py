@@ -333,5 +333,6 @@ def test_rip_relative_import_call_bridges_through_native_path() -> None:
         image_sections=_sections(code, bytes(16)),
         selected_extents=((0x1000, len(code)),),
     )
-    assert "n_call_ptr" in assembly
+    assert "n_call_frame" in assembly
+    assert "n_call_ptr" not in assembly
     assert f"local_addr {lifter.IMAGE_BASE}" in assembly

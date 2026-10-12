@@ -36,8 +36,10 @@ turn on debugger-sensitive poison behavior.
 Candidate promotion and release replay run the exact rolling-capable DLL through
 the native selected-function paged-v1 E2E gate in both eager and memory-guard
 modes and through the source-bound schema-v3 padded-DLL E2E gate. Any skip,
-output mismatch, non-paged program, or test count other than twenty-two rejects the
-candidate/release replay.
+output mismatch, non-paged program, or test count other than twenty-eight rejects the
+candidate/release replay. Six mandatory frame-call cases are source-compiled
+native primitive proof, not candidate-DLL executions; the artifact-bound lanes
+retain their separate candidate binding.
 The separate EXE/DLL round-trip gate is frozen at nineteen checks and rejects
 reduced or ambiguous terminal summaries.
 | **Obfuscation** (`obfuscation/`) | A custom LLVM pass plugin (control-flow flattening + opaque predicates + MBA + bogus control flow, per-build randomized). *Drafted, not yet compiled — needs an LLVM toolchain; see its README.* |
@@ -277,7 +279,13 @@ Concrete, honest limitations of the offline layer:
   stack return addresses and use shadow-validated VM returns. Bounded
   RIP-relative import calls, proven direct calls to first-party PDATA entries
   left native, and the MSVC CFG-dispatch idiom cross the Win64 native-call
-  bridge. The bounded legacy XMM transport subset includes whole-register,
+  frame bridge. It forwards positional float/double arguments, captures volatile
+  GPR/XMM returns and arithmetic flags, and invokes the actual CFG dispatch
+  pointer with its target in RAX. It remains bounded to eight arguments and the
+  standard Win64 ABI, not vectorcall or exception/return-address transparency.
+  The new `n_call_frame` opcode changes the mapping fingerprint: rebuild and
+  stage an intact native candidate; an older mapping is not compatible with
+  newly emitted programs. The bounded legacy XMM transport subset includes whole-register,
   scalar MOVSS/MOVSD, low/high 64-bit lane moves, and immediate whole-register
   byte shifts. Legacy SSE2 PCMPEQB/PCMPEQW/PCMPEQD and
   PCMPGTB/PCMPGTW/PCMPGTD support XMM or aligned 128-bit memory sources and

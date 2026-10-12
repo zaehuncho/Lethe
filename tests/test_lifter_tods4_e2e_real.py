@@ -293,6 +293,7 @@ int main(void) {{
     vm_source = (ROOT / "stub/src/daedalus_vm.c").as_posix()
     rolling_source = (ROOT / "stub/src/daedalus_rolling.c").as_posix()
     store128_source = (ROOT / "stub/src/daedalus_store128.asm").as_posix()
+    frame_source = (ROOT / "stub/src/daedalus_call_frame.asm").as_posix()
     trampoline_source = (ROOT / "stub/src/daedalus_trampoline.asm").as_posix()
     vm_include = (ROOT / "stub/src").as_posix()
     (tmp_path / "CMakeLists.txt").write_text(
@@ -300,7 +301,7 @@ int main(void) {{
 cmake_minimum_required(VERSION 3.20)
 project(lethe_tods4_dualrun C ASM_MASM)
 add_executable(tods4_dualrun harness.c member_call.asm "{vm_source}"
-    "{rolling_source}" "{store128_source}" "{trampoline_source}")
+    "{rolling_source}" "{store128_source}" "{frame_source}" "{trampoline_source}")
 target_include_directories(tods4_dualrun PRIVATE "{vm_include}")
 target_compile_definitions(tods4_dualrun PRIVATE DVM_ROLLING WIN32_LEAN_AND_MEAN NOMINMAX)
 """.lstrip(),

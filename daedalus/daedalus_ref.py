@@ -138,7 +138,8 @@ class RefVM:
     """
 
     def __init__(self, code: bytes, data: bytes, args=None,
-                 decoder=None, mem=None, mem_base=0, native_call_hook=None):
+                 decoder=None, mem=None, mem_base=0, native_call_hook=None,
+                 native_frame_hook=None):
         self.code = code
         self.data = bytes(data)
         self.args = list(args or [])
@@ -149,6 +150,10 @@ class RefVM:
         # letting the differential harness model an external callee that both a
         # Unicorn call-out and this reference interpreter drive identically.
         self.native_call_hook = native_call_hook
+        # Explicit test-only frame model: same hook signature, but the hook
+        # must write volatile GPR/XMM and flag locals for the callee it models.
+        # No automatic fallback to a scalar-only hook is permitted.
+        self.native_frame_hook = native_frame_hook
         self.stack: list[int] = []
         self.ret_stack: list[int] = []
         self.locals = bytearray(DVM_LOCAL_SIZE)
@@ -356,6 +361,15 @@ class RefVM:
                 argv = [self._pop() for _ in range(argc)][::-1]
                 self._push(self.native_call_hook(self, func_ptr, argc, argv)
                            & MASK64)
+            elif m == 'n_call_frame' and self.native_frame_hook is not None:
+                func_ptr = self._pop()
+                argc = self._pop()
+                if argc != 8 or func_ptr == 0:
+                    raise DaedalusError("n_call_frame requires non-null target and argc 8")
+                argv = [self._pop() for _ in range(argc)][::-1]
+                result = self.native_frame_hook(self, func_ptr, argc, argv) & MASK64
+                self.locals[0:8] = result.to_bytes(8, 'little')
+                self._push(result)
             elif m.startswith('n_'):
                 raise NativeOpUnsupported(m)
             else:

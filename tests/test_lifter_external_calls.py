@@ -95,10 +95,10 @@ def test_import_call_lifts_to_native_bridge_and_assembles() -> None:
     code = _call_to_slot(_IMPORT_CALLER)
     vasm = _lift(code)
     # The bridge marshals the four register args, four outgoing stack slots, a
-    # fixed argc of 8, and the slot-resolved pointer, then dispatches n_call_ptr
+    # fixed argc of 8, and the slot-resolved pointer, then dispatches n_call_frame
     # and commits RAX.
-    assert "n_call_ptr" in vasm
-    assert vasm.count("n_call_ptr") == 1
+    assert "n_call_frame" in vasm
+    assert vasm.count("n_call_frame") == 1
     # slot address = runtime image base local + decoded slot RVA.
     assert f"local_addr {lifter.IMAGE_BASE}" in vasm
     assert f"push_imm64 0x{_SLOT_RVA:016X}" in vasm
@@ -128,7 +128,7 @@ def test_internal_and_import_calls_coexist() -> None:
     assert len(analysis.internal_return_rvas) == 1    # helper's ret
     assert len(analysis.top_level_return_rvas) == 1   # the entry's ret
     vasm = _lift(code)
-    assert "n_call_ptr" in vasm
+    assert "n_call_frame" in vasm
     assert daedalus_asm.assemble(vasm)
 
 
@@ -261,7 +261,7 @@ def test_import_call_arg_marshalling_matches_unicorn_callout() -> None:
     mem[slot_off:slot_off + 8] = callee_va.to_bytes(8, "little")
     vm = daedalus_ref.RefVM(
         code_bytes, data, mem=mem, mem_base=mem_base,
-        native_call_hook=mock_callee,
+        native_frame_hook=mock_callee,
     )
 
     def _set(reg_name, value):
@@ -303,3 +303,34 @@ def test_import_slot_in_selected_extent_fails_closed() -> None:
     )
     with pytest.raises(lifter.LiftUnsupported, match="overlaps selected"):
         _lift(code, sections=sections)
+
+
+@pytest.mark.parametrize("argc,target,count", [(7,1,8),(9,1,8),(0x100000008,1,8),(8,0,8),(8,1,0)])
+def test_frame_opcode_rejects_malformed_call_before_hook(argc,target,count):
+    from daedalus_ref import RefVM, DaedalusError
+    calls=[]
+    source=".code\n"+("push_imm64 0\n"*count)+f"push_imm64 {argc}\npush_imm64 {target}\nn_call_frame\n"
+    program=daedalus_asm.assemble(source)
+    vm=RefVM(program[2:],b"",native_frame_hook=lambda *args:calls.append(args))
+    with pytest.raises(DaedalusError):vm.run()
+    assert calls==[]
+
+
+def test_frame_opcode_never_falls_back_to_scalar_hook():
+    from daedalus_ref import RefVM, NativeOpUnsupported
+    program=daedalus_asm.assemble(".code\nn_call_frame\n")
+    calls=[]
+    with pytest.raises(NativeOpUnsupported):
+        RefVM(program[2:],b"",native_call_hook=lambda *args:calls.append(args)).run()
+    assert calls==[]
+
+
+def test_frame_opcode_wire_metadata_and_native_canonical_fingerprint_agree():
+    from daedalus_disasm import OPCODE_TABLE
+    from shuffle_opcodes import CANONICAL_OPCODES, opcode_mapping_sha256
+    assert daedalus_asm.OPCODES["n_call_frame"]==(0x3B,0,"none")
+    assert OPCODE_TABLE[0x3B]==("n_call_frame",0,"none")
+    assert dict(CANONICAL_OPCODES)==daedalus_asm.OPCODES
+    digest=opcode_mapping_sha256({n:v[0] for n,v in CANONICAL_OPCODES.items()})
+    assert digest in (ROOT/"stub/src/daedalus_vm.c").read_text(encoding="utf-8")
+    assert "return op <= DVM_N_CALL_FRAME;" in (ROOT/"stub/src/daedalus_rolling.c").read_text(encoding="utf-8")

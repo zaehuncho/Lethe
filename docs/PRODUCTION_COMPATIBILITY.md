@@ -68,7 +68,10 @@ replay. It runs `test_native_runtime_hardening_stress.py`,
 `test_native_virtualization_runtime.py`,
 `test_xmm_store128_native.py`, `test_xfg_virtualization_preflight.py`, and
 the six required post-startup/export-tamper nodes in `test_native_exe_exports.py`
-against the exact rebuilt artifact. It requires all twenty-two cases without
+against the exact rebuilt artifact. Six additional mandatory nodes in
+`test_lifter_frame_call_native.py` compile source-level primitive fixtures from
+the same release source; these six do not execute the candidate DLL. The command
+requires all twenty-eight cases without
 skips, and proves the selected EXE leaf emits
 a paged-v1 program whose eager and memory-guard packed outputs match the
 original. The DLL E2E case additionally proves a source-bound schema-v3

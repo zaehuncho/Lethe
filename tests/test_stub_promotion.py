@@ -269,10 +269,11 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
         "test_native_exe_exports.py",
+        "test_lifter_frame_call_native.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 22
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 28
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 22
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 28
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
@@ -821,3 +822,11 @@ def test_ordinary_ci_validates_contract_without_demanding_a_release() -> None:
 
     assert "tools\\production_gate.py --validate-only" in workflow
     assert "tools\\release_check.py" not in workflow
+
+
+def test_release_runtime_gate_mandates_all_frame_call_boundaries():
+    expected={"tests/test_lifter_frame_call_native.py::test_native_frame_call_boundary["+kind+"]"
+              for kind in ("float","state","guard","invalid","aligned","unwind")}
+    actual={node for node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+            if node.startswith("tests/test_lifter_frame_call_native.py::")}
+    assert actual==expected

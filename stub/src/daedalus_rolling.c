@@ -17,6 +17,7 @@
 #ifdef DVM_ROLLING
 
 #include "daedalus_rolling.h"
+#include "daedalus_vm.h" /* canonical ISA upper bound */
 #include "crypto.h"   /* crypto_sha256 */
 #ifdef DVM_ROLL_POISON
 #include <intrin.h>   /* __readgsqword for the PEB read */
@@ -47,7 +48,7 @@ static uint32_t dvm_roll_width(uint8_t canon_op)
 }
 
 /* 1 iff `op` is a defined opcode (canonical byte). Range-based: the ISA is a
- * contiguous 0x00..0x38 today; a byte outside that is a decode fault.
+ * contiguous 0x00..0x3B today; a byte outside that is a decode fault.
  *
  * NOTE (rolling vs decoys): shuffled builds can mint DECOY opcodes that unmap to
  * canonical 0x80..0x90. Those are NOT supported inside a rolling container --
@@ -58,7 +59,7 @@ static uint32_t dvm_roll_width(uint8_t canon_op)
  * encoder optable together. */
 static int dvm_roll_opcode_valid(uint8_t op)
 {
-    return op <= 0x38;
+    return op <= DVM_N_CALL_FRAME;
 }
 
 #ifdef DVM_SHUFFLED

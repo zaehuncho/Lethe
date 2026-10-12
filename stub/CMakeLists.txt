@@ -23,6 +23,7 @@ add_library(lethe_stub_x64 SHARED
     src/daedalus_vm.c
     src/stub_entrypoints.asm
     src/daedalus_trampoline.asm
+    src/daedalus_call_frame.asm
     src/daedalus_x64_thunk.asm
     src/daedalus_store128.asm
     src/miniz.c

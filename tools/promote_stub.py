@@ -59,6 +59,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_xmm_store128_native.py",
     "test_xfg_virtualization_preflight.py",
     "test_native_exe_exports.py",
+    "test_lifter_frame_call_native.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_runtime_hardening_stress.py::"
@@ -105,6 +106,19 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_packed_exe_rejects_visible_export_tamper[eat-target]",
     "tests/test_native_exe_exports.py::"
     "test_packed_exe_rejects_visible_export_tamper[forwarder-name]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[float]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[state]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[guard]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[invalid]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[aligned]",
+    "tests/test_lifter_frame_call_native.py::"
+    "test_native_frame_call_boundary[unwind]",
+
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
 REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT = 19
