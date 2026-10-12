@@ -888,6 +888,18 @@ def _validate_source_exceptions(
                             f"function 0x{record.chain_primary_rva:X}, not the "
                             f"selected function 0x{spec.rva:X}",
                         )
+        # A manual spec may select only the primary or a contiguous prefix of
+        # its fragments.  Removing that primary would leave any later retained
+        # CHAININFO record pointing at an absent source runtime function.
+        if any(
+            i not in covering
+            and record.unwind_flags & UNW_FLAG_CHAININFO
+            and record.chain_primary_rva == spec.rva
+            for i, record in enumerate(metadata.records)
+        ):
+            raise FunctionRejected(
+                spec, "selected extent omits a chained fragment of its "
+                f"source runtime-function primary 0x{spec.rva:X}")
         for i in covering:
             removed_indices.add(i)
             removed.append(replace(planned_records[i], function_name=spec.name))

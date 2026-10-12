@@ -244,6 +244,7 @@ class _RuntimeRange:
     begin: int
     end: int
     unwind_flags: int
+    chain_primary_rva: int = 0
 
 
 @dataclass(frozen=True)
@@ -327,16 +328,20 @@ def _runtime_ranges(parsed: Any, sections: Sequence[Any]) -> tuple[_RuntimeRange
             begin = record.begin_rva
             end = record.end_rva
             flags = record.unwind_flags
+            chain_primary = getattr(record, "chain_primary_rva", 0)
         except AttributeError as exc:
             raise FunctionDiscoveryError("invalid runtime-function record") from exc
         if (type(begin) is not int or type(end) is not int or type(flags) is not int
+                or type(chain_primary) is not int
                 or begin <= 0 or end <= begin or end > parsed.size_of_image
-                or flags < 0 or flags & ~0xF):
+                or flags < 0 or flags & ~0xF
+                or chain_primary < 0 or chain_primary >= parsed.size_of_image
+                or (not flags & 0x4 and chain_primary != 0)):
             raise FunctionDiscoveryError("invalid runtime-function record")
         if begin < previous_end:
             raise FunctionDiscoveryError("runtime-function ranges overlap or are unsorted")
         _read_executable(sections, begin, end - begin, "runtime function")
-        result.append(_RuntimeRange(begin, end, flags))
+        result.append(_RuntimeRange(begin, end, flags, chain_primary))
         previous_end = end
     return tuple(result)
 
@@ -983,7 +988,6 @@ def _build_extents(
         parsed: Any, sections: Sequence[Any], runtime: Sequence[_RuntimeRange],
         exports: Sequence[ExportSymbol], maps: Sequence[MapSymbol], leaf_cap: int,
 ) -> tuple[_Extent, ...]:
-    runtime_by_begin = {item.begin: item for item in runtime}
     exports_by_rva: dict[int, ExportSymbol] = {}
     export_names: set[str] = set()
     for symbol in exports:
@@ -1008,7 +1012,43 @@ def _build_extents(
         raise FunctionDiscoveryError("duplicate or ambiguous MSVC MAP binding")
     used_names: dict[str, int] = {}
     extents = []
-    for record in runtime:
+    index = 0
+    while index < len(runtime):
+        record = runtime[index]
+        # A linker-split function can have contiguous CHAININFO continuations.
+        # Only the exact primary plus fragments whose validated ultimate root
+        # is that primary may be presented as one selectable source extent.
+        # A symbol at a fragment entry is an independently reachable interior
+        # entry, so leave the records separate and fail closed instead.
+        group_end = record.end
+        group_next = index + 1
+        if record.unwind_flags == 0:
+            while group_next < len(runtime):
+                fragment = runtime[group_next]
+                if (fragment.begin != group_end or fragment.unwind_flags != 0x4
+                        or fragment.chain_primary_rva != record.begin):
+                    break
+                if (fragment.begin in exports_by_rva
+                        or fragment.begin in maps_by_rva):
+                    break
+                group_end = fragment.end
+                group_next += 1
+        grouped = group_next > index + 1
+        # Removing only a prefix would leave a retained CHAININFO record whose
+        # primary PDATA record was removed by the materializer.  All fragments
+        # of this root must be in the exact contiguous tile.
+        if grouped and any(
+                other.unwind_flags & 0x4
+                and other.chain_primary_rva == record.begin
+                for other in runtime[group_next:]):
+            grouped = False
+        if grouped and any(
+                record.begin < symbol_rva < group_end
+                for symbol_rva in (*exports_by_rva, *maps_by_rva)):
+            grouped = False
+        if not grouped:
+            group_end = record.end
+            group_next = index + 1
         export = exports_by_rva.pop(record.begin, None)
         mapped = maps_by_rva.get(record.begin)
         names = {item.name for item in (export, mapped) if item is not None}
@@ -1023,26 +1063,33 @@ def _build_extents(
             source_parts.append("export")
         if mapped:
             source_parts.append("map")
-        source_parts.append("pdata")
-        size = record.end - record.begin
+        source_parts.append("pdata-chain-group" if grouped else "pdata")
+        size = group_end - record.begin
         source = _read_executable(sections, record.begin, size, "runtime function")
-        try:
-            lifted_body_size = x64_lifter.canonical_lifted_body_size(
-                source, record.begin
-            )
-        except x64_lifter.LiftUnsupported:
+        if grouped:
+            # The planner only subsumes multiple source PDATA records when the
+            # entire tiled extent is lifted, never by padding-aware trimming.
             lifted_body_size = size
+        else:
+            try:
+                lifted_body_size = x64_lifter.canonical_lifted_body_size(
+                    source, record.begin
+                )
+            except x64_lifter.LiftUnsupported:
+                lifted_body_size = size
         extents.append(_Extent(
             name=name,
             source="+".join(source_parts),
             rva=record.begin,
             size=size,
             lifted_body_size=lifted_body_size,
-            extent_kind="runtime_function",
+            extent_kind=("runtime_function_group" if grouped
+                         else "runtime_function"),
             exact=True,
             heuristic=False,
             unwind_flags=record.unwind_flags,
         ))
+        index = group_next
 
     for symbol in exports_by_rva.values():
         size, reason = _heuristic_leaf_extent(sections, symbol.rva, leaf_cap)

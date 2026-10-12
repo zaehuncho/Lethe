@@ -342,7 +342,9 @@ selected body equals its source extent and emits schema v3 when any canonical
 suffix is trimmed. Schema v3 binds source and body extents,
 full-extent and body SHA-256 values, the exact PDATA record, and a recomputed
 canonical-padding proof. The packer continues to accept schema v2 strictly as
-equal extents.
+equal extents. Schema v4 binds each record of a complete, contiguous,
+handler-free primary/CHAININFO group and forbids trimming or orphaning a chain
+fragment; unrelated handler records remain rejected.
 An explicit empty DIR64 metadata set is distinct from missing metadata. Rolling
 containers and nonempty VM data regions are rejected for production-selected
 functions; the raw program is never materialized beside its paged envelope.
@@ -351,8 +353,10 @@ The exception mutation plan is also all-or-nothing. Source AMD64
 `RUNTIME_FUNCTION` records must arrive as an immutable tuple sorted by
 `BeginAddress`, with non-overlapping code ranges and explicit unwind flags. A
 record exactly matching a selected function is removed and replaced by the
-generated thunk record. Partial overlaps and selected records using EHANDLER,
-UHANDLER, or CHAININFO are rejected. Retained and generated records are merged
+generated thunk record. A complete contiguous primary/CHAININFO group can be
+selected as one full extent only when every fragment chains to that primary;
+partial groups and EHANDLER/UHANDLER selections are rejected. Retained and
+generated records are merged
 in address order into one deterministic table allocated inside the declared
 generated-data reservation; each generated record and each function unwind plan
 contains its final record RVA. The manifest carries the retained, removed,

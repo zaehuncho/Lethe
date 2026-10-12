@@ -21,6 +21,7 @@ from .strict_json import StrictJSONError, load_json_object_bytes
 SCHEMA = "lethe.virtualization-selection"
 LEGACY_VERSION = 2
 VERSION = 3
+GROUP_VERSION = 4
 MAX_MANIFEST_BYTES = 1024 * 1024
 AMD64_MACHINE = 0x8664
 _HEX = frozenset("0123456789abcdef")
@@ -218,6 +219,48 @@ def _runtime_identity(parsed: Any, rva: int, size: int) -> dict[str, int]:
     }
 
 
+def _runtime_group_identities(
+        parsed: Any, rva: int, size: int,
+) -> list[dict[str, int]]:
+    """Bind a v4 extent to an exactly tiled primary/CHAININFO PDATA group."""
+    end = rva + size
+    matches = [
+        (index, record) for index, record in enumerate(parsed.runtime_functions)
+        if record.begin_rva < end and rva < record.end_rva
+    ]
+    if (len(matches) < 2 or matches[0][1].begin_rva != rva
+            or matches[-1][1].end_rva != end):
+        raise VirtualizationSelectionError(
+            "selected group does not exactly match multiple runtime records")
+    if any(
+            getattr(record, "chain_primary_rva", 0) == rva
+            and record.unwind_flags & 4
+            and not (rva <= record.begin_rva < record.end_rva <= end)
+            for record in parsed.runtime_functions):
+        raise VirtualizationSelectionError(
+            "selected runtime-function group omits a chained fragment")
+    records = []
+    previous_end = rva
+    for position, (index, record) in enumerate(matches):
+        root = getattr(record, "chain_primary_rva", 0)
+        if (record.begin_rva != previous_end
+                or (position == 0 and (record.unwind_flags != 0 or root != 0))
+                or (position > 0 and (record.unwind_flags != 4 or root != rva))):
+            raise VirtualizationSelectionError(
+                "selected runtime-function group has an unproven chain root "
+                "or noncontiguous/handler fragment")
+        records.append({
+            "begin_rva": record.begin_rva,
+            "chain_primary_rva": root,
+            "end_rva": record.end_rva,
+            "index": index,
+            "unwind_flags": record.unwind_flags,
+            "unwind_info_rva": record.unwind_info_rva,
+        })
+        previous_end = record.end_rva
+    return records
+
+
 def build_manifest(
     report: Any,
     parsed: Any,
@@ -238,7 +281,7 @@ def build_manifest(
     for item in report.candidates:
         if not (
             item.exact_extent
-            and item.extent_kind == "runtime_function"
+            and item.extent_kind in ("runtime_function", "runtime_function_group")
             and item.unwind_flags == 0
             and item.liftable
             and item.direct_control_proof_status == "passed"
@@ -249,15 +292,17 @@ def build_manifest(
         original = _extent_bytes(parsed, item.rva, source_extent_size)
         selected.append((item, original, source_extent_size, lifted_body_size))
 
-    # Version 2 remains the byte-for-byte equal-extent format.  A report that
-    # contains any canonical padding trim is promoted as a unit to version 3,
-    # avoiding mixed per-entry interpretation.
+    # Version 2 remains the byte-for-byte equal-extent format.  Canonical
+    # padding promotes a report to v3; any complete PDATA chain group promotes
+    # the whole selection to v4 so every record/root has a bound identity.
     version = (
-        VERSION if any(body_size != source_size for _, _, source_size, body_size
-                       in selected)
+        GROUP_VERSION if any(item.extent_kind == "runtime_function_group"
+                             for item, *_ in selected)
+        else VERSION if any(body_size != source_size
+                            for _, _, source_size, body_size in selected)
         else LEGACY_VERSION
     )
-    if version == VERSION:
+    if version >= VERSION:
         _validate_pdata_inventory(parsed)
     selections = []
     for item, original, source_extent_size, lifted_body_size in selected:
@@ -283,14 +328,24 @@ def build_manifest(
                 "size": lifted_body_size,
             },
             "name": item.name,
-            "runtime_function": _runtime_identity(
-                parsed, item.rva, source_extent_size),
             "source_extent": {
                 "rva": item.rva,
                 "size": source_extent_size,
             },
             "tail_exit_approvals": [],
         }
+        if version == GROUP_VERSION:
+            selection["runtime_functions"] = (
+                _runtime_group_identities(parsed, item.rva, source_extent_size)
+                if item.extent_kind == "runtime_function_group"
+                else [{
+                    **_runtime_identity(parsed, item.rva, source_extent_size),
+                    "chain_primary_rva": 0,
+                }]
+            )
+        else:
+            selection["runtime_function"] = _runtime_identity(
+                parsed, item.rva, source_extent_size)
         if version == LEGACY_VERSION:
             selection["original_bytes_sha256"] = hashlib.sha256(
                 original).hexdigest()
@@ -436,6 +491,7 @@ def _validate_pdata_inventory(parsed: Any) -> None:
                 item.end_rva,
                 item.unwind_info_rva,
                 item.unwind_flags,
+                getattr(item, "chain_primary_rva", 0),
             )
             for item in parsed.runtime_functions
         )
@@ -445,6 +501,7 @@ def _validate_pdata_inventory(parsed: Any) -> None:
                 item.end_rva,
                 item.unwind_info_rva,
                 item.unwind_flags,
+                item.chain_primary_rva,
             )
             for item in validated
         )
@@ -475,8 +532,9 @@ def verify_manifest_bytes(
     _string(root["schema"], "selection manifest schema", maximum=64)
     version = _integer(
         root["version"], "selection manifest version",
-        minimum=LEGACY_VERSION, maximum=VERSION)
-    if root["schema"] != SCHEMA or version not in (LEGACY_VERSION, VERSION):
+        minimum=LEGACY_VERSION, maximum=GROUP_VERSION)
+    if root["schema"] != SCHEMA or version not in (
+            LEGACY_VERSION, VERSION, GROUP_VERSION):
         raise VirtualizationSelectionError(
             "selection manifest schema/version is unsupported")
     source = _exact(root["source"], {
@@ -508,7 +566,7 @@ def verify_manifest_bytes(
     values = _list(root["selections"], "selection manifest selections")
     if not values:
         raise VirtualizationSelectionError("selection manifest selects no functions")
-    if version == VERSION:
+    if version >= VERSION:
         _validate_pdata_inventory(parsed)
     functions: list[SelectedFunction] = []
     gaps: list[GapAcknowledgement] = []
@@ -520,7 +578,8 @@ def verify_manifest_bytes(
         common_fields = {
             "coverage_gaps", "direct_reference_verdict",
             "indirect_target_closure", "lifted_body_extent", "name",
-            "runtime_function", "source_extent", "tail_exit_approvals",
+            "source_extent", "tail_exit_approvals",
+            "runtime_functions" if version == GROUP_VERSION else "runtime_function",
         }
         version_fields = (
             {"original_bytes_sha256"}
@@ -559,7 +618,9 @@ def verify_manifest_bytes(
 
         candidate = candidates.get(rva)
         if (candidate is None or not candidate.exact_extent
-                or candidate.extent_kind != "runtime_function"
+                or candidate.extent_kind not in (
+                    ("runtime_function", "runtime_function_group")
+                    if version == GROUP_VERSION else ("runtime_function",))
                 or candidate.size != size or candidate.body_size != body_size
                 or not candidate.liftable
                 or candidate.unwind_flags != 0):
@@ -596,18 +657,42 @@ def verify_manifest_bytes(
             raise VirtualizationSelectionError(
                 f"{label} does not acknowledge unproven indirect target closure")
 
-        runtime = _exact(item["runtime_function"], {
-            "begin_rva", "end_rva", "index", "unwind_flags", "unwind_info_rva",
-        }, f"{label}.runtime_function")
-        for field in (
-                "begin_rva", "end_rva", "index", "unwind_flags",
-                "unwind_info_rva"):
-            _integer(
-                runtime[field], f"{label}.runtime_function.{field}",
-                minimum=0)
-        if runtime != _runtime_identity(parsed, rva, size):
-            raise VirtualizationSelectionError(
-                f"{label} runtime-function identity changed")
+        if version == GROUP_VERSION:
+            runtime_values = _list(
+                item["runtime_functions"], f"{label}.runtime_functions")
+            runtime = []
+            for record_index, value in enumerate(runtime_values):
+                record_label = f"{label}.runtime_functions[{record_index}]"
+                record = _exact(value, {
+                    "begin_rva", "chain_primary_rva", "end_rva", "index",
+                    "unwind_flags", "unwind_info_rva",
+                }, record_label)
+                for field in record:
+                    _integer(record[field], f"{record_label}.{field}", minimum=0)
+                runtime.append(record)
+            if candidate.extent_kind == "runtime_function_group":
+                expected_runtime = _runtime_group_identities(parsed, rva, size)
+            else:
+                expected_runtime = [{
+                    **_runtime_identity(parsed, rva, size),
+                    "chain_primary_rva": 0,
+                }]
+            if runtime != expected_runtime:
+                raise VirtualizationSelectionError(
+                    f"{label} runtime-function group identity changed")
+        else:
+            runtime = _exact(item["runtime_function"], {
+                "begin_rva", "end_rva", "index", "unwind_flags", "unwind_info_rva",
+            }, f"{label}.runtime_function")
+            for field in (
+                    "begin_rva", "end_rva", "index", "unwind_flags",
+                    "unwind_info_rva"):
+                _integer(
+                    runtime[field], f"{label}.runtime_function.{field}",
+                    minimum=0)
+            if runtime != _runtime_identity(parsed, rva, size):
+                raise VirtualizationSelectionError(
+                    f"{label} runtime-function identity changed")
         source_bytes = _extent_bytes(parsed, rva, size)
         actual_source_hash = hashlib.sha256(source_bytes).hexdigest()
         if version == LEGACY_VERSION:
@@ -648,11 +733,22 @@ def verify_manifest_bytes(
             _integer(
                 padding["suffix_size"],
                 f"{label}.padding_proof.suffix_size")
-            current_padding = _current_padding_proof(
-                rva=rva,
-                source_extent_size=size,
-                lifted_body_size=body_size,
-                source_bytes=source_bytes,
+            current_padding = (
+                {
+                    "canonical_body_size": size,
+                    "source_extent_runtime_bound": True,
+                    "status": "not_applicable",
+                    "suffix_rva": rva + size,
+                    "suffix_size": 0,
+                }
+                if candidate.extent_kind == "runtime_function_group"
+                and version == GROUP_VERSION and body_size == size
+                else _current_padding_proof(
+                    rva=rva,
+                    source_extent_size=size,
+                    lifted_body_size=body_size,
+                    source_bytes=source_bytes,
+                )
             )
             if padding != current_padding:
                 raise VirtualizationSelectionError(
@@ -675,7 +771,7 @@ def verify_manifest_bytes(
             name,
             rva,
             size,
-            body_size if version == VERSION else None,
+            body_size if version >= VERSION else None,
         ))
 
     # Candidate gap inventories are commonly identical.  Require any repeated
