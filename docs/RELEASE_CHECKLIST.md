@@ -101,6 +101,16 @@ an unchanged incoming caller output pointer plus its fifth stack argument.
 This is bounded admission evidence,
 not a claim of arbitrary memory-safety analysis or general ISA support.
 
+Read-only function discovery replays that same materialized-stack proof with
+the thunk's actual window size, canonical lifted body and per-candidate proven
+native-call targets before reporting `liftable=true` or emitting a starter
+selection. Dynamic/oversized frames, unbalanced returns, out-of-window aliases
+and unsupported native pointer escapes therefore appear as explicit lift
+rejections rather than a starter selection that fails later during packing.
+Instruction-specific failures retain their original diagnostic precedence.
+Passing this preflight still does not prove indirect-target closure, whole-image
+executable coverage, native application behavior or release readiness.
+
 ## 3. Preflight the native candidate
 
 Choose and record an exact 64-lowercase-hex-character opcode-shuffle seed so the candidate can be

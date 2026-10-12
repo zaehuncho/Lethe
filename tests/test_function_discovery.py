@@ -278,6 +278,74 @@ def test_json_table_and_starter_selection_are_deterministic():
     assert "indirect closure: unproven" in table
 
 
+@pytest.mark.parametrize("source,reason", [
+    ("sub rsp,0x210; xor eax,eax; add rsp,0x210; ret", "source stack depth"),
+    ("mov rbp,rsp; mov rax,[rbp-0x220]; ret", "exceeds 512-byte window"),
+    ("mov r11,rsp; mov rax,[r11+rcx*8]; ret", "unbounded source stack"),
+    ("mov rbp,rsp; mov rax,[ebp]; ret", "memory base is not a supported 64-bit GPR"),
+    ("sub rsp,rcx; mov eax,1; ret", "dynamic source stack pointer"),
+    ("sub rsp,0x28; mov eax,1; ret", "unbalanced top-level RET"),
+    ("again: sub rsp,0x10; test ecx,ecx; jnz again; add rsp,0x10; ret", "unbalanced top-level RET"),
+])
+def test_materialized_stack_preflight_rejects_unbuildable_starter_candidates(source, reason):
+    """Discovery must replay the planner's exact bounded stack proof."""
+    code = _asm(source, 0x1000)
+    report = discovery.discover_functions(_parsed([(0x1000, code, 0)]), exports=())
+    item = report.candidates[0]
+    assert item.liftable is False
+    assert reason in item.rejection_reason
+    assert report.starter_selection_manifest()["functions"] == []
+    assert json.loads(report.to_json())["candidates"][0]["liftable"] is False
+    assert item.rejection_reason in discovery.render_table(report)
+
+
+def test_materialized_stack_preflight_rejects_native_pointer_escape_at_call():
+    caller = _asm(
+        "sub rsp,0x28; lea rcx,[rsp+0x20]; call 0x1200; add rsp,0x28; ret", 0x1000)
+    callee = _asm("mov rax,rcx; add rax,1; ret", 0x1200)
+    report = discovery.discover_functions(
+        _parsed([(0x1000, caller, 0), (0x1200, callee, 0)]), exports=())
+    item = report.candidates[0]
+    assert item.liftable is False
+    assert "unmodeled native source stack pointer escape" in item.rejection_reason
+    assert item.first_unsupported_instruction is not None
+    assert "call" in item.first_unsupported_instruction.text
+    assert {row["rva"] for row in report.starter_selection_manifest()["functions"]} == {0x1200}
+
+
+@pytest.mark.parametrize("source", [
+    "sub rsp,0x28; lea r11,[rsp+0x20]; mov [r11],rcx; mov rax,[r11]; add rsp,0x28; ret",
+    "push rbp; mov rbp,rsp; sub rsp,0x30; mov [rbp-8],rdx; mov rax,[rbp-8]; leave; ret",
+    "push rbp; mov rbp,rsp; sub rsp,0x30; lea r10,[rsp+0x20]; mov [rsp],r10; "
+    "mov r11,[rsp]; mov [r11],rcx; mov rax,[r11]; mov rsp,rbp; pop rbp; ret",
+])
+def test_materialized_stack_preflight_keeps_bounded_aliases_and_frames_selectable(source):
+    code = _asm(source, 0x1000)
+    report = discovery.discover_functions(_parsed([(0x1000, code, 0)]), exports=())
+    assert report.candidates[0].liftable is True
+    assert report.candidates[0].rejection_reason is None
+    assert report.starter_selection_manifest()["functions"] == [
+        {"name": "sub_00001000", "rva": 0x1000, "size": len(code)}]
+
+
+def test_materialized_stack_preflight_uses_canonical_body_not_padding_suffix():
+    body = _asm("sub rsp,0x28; mov [rsp+0x20],rcx; add rsp,0x28; ret", 0x1000)
+    report = discovery.discover_functions(
+        _parsed([(0x1000, body + b"\xcc" * 16, 0)]), exports=())
+    item = report.candidates[0]
+    assert item.liftable is True and item.body_size == len(body)
+    assert item.size == len(body) + 16
+
+
+def test_materialized_stack_preflight_bounded_native_caller_preserves_incoming_pointer():
+    caller = _asm("sub rsp,0x28; call 0x1200; add rsp,0x28; ret", 0x1000)
+    callee = _asm("mov rax,[rcx]; add rax,1; ret", 0x1200)
+    report = discovery.discover_functions(
+        _parsed([(0x1000, caller, 0), (0x1200, callee, 0)]), exports=())
+    assert all(item.liftable for item in report.candidates)
+    assert {row["rva"] for row in report.starter_selection_manifest()["functions"]} == {0x1000, 0x1200}
+
+
 def test_candidate_overlap_and_export_aliases_fail_closed():
     code = _asm("mov eax, 1; ret", 0x1000)
     parsed = _parsed([(0x1000, code, 0)], end=0x1100)

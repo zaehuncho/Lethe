@@ -18,8 +18,9 @@ from typing import Any, Sequence
 from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
 try:
-    from . import x64_lifter
+    from . import win64_thunk, x64_lifter
 except ImportError:  # standalone tools/tests
+    import win64_thunk  # type: ignore
     import x64_lifter  # type: ignore
 
 try:
@@ -692,6 +693,16 @@ def _lift_status(
             image_sections=sections,
             selected_extents=((extent.rva, extent.size),),
             source_extent_size=extent.size,
+            native_call_targets=native_call_targets,
+        )
+        # An ISA-liftable body is not necessarily materializable. Replay the
+        # planner's exact source-stack proof before marking it selectable, so
+        # generated starter manifests cannot advertise a body the packer must
+        # reject for control-frame overlap or an unmodeled pointer escape.
+        x64_lifter.validate_materialized_stack_window(
+            code,
+            base=extent.rva,
+            window_size=win64_thunk.STACK_WINDOW_SIZE,
             native_call_targets=native_call_targets,
         )
         daedalus_asm.assemble(assembly)
