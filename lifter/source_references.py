@@ -10,7 +10,7 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from iced_x86 import MemorySizeExt, Mnemonic, Register
+from iced_x86 import MemorySizeExt, Mnemonic, OpKind, Register
 
 
 class SourceReferenceError(ValueError):
@@ -39,11 +39,19 @@ def instruction_references(instructions: Iterable[Any]) -> tuple[SourceReference
             )
         address_only = instruction.mnemonic == Mnemonic.LEA
         size = 1 if address_only else MemorySizeExt.size(instruction.memory_size)
-        # Memory bit-string offsets can move the access outside the encoded
-        # base/operand width. They need a separate bounded address proof.
-        if size <= 0 or instruction.mnemonic in {
+        # A register bit-string offset can move beyond the encoded base.
+        # Admit only an encoded imm8 *inside* the operand: the complete
+        # 2/4/8-byte access then starts at the decoded RIP target. Do not infer
+        # bounds from a register or normalize unsupported large immediates.
+        bit_string = instruction.mnemonic in {
             Mnemonic.BT, Mnemonic.BTC, Mnemonic.BTR, Mnemonic.BTS,
-        }:
+        }
+        bounded_bit = (
+            bit_string and size in (2, 4, 8) and instruction.op_count == 2
+            and instruction.op_kind(1) == OpKind.IMMEDIATE8
+            and instruction.immediate8 < size * 8
+        )
+        if size <= 0 or (bit_string and not bounded_bit):
             raise SourceReferenceError(
                 f"unbounded source reference: memory span at RVA 0x{instruction.ip:X}"
             )
