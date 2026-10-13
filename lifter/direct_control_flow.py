@@ -967,13 +967,19 @@ def _decode_source_inventory(parsed, sections, selected):
 
 def _validate_known_references(parsed, decodes, selected):
     try:
-        index = source_references.SourceReferenceIndex((
+        references = (
             *source_references.instruction_references(
                 instruction for decoded in decodes for instruction in decoded.instructions
             ),
             *source_references.dir64_references(parsed),
             *source_references.metadata_references(parsed),
-        ))
+        )
+        index = source_references.SourceReferenceIndex(
+            references,
+            proven_entry_calls=source_references.proven_immediate_entry_calls(
+                decodes, known_entry_targets=(item.target_rva for item in references
+                                               if item.address_only)),
+        )
         index.validate(selected)
     except source_references.SourceReferenceError as exc:
         raise DirectControlFlowError(str(exc)) from exc

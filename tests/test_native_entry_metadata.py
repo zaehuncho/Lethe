@@ -60,7 +60,7 @@ def _build(tmp_path: Path) -> Path:
         assembly = (
             "OPTION CASEMAP:NONE\nPUBLIC vm_probe\nPUBLIC probe_alias\n"
             "PUBLIC native_probe\nPUBLIC reference_slot\n.data\n"
-            "reference_slot QWORD vm_probe\n.code\n"
+            "reference_slot QWORD native_probe\n.code\n"
             "vm_probe PROC FRAME\n .endprolog\n"
             + (alias if mode == "entry" else "") + " nop\n"
             + (alias if mode == "interior" else "")

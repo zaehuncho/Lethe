@@ -165,8 +165,14 @@ executable coverage, native application behavior or release readiness.
 Known source-reference rejection is mandatory even with exact coverage-gap or
 unproven-indirect-target acknowledgements. Decoded fixed-width RIP memory spans
 must not overlap any overwritten function byte (including entry and padding);
-RIP LEA and validated DIR64 pointer values must not target its interior. Exact
-original-entry addresses remain supported as callable pointers. Unknown memory
+RIP LEA and validated DIR64 pointer values must not target its interior. A
+DIR64 pointer to the exact selected entry also rejects: data pointer consumers
+are not bounded by a local call sequence. An exact-entry RIP LEA remains
+callable only when one strictly decoded function contains the full-width LEA
+immediately followed by CALL of the same register, with no decoded direct
+inbound edge or known metadata/address entry to the CALL site. Other exact-entry
+LEAs reject; exact PE invocation metadata and direct entry calls remain valid.
+This is a narrow local-use proof, not arbitrary indirect-target closure. Unknown memory
 spans, register/unsupported memory bit-string offsets and EIP-relative
 address-size forms fail closed. BT/BTC/BTR/BTS admit only an encoded imm8 below
 the 16/32/64-bit operand width, with the entire 2/4/8-byte memory span checked;
@@ -174,8 +180,9 @@ the immediate bit index never waives an overlap. This also covers the native CRT
 BTR qword RIP-data,7 form without rejecting unrelated selected functions.
 FS/GS-relative RIP dereferences also fail closed: the runtime segment base is
 not a proven image RVA (Intel SDM Volume 1, section 3.3.7). This does not reject
-ignored CS/DS/ES/SS overrides, non-accessing NOPs or address-only native LEAs;
-the ordinary byte-span/interior checks still apply to those address forms.
+ignored CS/DS/ES/SS overrides or non-accessing NOPs. Address-only native LEAs
+still require the exact-entry local-use proof above or a disjoint target; the
+ordinary byte-span/interior checks also apply.
 Discovery caches these known references once. Preflight includes strictly decoded
 PDB supplemental ranges; low-level commit independently rescans current runtime
 and selected extents and rereads DIR64 values, so stale native instructions or
@@ -186,11 +193,18 @@ negative checks proves arbitrary computed/indirect address closure.
 `tests/test_native_known_references.py` is a mandatory native promotion node.
 It includes generated EXE/DLL FS/GS rejection cases whose retained/exported
 segment-relative functions are never executed; no host segment-register change
-is required. All original source-reference negatives and callable-entry
-positive controls remain mandatory.
+is required. All original source-reference negatives and the bounded
+callable-entry positive controls remain mandatory.
 Generated EXE and DLL fixtures preserve the original six RIP-load, LEA-interior
 and DIR64-interior mismatches as required typed packing rejections with no output;
-both exact-entry function-pointer controls must still pack and match originals.
+the local exact-entry LEA-to-CALL control packs and matches originals, while an
+unbounded exact-entry DIR64 data pointer now rejects before output.
+`tests/test_native_computed_entry.py` is also mandatory: generated EXE and DLL
+originals must return 42, exact straight-line LEA callers must pack with parity,
+and arithmetic-derived LEA, branch-into-CALL, and exact/derived DIR64 callers
+must reject without writing a packed output. The retained source98 candidate
+accepted the derived and branch fixtures, then both packed roles faulted with
+`0xC0000005`; it is not evidence of a safe older candidate.
 The default tracked prebuilt is not promoted by adding this contract. Older
 candidate attestations are historical evidence and do not claim the new node.
 

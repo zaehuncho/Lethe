@@ -2,8 +2,9 @@
 
 This is not indirect/address-taken closure. Decoded RIP operands, validated
 file-backed DIR64 pointer values, exact PE invocation entries and metadata
-storage spans participate. An exact selected entry may remain callable;
-interior entries and reads of overwritten source bytes may not.
+storage spans participate. Exact metadata invocation entries and a bounded
+LEA-to-immediate-CALL use may remain callable. Other address-taken selected
+entries, interior entries and reads of overwritten source bytes may not.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import os
 import struct
 from typing import Any, Iterable
 
-from iced_x86 import MemorySizeExt, Mnemonic, OpKind, Register
+from iced_x86 import FlowControl, MemorySizeExt, Mnemonic, OpKind, Register
 
 
 class SourceReferenceError(ValueError):
@@ -27,6 +28,69 @@ class SourceReference:
     source_rva: int
     kind: str
     address_only: bool = False
+    metadata_entry: bool = False
+
+
+_POINTER_REGISTERS = frozenset({
+    Register.RAX, Register.RBX, Register.RCX, Register.RDX,
+    Register.RSI, Register.RDI, Register.RBP, Register.RSP,
+    Register.R8, Register.R9, Register.R10, Register.R11,
+    Register.R12, Register.R13, Register.R14, Register.R15,
+})
+
+
+def proven_immediate_entry_calls(
+    decoded_groups: Iterable[Any], *,
+    known_entry_targets: Iterable[int] = (),
+) -> frozenset[tuple[int, int]]:
+    """Prove only a local full-width LEA followed by CALL of that exact register.
+
+    Every group must be one already strictly decoded function or supplemental
+    extent. No intervening instruction, store, arithmetic, register alias,
+    direct branch into the CALL site, or known address-taken CALL-site entry
+    earns an exception. This proves a bounded decoded local use, not general
+    indirect target closure.
+    """
+    # Discovery caches each validated function as a tuple; preflight keeps
+    # structured decode records. Preserve the same proof for both callers.
+    groups = tuple(tuple(getattr(group, "instructions", group))
+                   for group in decoded_groups)
+    all_instructions = tuple(instruction for group in groups
+                             for instruction in group)
+    near_kinds = {OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32,
+                  OpKind.NEAR_BRANCH64}
+    direct_incoming = frozenset(
+        int(instruction.near_branch_target)
+        for instruction in all_instructions
+        if instruction.flow_control in {
+            FlowControl.CALL, FlowControl.UNCONDITIONAL_BRANCH,
+            FlowControl.CONDITIONAL_BRANCH,
+        }
+        and instruction.op_count >= 1
+        and instruction.op_kind(0) in near_kinds
+    )
+    entry_targets = frozenset(known_entry_targets)
+    proven: set[tuple[int, int]] = set()
+    for instructions in groups:
+        by_ip = {int(instruction.ip): instruction for instruction in instructions}
+        for instruction in instructions:
+            if (instruction.mnemonic != Mnemonic.LEA
+                    or not instruction.is_ip_rel_memory_operand
+                    or instruction.memory_base != Register.RIP
+                    or instruction.op_count != 2
+                    or instruction.op_kind(0) != OpKind.REGISTER
+                    or instruction.op0_register not in _POINTER_REGISTERS):
+                continue
+            following = by_ip.get(int(instruction.next_ip))
+            if (following is not None
+                    and int(following.ip) not in direct_incoming
+                    and int(following.ip) not in entry_targets
+                    and following.mnemonic == Mnemonic.CALL
+                    and following.op_count == 1
+                    and following.op_kind(0) == OpKind.REGISTER
+                    and following.op0_register == instruction.op0_register):
+                proven.add((int(instruction.ip), int(instruction.ip_rel_memory_address)))
+    return frozenset(proven)
 
 
 def instruction_references(instructions: Iterable[Any]) -> tuple[SourceReference, ...]:
@@ -140,7 +204,7 @@ def metadata_references(parsed: Any, *, exports: Iterable[Any] | None = None) ->
                 or (rva == 0 and size > 1) or (rva > 0 and size == 0)):
             raise SourceReferenceError(f"source reference: invalid {kind} RVA span")
         if rva and size:
-            references.append(SourceReference(rva, size, rva, kind, entry))
+            references.append(SourceReference(rva, size, rva, kind, entry, entry))
 
     # The strict reader uses the source PE header and current ParsedPE section
     # bytes, so a stale EAT in a persisted manifest is checked at commit too.
@@ -411,10 +475,12 @@ def metadata_references(parsed: Any, *, exports: Iterable[Any] | None = None) ->
 class SourceReferenceIndex:
     """Build once; query candidate extents without rescanning the image."""
 
-    def __init__(self, references: Iterable[SourceReference]) -> None:
+    def __init__(self, references: Iterable[SourceReference], *,
+                 proven_entry_calls: Iterable[tuple[int, int]] = ()) -> None:
         self.references = tuple(sorted(references))
         self.starts = tuple(item.target_rva for item in self.references)
         self.max_size = max((item.size for item in self.references), default=1)
+        self.proven_entry_calls = frozenset(proven_entry_calls)
 
     def rejection(self, name: str, rva: int, size: int) -> str | None:
         start = bisect_left(self.starts, rva - self.max_size + 1)
@@ -422,7 +488,10 @@ class SourceReferenceIndex:
         for item in self.references[start:end]:
             if item.target_rva + item.size <= rva:
                 continue
-            if item.address_only and item.target_rva == rva:
+            if item.target_rva == rva and item.metadata_entry:
+                continue
+            if (item.target_rva == rva and item.kind == "RIP address"
+                    and (item.source_rva, rva) in self.proven_entry_calls):
                 continue
             return (
                 f"known source reference: {item.kind} at RVA 0x{item.source_rva:X} "

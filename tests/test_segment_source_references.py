@@ -69,7 +69,7 @@ def test_address_only_lea_does_not_add_segment_base_or_waive_interior_reference(
     raw = _seg_rip('lea rax,{mem}', segment, target)
     refs = source_references.instruction_references(Decoder(64, raw, ip=0x1100))
     assert len(refs) == 1 and refs[0].address_only and refs[0].target_rva == target
-    _admit(_image(raw), interface, 0x1000 < target < 0x1007)
+    _admit(_image(raw), interface, 0x1000 <= target < 0x1007)
 
 
 @pytest.mark.parametrize('interface', ['preflight', 'discovery'])

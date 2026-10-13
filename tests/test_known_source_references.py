@@ -6,10 +6,11 @@ import struct
 from types import SimpleNamespace
 
 import pytest
+from iced_x86 import Decoder, Mnemonic
 from keystone import KS_ARCH_X86, KS_MODE_64, Ks
 
 from lifter import direct_control_flow as flow, function_discovery as discovery
-from lifter import virtualization_plan as plan
+from lifter import source_references, virtualization_plan as plan
 from packer import pe_analyze, virtualize
 from tests import test_function_discovery as fixtures
 from tests import test_virtualization_materializer as materializer
@@ -67,8 +68,76 @@ def test_fixed_width_access_checks_entire_span(interface, template, width, offse
 
 @pytest.mark.parametrize("interface", ["preflight", "discovery"])
 @pytest.mark.parametrize("offset", [-1, 0, 1, 5, 7])
-def test_lea_interior_rejects_but_entry_pointer_remains_supported(interface, offset):
-    _admit(_image(_rip("lea rax,{mem}", 0x1000 + offset)), interface, 0 < offset < 7)
+def test_lea_interior_or_unconsumed_entry_pointer_rejects(interface, offset):
+    # LEA of an exact entry is not by itself a proof that arithmetic cannot
+    # derive an interior target before an indirect call.
+    _admit(_image(_rip("lea rax,{mem}", 0x1000 + offset)), interface, 0 <= offset < 7)
+
+
+def _bounded_entry_call(branch_to_call):
+    # An immediate LEA-to-CALL transfer preserves the selected entry. A
+    # direct branch into CALL can bypass LEA and supply entry+1 in RAX.
+    prefix = bytes(_KS.asm("sub rsp,0x28" +
+                           ("; mov rax,rcx" if branch_to_call else ""),
+                           addr=0x1100)[0])
+    branch = bytes.fromhex("eb07") if branch_to_call else b""
+    lea = _rip("lea rax,{mem}", 0x1000,
+               source=0x1100 + len(prefix) + len(branch))
+    assert len(lea) == 7
+    suffix = bytes(_KS.asm("call rax; add rsp,0x28; ret",
+                           addr=0x1100 + len(prefix) + len(branch) + len(lea))[0])
+    return prefix + branch + lea + suffix
+
+
+@pytest.mark.parametrize("interface", ["preflight", "discovery"])
+@pytest.mark.parametrize("branch_to_call", [False, True])
+def test_bounded_exact_entry_call_and_alternate_predecessor_agree(
+        interface, branch_to_call):
+    _admit(_image(_bounded_entry_call(branch_to_call)), interface, branch_to_call)
+
+
+def test_unresolved_native_prefix_cannot_prove_exact_entry_call(monkeypatch):
+    image = _image(_bounded_entry_call(False))
+    original = discovery.jump_table.decode_function_body
+
+    def unresolved_native(code, begin, end):
+        if begin == 0x1100:
+            raise discovery.jump_table.JumpTableUnresolved("fixture unscanned suffix")
+        return original(code, begin, end)
+
+    monkeypatch.setattr(discovery.jump_table, "decode_function_body", unresolved_native)
+    report = discovery.discover_functions(image, exports=())
+    selected = next(item for item in report.candidates if item.rva == 0x1000)
+    assert selected.direct_control_proof_status == "rejected"
+    assert "known source reference: RIP address" in selected.direct_control_rejection_reason
+    with pytest.raises(flow.DirectControlFlowError):
+        flow.analyze_direct_control_flow(
+            image, (plan.FunctionSpec("probe", 0x1000, 7),), production=False)
+
+
+def test_other_function_direct_edge_cannot_prove_local_exact_call():
+    native = tuple(Decoder(64, _bounded_entry_call(False), ip=0x1100))
+    call_rva = next(int(item.ip) for item in native if item.mnemonic == Mnemonic.CALL)
+    other = tuple(Decoder(64, bytes(_KS.asm(f"jmp {call_rva}", addr=0x1200)[0]),
+                          ip=0x1200))
+    proven = source_references.proven_immediate_entry_calls((native, other))
+    assert not proven
+    assert source_references.SourceReferenceIndex(
+        source_references.instruction_references(native),
+        proven_entry_calls=proven,
+    ).rejection("probe", 0x1000, 7) is not None
+
+
+def test_known_address_entry_to_call_site_cannot_prove_local_exact_call():
+    native = tuple(Decoder(64, _bounded_entry_call(False), ip=0x1100))
+    call_rva = next(int(item.ip) for item in native if item.mnemonic == Mnemonic.CALL)
+    proven = source_references.proven_immediate_entry_calls(
+        (native,), known_entry_targets=(call_rva,))
+    assert not proven
+    assert source_references.SourceReferenceIndex(
+        source_references.instruction_references(native),
+        proven_entry_calls=proven,
+    ).rejection("probe", 0x1000, 7) is not None
 
 
 @pytest.mark.parametrize("interface", ["preflight", "discovery"])
@@ -78,7 +147,9 @@ def test_dir64_values_not_just_slot_locations_participate(interface, offset):
     image.sections.append(pe_analyze.ParsedSection(
         ".rdata", 0x4000, 8, struct.pack("<Q", image.image_base + 0x1000 + offset), 0x40000040))
     image.dir64_relocations = (pe_analyze.ParsedDir64Relocation(0x4000),)
-    _admit(image, interface, 0 < offset < 7)
+    # A relocatable pointer value is available outside the decoded local
+    # caller; exact-entry storage is not an indirect-target closure proof.
+    _admit(image, interface, 0 <= offset < 7)
 
 
 @pytest.mark.parametrize("interface", ["preflight", "discovery"])
@@ -176,7 +247,7 @@ def test_low_level_commit_rechecks_external_native_bytes_and_pointer_values(kind
             old.begin_rva, old.begin_rva + len(native), old.unwind_info_rva))
         image.sections[1].raw = image.sections[1].raw[:12] + struct.pack("<III", 0x1020, 0x1020 + len(native), 0x3010)
     else:
-        image.sections[3].raw = struct.pack("<Q", image.image_base + 0x1000)
+        image.sections[3].raw = struct.pack("<Q", image.image_base + 0x4000)
     manifest = _manifest(image, len(selected))
     # A valid, unchanged source still commits. This does not execute the stub.
     assert virtualize.apply_virtualization_manifest(image, manifest, acknowledge_no_interior_entries=True)
@@ -185,7 +256,7 @@ def test_low_level_commit_rechecks_external_native_bytes_and_pointer_values(kind
         assert len(replacement) == len(native)
         image.sections[0].raw = image.sections[0].raw[:0x20] + replacement
     else:
-        image.sections[3].raw = struct.pack("<Q", image.image_base + 0x1001)
+        image.sections[3].raw = struct.pack("<Q", image.image_base + 0x1000)
     before = copy.deepcopy(image)
     with pytest.raises(virtualize.VirtualizationMaterializationError, match="known source reference"):
         virtualize.apply_virtualization_manifest(image, manifest, acknowledge_no_interior_entries=True)

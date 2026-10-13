@@ -920,6 +920,7 @@ def _linear_prefix(code: bytes, begin: int, end: int) -> tuple[Any, ...]:
 def _scan_direct_control(
         sections: Sequence[Any], runtime: Sequence[_RuntimeRange],
         *, reference_instructions: list[Any] | None = None,
+        reference_groups: list[tuple[Any, ...]] | None = None,
 ) -> tuple[tuple[_DirectEdge, ...], tuple[tuple[int, int], ...]]:
     """Decode the runtime inventory once and record all near direct edges.
 
@@ -941,8 +942,13 @@ def _scan_direct_control(
         try:
             body = jump_table.decode_function_body(code, record.begin, record.end)
             instructions = body.instructions
+            if reference_groups is not None:
+                reference_groups.append(tuple(instructions))
         except jump_table.JumpTableUnresolved:
             # Data-in-code we cannot prove: bail this one function to native.
+            # Keep its decoded prefix for negative references/direct edges,
+            # but never promote a local LEA-to-CALL pair from a partial decode
+            # into positive exact-entry proof.
             instructions = _linear_prefix(code, record.begin, record.end)
             quarantined.append((record.begin, record.end))
         for instruction in instructions:
@@ -1175,16 +1181,26 @@ def discover_functions(
     direct_transfers = ()
     reference_index = source_references.SourceReferenceIndex(())
     reference_instructions = []
+    reference_groups: list[tuple[Any, ...]] = []
     quarantined_ranges: tuple[tuple[int, int], ...] = ()
     try:
         direct_transfers, quarantined_ranges = _scan_direct_control(
-            sections, runtime, reference_instructions=reference_instructions
+            sections, runtime, reference_instructions=reference_instructions,
+            reference_groups=reference_groups,
         )
-        reference_index = source_references.SourceReferenceIndex((
+        references = (
             *source_references.instruction_references(reference_instructions),
             *source_references.dir64_references(parsed),
             *source_references.metadata_references(parsed, exports=export_records),
-        ))
+        )
+        reference_index = source_references.SourceReferenceIndex(
+            references,
+            proven_entry_calls=source_references.proven_immediate_entry_calls(
+                reference_groups,
+                known_entry_targets=(item.target_rva for item in references
+                                     if item.address_only),
+            ),
+        )
         direct_status = "passed"
     except (FunctionDiscoveryError, source_references.SourceReferenceError) as exc:
         direct_status = "rejected"
@@ -1278,8 +1294,15 @@ def discover_functions(
                 try:
                     code = _read_executable(sections, extent.rva, extent.size, "candidate")
                     body = jump_table.decode_function_body(code, extent.rva, extent.rva + extent.size)
+                    leaf_references = source_references.instruction_references(body.instructions)
                     source_references.SourceReferenceIndex(
-                        source_references.instruction_references(body.instructions)
+                        leaf_references,
+                        proven_entry_calls=source_references.proven_immediate_entry_calls(
+                            (*reference_groups, tuple(body.instructions)),
+                            known_entry_targets=(item.target_rva for item in
+                                                 (*reference_index.references, *leaf_references)
+                                                 if item.address_only),
+                        ),
                     ).validate((extent,))
                 except (jump_table.JumpTableUnresolved, source_references.SourceReferenceError) as exc:
                     control_reason = str(exc)
