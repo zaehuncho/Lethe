@@ -21,4 +21,8 @@ policy wrapper over all 32 Boolean combinations and the lease wrapper over 20
 defined-behavior boundary vectors. These fixture results do not prove product
 workflow acceptance or general DLL/EXE support. A prior LINKREPRO replay of
 the isolated prototype produced functional parity but not byte-identical PEs;
-that failed final-link binding check remains open.
+retain that failed run as historical evidence. The separate opt-in
+`lifter.product_fixture_link_verify.verify_product_fixture_final_link`
+has since proved raw PE byte-equal replay of the reviewed synthetic fixture
+EXE/DLL only. It does not prove product closure, archive-member selection,
+XFG enforcement, production keys, or release admission.
