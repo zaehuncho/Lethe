@@ -44,6 +44,7 @@ def fixture(*, virtual_size: int = 0x80):
         symbol_count=2,
         distinct_ranges=((0x1000, 0x1001), (0x1020, 0x1021)),
         supplemental_ranges=((0x1020, 0x1021),),
+        range_multiplicities=((0x1000, 0x1001, 1), (0x1020, 0x1021, 1)),
     )
     return parsed, bound
 
@@ -142,7 +143,8 @@ def test_pdb_only_direct_jump_to_selected_interior_rejects(monkeypatch) -> None:
     parsed.sections[0].raw = bytes(text)
     parsed.runtime_functions = (SimpleNamespace(begin_rva=0x1000, end_rva=0x1002),)
     bound = replace(bound, distinct_ranges=((0x1000, 0x1002), (0x1020, 0x1025)),
-                    supplemental_ranges=((0x1020, 0x1025),))
+                    supplemental_ranges=((0x1020, 0x1025),),
+                    range_multiplicities=((0x1000, 0x1002, 1), (0x1020, 0x1025, 1)))
     monkeypatch.setattr(inventory, "run_bound_inventory", lambda *args: bound)
     with pytest.raises(coverage.PdbCoverageError, match="enters selected.*interior"):
         coverage.prove_pdb_executable_coverage(

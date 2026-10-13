@@ -48,6 +48,7 @@ def _fixture(tmp_path: Path, *, selected_code: bytes = b"\xc3"):
         symbol_count=2,
         distinct_ranges=((0x1000, 0x1001), leaf),
         supplemental_ranges=(leaf,),
+        range_multiplicities=((0x1000, 0x1001, 1), (*leaf, 1)),
     )
     spec = (SimpleNamespace(name="selected_leaf", rva=leaf[0], size=len(selected_code)),)
     return parsed, bound, spec
@@ -95,7 +96,8 @@ def test_partial_pdb_overlap_with_selected_leaf_still_rejects(
 ) -> None:
     parsed, bound, spec = _fixture(tmp_path)
     bound = replace(bound, distinct_ranges=((0x1000, 0x1001), bound_leaf),
-                    supplemental_ranges=(bound_leaf,))
+                    supplemental_ranges=(bound_leaf,),
+                    range_multiplicities=((0x1000, 0x1001, 1), (*bound_leaf, 1)))
     with pytest.raises(coverage.PdbCoverageError, match="overlaps a known function"):
         _prove(monkeypatch, tmp_path, parsed, bound, spec)
 
@@ -109,7 +111,8 @@ def test_pdb_proper_subset_of_selected_extent_still_rejects(
 ) -> None:
     parsed, bound, spec = _fixture(tmp_path, selected_code=selected_code)
     bound = replace(bound, distinct_ranges=((0x1000, 0x1001), bound_leaf),
-                    supplemental_ranges=(bound_leaf,))
+                    supplemental_ranges=(bound_leaf,),
+                    range_multiplicities=((0x1000, 0x1001, 1), (*bound_leaf, 1)))
     with pytest.raises(coverage.PdbCoverageError, match="overlaps a known function"):
         _prove(monkeypatch, tmp_path, parsed, bound, spec)
 
@@ -124,7 +127,8 @@ def test_selected_leaf_interior_direct_branch_still_rejects(
     parsed.runtime_functions = (SimpleNamespace(
         begin_rva=0x1000, end_rva=0x1005, unwind_info_rva=0x2000,
     ),)
-    bound = replace(bound, distinct_ranges=((0x1000, 0x1005), (0x1020, 0x1022)))
+    bound = replace(bound, distinct_ranges=((0x1000, 0x1005), (0x1020, 0x1022)),
+                    range_multiplicities=((0x1000, 0x1005, 1), (0x1020, 0x1022, 1)))
     with pytest.raises(coverage.PdbCoverageError, match="enters selected.*interior"):
         _prove(monkeypatch, tmp_path, parsed, bound, spec)
 
@@ -144,7 +148,8 @@ def test_pdb_span_intersecting_pdata_is_not_filtered(
 ) -> None:
     parsed, bound, _spec = _fixture(tmp_path, selected_code=b"\x90\xc3")
     bound = replace(bound, distinct_ranges=((0x1000, 0x1002), (0x1020, 0x1022)),
-                    supplemental_ranges=((0x1000, 0x1002), (0x1020, 0x1022)))
+                    supplemental_ranges=((0x1000, 0x1002), (0x1020, 0x1022)),
+                    range_multiplicities=((0x1000, 0x1002, 1), (0x1020, 0x1022, 1)))
     spec = (SimpleNamespace(name="not_a_leaf", rva=0x1000, size=2),)
     with pytest.raises(coverage.PdbCoverageError, match="partially overlaps runtime function"):
         _prove(monkeypatch, tmp_path, parsed, bound, spec)

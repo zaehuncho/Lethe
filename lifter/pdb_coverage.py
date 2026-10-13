@@ -318,6 +318,37 @@ def prove_pdb_executable_coverage(
     bound = pdb_function_inventory.run_bound_inventory(
         parsed, image_path, pdb_path, helper_path, msdia_path
     )
+    # Coverage uses distinct DIA extents, but selecting a PDB-only leaf needs
+    # the raw function-symbol multiplicity. An ICF alias at the same RVA is not
+    # proof that one named helper owns the machine-code entry exclusively.
+    rows = bound.range_multiplicities
+    if type(rows) is not tuple or type(bound.symbol_count) is not int:
+        raise PdbCoverageError("PDB alias multiplicity inventory is malformed")
+    spans = bound.distinct_ranges
+    if type(spans) is not tuple or not spans:
+        raise PdbCoverageError("PDB alias multiplicity inventory is malformed")
+    previous_end = 0
+    for span in spans:
+        if (type(span) is not tuple or len(span) != 2
+                or type(span[0]) is not int or type(span[1]) is not int
+                or not 0 < span[0] < span[1] <= 0x1_0000_0000
+                or span[0] < previous_end):
+            raise PdbCoverageError("PDB alias multiplicity inventory is malformed")
+        previous_end = span[1]
+    if len(rows) != len(spans):
+        raise PdbCoverageError("PDB alias multiplicity inventory is incomplete")
+    total = 0
+    by_span = {}
+    for row, span in zip(rows, spans):
+        if (type(row) is not tuple or len(row) != 3
+                or type(row[0]) is not int or type(row[1]) is not int
+                or type(row[2]) is not int or row[:2] != span
+                or row[2] <= 0):
+            raise PdbCoverageError("PDB alias multiplicity inventory is malformed")
+        by_span[span] = row[2]
+        total += row[2]
+    if total != bound.symbol_count:
+        raise PdbCoverageError("PDB alias multiplicity inventory is incomplete")
     sections = direct_control_flow._normalize_sections(parsed)
     for begin, end in bound.supplemental_ranges:
         owner = next(
@@ -345,11 +376,19 @@ def prove_pdb_executable_coverage(
     # but do not submit it a second time as supplemental code. This exception
     # is PDB-bound; raw supplements and every partial overlap still reject.
     pdb_occurrences = Counter(bound.supplemental_ranges)
-    selected_pdb_leaves = {
+    exact_pdb_leaves = {
         (item.rva, item.end_rva)
         for item in selected
-        if pdb_occurrences[(item.rva, item.end_rva)] == 1
+        if pdb_occurrences[(item.rva, item.end_rva)]
         and all(end <= item.rva or begin >= item.end_rva for begin, end in pdata)
+    }
+    for span in exact_pdb_leaves:
+        if pdb_occurrences[span] == 1 and by_span.get(span) != 1:
+            raise PdbCoverageError(
+                f"selected leaf 0x{span[0]:X} has an aliased PDB function range"
+            )
+    selected_pdb_leaves = {
+        span for span in exact_pdb_leaves if pdb_occurrences[span] == 1
     }
     supplement = tuple(sorted((
         *(span for span in bound.supplemental_ranges if span not in selected_pdb_leaves),

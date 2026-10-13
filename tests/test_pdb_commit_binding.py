@@ -47,6 +47,7 @@ def _case(monkeypatch, tmp_path: Path, *, pdb_code: bytes = b"\x90" * 7 + b"\xc3
         symbol_count=2,
         distinct_ranges=((0x1000, 0x1000 + len(selected)), (0x1020, 0x1028)),
         supplemental_ranges=((0x1020, 0x1028),),
+        range_multiplicities=((0x1000, 0x1000 + len(selected), 1), (0x1020, 0x1028, 1)),
     )
     # The external-file fixture pins bytes but is not a full PE header.
     monkeypatch.setattr(function_discovery, "parse_pe_exports", lambda _parsed: ())

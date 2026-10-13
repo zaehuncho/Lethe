@@ -6,6 +6,7 @@ to decode every supplemental body and prove all residual executable bytes.
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -47,6 +48,8 @@ class BoundPdbInventory:
     symbol_count: int
     distinct_ranges: tuple[tuple[int, int], ...]
     supplemental_ranges: tuple[tuple[int, int], ...]
+    # Raw DIA multiplicity survives distinct-span coverage normalization.
+    range_multiplicities: tuple[tuple[int, int, int], ...]
     msdia_sha256: str | None = None
 
 
@@ -197,7 +200,8 @@ def bind_inventory(
         pdata = direct_control_flow._normalize_runtime_functions(parsed)
     except direct_control_flow.DirectControlFlowError as exc:
         raise PdbInventoryError(str(exc)) from exc
-    distinct = sorted(set(source))
+    counts = Counter(source)
+    distinct = sorted(counts)
     if any(current[0] < previous[1] for previous, current in zip(distinct, distinct[1:])):
         raise PdbInventoryError("PDB function extents overlap")
     supplemental = []
@@ -234,6 +238,9 @@ def bind_inventory(
         symbol_count=len(source),
         distinct_ranges=tuple(distinct),
         supplemental_ranges=tuple(supplemental),
+        range_multiplicities=tuple(
+            (begin, end, counts[(begin, end)]) for begin, end in distinct
+        ),
     )
 
 
