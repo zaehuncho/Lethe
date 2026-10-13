@@ -64,6 +64,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_fp_frame_materialized.py",
     "test_native_known_references.py",
     "test_native_entry_metadata.py",
+    "test_candidate_native_contract.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_runtime_hardening_stress.py::"
@@ -81,7 +82,7 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_executable_calls_virtualized_leaf[memguard]",
     "tests/test_native_virtualization_runtime.py::"
-    "test_packed_executable_calls_virtualized_native_callee",
+    "test_retained_native_callee_discovery_rejects_forced_aslr_exe",
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
     "tests/test_native_virtualization_runtime.py::"
@@ -135,13 +136,21 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_lifter_frame_call_native.py::"
     "test_native_frame_call_boundary[unwind]",
     "tests/test_native_fp_frame_materialized.py::"
-    "test_materialized_fp_stack_frame_exe_and_dll_parity",
+    "test_materialized_frame_aliases_and_native_callers_exe_dll",
     "tests/test_native_fp_frame_materialized.py::"
     "test_fp_frame_old_address_taken_exe_rejects_before_output",
     "tests/test_native_known_references.py::"
     "test_materialized_known_reference_admission_exe_and_dll",
     "tests/test_native_entry_metadata.py::"
     "test_materialized_export_entry_metadata_exe_and_dll",
+    "tests/test_candidate_native_contract.py::"
+    "test_materialized_internal_vm_call_exe_and_dll_parity",
+    "tests/test_candidate_native_contract.py::"
+    "test_native_callee_without_physical_frame_rejects_exe_and_dll[direct_pdata]",
+    "tests/test_candidate_native_contract.py::"
+    "test_native_callee_without_physical_frame_rejects_exe_and_dll[return_site]",
+    "tests/test_candidate_native_contract.py::"
+    "test_native_callee_without_physical_frame_rejects_exe_and_dll[home_write]",
 
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)
@@ -301,6 +310,9 @@ def candidate_policy_payload() -> dict[str, Any]:
         "compile_policy": "/W4 /WX /Brepro",
         "link_policy": "/Brepro /INCREMENTAL:NO",
         "required_evidence": sorted(REQUIRED_CANDIDATE_EVIDENCE),
+        "required_native_runtime_count": REQUIRED_NATIVE_RUNTIME_PASS_COUNT,
+        "required_native_runtime_nodes_sha256": _canonical_sha256(
+            list(REQUIRED_NATIVE_RUNTIME_NODE_IDS)),
     }
 
 

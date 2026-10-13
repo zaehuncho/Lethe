@@ -708,7 +708,10 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[bytes]:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows x64 materialization only")
-def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypatch) -> None:
+def test_materialized_frame_aliases_and_native_callers_exe_dll(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Preserve safe frame work and reject every unresolved physical callee frame."""
     if os.environ.get(runtime._RUN_GATE) != "1":
         pytest.skip(f"set {runtime._RUN_GATE}=1 to run the native virtualization proof")
     pytest.importorskip("lief")
@@ -720,66 +723,92 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
     stub_pin = hashlib.sha256(stub.read_bytes()).hexdigest()
     monkeypatch.setenv(runtime._VIRTUALIZATION_GATE, "1")
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
-    negative_work=tmp_path/"original-opaque-spill"
+
+    negative_work = tmp_path / "original-opaque-spill"
     negative_work.mkdir()
-    negative_exe,negative_dll,negative_host=_build(negative_work,asm=_ASM_WITH_OPAQUE_SPILL)
-    negative_records=[]
-    for source,is_dll in ((negative_exe,False),(negative_dll,True)):
-        before=_run([str(negative_host),str(source)] if is_dll else [str(source)])
-        assert before.returncode==0,(before.stdout,before.stderr)
-        image=assemble._StubImage(source.read_bytes())
-        parsed=pe_analyze.analyze_pe(str(source))
-        rva=image.find_export_rva("vm_fp_call")
-        record,=(r for r in parsed.runtime_functions if r.begin_rva==rva)
-        spec=virtualization_plan.FunctionSpec("vm_fp_call",rva,record.end_rva-rva)
-        proof=direct_control_flow.analyze_direct_control_flow(parsed,(spec,),production=False)
-        gaps=tuple(orchestrator.VirtualizationGapAcknowledgement(
-            item.rva,item.size,"exact generated original opaque-spill negative control")
+    negative_exe, negative_dll, negative_host = _build(
+        negative_work, asm=_ASM_WITH_OPAQUE_SPILL)
+    for source, is_dll in ((negative_exe, False), (negative_dll, True)):
+        before = _run([str(negative_host), str(source)] if is_dll else [str(source)])
+        assert before.returncode == 0, (before.stdout, before.stderr)
+        image = assemble._StubImage(source.read_bytes())
+        parsed = pe_analyze.analyze_pe(str(source))
+        rva = image.find_export_rva("vm_fp_call")
+        record, = (r for r in parsed.runtime_functions if r.begin_rva == rva)
+        spec = virtualization_plan.FunctionSpec("vm_fp_call", rva,
+                                                 record.end_rva - rva)
+        proof = direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+        gaps = tuple(orchestrator.VirtualizationGapAcknowledgement(
+            item.rva, item.size, "exact original opaque-spill negative fixture gap")
             for item in proof.coverage_gaps)
-        output=negative_work/("must-not-exist.dll" if is_dll else "must-not-exist.exe")
-        result=orchestrator.pack_file(str(source),orchestrator.PackOptions(
-            output_path=str(output),is_dll=is_dll,stub_path=str(stub),
-            virtualization_specs=(orchestrator.VirtualizationSpec(spec.name,spec.rva,spec.size),),
+        output = negative_work / ("must-not-exist.dll" if is_dll else "must-not-exist.exe")
+        result = orchestrator.pack_file(str(source), orchestrator.PackOptions(
+            output_path=str(output), is_dll=is_dll, stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size),),
             virtualization_gap_acknowledgements=gaps,
-            acknowledge_unproven_indirect_targets=True,_allow_unverified_stub_for_tests=True))
-        assert not result.ok and "native source stack pointer escape" in result.error
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True))
+        assert not result.ok and "opaque native CALL lacks physical callee return-address" in result.error
         assert not output.exists()
-        negative_records.append(dict(is_dll=is_dll,input_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-            original_exit=before.returncode,original_stdout=before.stdout.decode("ascii"),
-            pack_ok=result.ok,diagnostic=result.error,output_exists=output.exists()))
-    (tmp_path/"original-opaque-spill-rejections.json").write_text(json.dumps(negative_records,indent=2))
+
+    pure_names = ("vm_alias_pointer", "vm_int_pair",
+                  "vm_alias_choose", "vm_alias_choose_spill")
+    native_names = ("vm_fp_call", "vm_tail_native_call", "vm_tail_import_call",
+                    "vm_arity_4", "vm_arity_8", "vm_arity_9",
+                    "vm_arity_16", "vm_arity_63")
     for source, is_dll in ((exe, False), (dll, True)):
+        original_pin = hashlib.sha256(source.read_bytes()).hexdigest()
         image = assemble._StubImage(source.read_bytes())
         parsed = pe_analyze.analyze_pe(str(source))
         _assert_tail_fixture(image, parsed)
-        specs = []
-        for name in ("vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-                     "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call", "vm_arity_4", "vm_arity_8", "vm_arity_9", "vm_arity_16", "vm_arity_63"):
+        source_command = [str(host), str(source)] if is_dll else [str(source)]
+        before = _run(source_command)
+        assert before.returncode == 0, (before.stdout, before.stderr)
+        all_specs = {}
+        for name in (*pure_names, *native_names):
             rva = image.find_export_rva(name)
             assert rva is not None
-            records = [record for record in parsed.runtime_functions
-                       if record.begin_rva == rva]
-            assert len(records) == 1
-            record = records[0]
-            specs.append(virtualization_plan.FunctionSpec(
-                name, rva, record.end_rva - record.begin_rva))
+            record, = (item for item in parsed.runtime_functions
+                       if item.begin_rva == rva)
+            all_specs[name] = virtualization_plan.FunctionSpec(
+                name, rva, record.end_rva - rva)
+        for name in native_names:
+            spec = all_specs[name]
+            proof = direct_control_flow.analyze_direct_control_flow(
+                parsed, (spec,), production=False)
+            gaps = tuple(orchestrator.VirtualizationGapAcknowledgement(
+                item.rva, item.size, "generated unsupported native caller gap")
+                for item in proof.coverage_gaps)
+            output = tmp_path / (name + (".must-not-exist.dll" if is_dll else ".must-not-exist.exe"))
+            result = orchestrator.pack_file(str(source), orchestrator.PackOptions(
+                output_path=str(output), is_dll=is_dll, stub_path=str(stub),
+                virtualization_specs=(orchestrator.VirtualizationSpec(
+                    spec.name, spec.rva, spec.size),),
+                virtualization_gap_acknowledgements=gaps,
+                acknowledge_unproven_indirect_targets=True,
+                _allow_unverified_stub_for_tests=True))
+            diagnostic = ("opaque native CALL lacks physical callee return-address"
+                          if name in ("vm_fp_call", "vm_tail_import_call") else
+                          "retained PDATA native CALL lacks physical return-slot")
+            assert not result.ok and diagnostic in result.error, (name, result.error)
+            assert not output.exists()
+
+        specs = tuple(all_specs[name] for name in pure_names)
         proof = direct_control_flow.analyze_direct_control_flow(
-            parsed, tuple(specs), production=False)
+            parsed, specs, production=False)
         gaps = tuple(orchestrator.VirtualizationGapAcknowledgement(
-            item.rva, item.size, "exact generated FP frame fixture gap")
+            item.rva, item.size, "exact generated pure frame fixture gap")
             for item in proof.coverage_gaps)
-        packed = tmp_path / ("fp_frame.packed.dll" if is_dll else "fp_frame.packed.exe")
-        source_cmd = [str(host), str(source)] if is_dll else [str(source)]
-        packed_cmd = [str(host), str(packed)] if is_dll else [str(packed)]
-        before = _run(source_cmd)
-        assert before.returncode == 0, (before.stdout, before.stderr)
+        packed = tmp_path / ("pure_frame.packed.dll" if is_dll else "pure_frame.packed.exe")
         captured = {}
         original_materialize = virtualize.materialize_selected_functions
 
         def capture(*args, **kwargs):
-            result = original_materialize(*args, **kwargs)
-            captured["result"] = result
-            return result
+            materialized = original_materialize(*args, **kwargs)
+            captured["result"] = materialized
+            return materialized
 
         with monkeypatch.context() as patch:
             patch.setattr(virtualize, "materialize_selected_functions", capture)
@@ -791,13 +820,19 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
                 acknowledge_unproven_indirect_targets=True,
                 _allow_unverified_stub_for_tests=True))
         assert result.ok, result.error
-        assert {fn.name for fn in captured["result"].manifest.functions} == {
-            "vm_fp_call", "vm_alias_pointer", "vm_int_pair",
-            "vm_alias_choose", "vm_alias_choose_spill", "vm_tail_native_call", "vm_tail_import_call", "vm_arity_4", "vm_arity_8", "vm_arity_9", "vm_arity_16", "vm_arity_63"}
-        after = _run(packed_cmd)
+        materialized = captured["result"]
+        assert {fn.name for fn in materialized.manifest.functions} == set(pure_names)
+        for name in native_names:
+            spec = all_specs[name]
+            assert image.read_at_rva(spec.rva, spec.size) == pe_analyze._slice_at_rva(
+                materialized.parsed.sections, spec.rva, spec.size,
+                what="unselected native caller")
+        packed_command = [str(host), str(packed)] if is_dll else [str(packed)]
+        after = _run(packed_command)
         assert (after.returncode, after.stdout, after.stderr) == (
             before.returncode, before.stdout, before.stderr)
-        assert hashlib.sha256(stub.read_bytes()).hexdigest() == stub_pin
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == original_pin
+    assert hashlib.sha256(stub.read_bytes()).hexdigest() == stub_pin
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows x64 materialization only")

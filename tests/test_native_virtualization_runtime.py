@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from lifter import direct_control_flow, virtualization_plan, win64_thunk
+from lifter import direct_control_flow, function_discovery, virtualization_plan, win64_thunk
 from packer import (
     assemble, bytecode_pages, orchestrator, pe_analyze, virtualize,
     virtualization_selection,
@@ -677,13 +677,8 @@ def test_packed_executable_calls_virtualized_leaf(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
-def test_packed_executable_calls_virtualized_native_callee(monkeypatch) -> None:
-    """Bind the proven direct-near-call bridge to the exact candidate stub.
-
-    The selected caller executes as authenticated paged bytecode while its
-    PDATA-proven callee remains native in the protected image. The packed EXE
-    must retain forced-ASLR output and exit parity with the original.
-    """
+def test_retained_native_callee_discovery_rejects_forced_aslr_exe() -> None:
+    """Original framed PDATA caller runs; packing rejects its unproven native CALL."""
     if os.environ.get(_RUN_GATE) != "1":
         pytest.skip(f"set {_RUN_GATE}=1 to run the native virtualization proof")
     pytest.importorskip("lief")
@@ -697,116 +692,58 @@ def test_packed_executable_calls_virtualized_native_callee(monkeypatch) -> None:
         pytest.fail(f"native test directory escaped repository root: {work}")
     try:
         source = _build_fixture(work)
+        source_pin = hashlib.sha256(source.read_bytes()).hexdigest()
         source_image = assemble._StubImage(source.read_bytes())
         caller_rva = source_image.find_export_rva("vm_direct_caller")
         callee_rva = source_image.find_export_rva("vm_native_helper")
         assert caller_rva is not None and callee_rva is not None
-
-        parsed_source = pe_analyze.analyze_pe(str(source))
-        caller_record = next(
-            record for record in parsed_source.runtime_functions
-            if record.begin_rva == caller_rva
-        )
-        callee_record = next(
-            record for record in parsed_source.runtime_functions
-            if record.begin_rva == callee_rva
-        )
-        caller_size = caller_record.end_rva - caller_record.begin_rva
-        callee_size = callee_record.end_rva - callee_record.begin_rva
-        caller_extent = _slice(parsed_source, caller_rva, caller_size)
-        callee_extent = _slice(parsed_source, callee_rva, callee_size)
-
+        parsed = pe_analyze.analyze_pe(str(source))
+        caller_record, = (row for row in parsed.runtime_functions
+                          if row.begin_rva == caller_rva)
+        callee_record, = (row for row in parsed.runtime_functions
+                          if row.begin_rva == callee_rva)
+        callee_extent = _slice(parsed, callee_rva,
+                               callee_record.end_rva - callee_rva)
         from iced_x86 import Decoder, Mnemonic, OpKind
-
+        caller_extent = _slice(parsed, caller_rva,
+                               caller_record.end_rva - caller_rva)
         decoded = []
         for instruction in Decoder(64, caller_extent, ip=caller_rva):
             decoded.append(instruction)
             if instruction.mnemonic == Mnemonic.RET:
                 break
-        assert decoded[-1].mnemonic == Mnemonic.RET
-        lifted_body_size = sum(instruction.len for instruction in decoded)
-        assert caller_size == lifted_body_size + 2
+        assert decoded and decoded[-1].mnemonic == Mnemonic.RET
+        spec = virtualization_plan.FunctionSpec(
+            "vm_direct_caller", caller_rva,
+            sum(instruction.len for instruction in decoded))
+        assert caller_record.end_rva - caller_rva == spec.size + 2
         calls = [item for item in decoded if item.mnemonic == Mnemonic.CALL]
-        assert len(calls) == 1
-        assert calls[0].op_kind(0) == OpKind.NEAR_BRANCH64
+        assert len(calls) == 1 and calls[0].op_kind(0) == OpKind.NEAR_BRANCH64
         assert calls[0].near_branch_target == callee_rva
 
+        report_path = work / "vm_direct_caller.report.json"
         selection_path = work / "vm_direct_caller.selection.json"
         assert virtualization_report.main([
-            str(source),
-            "--format", "json",
-            "--output", str(work / "vm_direct_caller.report.json"),
+            str(source), "--format", "json", "--output", str(report_path),
             "--emit-selection-manifest", str(selection_path),
         ]) == 0
-        selection_manifest = json.loads(
-            selection_path.read_text(encoding="ascii"))
-        selection_manifest["selections"] = [
-            item for item in selection_manifest["selections"]
-            if item["source_extent"]["rva"] == caller_rva
-        ]
-        assert len(selection_manifest["selections"]) == 1
-        selection_item = selection_manifest["selections"][0]
-        assert selection_item["source_extent"] == {
-            "rva": caller_rva, "size": caller_size,
-        }
-        assert selection_item["lifted_body_extent"] == {
-            "rva": caller_rva, "size": lifted_body_size,
-        }
-        selection_item["indirect_target_closure"]["acknowledged"] = True
-        for gap in selection_item["coverage_gaps"]:
-            gap["acknowledged"] = True
-            gap["rationale"] = "exact native direct-call fixture linker gap"
-        selection_path.write_bytes(
-            virtualization_selection.canonical_json(selection_manifest))
-
-        stub = _candidate_stub_or_build(work)
-        captured = {}
-        materialize = virtualize.materialize_selected_functions
-
-        def capture_materialization(*args, **kwargs):
-            result = materialize(*args, **kwargs)
-            captured["result"] = result
-            return result
-
-        monkeypatch.setattr(
-            virtualize, "materialize_selected_functions", capture_materialization)
-        monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
-        packed = work / "vm_direct_caller.packed.exe"
-        progress: list[str] = []
-        result = orchestrator.pack_file(
-            str(source),
-            orchestrator.PackOptions(
-                output_path=str(packed),
-                is_dll=False,
-                stub_path=str(stub),
-                virtualization_selection_manifest=str(selection_path),
-                _allow_unverified_stub_for_tests=True,
-            ),
-            progress.append,
-        )
-        assert result.ok, result.error
-        assert any("virtualized 1 selected function" in line for line in progress)
-
-        materialized = captured["result"]
-        function = materialized.manifest.functions[0]
-        assert function.target_rva == caller_rva
-        assert function.program_format == "paged-v1"
-        assert function.capabilities["external_calls_supported"] is True
-        assert function.capabilities["direct_native_calls_supported"] is True
-        entry = _slice(materialized.parsed, caller_rva, caller_size)
-        assert entry[0] == 0xE9
-        assert entry[5:] == b"\xCC" * (caller_size - 5)
-        assert _slice(materialized.parsed, callee_rva, callee_size) == callee_extent
+        manifest = json.loads(selection_path.read_text(encoding="ascii"))
+        assert not any(item["source_extent"]["rva"] == caller_rva
+                       for item in manifest["selections"])
+        candidate, = (item for item in function_discovery.discover_functions(parsed).candidates
+                      if item.rva == caller_rva)
+        assert not candidate.liftable
+        diagnostic = "retained PDATA native CALL lacks physical return-slot"
+        assert diagnostic in candidate.rejection_reason
 
         launcher = source.parent / "force_aslr.exe"
         original_run = _run_forced_aslr(source, launcher)
-        packed_run = _run_forced_aslr(packed, launcher)
-        assert original_run.returncode == 0
-        assert original_run.stdout == b"vm-answer=42\r\n"
-        assert original_run.stderr == b""
-        assert packed_run.returncode == original_run.returncode
-        assert packed_run.stdout == original_run.stdout
-        assert packed_run.stderr == original_run.stderr
+        assert (original_run.returncode, original_run.stdout, original_run.stderr) == (
+            0, b"vm-answer=42\r\n", b"")
+        assert _slice(parsed, callee_rva,
+                      callee_record.end_rva - callee_rva) == callee_extent
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == source_pin
+        assert not (work / "vm_direct_caller.packed.exe").exists()
     finally:
         if (work.parent == root and work.name.startswith(".native_vm_call_")
                 and work.exists()):

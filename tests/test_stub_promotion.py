@@ -274,26 +274,37 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_fp_frame_materialized.py",
         "test_native_known_references.py",
         "test_native_entry_metadata.py",
+        "test_candidate_native_contract.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 38
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 42
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert ("tests/test_native_known_references.py::"
             "test_materialized_known_reference_admission_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert ("tests/test_native_entry_metadata.py::"
             "test_materialized_export_entry_metadata_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 38
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 42
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert (
         "tests/test_native_virtualization_runtime.py::"
-        "test_packed_executable_calls_virtualized_native_callee"
+        "test_retained_native_callee_discovery_rejects_forced_aslr_exe"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert (
         "tests/test_native_virtualization_runtime.py::"
         "test_packed_dll_calls_source_bound_virtualized_padded_leaf"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    for node in (
+        "tests/test_candidate_native_contract.py::test_materialized_internal_vm_call_exe_and_dll_parity",
+        "tests/test_candidate_native_contract.py::test_native_callee_without_physical_frame_rejects_exe_and_dll[direct_pdata]",
+        "tests/test_candidate_native_contract.py::test_native_callee_without_physical_frame_rejects_exe_and_dll[return_site]",
+        "tests/test_candidate_native_contract.py::test_native_callee_without_physical_frame_rejects_exe_and_dll[home_write]",
+        "tests/test_native_fp_frame_materialized.py::test_materialized_frame_aliases_and_native_callers_exe_dll",
+    ):
+        assert node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    assert promote_stub.candidate_policy_payload()["required_native_runtime_count"] == 42
+    assert len(promote_stub.candidate_policy_payload()["required_native_runtime_nodes_sha256"]) == 64
     for node in (
         "tests/test_native_virtualization_runtime.py::test_padded_dll_address_taken_entry_rejects_before_output",
         "tests/test_chain_group_materialized.py::test_complete_chain_group_materializes_and_runs[exe]",

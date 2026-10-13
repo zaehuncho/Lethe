@@ -264,7 +264,7 @@
       "applies_to": ["exe", "dll"],
       "required": true,
       "status": "partial",
-      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing, legacy XMM register moves and the twelve XOR/AND/AND-NOT/OR forms with aligned logical memory sources, scalar MOVD/MOVQ and MOVSS/MOVSD transfers, low/high MOVLPS/MOVLPD/MOVHPS/MOVHPD memory transfers, MOVHLPS/MOVLHPS register-lane shuffles, immediate PSLLDQ/PSRLDQ byte shifts, aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU memory transfers, RIP-relative import calls, proven direct calls to first-party PDATA entries left native, and the MSVC CFG-dispatch idiom are covered, while header/gap/executable/discardable/address-taken RIP targets, other SIMD/FP arithmetic forms, AVX-family state, DIV/IDIV fault delivery, other indirect/native call shapes, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
+      "blocker": "Only an explicit bounded function subset is liftable; bounded RIP-relative scalar data addressing, legacy XMM register moves and the twelve XOR/AND/AND-NOT/OR forms with aligned logical memory sources, scalar MOVD/MOVQ and MOVSS/MOVSD transfers, low/high MOVLPS/MOVLPD/MOVHPS/MOVHPD memory transfers, MOVHLPS/MOVLHPS register-lane shuffles, immediate PSLLDQ/PSRLDQ byte shifts, aligned MOVAPS/MOVDQA and unaligned MOVUPS/MOVDQU memory transfers, same-extent internal VM calls are covered, while RIP-relative import calls, direct calls to retained PDATA functions, neutral IAT-tail calls, and the MSVC CFG-dispatch idiom reject before output until the physical native-callee return-slot and writable shadow-space contract is proven; header/gap/executable/discardable/address-taken RIP targets, other SIMD/FP arithmetic forms, AVX-family state, DIV/IDIV fault delivery, other indirect/native call shapes, exception-bearing bodies, and general indirect/address-taken closure remain unsupported.",
       "evidence": [
         {
           "type": "native",
@@ -304,7 +304,12 @@
         {
           "type": "native-pytest",
           "path": "tests/test_native_virtualization_runtime.py",
-          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative scalar and XMM memory-transfer bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata. A candidate-bound packed EXE also virtualizes a direct caller while its PDATA-proven callee remains native and preserves forced-ASLR output and exit parity."
+          "claim": "Authenticated eager-pack and memory-guard selected-function paths execute bounded RIP-relative scalar and XMM memory-transfer bytecode identically to the source under mandatory process relocation of a /DYNAMICBASE image with real DIR64 metadata. A candidate-bound original framed caller preserves forced-ASLR behavior but virtualization rejects its unproven retained-PDATA native CALL before output."
+        },
+        {
+          "type": "native-pytest",
+          "path": "tests/test_candidate_native_contract.py",
+          "claim": "Fresh generated EXE/DLL select a same-extent internal VM caller and match original output and exit. Direct retained-PDATA and opaque imported callee return/home-slot fixtures execute originally but reject typed before packed output."
         }
       ]
     },

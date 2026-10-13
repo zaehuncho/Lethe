@@ -112,55 +112,38 @@ other unmodeled pointer transfers fail closed. Source-derived pointers in the
 captured volatile native-call registers or four outgoing stack positions require
 a native-call pointer summary that is not yet implemented; those functions are
 rejected, not rewritten. Ordinary incoming caller pointers are not relocated.
-The materialized FP EXE/DLL regression also uses an RBP frame and a spilled/reloaded
-source-stack pointer for outgoing stores, and a second virtualized function checks
-an unchanged incoming caller output pointer plus its fifth stack argument.
-Its third selected function executes legacy `CVTDQ2PD` in both self-aliasing
-register and m64 forms. Eight directed signed-int32 pairs execute under 32 MXCSR
-settings covering every rounding mode, FTZ, sticky status and masked/unmasked
-exceptions; exact MXCSR preservation and four output doubles are asserted.
-The eight-byte input ends at a PAGE_NOACCESS boundary, so an accidental m128
-read faults rather than silently passing. The source-level plain/rolling frame
-harness also includes this exact conversion in its all-incoming-flags replay.
-General rounded conversions and floating-point arithmetic remain unsupported;
-the exact int32-to-binary64 lift uses existing integer opcodes, not host FP state.
-Fourth and fifth selected functions exercise conditional selection among a
-local stack slot, the caller's fifth argument and RIP-relative constant data.
-One reloads a selected pointer from an exact qword spill. Six signed selectors,
-including both int32 extremes, exercise all choices in the original and packed
-EXE/DLL while preserving the unchanged incoming caller output pointer. The
-original FP-call, alias and conversion assertions remain mandatory.
-This is bounded admission evidence,
-not a claim of arbitrary memory-safety analysis or general ISA support.
+Current materialized EXE/DLL frame acceptance selects native-call-free alias,
+conditional-pointer and exact signed-int32-to-binary64 conversion functions.
+The original FP, arity-4/8/9/16/63, retained-PDATA-tail and import-tail caller
+functions still run natively but are not selected. Each native-caller selection
+must reject before output with a typed physical callee-frame diagnostic. The
+original opaque-spill FP fixture also rejects before output; its opaque
+callee diagnostic takes precedence.
+Pure frame selection must preserve exact original/packed stdout, exit, source
+hashes and the unselected native caller bytes in the materialization image. The exact conversion still uses
+integer bytecode, not host floating-point arithmetic; rounded FP arithmetic,
+other SIMD state and arbitrary pointer escape remain unsupported.
 
-Read-only function discovery replays that same materialized-stack proof with
-the thunk's actual window size, canonical lifted body and per-candidate proven
-native-call targets before reporting `liftable=true` or emitting a starter
-selection. Dynamic/oversized frames, unbalanced returns, out-of-window aliases
-and unsupported native pointer escapes therefore appear as explicit lift
-rejections rather than a starter selection that fails later during packing.
-Instruction-specific failures retain their original diagnostic precedence.
-Canonical state-neutral native tail thunks may now serve as external call
-entries: at most sixteen unprefixed `E9 rel32`/terminal `FF25` instructions must
-resolve to a retained PDATA entry or an exact normal-import IAT slot. Every
-thunk byte stays outside selected extents and runtime bodies, in file-backed,
-non-discardable executable storage. Import slots require all eight bytes in
-non-executable, non-discardable storage and complete normal-import metadata.
-The original thunks/slots remain native; no guard, dispatch or call target is
-substituted. Cycles, excessive depth, prefixes, short/register jumps, arbitrary
-leaf code, malformed IAT metadata and unsupported source-pointer escapes still
-fail closed. This is not general indirect-target closure or exception bridging.
-The mandatory materialized node retains its original five functions and adds
-two callers for seven selected EXE/DLL functions. Both execute two neutral
-direct-jump thunks, one ending at a retained framed native five-argument sum,
-the other at an exact `GetCurrentProcess` import thunk. Their original/packed
-results must be 83 and the unchanged pseudo-handle -1. Fixture checks require
-the actual E9/E9 and FF25 encodings and absence of unwind records on the neutral
-thunks; source-call pointer escapes and the existing frame/alias/conversion
-assertions remain mandatory. This is generated fixture evidence, not an
-installed product, universal thunk form or clean-VM enforcement claim.
-Passing this preflight still does not prove indirect-target closure, whole-image
-executable coverage, native application behavior or release readiness.
+A fresh generated EXE/DLL contract fixture also selects a native-call-free
+same-extent internal VM CALL. Original and packed binaries must produce the
+same output and exit status. Generated direct calls to a retained PDATA callee
+and imported callees that observe their own physical return address or mutate
+caller shadow space must execute correctly in the originals but reject through
+both discovery/planning and the packer without creating an output. The
+candidate-bound test uses the fresh raw built stub and a hash-equivalent
+schema-1 test-only copy because schema-2 promotion has not completed. A later strict
+current-candidate check must use the schema-2 bundle with
+no test override. Historic candidate bundles are not current-source evidence.
+
+Read-only discovery and production planning identify canonical neutral E9/FF25
+chains only to issue precise typed rejections for opaque external callees.
+Neither retained PDATA entries nor exact normal-import IAT slots prove the
+callee's physical [RSP] return address, mutable Win64 home slots, CET pairing,
+or native-to-virtual pointer effects. Materialized native CALL admission remains
+empty until these effects are modeled and verified. Low-level diagnostic bridge
+tests do not grant production-planner admission. A selected function with one
+of these calls must fail before bytecode/output, irrespective of an otherwise
+bounded source virtual-stack analysis or target-identity proof.
 
 Known source-reference rejection is mandatory even with exact coverage-gap or
 unproven-indirect-target acknowledgements. Decoded fixed-width RIP memory spans
@@ -277,7 +260,7 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-frozen thirty-node native hardening, selected-function, captured-call
+frozen forty-two-node native hardening, selected-function, captured-call
 frame, 128-bit memory, XFG,
 and post-startup EXE export
 replay, the complete nineteen-check EXE/DLL round trip, and native production
@@ -545,14 +528,14 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of thirty
+The candidate-bound native runtime record must name the frozen list of forty-two
 node IDs spanning hardening stress, selected-function virtualization E2E,
 plain and shuffled-rolling STORE128 atomic-fault checks, captured frame calls
 and unwind recovery, XFG preflight, and post-startup EXE exports (one positive plus five directory/snapshot mutations).
 The count-zero mutation may be rejected by Windows before the stub executes;
 it is not proof that the stub's own verifier ran. The optional early-attach
 characterization is excluded and does not establish support. The mandatory
-terminal pytest summary must report exactly thirty passes
+terminal pytest summary must report exactly forty-two passes
 with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.
