@@ -10,10 +10,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from packer.strict_json import StrictJSONError, load_json_object_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MATRIX = ROOT / "docs" / "production_compatibility.json"
 VALID_TARGETS = frozenset(("exe", "dll"))
+MAX_DOCUMENT_BYTES = 1_048_576
 VALID_STATUSES = frozenset(
     ("proven", "failing", "blocked", "partial", "experimental", "unverified")
 )
@@ -29,16 +35,31 @@ def _require(condition: bool, message: str) -> None:
         raise MatrixError(message)
 
 
-def load_matrix(path: Path) -> dict[str, Any]:
+def _load_document(path: Path, *, what: str, allow_bom: bool = False) -> dict[str, Any]:
     try:
-        matrix = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MatrixError(f"cannot read compatibility matrix {path}: {exc}") from exc
-    _require(isinstance(matrix, dict), "matrix root must be an object")
-    _require(matrix.get("schema") == 1, "matrix schema must be 1")
+        # Bound the read itself, not just an already-allocated document. The
+        # native PowerShell producer may emit one leading UTF-8 BOM; count it
+        # toward the inclusive raw-byte limit before stripping it.
+        with path.open("rb") as stream:
+            data = stream.read(MAX_DOCUMENT_BYTES + 1)
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise StrictJSONError(f"{what} exceeds the {MAX_DOCUMENT_BYTES}-byte limit")
+        if allow_bom and data.startswith(b"\xef\xbb\xbf"):
+            data = data[3:]
+        return load_json_object_bytes(data, what=what, max_bytes=MAX_DOCUMENT_BYTES)
+    except (OSError, ValueError) as exc:
+        raise MatrixError(f"cannot read {what} {path}: {exc}") from exc
+
+
+def load_matrix(path: Path) -> dict[str, Any]:
+    matrix = _load_document(path, what="compatibility matrix")
+    _require(type(matrix.get("schema")) is int and matrix["schema"] == 1,
+             "matrix schema must be 1")
     declared_statuses = matrix.get("status_values")
     _require(
         isinstance(declared_statuses, list)
+        and all(isinstance(status, str) for status in declared_statuses)
+        and len(declared_statuses) == len(set(declared_statuses))
         and set(declared_statuses) == VALID_STATUSES,
         "matrix status_values do not match the gate contract",
     )
@@ -64,6 +85,7 @@ def load_matrix(path: Path) -> dict[str, Any]:
         _require(
             isinstance(applies_to, list)
             and applies_to
+            and all(isinstance(target, str) for target in applies_to)
             and len(applies_to) == len(set(applies_to))
             and set(applies_to) <= VALID_TARGETS,
             f"{feature_id}: applies_to must contain unique exe/dll targets",
@@ -73,15 +95,16 @@ def load_matrix(path: Path) -> dict[str, Any]:
             f"{feature_id}: required must be boolean",
         )
         status = feature.get("status")
-        _require(status in VALID_STATUSES, f"{feature_id}: invalid status {status!r}")
+        _require(isinstance(status, str) and status in VALID_STATUSES,
+                 f"{feature_id}: invalid status {status!r}")
         native_checks = feature.get("native_checks", [])
         _require(
             isinstance(native_checks, list)
-            and len(native_checks) == len(set(native_checks))
             and all(
                 isinstance(check, str) and ID_PATTERN.fullmatch(check) is not None
                 for check in native_checks
-            ),
+            )
+            and len(native_checks) == len(set(native_checks)),
             f"{feature_id}: native_checks must contain unique check ids",
         )
         evidence = feature.get("evidence")
@@ -96,7 +119,10 @@ def load_matrix(path: Path) -> dict[str, Any]:
                 isinstance(evidence_path, str) and evidence_path.strip(),
                 f"{feature_id}: evidence[{evidence_index}] path is required",
             )
-            resolved = (ROOT / evidence_path).resolve()
+            try:
+                resolved = (ROOT / evidence_path).resolve()
+            except (OSError, ValueError) as exc:
+                raise MatrixError(f"{feature_id}: invalid evidence path") from exc
             try:
                 resolved.relative_to(ROOT.resolve())
             except ValueError as exc:
@@ -125,12 +151,9 @@ def load_evidence(
     *,
     artifact_path: Path | None = None,
 ) -> dict[str, Any]:
-    try:
-        evidence = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MatrixError(f"cannot read native evidence {path}: {exc}") from exc
-    _require(isinstance(evidence, dict), "native evidence root must be an object")
-    _require(evidence.get("schema") == 1, "native evidence schema must be 1")
+    evidence = _load_document(path, what="native evidence", allow_bom=True)
+    _require(type(evidence.get("schema")) is int and evidence["schema"] == 1,
+             "native evidence schema must be 1")
     _require(
         isinstance(evidence.get("tracked_source_dirty"), bool),
         "native evidence tracked_source_dirty must be boolean",
@@ -155,11 +178,14 @@ def load_evidence(
     # Bundled evidence is portable: an attestor may supply the exact artifact
     # whose digest must match instead of trusting a stale machine-local path.
     # Without an override, relative identities resolve beside the evidence.
-    stub_path = artifact_path.resolve() if artifact_path is not None else Path(stub_path_value)
-    if artifact_path is None and not stub_path.is_absolute():
-        stub_path = (path.resolve().parent / stub_path).resolve()
-    _require(stub_path.is_file(), f"native evidence stub is missing: {stub_path}")
-    actual_stub_sha256 = hashlib.sha256(stub_path.read_bytes()).hexdigest()
+    try:
+        stub_path = artifact_path.resolve() if artifact_path is not None else Path(stub_path_value)
+        if artifact_path is None and not stub_path.is_absolute():
+            stub_path = (path.resolve().parent / stub_path).resolve()
+        _require(stub_path.is_file(), f"native evidence stub is missing: {stub_path}")
+        actual_stub_sha256 = hashlib.sha256(stub_path.read_bytes()).hexdigest()
+    except (OSError, ValueError) as exc:
+        raise MatrixError(f"cannot read native evidence stub: {exc}") from exc
     _require(
         actual_stub_sha256 == stub_sha256,
         "native evidence stub SHA-256 does not match the current artifact",
@@ -176,11 +202,14 @@ def load_evidence(
             f"native evidence test[{index}] has invalid id",
         )
         _require(check_id not in by_id, f"duplicate native evidence id: {check_id}")
-        _require(status in ("passed", "failed"), f"{check_id}: invalid evidence status")
+        _require(isinstance(status, str) and status in ("passed", "failed"),
+                 f"{check_id}: invalid evidence status")
         by_id[check_id] = status
     passed = sum(status == "passed" for status in by_id.values())
-    _require(evidence.get("passed") == passed, "native evidence passed count is inconsistent")
-    _require(evidence.get("total") == len(by_id), "native evidence total count is inconsistent")
+    _require(type(evidence.get("passed")) is int and evidence["passed"] == passed,
+             "native evidence passed count is inconsistent")
+    _require(type(evidence.get("total")) is int and evidence["total"] == len(by_id),
+             "native evidence total count is inconsistent")
     _require(
         evidence.get("ready") is (passed == len(by_id)),
         "native evidence ready state is inconsistent",
@@ -193,6 +222,8 @@ def evaluate(
     scope: str,
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    _require(isinstance(scope, str) and scope in ("all", "exe", "dll"),
+             "scope must be all, exe, or dll")
     targets = VALID_TARGETS if scope == "all" else frozenset((scope,))
     selected = [
         feature

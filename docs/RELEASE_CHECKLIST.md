@@ -67,6 +67,17 @@ matches the signed green result:
 uv run python tools/release_check.py
 ```
 
+The compatibility matrix and native-evidence inputs share a strict JSON boundary:
+one object, at most 1 MiB of raw UTF-8 bytes, 64 nesting levels and 100,000 JSON
+nodes. Duplicate keys (including escaped aliases), nonfinite numbers, boolean or
+floating-point schema/count fields, and malformed list members are rejected.
+The native PowerShell evidence format retains its optional leading UTF-8 BOM;
+the matrix remains BOM-free. Invalid input returns exit 2 with `ready=false` in
+JSON mode. Programmatic evaluation also requires an exact `all`, `exe` or `dll`
+scope, so a typo cannot produce an empty green gate. These checks validate input
+structure, not native behavior or evidence authenticity; the existing artifact
+hash, source provenance and production-feature requirements still apply.
+
 ### Captured-frame external calls
 
 Run `tests/test_lifter_frame_call_native.py` with the native toolchain. Its own
