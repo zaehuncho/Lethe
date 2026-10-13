@@ -38,6 +38,14 @@ def instruction_references(instructions: Iterable[Any]) -> tuple[SourceReference
                 f"unbounded source reference: address-size-relative operand at RVA 0x{instruction.ip:X}"
             )
         address_only = instruction.mnemonic == Mnemonic.LEA
+        # FS/GS add a runtime segment base to the effective RIP address.
+        # Without a proof of that base, its decoded RVA is not a bounded
+        # image reference. LEA does not dereference or add a segment base;
+        # NOP was excluded above, and legacy segment bases are zero in x64.
+        if not address_only and instruction.memory_segment in {Register.FS, Register.GS}:
+            raise SourceReferenceError(
+                f"unbounded source reference: segment-relative memory operand at RVA 0x{instruction.ip:X}"
+            )
         size = 1 if address_only else MemorySizeExt.size(instruction.memory_size)
         # A register bit-string offset can move beyond the encoded base.
         # Admit only an encoded imm8 *inside* the operand: the complete

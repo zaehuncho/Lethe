@@ -172,6 +172,10 @@ address-size forms fail closed. BT/BTC/BTR/BTS admit only an encoded imm8 below
 the 16/32/64-bit operand width, with the entire 2/4/8-byte memory span checked;
 the immediate bit index never waives an overlap. This also covers the native CRT
 BTR qword RIP-data,7 form without rejecting unrelated selected functions.
+FS/GS-relative RIP dereferences also fail closed: the runtime segment base is
+not a proven image RVA (Intel SDM Volume 1, section 3.3.7). This does not reject
+ignored CS/DS/ES/SS overrides, non-accessing NOPs or address-only native LEAs;
+the ordinary byte-span/interior checks still apply to those address forms.
 Discovery caches these known references once. Preflight includes strictly decoded
 PDB supplemental ranges; low-level commit independently rescans current runtime
 and selected extents and rereads DIR64 values, so stale native instructions or
@@ -180,6 +184,10 @@ reference inventory and is not an admission or closure proof. None of these
 negative checks proves arbitrary computed/indirect address closure.
 
 `tests/test_native_known_references.py` is a mandatory native promotion node.
+It includes generated EXE/DLL FS/GS rejection cases whose retained/exported
+segment-relative functions are never executed; no host segment-register change
+is required. All original source-reference negatives and callable-entry
+positive controls remain mandatory.
 Generated EXE and DLL fixtures preserve the original six RIP-load, LEA-interior
 and DIR64-interior mismatches as required typed packing rejections with no output;
 both exact-entry function-pointer controls must still pack and match originals.
