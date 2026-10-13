@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from lifter import virtualization_plan as plan
-from lifter import win64_thunk
+from lifter import direct_control_flow, win64_thunk
 
 from . import bytecode_pages, cfg_preservation, pe_analyze
 from .assemble import AssembleError, _StubImage
@@ -1052,18 +1052,12 @@ def _commit_manifest(
         raise _fail(
             f"unsupported virtualization manifest version {manifest.version}"
         )
-    _validate_padding_suffix_bindings(
-        parsed,
-        tuple(
-            plan.FunctionSpec(
-                function.name,
-                function.target_rva,
-                function.target_size,
-                function.lifted_body_size,
-            )
-            for function in manifest.functions
-        ),
+    selected_specs = tuple(
+        plan.FunctionSpec(function.name, function.target_rva, function.target_size,
+                          function.lifted_body_size)
+        for function in manifest.functions
     )
+    _validate_padding_suffix_bindings(parsed, selected_specs)
     _validate_direct_only_references(parsed, manifest)
     cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed, manifest)
     if not cfg_plan.preservation_supported:
@@ -1072,6 +1066,10 @@ def _commit_manifest(
     _validate_manifest_source(
         parsed, manifest, source_relocations, source_runtime_functions
     )
+    try:
+        direct_control_flow.validate_known_source_references(parsed, selected_specs)
+    except direct_control_flow.DirectControlFlowError as exc:
+        raise _fail(f"source reference validation failed: {exc}") from exc
     new_size_of_image = _validate_manifest_layout(parsed, manifest)
 
     result = copy.deepcopy(parsed)

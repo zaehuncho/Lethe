@@ -25,9 +25,10 @@ except ImportError:  # standalone tools/tests
     import x64_lifter  # type: ignore
 
 try:
-    from . import jump_table
+    from . import jump_table, source_references
 except ImportError:  # standalone tools/tests
     import jump_table  # type: ignore
+    import source_references  # type: ignore
 
 try:
     from daedalus import daedalus_asm
@@ -917,7 +918,8 @@ def _linear_prefix(code: bytes, begin: int, end: int) -> tuple[Any, ...]:
 
 
 def _scan_direct_control(
-        sections: Sequence[Any], runtime: Sequence[_RuntimeRange]
+        sections: Sequence[Any], runtime: Sequence[_RuntimeRange],
+        *, reference_instructions: list[Any] | None = None,
 ) -> tuple[tuple[_DirectEdge, ...], tuple[tuple[int, int], ...]]:
     """Decode the runtime inventory once and record all near direct edges.
 
@@ -946,6 +948,9 @@ def _scan_direct_control(
         for instruction in instructions:
             instruction_starts.add(instruction.ip)
         decoded.extend(instructions)
+
+    if reference_instructions is not None:
+        reference_instructions.extend(decoded)
 
     def _in_quarantine(rva: int) -> bool:
         return any(begin <= rva < end for begin, end in quarantined)
@@ -1168,13 +1173,19 @@ def discover_functions(
     global_gaps = _coverage_gaps(sections, runtime_pairs)
     direct_error = None
     direct_transfers = ()
+    reference_index = source_references.SourceReferenceIndex(())
+    reference_instructions = []
     quarantined_ranges: tuple[tuple[int, int], ...] = ()
     try:
         direct_transfers, quarantined_ranges = _scan_direct_control(
-            sections, runtime
+            sections, runtime, reference_instructions=reference_instructions
         )
+        reference_index = source_references.SourceReferenceIndex((
+            *source_references.instruction_references(reference_instructions),
+            *source_references.dir64_references(parsed),
+        ))
         direct_status = "passed"
-    except FunctionDiscoveryError as exc:
+    except (FunctionDiscoveryError, source_references.SourceReferenceError) as exc:
         direct_status = "rejected"
         direct_error = str(exc)
 
@@ -1259,6 +1270,20 @@ def discover_functions(
                         f"enters candidate interior RVA 0x{transfer.target_rva:X}"
                     )
                     break
+        if extent.size and control_status == "passed":
+            control_reason = reference_index.rejection(extent.name, extent.rva, extent.size)
+            if control_reason is None and extent.heuristic:
+                # Export/MAP-only leaves are absent from the cached pdata scan.
+                try:
+                    code = _read_executable(sections, extent.rva, extent.size, "candidate")
+                    body = jump_table.decode_function_body(code, extent.rva, extent.rva + extent.size)
+                    source_references.SourceReferenceIndex(
+                        source_references.instruction_references(body.instructions)
+                    ).validate((extent,))
+                except (jump_table.JumpTableUnresolved, source_references.SourceReferenceError) as exc:
+                    control_reason = str(exc)
+            if control_reason is not None:
+                control_status = "rejected"
         candidates.append(FunctionCandidate(
             name=extent.name,
             source=extent.source,

@@ -5,7 +5,8 @@ strictly decoded AMD64 runtime-function ranges.  It intentionally does not
 claim that address-taken or indirect targets are closed.  Executable bytes
 outside runtime-function records are surfaced as explicit coverage gaps; the
 default production mode rejects every gap unless the caller acknowledges its
-exact range and records a rationale.
+exact range and records a rationale. Known decoded source references that
+would observe overwritten bytes are rejected independently of those waivers.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ from typing import Any, Sequence
 from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
 try:
-    from . import jump_table
+    from . import jump_table, source_references
 except ImportError:  # standalone tools/tests
     import jump_table  # type: ignore
+    import source_references  # type: ignore
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
@@ -895,27 +897,7 @@ def _validate_direct_targets(
                 )
 
 
-def analyze_direct_control_flow(
-    parsed: Any,
-    selected_specs: Sequence[Any],
-    *,
-    tail_exit_policy: TailExitPolicy = TailExitPolicy(),
-    coverage_acknowledgements: Sequence[CoverageGapAcknowledgement] = (),
-    production: bool = True,
-    _supplemental_code_ranges: tuple[tuple[int, int], ...] = (),
-) -> DirectControlFlowProof:
-    """Analyze direct x64 transfers that could bypass selected entry patches.
-
-    ``selected_specs`` accepts :class:`SelectedFunctionRange` or structural
-    records such as ``virtualization_plan.FunctionSpec``.  Production mode
-    rejects unacknowledged executable coverage gaps.  Exact acknowledgements
-    waive that gate but remain visible and never turn coverage into a proof.
-    """
-
-    if not isinstance(tail_exit_policy, TailExitPolicy):
-        raise DirectControlFlowError("tail_exit_policy must be TailExitPolicy")
-    sections = _normalize_sections(parsed)
-    selected = _normalize_selected(selected_specs)
+def _decode_source_inventory(parsed, sections, selected):
     runtime_ranges = _normalize_runtime_functions(parsed)
 
     exact_runtime = set(runtime_ranges)
@@ -979,6 +961,60 @@ def analyze_direct_control_flow(
         _decode_runtime(sections, begin, end)
         for begin, end in extra_selected_ranges
     )
+    return (runtime_ranges, runtime_decodes, isolated_spans,
+            extra_selected_ranges, selected_decodes, isolated_runtime)
+
+
+def _validate_known_references(parsed, decodes, selected):
+    try:
+        index = source_references.SourceReferenceIndex((
+            *source_references.instruction_references(
+                instruction for decoded in decodes for instruction in decoded.instructions
+            ),
+            *source_references.dir64_references(parsed),
+        ))
+        index.validate(selected)
+    except source_references.SourceReferenceError as exc:
+        raise DirectControlFlowError(str(exc)) from exc
+
+
+def validate_known_source_references(parsed, selected_specs):
+    """Recheck current source bytes without waiving or claiming indirect closure.
+
+    Used again at commit, including native instructions/pointer values outside
+    the selected body hashes. Supplemental PDB extents are checked in preflight.
+    """
+    sections = _normalize_sections(parsed)
+    selected = _normalize_selected(selected_specs)
+    _, runtime, _, _, extra, _ = _decode_source_inventory(parsed, sections, selected)
+    _validate_known_references(parsed, (*runtime, *extra), selected)
+
+
+def analyze_direct_control_flow(
+    parsed: Any,
+    selected_specs: Sequence[Any],
+    *,
+    tail_exit_policy: TailExitPolicy = TailExitPolicy(),
+    coverage_acknowledgements: Sequence[CoverageGapAcknowledgement] = (),
+    production: bool = True,
+    _supplemental_code_ranges: tuple[tuple[int, int], ...] = (),
+) -> DirectControlFlowProof:
+    """Analyze direct x64 transfers that could bypass selected entry patches.
+
+    ``selected_specs`` accepts :class:`SelectedFunctionRange` or structural
+    records such as ``virtualization_plan.FunctionSpec``.  Production mode
+    rejects unacknowledged executable coverage gaps.  Exact acknowledgements
+    waive that gate but remain visible and never turn coverage into a proof.
+    """
+
+    if not isinstance(tail_exit_policy, TailExitPolicy):
+        raise DirectControlFlowError("tail_exit_policy must be TailExitPolicy")
+    sections = _normalize_sections(parsed)
+    selected = _normalize_selected(selected_specs)
+    (runtime_ranges, runtime_decodes, isolated_spans,
+     extra_selected_ranges, selected_decodes, isolated_runtime) = _decode_source_inventory(
+        parsed, sections, selected
+    )
     # Internal entry point for exact-PDB-bound and byte-classified residual
     # coverage. Public callers never receive a raw range waiver. Every added
     # extent is still strictly decoded and participates in direct-edge checks.
@@ -1028,6 +1064,7 @@ def analyze_direct_control_flow(
         )
     )
     _validate_direct_targets(decodes, selected)
+    _validate_known_references(parsed, decodes, selected)
     decoded_by_begin = {item.begin_rva: item for item in decodes}
     decoded_entries = frozenset(decoded_by_begin)
     selected_reachable = {}
@@ -1184,4 +1221,5 @@ __all__ = [
     "TailExitApproval",
     "TailExitPolicy",
     "analyze_direct_control_flow",
+    "validate_known_source_references",
 ]

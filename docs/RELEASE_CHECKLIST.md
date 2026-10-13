@@ -162,6 +162,26 @@ installed product, universal thunk form or clean-VM enforcement claim.
 Passing this preflight still does not prove indirect-target closure, whole-image
 executable coverage, native application behavior or release readiness.
 
+Known source-reference rejection is mandatory even with exact coverage-gap or
+unproven-indirect-target acknowledgements. Decoded fixed-width RIP memory spans
+must not overlap any overwritten function byte (including entry and padding);
+RIP LEA and validated DIR64 pointer values must not target its interior. Exact
+original-entry addresses remain supported as callable pointers. Unknown memory
+spans, memory bit-string offsets and EIP-relative address-size forms fail closed.
+Discovery caches these known references once. Preflight includes strictly decoded
+PDB supplemental ranges; low-level commit independently rescans current runtime
+and selected extents and rereads DIR64 values, so stale native instructions or
+pointer values cannot waive these checks. The planner alone has no whole-image
+reference inventory and is not an admission or closure proof. None of these
+negative checks proves arbitrary computed/indirect address closure.
+
+`tests/test_native_known_references.py` is a mandatory native promotion node.
+Generated EXE and DLL fixtures preserve the original six RIP-load, LEA-interior
+and DIR64-interior mismatches as required typed packing rejections with no output;
+both exact-entry function-pointer controls must still pack and match originals.
+The default tracked prebuilt is not promoted by adding this contract. Older
+candidate attestations are historical evidence and do not claim the new node.
+
 An optional exact-PDB path now proves direct-reference executable coverage for
 one explicitly selected image by binding the PE RSDS GUID/age to DIA function
 extents and strictly decoding every remaining byte as a narrow canonical
@@ -217,7 +237,7 @@ $commit = (git rev-parse HEAD).Trim()
 The full staging run creates a new, previously nonexistent staging directory.
 It performs a fresh VS2022 x64 Release build with `/W4 /WX /Brepro`, verifies
 MSVC and the committed Python 3.12 lock, runs non-empty CTest, then runs the
-frozen twenty-nine-node native hardening, selected-function, captured-call
+frozen thirty-node native hardening, selected-function, captured-call
 frame, 128-bit memory, XFG,
 and post-startup EXE export
 replay, the complete nineteen-check EXE/DLL round trip, and native production
@@ -485,14 +505,14 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of twenty-nine
+The candidate-bound native runtime record must name the frozen list of thirty
 node IDs spanning hardening stress, selected-function virtualization E2E,
 plain and shuffled-rolling STORE128 atomic-fault checks, captured frame calls
 and unwind recovery, XFG preflight, and post-startup EXE exports (one positive plus five directory/snapshot mutations).
 The count-zero mutation may be rejected by Windows before the stub executes;
 it is not proof that the stub's own verifier ran. The optional early-attach
 characterization is excluded and does not establish support. The mandatory
-terminal pytest summary must report exactly twenty-nine passes
+terminal pytest summary must report exactly thirty passes
 with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.
