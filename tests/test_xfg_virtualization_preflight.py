@@ -124,12 +124,23 @@ def _visual_studio_available() -> bool:
     return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
-def _direct_only_manifest() -> SimpleNamespace:
+def _direct_only_manifest(source: Path, parsed: pe_analyze.ParsedPE) -> SimpleNamespace:
+    """Bind the synthetic plan to the actual direct-only compiler output."""
+    image = assemble._StubImage(source.read_bytes())
+    target_rva = image.find_export_rva("direct_increment")
+    assert target_rva is not None
+    target_size = _straight_line_leaf_size(image, target_rva)
+    assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
+    assert parsed.load_config is not None
+    assert any(target.rva == target_rva
+               for target in parsed.load_config.guard_cf_targets)
+    assert all(not (target_rva < target.rva < target_rva + target_size)
+               for target in parsed.load_config.guard_cf_targets)
     return SimpleNamespace(
         functions=(
             SimpleNamespace(
-                target_rva=0x1000,
-                target_size=0x20,
+                target_rva=target_rva,
+                target_size=target_size,
                 cfg_target_rvas=(),
                 generated_executable_ranges=(
                     SimpleNamespace(rva=0x5000, size=0x40),
@@ -140,8 +151,10 @@ def _direct_only_manifest() -> SimpleNamespace:
     )
 
 
-def _forged_generated_gfid_manifest() -> SimpleNamespace:
-    manifest = _direct_only_manifest()
+def _forged_generated_gfid_manifest(
+    source: Path, parsed: pe_analyze.ParsedPE,
+) -> SimpleNamespace:
+    manifest = _direct_only_manifest(source, parsed)
     function = manifest.functions[0]
     function.cfg_target_rvas = (0x5000,)
     function.capabilities = {"direct_only_thunk": False}
@@ -1044,7 +1057,7 @@ def test_real_xfg_direct_only_plan_preserves_source_gfid_identity(
         for target in parsed.load_config.guard_cf_targets
     )
     plan = cfg_preservation.build_cfg_preservation_plan(
-        parsed, _direct_only_manifest()
+        parsed, _direct_only_manifest(real_msvc_xfg_image, parsed)
     )
     assert plan.generated_thunk_targets == ()
     assert plan.preservation_supported is True
@@ -1059,7 +1072,7 @@ def test_real_xfg_forged_generated_gfid_blocks_before_output(
 ) -> None:
     parsed = pe_analyze.analyze_pe(str(real_msvc_xfg_image))
     plan = cfg_preservation.build_cfg_preservation_plan(
-        parsed, _forged_generated_gfid_manifest()
+        parsed, _forged_generated_gfid_manifest(real_msvc_xfg_image, parsed)
     )
     assert [target.rva for target in plan.generated_thunk_targets] == [0x5000]
     assert plan.preservation_supported is False
@@ -1071,7 +1084,7 @@ def test_real_xfg_forged_generated_gfid_blocks_before_output(
         match="generated VM thunk RVAs.*8-byte XFG function hashes",
     ):
         cfg_preservation.require_cfg_preservation_supported(
-            parsed, _forged_generated_gfid_manifest()
+            parsed, _forged_generated_gfid_manifest(real_msvc_xfg_image, parsed)
         )
     assert parsed == before
 

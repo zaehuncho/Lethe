@@ -25,6 +25,27 @@ from tests import test_native_virtualization_runtime as native_fixture
 _ROOT = Path(__file__).resolve().parents[1]
 
 
+def _runtime_stub_for_chain_group(work: Path) -> tuple[Path, bool]:
+    """Separate a completed staged bundle from the promoter's raw build input."""
+    staged = os.environ.get("LETHE_CHAIN_GROUP_CANDIDATE_PATH")
+    if staged:
+        from tools.promote_stub import validate_candidate_bundle
+
+        stub = Path(staged).resolve()
+        verified = validate_candidate_bundle(stub, stub.with_suffix(".manifest.json"))
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                       cwd=_ROOT, text=True).strip()
+        assert verified["source_commit"] == head
+        assert not subprocess.check_output(["git", "status", "--porcelain"],
+                                           cwd=_ROOT).strip()
+        return stub, False
+
+    # Promotion sets LETHE_NATIVE_RUNTIME_STUB_PATH before a schema-2 bundle
+    # exists.  The native fixture checks its fresh CMake provenance and makes
+    # a hash-bound schema-1 test copy; orchestrator keeps the test override.
+    return native_fixture._candidate_stub_or_build(work), True
+
+
 @pytest.fixture(scope="module")
 def built_runtime():
     if os.name != "nt" or not shutil.which("cmake") or not native_fixture._visual_studio_available():
@@ -32,25 +53,90 @@ def built_runtime():
     work = Path(tempfile.mkdtemp(prefix=".chain_group_e2e_", dir=_ROOT)).resolve()
     assert work.parent == _ROOT.resolve() and work.name.startswith(".chain_group_e2e_")
     try:
-        candidate = (os.environ.get("LETHE_CHAIN_GROUP_CANDIDATE_PATH")
-                     or os.environ.get(native_fixture._STUB_PATH_ENV))
-        if candidate:
-            from tools.promote_stub import validate_candidate_bundle
-            stub = Path(candidate).resolve()
-            verified = validate_candidate_bundle(stub, stub.with_suffix(".manifest.json"))
-            head = subprocess.check_output(["git", "rev-parse", "HEAD"],
-                                           cwd=_ROOT, text=True).strip()
-            assert verified["source_commit"] == head
-            assert not subprocess.check_output(["git", "status", "--porcelain"],
-                                               cwd=_ROOT).strip()
-            allow_override = False
-        else:
-            stub = native_fixture._build_stub(work)
-            allow_override = True
+        stub, allow_override = _runtime_stub_for_chain_group(work)
         yield work, stub, allow_override
     finally:
         assert work.parent == _ROOT.resolve() and work.name.startswith(".chain_group_e2e_")
         shutil.rmtree(work)
+
+
+def test_chain_group_promotion_raw_stub_uses_test_bound_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The promoter's pre-manifest build must not masquerade as staged schema 2."""
+    raw = tmp_path / "build" / "Release" / "lethe_stub_x64.dll"
+    copy = tmp_path / "candidate_stub" / "lethe_stub_x64.dll"
+    monkeypatch.delenv("LETHE_CHAIN_GROUP_CANDIDATE_PATH", raising=False)
+    monkeypatch.setenv(native_fixture._STUB_PATH_ENV, str(raw))
+    calls: list[Path] = []
+
+    def copy_raw(work: Path) -> Path:
+        assert work == tmp_path
+        assert os.environ[native_fixture._STUB_PATH_ENV] == str(raw)
+        calls.append(work)
+        return copy
+
+    monkeypatch.setattr(native_fixture, "_candidate_stub_or_build", copy_raw)
+    assert _runtime_stub_for_chain_group(tmp_path) == (copy, True)
+    assert calls == [tmp_path]
+
+
+def test_chain_group_staged_missing_or_legacy_bundle_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.promote_stub import PromotionError
+
+    stub = tmp_path / "staged.dll"
+    stub.write_bytes(b"fixture")
+    monkeypatch.setenv("LETHE_CHAIN_GROUP_CANDIDATE_PATH", str(stub))
+    monkeypatch.setenv(native_fixture._STUB_PATH_ENV, str(tmp_path / "raw.dll"))
+    monkeypatch.setattr(native_fixture, "_candidate_stub_or_build",
+                        lambda _work: pytest.fail("staged path fell back to raw stub"))
+    with pytest.raises(PromotionError, match="cannot read staged manifest"):
+        _runtime_stub_for_chain_group(tmp_path)
+    stub.with_suffix(".manifest.json").write_text('{"schema":1}', encoding="ascii")
+    with pytest.raises(PromotionError, match="schema 2"):
+        _runtime_stub_for_chain_group(tmp_path)
+
+
+def test_chain_group_staged_bundle_is_source_pinned_and_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import promote_stub
+
+    stub = tmp_path / "staged.dll"
+    monkeypatch.setenv("LETHE_CHAIN_GROUP_CANDIDATE_PATH", str(stub))
+    monkeypatch.setenv(native_fixture._STUB_PATH_ENV, str(tmp_path / "raw.dll"))
+    monkeypatch.setattr(native_fixture, "_candidate_stub_or_build",
+                        lambda _work: pytest.fail("staged path fell back to raw stub"))
+    calls: list[tuple[Path, Path]] = []
+
+    def validate(path: Path, manifest: Path) -> dict[str, str]:
+        calls.append((path, manifest))
+        return {"source_commit": "a" * 40}
+
+    monkeypatch.setattr(promote_stub, "validate_candidate_bundle", validate)
+    source_status = [b""]
+
+    def git_output(argv: list[str], **kwargs: object) -> str | bytes:
+        if argv == ["git", "rev-parse", "HEAD"]:
+            assert kwargs == {"cwd": _ROOT, "text": True}
+            return "a" * 40 + "\n"
+        assert argv == ["git", "status", "--porcelain"]
+        assert kwargs == {"cwd": _ROOT}
+        return source_status[0]
+
+    monkeypatch.setattr(subprocess, "check_output", git_output)
+    assert _runtime_stub_for_chain_group(tmp_path) == (stub.resolve(), False)
+    assert calls == [(stub.resolve(), stub.with_suffix(".manifest.json"))]
+    monkeypatch.setattr(promote_stub, "validate_candidate_bundle",
+                        lambda _stub, _manifest: {"source_commit": "b" * 40})
+    with pytest.raises(AssertionError):
+        _runtime_stub_for_chain_group(tmp_path)
+    monkeypatch.setattr(promote_stub, "validate_candidate_bundle", validate)
+    source_status[0] = b" M tests/test_chain_group_materialized.py\n"
+    with pytest.raises(AssertionError):
+        _runtime_stub_for_chain_group(tmp_path)
 
 
 def _run(kind: str, source: Path, host: Path | None) -> subprocess.CompletedProcess[bytes]:
