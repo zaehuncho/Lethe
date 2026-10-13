@@ -50,13 +50,16 @@ def _runtime_stub_for_chain_group(work: Path) -> tuple[Path, bool]:
 def built_runtime():
     if os.name != "nt" or not shutil.which("cmake") or not native_fixture._visual_studio_available():
         pytest.skip("Windows and the Visual Studio x64 toolchain are required")
-    work = Path(tempfile.mkdtemp(prefix=".chain_group_e2e_", dir=_ROOT)).resolve()
-    assert work.parent == _ROOT.resolve() and work.name.startswith(".chain_group_e2e_")
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    source_root = _ROOT.resolve()
+    assert temp_root != source_root and source_root not in temp_root.parents
+    work = Path(tempfile.mkdtemp(prefix=".chain_group_e2e_", dir=temp_root)).resolve()
+    assert work.parent == temp_root and work.name.startswith(".chain_group_e2e_")
     try:
         stub, allow_override = _runtime_stub_for_chain_group(work)
         yield work, stub, allow_override
     finally:
-        assert work.parent == _ROOT.resolve() and work.name.startswith(".chain_group_e2e_")
+        assert work.parent == temp_root and work.name.startswith(".chain_group_e2e_")
         shutil.rmtree(work)
 
 
