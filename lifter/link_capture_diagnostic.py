@@ -18,7 +18,9 @@ from pathlib import Path
 import re
 import struct
 
-from .link_capture_archive import _capture_regular_file, _capture_root, _capture_token
+from .link_capture_archive import (
+    CaptureClosureError, _capture_regular_file, _capture_root, _capture_token,
+)
 
 
 class CaptureDiagnosticError(ValueError):
@@ -34,6 +36,7 @@ MAX_RELOCATIONS = 3_000_000
 MAX_ARCHIVE_MEMBERS = 100_000
 MAX_ARCHIVE_INDEX_SYMBOLS = 500_000
 MAX_LABEL_BYTES = 512
+MAX_CAPTURE_FILES = 512
 BIGOBJ_CLASS_ID = bytes.fromhex("c7a1bad1eebaa94baf20faf66aa4dcb8")
 
 
@@ -181,6 +184,20 @@ def inspect_object_bytes(identity: str, raw: bytes, *, in_archive: bool = False)
     _require(len(raw) >= 20, "ordinary COFF header is truncated")
     machine, count, _, symptr, nsyms, optional, _ = struct.unpack_from(
         "<HHIIIHH", raw)
+    if machine == 0 and optional == 0 and in_archive:
+        # MSVC CRT archives carry machine-neutral CodeView-only members.  They
+        # cannot introduce runtime code, but no other unknown-machine member
+        # is accepted as a proxy for an AMD64 object.
+        _require(count == 1 and raw[20:28] == b".debug$S",
+                 "neutral archive member is not CodeView-only")
+        result = _object_sections(identity, raw, header_size=20,
+            section_count=count, symbol_offset=symptr, symbol_count=nsyms,
+            symbol_width=18, kind="neutral_debug_coff")
+        _require(result["executable_sections"] == 0 and
+                 result["executable_relocations"] == 0 and
+                 not result["directives"],
+                 "neutral archive member contains code or directives")
+        return result
     _require(machine == 0x8664 and optional == 0,
              "ordinary AMD64 COFF header is invalid")
     return _object_sections(identity, raw, header_size=20,
@@ -318,6 +335,102 @@ def inspect_archive_bytes(name: str, raw: bytes) -> dict:
             "linker_extraction_proven": False}
 
 
+def _capture_other_files(root: Path, response_names: set[str],
+                         response_sha256: str) -> tuple[list[dict], dict[str, str], dict[str, int], dict[str, str]]:
+    """Bind flat capture files that LINKREPRO copied outside ``link.rsp``.
+
+    MSVC records some directive-resolved default libraries as ordinary sibling
+    files without adding them to its response.  They are *possible* linker
+    inputs, not proof of extraction.  A selected-symbol superset must scan them
+    too; an unknown sibling is not silently ignored.
+    """
+    try:
+        entries = tuple(root.iterdir())
+    except OSError as exc:
+        raise CaptureDiagnosticError("LINKREPRO directory cannot be enumerated") from exc
+    _require(len(entries) <= MAX_CAPTURE_FILES,
+             "LINKREPRO capture file count is unsupported")
+    names: dict[str, str] = {}
+    folded_response = {name.casefold() for name in response_names}
+    implicit: list[dict] = []
+    hashes: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    roles: dict[str, str] = {}
+    implicit_bytes = 0
+    captured_bytes = 0
+    for entry in entries:
+        name = entry.name
+        _require(bool(re.fullmatch(r"[A-Za-z0-9_.@+\-$]+", name)) and
+                 name not in (".", ".."),
+                 "LINKREPRO capture filename is unsupported")
+        folded = name.casefold()
+        _require(folded not in names, "LINKREPRO capture filename is case-ambiguous")
+        names[folded] = name
+        try:
+            size = entry.lstat().st_size
+        except OSError as exc:
+            raise CaptureDiagnosticError("LINKREPRO capture file cannot be stated") from exc
+        if folded == "link.rsp":
+            per_file_limit = 1024 * 1024
+        elif folded == "env.setting":
+            per_file_limit = 64 * 1024
+        elif folded.endswith(".pdb"):
+            per_file_limit = 64 * 1024 * 1024
+        elif folded in folded_response or folded.endswith(".lib"):
+            per_file_limit = MAX_INPUT_BYTES
+        else:
+            raise CaptureDiagnosticError(
+                "LINKREPRO unlisted non-library material file is unsupported")
+        _require(0 <= size <= per_file_limit,
+                 "LINKREPRO capture file byte count is unsupported")
+        _require(0 <= size <= MAX_CAPTURE_BYTES - captured_bytes,
+                 "LINKREPRO total captured file bytes are excessive")
+        try:
+            raw = _capture_regular_file(root, name)
+        except CaptureClosureError as exc:
+            raise CaptureDiagnosticError(f"LINKREPRO capture file is redirected or unreadable: {name}") from exc
+        _require(len(raw) == size,
+                 "LINKREPRO capture file changed after size preflight")
+        captured_bytes += size
+        hashes[name] = sha256(raw).hexdigest()
+        sizes[name] = len(raw)
+        if folded == "link.rsp":
+            _require(name == "link.rsp" and hashes[name] == response_sha256,
+                     "LINKREPRO response changed during capture scan")
+            roles[name] = "response_record"
+        elif folded in folded_response:
+            _require(name in response_names,
+                     "LINKREPRO material input filename casing differs")
+            roles[name] = "response_listed_material_input"
+        elif folded == "env.setting":
+            _require(name == "env.setting" and len(raw) <= 64 * 1024,
+                     "LINKREPRO environment record is unsupported")
+            roles[name] = "environment_record"
+        elif folded.endswith(".pdb"):
+            _require(len(raw) <= 64 * 1024 * 1024,
+                     "LINKREPRO captured PDB is excessive")
+            # Pair analysis later separates /PDBMAP input payloads from the
+            # declared /PDB output.  A PDB is not silently a COFF input.
+            roles[name] = "pdb_metadata_not_coff_input"
+        elif folded.endswith(".lib"):
+            _require(len(raw) <= MAX_INPUT_BYTES,
+                     "LINKREPRO implicit library is excessive")
+            implicit_bytes += len(raw)
+            _require(implicit_bytes <= MAX_CAPTURE_BYTES,
+                     "LINKREPRO implicit libraries are excessive")
+            item = inspect_archive_bytes(name, raw)
+            item["origin"] = "captured_implicit_library_not_in_response"
+            implicit.append(item)
+            roles[name] = "captured_implicit_possible_material_input"
+        else:
+            raise CaptureDiagnosticError(
+                "LINKREPRO unlisted non-library material file is unsupported")
+    _require(names.get("link.rsp") == "link.rsp" and
+             folded_response <= set(names),
+             "LINKREPRO response material file is missing")
+    return sorted(implicit, key=lambda item: item["name"].casefold()), hashes, sizes, roles
+
+
 def inspect_capture_inputs(capture: Path) -> dict:
     """Return a complete format inventory, never a production admissibility result."""
     root = _capture_root(capture)
@@ -383,12 +496,30 @@ def inspect_capture_inputs(capture: Path) -> dict:
             totals["directive_sections"] += len(item["directives"])
         item["rsp_occurrences"] = occurrences[name.casefold()]
         inputs.append(item)
+    implicit, all_file_hashes, all_file_sizes, all_file_roles = _capture_other_files(
+        root, set(order), sha256(rsp).hexdigest())
+    implicit_totals: Counter[str] = Counter()
+    for item in implicit:
+        implicit_totals["libraries"] += 1
+        implicit_totals["archive_members"] += item["member_count"]
+        for kind, number in item["member_kinds"].items():
+            implicit_totals["member_" + kind] += number
+        implicit_totals["directive_sections"] += sum(
+            len(member["directives"]) for member in item["members"])
+    _require(aggregate + sum(item["bytes"] for item in implicit) <= MAX_CAPTURE_BYTES,
+             "LINKREPRO explicit plus implicit input bytes are excessive")
     return {"status": "diagnostic_input_inventory_only",
             "capture": str(root), "link_rsp_sha256": sha256(rsp).hexdigest(),
             "input_occurrences": len(paths), "distinct_inputs": len(inputs),
             "total_input_bytes": aggregate,
-            "switches": switches,
+             "switches": switches,
             "counts": dict(sorted(totals.items())), "inputs": inputs,
+             "implicit_libraries": implicit,
+             "implicit_counts": dict(sorted(implicit_totals.items())),
+             "capture_file_sha256": dict(sorted(all_file_hashes.items())),
+             "capture_file_sizes": dict(sorted(all_file_sizes.items())),
+             "capture_file_roles": dict(sorted(all_file_roles.items())),
+             "all_captured_implicit_libraries_inventoried": True,
             "linker_member_extraction_proven": False,
             "direct_instruction_boundaries_proven": False,
             "indirect_target_closure_proven": False,

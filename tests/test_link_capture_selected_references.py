@@ -9,6 +9,7 @@ import struct
 import pytest
 
 from lifter import link_capture_selected_references as selected
+from lifter.link_capture_diagnostic import inspect_capture_inputs
 
 
 SYMBOL = "?allowedRuntime@AutomationAccessPolicy@orion@@SA_N_N0000@Z"
@@ -175,3 +176,81 @@ def test_selected_link_option_rejects_before_input_scan(monkeypatch):
     with pytest.raises(selected.SelectedReferenceError,
                        match="linker option"):
         selected.inspect_selected_capture(Path("capture"), inputs)
+
+
+def _archive_member(label: str, body: bytes) -> bytes:
+    header = (label.encode("ascii").ljust(16, b" ") + b"0".ljust(12, b" ") +
+              b"0".ljust(6, b" ") + b"0".ljust(6, b" ") +
+              b"100644".ljust(8, b" ") +
+              str(len(body)).encode("ascii").ljust(10, b" ") + b"`\n")
+    return header + body + (b"\n" if len(body) & 1 else b"")
+
+
+def _implicit_archive(body: bytes) -> bytes:
+    first = _archive_member("/", struct.pack(">I", 0))
+    placeholder = _archive_member("/", bytes(12))
+    offset = 8 + len(first) + len(placeholder)
+    second = _archive_member("/", struct.pack("<III", 1, offset, 0))
+    assert len(second) == len(placeholder)
+    return b"!<arch>\n" + first + second + _archive_member("member.obj/", body)
+
+
+def test_selected_reference_in_implicit_archive_is_scanned(tmp_path, monkeypatch):
+    root = tmp_path / "capture"
+    root.mkdir()
+    helper = _coff(defined=True)
+    (root / "helper.obj").write_bytes(helper)
+    (root / "implicit.lib").write_bytes(_implicit_archive(_coff()))
+    (root / "link.rsp").write_text('".\\helper.obj"\r\n', encoding="utf-16", newline="")
+    source = {"source_body_and_abi_verified": True, "symbol": SYMBOL,
+              "source_coff_sha256": sha256(helper).hexdigest(),
+              "source_pe_sha256": "a" * 64, "source_pdb_sha256": "b" * 64,
+              "source_map_sha256": "c" * 64, "pdb_binding_sha256": "d" * 64}
+    monkeypatch.setattr(selected, "inspect_source", lambda _: source)
+    inputs = type("Inputs", (), {"symbol": SYMBOL})()
+    report = selected.inspect_selected_capture(root, inputs)
+    assert report["counts"]["selected_archive_references"] == 1
+    assert report["implicit_library_hashes"] == {
+        "implicit.lib": sha256((root / "implicit.lib").read_bytes()).hexdigest()}
+    assert report["all_captured_implicit_libraries_scanned"] is True
+    assert report["all_captured_archive_members_scanned"] is True
+    assert report["all_possible_archive_members_scanned"] is False
+    assert report["production_admitted"] is False
+    assert inspect_capture_inputs(root)["distinct_inputs"] == 1
+
+
+def test_competing_implicit_archive_definition_rejects(tmp_path, monkeypatch):
+    root = tmp_path / "capture"
+    root.mkdir()
+    helper = _coff(defined=True)
+    (root / "helper.obj").write_bytes(helper)
+    (root / "implicit.lib").write_bytes(_implicit_archive(_coff(defined=True)))
+    (root / "link.rsp").write_text('".\\helper.obj"\r\n', encoding="utf-16", newline="")
+    source = {"source_body_and_abi_verified": True, "symbol": SYMBOL,
+              "source_coff_sha256": sha256(helper).hexdigest(),
+              "source_pe_sha256": "a" * 64, "source_pdb_sha256": "b" * 64,
+              "source_map_sha256": "c" * 64, "pdb_binding_sha256": "d" * 64}
+    monkeypatch.setattr(selected, "inspect_source", lambda _: source)
+    inputs = type("Inputs", (), {"symbol": SYMBOL})()
+    with pytest.raises(selected.SelectedReferenceError, match="competing definition"):
+        selected.inspect_selected_capture(root, inputs)
+
+
+def test_unsafe_selected_relocation_in_implicit_archive_rejects(tmp_path, monkeypatch):
+    root = tmp_path / "capture"
+    root.mkdir()
+    helper = _coff(defined=True)
+    (root / "helper.obj").write_bytes(helper)
+    (root / "caller.obj").write_bytes(_coff())
+    (root / "implicit.lib").write_bytes(_implicit_archive(_coff(kind=0x5)))
+    (root / "link.rsp").write_text(
+        '".\\helper.obj"\r\n".\\caller.obj"\r\n', encoding="utf-16", newline="")
+    source = {"source_body_and_abi_verified": True, "symbol": SYMBOL,
+              "source_coff_sha256": sha256(helper).hexdigest(),
+              "source_pe_sha256": "a" * 64, "source_pdb_sha256": "b" * 64,
+              "source_map_sha256": "c" * 64, "pdb_binding_sha256": "d" * 64}
+    monkeypatch.setattr(selected, "inspect_source", lambda _: source)
+    inputs = type("Inputs", (), {"symbol": SYMBOL})()
+    with pytest.raises(selected.SelectedReferenceError,
+                       match="zero-addend AMD64 REL32 E8"):
+        selected.inspect_selected_capture(root, inputs)

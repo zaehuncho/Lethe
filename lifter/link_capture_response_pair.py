@@ -28,9 +28,13 @@ _INPUT = re.compile(r"\.\\[A-Za-z0-9_.@+\-$]+\.(?:obj|lib|res)\Z", re.I)
 _PDBMAP = re.compile(
     r"/pdbmap:([A-Za-z]:\\[^=]+)=(\.\\[A-Za-z0-9_.@+\-$]+\.pdb)\Z", re.I
 )
+_OUTPUT_PDB = re.compile(r"/pdb:(\.\\[A-Za-z0-9_.@+\-$]+\.pdb)\Z", re.I)
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FORBIDDEN = ("/LTCG", "/WHOLEARCHIVE", "/INCLUDE:", "/ALTERNATENAME:",
               "/DEFAULTLIB:", "/ORDER:", "/DEF:", "/FORCE", "/MERGE:")
+_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_()]*\Z")
+_ENV_DRIVE = re.compile(r"=([A-Za-z]):=(.+)\Z")
+_ENV_HIDDEN = re.compile(r"=([A-Za-z_][A-Za-z0-9_()]*)=(.*)\Z")
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -63,6 +67,72 @@ def _read_response(root: Path) -> tuple[str, tuple[str, ...]]:
     _require(0 < len(tokens) <= 2048 and all(len(token) <= 4096 for token in tokens),
              "LINKREPRO response token count or length is unsupported")
     return _sha(raw), tokens
+
+
+def _environment_profile(root: Path) -> tuple[str, tuple[tuple[str, str], ...], bool]:
+    """Bind the captured environment without equating capture-local paths.
+
+    LINK_REPRO must name this exact capture.  The working-directory drive entry
+    may differ between two link invocations only inside their common evidence
+    root.  Neither exception proves linker environment or CWD semantics.
+    """
+    try:
+        raw = _capture_regular_file(root, "env.setting")
+    except CaptureClosureError as exc:
+        raise ResponsePairError("LINKREPRO environment record is missing or redirected") from exc
+    _require(0 < len(raw) <= 64 * 1024,
+             "LINKREPRO environment record size is unsupported")
+    try:
+        decoded = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ResponsePairError("LINKREPRO environment record is not UTF-8") from exc
+    _require(decoded.endswith("\r\n") and "\x00" not in decoded and
+             all("\r" not in line and "\n" not in line
+                 for line in decoded.split("\r\n")[:-1]),
+             "LINKREPRO environment line separators are unsupported")
+    rows: dict[str, str] = {}
+    local_drive = False
+    link_repro = False
+    for line in decoded.split("\r\n")[:-1]:
+        drive = _ENV_DRIVE.fullmatch(line) if line.startswith("=") else None
+        if drive is not None:
+            key, value = "=" + drive.group(1).upper() + ":", drive.group(2)
+            _require(Path(value).is_absolute() and
+                     Path(value).drive.casefold() == key[1:].casefold() and
+                     ".." not in Path(value).parts,
+                     "LINKREPRO drive working directory is unsupported")
+            if key[1:].casefold() == root.drive.casefold():
+                try:
+                    Path(value).resolve(strict=True).relative_to(root.parent.parent)
+                except (OSError, ValueError) as exc:
+                    raise ResponsePairError(
+                        "LINKREPRO local working directory escapes evidence root") from exc
+                local_drive = True
+                value = "<CAPTURE_LOCAL_WORKING_DIRECTORY>"
+        elif line.startswith("="):
+            # CMD also emits hidden non-drive records such as =ExitCode.
+            # They are retained byte-for-byte in the compared profile.
+            hidden = _ENV_HIDDEN.fullmatch(line)
+            _require(hidden is not None,
+                     "LINKREPRO hidden environment entry is malformed")
+            key, value = "=" + hidden.group(1), hidden.group(2)
+        else:
+            _require("=" in line and not line.startswith("="),
+                     "LINKREPRO environment entry is malformed")
+            key, value = line.split("=", 1)
+            _require(_ENV_KEY.fullmatch(key) is not None,
+                     "LINKREPRO environment key or value is unsupported")
+            if key.casefold() == "link_repro":
+                _require(value.casefold() == str(root).casefold(),
+                         "LINKREPRO environment capture path differs")
+                link_repro = True
+                value = "<THIS_CAPTURE_ROOT>"
+        folded = key.casefold()
+        _require(folded not in rows,
+                 "LINKREPRO environment key is case-ambiguous")
+        rows[folded] = value
+    _require(link_repro, "LINKREPRO environment capture path is missing")
+    return _sha(raw), tuple(sorted(rows.items())), local_drive
 
 
 def _profile(root: Path, tokens: tuple[str, ...]) -> tuple[tuple[str, ...],
@@ -113,6 +183,15 @@ def _profile(root: Path, tokens: tuple[str, ...]) -> tuple[tuple[str, ...],
     _require(len({name.casefold() for name in inputs}) <= 256,
              "LINKREPRO response input inventory is excessive")
     return tuple(profile), tuple(inputs), mapped_pdb, tuple(sorted(pdbmap_rows))
+
+
+def _output_pdb_name(tokens: tuple[str, ...], mapped_pdb: dict[str, str]) -> str | None:
+    names = [match.group(1)[2:] for token in tokens
+             if (match := _OUTPUT_PDB.fullmatch(token)) is not None]
+    _require(len(names) <= 1 and
+             (not names or names[0].casefold() not in mapped_pdb),
+             "LINKREPRO output PDB is repeated or overlaps mapped input PDB")
+    return names[0] if names else None
 
 
 def inspect_response_pair(
@@ -181,8 +260,20 @@ def inspect_response_pair(
              "LINKREPRO linker options differ between original and replacement")
     _require(before_pdb == after_pdb and before_rows == after_rows,
              "LINKREPRO captured PDBMAP payload differs")
-    _require(set(expected) == set(name[2:] for name in before_inputs),
-             "LINKREPRO material input inventory differs from source report")
+    before_output_pdb = _output_pdb_name(before_tokens, before_pdb)
+    after_output_pdb = _output_pdb_name(after_tokens, after_pdb)
+    _require(before_output_pdb == after_output_pdb,
+             "LINKREPRO output PDB option differs")
+    explicit = original_selected.get("response_input_hashes", expected)
+    implicit = original_selected.get("implicit_library_hashes", {})
+    _require(type(explicit) is dict and type(implicit) is dict and
+             not set(explicit).intersection(implicit) and
+             expected == {**explicit, **implicit} and
+             set(explicit) == set(name[2:] for name in before_inputs),
+             "LINKREPRO explicit/implicit input inventory differs from source report")
+    _require(implicit == replacement_omission.get(
+                 "replacement_implicit_library_hashes", implicit),
+             "LINKREPRO captured implicit libraries differ")
     seen: set[str] = set()
     for token in before_inputs:
         name = token[2:]
@@ -198,6 +289,50 @@ def inspect_response_pair(
                  "original LINKREPRO material input changed")
         _require(_sha(new_raw) == (new_hash if name == helper else expected[name]),
                  "replacement LINKREPRO material input changed")
+    for name, digest in implicit.items():
+        _require(bool(_INPUT.fullmatch(".\\" + name)) and name.lower().endswith(".lib") and
+                 _sha(_capture_regular_file(before_root, name)) == digest and
+                 _sha(_capture_regular_file(after_root, name)) == digest,
+                 "LINKREPRO captured implicit library changed")
+    before_env_sha, before_env_profile, before_local = _environment_profile(before_root)
+    after_env_sha, after_env_profile, after_local = _environment_profile(after_root)
+    _require(before_env_profile == after_env_profile and before_local == after_local,
+             "LINKREPRO captured environment profile differs")
+    before_files = original_selected.get("capture_file_sha256", {})
+    after_files = replacement_omission.get("replacement_capture_file_sha256", {})
+    before_roles = original_selected.get("capture_file_roles", {})
+    after_roles = replacement_omission.get("replacement_capture_file_roles", {})
+    if before_files or after_files:
+        _require(type(before_files) is dict and type(after_files) is dict and
+                 all(type(name) is str and type(digest) is str and
+                     _DIGEST.fullmatch(digest) for files in (before_files, after_files)
+                     for name, digest in files.items()) and
+                 before_files.get("env.setting") == before_env_sha and
+                 after_files.get("env.setting") == after_env_sha and
+                 set(before_files) == set(after_files),
+                 "LINKREPRO captured file inventory differs")
+        _require(all(before_files[name] == after_files[name]
+                     for name in before_files
+                     if name not in (helper, "link.rsp", "env.setting",
+                                     before_output_pdb)),
+                 "LINKREPRO captured non-helper file changed")
+        _require(type(before_roles) is dict and type(after_roles) is dict and
+                 before_roles == after_roles and
+                 set(before_roles) == set(before_files),
+                 "LINKREPRO captured file roles differ")
+        if before_output_pdb is not None:
+            _require(before_roles.get(before_output_pdb) ==
+                     "pdb_metadata_not_coff_input",
+                     "LINKREPRO output PDB file role differs")
+        for root, files in ((before_root, before_files), (after_root, after_files)):
+            for name, digest in files.items():
+                try:
+                    actual = _sha(_capture_regular_file(root, name))
+                except CaptureClosureError as exc:
+                    raise ResponsePairError(
+                        "LINKREPRO capture file changed during final re-read") from exc
+                _require(actual == digest,
+                         "LINKREPRO capture file changed during final re-read")
     return {
         "schema": 1,
         "status": "captured_response_and_inputs_paired",
@@ -206,6 +341,20 @@ def inspect_response_pair(
         "replacement_rsp_sha256": after_rsp,
         "input_occurrences": len(before_inputs),
         "distinct_inputs": len(seen),
+        "captured_implicit_libraries": len(implicit),
+        "captured_implicit_library_hashes": dict(sorted(implicit.items())),
+        "captured_implicit_libraries_equal": True,
+        "captured_file_count": len(before_files),
+        "captured_file_roles": dict(sorted(before_roles.items())),
+        "original_env_setting_sha256": before_env_sha,
+        "replacement_env_setting_sha256": after_env_sha,
+        "environment_equal_except_bound_capture_local_paths": True,
+        "environment_working_directory_semantics_proven": False,
+        "captured_output_pdb": before_output_pdb,
+        "captured_output_pdb_equal": None if before_output_pdb is None else (
+            before_files.get(before_output_pdb) == after_files.get(before_output_pdb)),
+        "captured_output_pdb_semantics_proven": False,
+        "capture_read_race_eliminated": False,
         "captured_pdbmap_payloads": dict(sorted(before_pdb.items())),
         "pdbmap_option_count": len(before_rows),
         "response_profile_equal_except_pdbmap_source_and_position": True,

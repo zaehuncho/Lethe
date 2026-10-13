@@ -1,7 +1,7 @@
 """Selected-symbol COFF reference proof for exact conventional /LINKREPRO inputs.
 
-This is deliberately narrower than a final-image closure proof. Every explicit
-object and every possible archive member is checked, so the selected-symbol
+This is deliberately narrower than a final-image closure proof. Every captured
+explicit object and captured archive member is checked, so the selected-symbol
 result does not assume a linker member-extraction order. Linker extraction,
 /OPT:REF/ICF mapping, indirect target closure and production admission remain
 separate false fields until stronger evidence exists.
@@ -65,6 +65,12 @@ def _scan_object(identity: str, raw: bytes, kind: str, selected: str,
     if kind == "short_import_v0":
         _require(selected.encode("ascii") not in raw,
                  "selected symbol is imported by an archive short-import member")
+        return {"definitions": [], "references": [], "debug_references": [], "weak_symbols": 0,
+                "target_weak_aliases": 0, "target_directives": 0,
+                "all_executable_relocations": 0}
+    if kind == "neutral_debug_coff":
+        _require(selected.encode("ascii") not in raw,
+                 "selected symbol appears in neutral debug-only archive member")
         return {"definitions": [], "references": [], "debug_references": [], "weak_symbols": 0,
                 "target_weak_aliases": 0, "target_directives": 0,
                 "all_executable_relocations": 0}
@@ -256,7 +262,7 @@ def _scan_inventory(capture: Path, inventory: dict, selected: str,
     references: list[dict] = []
     debug_references: list[dict] = []
     counts: Counter[str] = Counter()
-    for item in inventory["inputs"]:
+    for item in (*inventory["inputs"], *inventory.get("implicit_libraries", ())):
         name = item.get("name", item.get("identity"))
         _require(isinstance(name, str), "captured input identity is missing")
         raw = _capture_regular_file(root, name)
@@ -296,7 +302,11 @@ def _scan_inventory(capture: Path, inventory: dict, selected: str,
 
 
 def inspect_selected_capture(capture: Path, inputs: ProductSourceInputs) -> dict:
-    """Prove only exact selected-symbol references over all captured input bytes."""
+    """Classify selected-symbol references in captured explicit and implicit COFF.
+
+    This scans every member of each captured archive, but cannot prove that
+    LINK.EXE used only these copies or which archive members it extracted.
+    """
     try:
         source = inspect_source(inputs)
     except ProductSourceProofError as exc:
@@ -333,7 +343,7 @@ def inspect_selected_capture(capture: Path, inputs: ProductSourceInputs) -> dict
     # Re-read exact capture-local inputs before returning. Diagnostic and scan
     # are separate passes, not a claim of race-free filesystem handles.
     root = _capture_root(capture)
-    for item in inventory["inputs"]:
+    for item in (*inventory["inputs"], *inventory.get("implicit_libraries", ())):
         name = item.get("name", item.get("identity"))
         _require(sha256(_capture_regular_file(root, name)).hexdigest() == item["sha256"],
                  "captured input changed after selected-reference scan")
@@ -346,11 +356,22 @@ def inspect_selected_capture(capture: Path, inputs: ProductSourceInputs) -> dict
             "pdb_binding_sha256": source["pdb_binding_sha256"],
             "capture_rsp_sha256": inventory["link_rsp_sha256"],
             "capture_input_hashes": {item.get("name", item.get("identity")): item["sha256"]
-                                     for item in inventory["inputs"]},
+                                     for item in (*inventory["inputs"],
+                                                  *inventory.get("implicit_libraries", ()))},
+            "response_input_hashes": {item.get("name", item.get("identity")): item["sha256"]
+                                      for item in inventory["inputs"]},
+            "implicit_library_hashes": {item["name"]: item["sha256"]
+                                         for item in inventory.get("implicit_libraries", ())},
+            "capture_file_sha256": inventory.get("capture_file_sha256", {}),
+            "capture_file_roles": inventory.get("capture_file_roles", {}),
             "definitions": definitions, "references": references,
             "debug_references": debug_references,
             "counts": dict(sorted(counts.items())),
-            "all_possible_archive_members_scanned": True,
+            "all_possible_archive_members_scanned": False,
+            "all_captured_archive_members_scanned": True,
+            "all_captured_implicit_libraries_inventoried": inventory.get(
+                "all_captured_implicit_libraries_inventoried", False),
+            "all_captured_implicit_libraries_scanned": True,
             "selected_input_references_classified": True,
             "capture_read_race_eliminated": False,
             "archive_member_extraction_proven": False,
@@ -373,17 +394,21 @@ def inspect_replacement_omission(original: dict, replacement_capture: Path) -> d
     helper = original["helper_object"]
     before = original["capture_input_hashes"]
     after = {item.get("name", item.get("identity")): item["sha256"]
-             for item in replacement["inputs"]}
+             for item in (*replacement["inputs"],
+                          *replacement.get("implicit_libraries", ()))}
     _require(set(before) == set(after) and helper in after and
              after[helper] != old_hash,
              "replacement input set/helper object is not exact")
     _require(all(after[name] == digest for name, digest in before.items()
                  if name != helper),
              "non-helper captured inputs differ from original link")
-    _require(all(item["sha256"] != old_hash for item in replacement["inputs"]),
+    _require(all(item["sha256"] != old_hash for item in
+                 (*replacement["inputs"], *replacement.get("implicit_libraries", ()))),
              "original helper object remains a captured top-level input")
     _require(all(member["sha256"] != old_hash
-                 for item in replacement["inputs"] if item["kind"] == "microsoft_coff_archive"
+                 for item in (*replacement["inputs"],
+                              *replacement.get("implicit_libraries", ()))
+                 if item["kind"] == "microsoft_coff_archive"
                  for member in item["members"]),
              "original helper object remains in a captured archive")
     root = _capture_root(replacement_capture)
@@ -399,6 +424,13 @@ def inspect_replacement_omission(original: dict, replacement_capture: Path) -> d
             "original_coff_sha256": old_hash,
             "replacement_coff_sha256": after[helper],
             "replacement_rsp_sha256": replacement["link_rsp_sha256"],
+            "replacement_implicit_library_hashes": {
+                item["name"]: item["sha256"]
+                for item in replacement.get("implicit_libraries", ())},
+            "replacement_capture_file_sha256": replacement.get(
+                "capture_file_sha256", {}),
+            "replacement_capture_file_roles": replacement.get(
+                "capture_file_roles", {}),
             "other_input_hashes_equal": True,
             "original_helper_object_omission_proven": True,
             "archive_member_extraction_proven": False,

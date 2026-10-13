@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 import os
 import struct
 
 import pytest
 
+from lifter import link_capture_diagnostic as diagnostic
 from lifter.link_capture_diagnostic import (
     BIGOBJ_CLASS_ID,
     CaptureDiagnosticError,
@@ -149,6 +151,112 @@ def test_capture_path_escape_and_ltcg_reject(tmp_path: Path) -> None:
         (capture / "link.rsp").write_text(switches + f'"{token}"\n', encoding="utf-16")
         with pytest.raises(CaptureDiagnosticError, match=message):
             inspect_capture_inputs(capture)
+
+
+def test_unlisted_implicit_archive_is_inventoried_without_admission(tmp_path: Path) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "good.obj").write_bytes(_ordinary())
+    (capture / "link.rsp").write_text('".\\good.obj"\r\n', encoding="utf-16", newline="")
+    implicit = _archive()
+    (capture / "implicit.lib").write_bytes(implicit)
+    report = inspect_capture_inputs(capture)
+    assert report["distinct_inputs"] == 1
+    assert report["implicit_counts"]["libraries"] == 1
+    assert report["implicit_counts"]["archive_members"] == 2
+    assert report["implicit_libraries"][0]["name"] == "implicit.lib"
+    assert report["capture_file_sha256"]["implicit.lib"] == sha256(implicit).hexdigest()
+    assert report["capture_file_roles"]["implicit.lib"] == (
+        "captured_implicit_possible_material_input")
+    assert report["capture_file_roles"]["good.obj"] == "response_listed_material_input"
+    assert report["all_captured_implicit_libraries_inventoried"] is True
+    assert report["production_admitted"] is False
+
+
+@pytest.mark.parametrize("suffix", ["obj", "res"])
+def test_unlisted_material_or_redirected_implicit_archive_rejects(
+        tmp_path: Path, suffix: str) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "good.obj").write_bytes(_ordinary())
+    (capture / "link.rsp").write_text('".\\good.obj"\r\n', encoding="utf-16", newline="")
+    unexpected = capture / f"unlisted.{suffix}"
+    unexpected.write_bytes(_ordinary())
+    with pytest.raises(CaptureDiagnosticError, match="unlisted non-library"):
+        inspect_capture_inputs(capture)
+    unexpected.unlink()
+    target = tmp_path / "archive.lib"
+    target.write_bytes(_archive())
+    try:
+        (capture / "implicit.lib").symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("Windows symlink privilege unavailable")
+    with pytest.raises(CaptureDiagnosticError, match="reparse|regular|redirect"):
+        inspect_capture_inputs(capture)
+
+
+def test_case_colliding_capture_names_reject_even_on_case_insensitive_host(
+        tmp_path: Path, monkeypatch) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "good.obj").write_bytes(_ordinary())
+    rsp = '".\\good.obj"\r\n'.encode("utf-16")
+    (capture / "link.rsp").write_bytes(rsp)
+    real_iterdir = Path.iterdir
+
+    def duplicate_names(path):
+        if path == capture:
+            return iter((capture / "link.rsp", capture / "good.obj",
+                         capture / "GOOD.OBJ"))
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", duplicate_names)
+    with pytest.raises(CaptureDiagnosticError, match="case-ambiguous"):
+        diagnostic._capture_other_files(capture, {"good.obj"}, sha256(rsp).hexdigest())
+
+
+def test_directory_sibling_has_typed_inventory_failure(tmp_path: Path) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "good.obj").write_bytes(_ordinary())
+    (capture / "link.rsp").write_text('".\\good.obj"\r\n', encoding="utf-16", newline="")
+    (capture / "implicit.lib").mkdir()
+    with pytest.raises(CaptureDiagnosticError, match="redirected or unreadable"):
+        inspect_capture_inputs(capture)
+
+
+def test_oversized_captured_pdb_rejects_before_read(tmp_path: Path, monkeypatch) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "good.obj").write_bytes(_ordinary())
+    (capture / "link.rsp").write_text('".\\good.obj"\r\n', encoding="utf-16", newline="")
+    with (capture / "output.pdb").open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    real_read = diagnostic._capture_regular_file
+
+    def reject_pdb_read(root, name):
+        if name == "output.pdb":
+            pytest.fail("oversized PDB was read before size preflight")
+        return real_read(root, name)
+
+    monkeypatch.setattr(diagnostic, "_capture_regular_file", reject_pdb_read)
+    with pytest.raises(CaptureDiagnosticError, match="byte count is unsupported"):
+        inspect_capture_inputs(capture)
+
+
+def test_only_archive_codeview_machine_neutral_coff_is_accepted() -> None:
+    body = b"CodeView"
+    raw = (struct.pack("<HHIIIHH", 0, 1, 0, 0, 0, 0, 0) +
+           _section(b".debug$S", 60, body, 0x42000040) + body)
+    item = inspect_object_bytes("debug.lib@0x80", raw, in_archive=True)
+    assert item["kind"] == "neutral_debug_coff"
+    assert item["executable_sections"] == 0
+    with pytest.raises(CaptureDiagnosticError, match="ordinary AMD64"):
+        inspect_object_bytes("top.obj", raw)
+    mutated = bytearray(raw)
+    struct.pack_into("<I", mutated, 20 + 36, 0x60000020)
+    with pytest.raises(CaptureDiagnosticError, match="contains code"):
+        inspect_object_bytes("debug.lib@0x80", bytes(mutated), in_archive=True)
 
 
 @pytest.mark.parametrize("target, expected", [

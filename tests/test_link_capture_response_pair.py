@@ -34,6 +34,8 @@ def _fixture(tmp_path):
         (root / "helper.obj").write_bytes(helper)
         (root / "caller.obj").write_bytes(common)
         (root / "vc143.pdb").write_bytes(pdb)
+        (root / "env.setting").write_bytes(
+            (f"LINK_REPRO={root}\r\nTEST_MARKER=fixed\r\n").encode("utf-8"))
     opts = ["/out:.\\fixture.exe", "/MACHINE:X64", "/OPT:REF",
             "/pdbmap:C:\\build\\before\\vc143.pdb=.\\vc143.pdb",
             ".\\caller.obj", ".\\helper.obj"]
@@ -170,6 +172,42 @@ def test_same_unknown_switch_is_only_report_consistency(tmp_path, monkeypatch):
     assert proof["response_option_semantics_proven"] is False
     assert proof["external_default_library_resolution_bound"] is False
     assert proof["production_admitted"] is False
+
+
+def test_implicit_archive_is_bound_and_byte_change_rejects(tmp_path, monkeypatch):
+    before, after, selected, omission = _fixture(tmp_path)
+    archive = _archive_with(_minimal_coff(b"\xc3"))
+    for root in (before, after):
+        (root / "implicit.lib").write_bytes(archive)
+    digest = _sha(archive)
+    selected["capture_input_hashes"]["implicit.lib"] = digest
+    selected["response_input_hashes"] = {
+        "helper.obj": _sha(b"old-coff"), "caller.obj": _sha(b"caller-coff")}
+    selected["implicit_library_hashes"] = {"implicit.lib": digest}
+    omission["replacement_implicit_library_hashes"] = {"implicit.lib": digest}
+    _mock_fresh(monkeypatch, selected, omission)
+    proof = pair.inspect_response_pair(before, after, _inputs(before))
+    assert proof["captured_implicit_libraries"] == 1
+    assert proof["captured_implicit_libraries_equal"] is True
+    assert proof["implicit_coff_directives_bound"] is False
+    changed = _archive_with(_minimal_coff(b"\x90"))
+    (after / "implicit.lib").write_bytes(changed)
+    with pytest.raises(pair.ResponsePairError, match="captured implicit library changed"):
+        pair.inspect_response_pair(before, after, _inputs(before))
+
+
+def test_environment_stable_key_and_capture_path_mutations_reject(tmp_path, monkeypatch):
+    before, after, selected, omission = _fixture(tmp_path)
+    _mock_fresh(monkeypatch, selected, omission)
+    original = (after / "env.setting").read_bytes()
+    (after / "env.setting").write_bytes(original.replace(b"TEST_MARKER=fixed",
+                                                   b"TEST_MARKER=changed"))
+    with pytest.raises(pair.ResponsePairError, match="environment profile differs"):
+        pair.inspect_response_pair(before, after, _inputs(before))
+    (after / "env.setting").write_bytes(original.replace(str(after).encode(),
+                                                   str(before).encode()))
+    with pytest.raises(pair.ResponsePairError, match="capture path differs"):
+        pair.inspect_response_pair(before, after, _inputs(before))
 
 
 def _minimal_coff(value: bytes) -> bytes:
