@@ -266,6 +266,7 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
     assert promote_stub.REQUIRED_NATIVE_RUNTIME_TESTS == (
         "test_native_runtime_hardening_stress.py",
         "test_native_virtualization_runtime.py",
+        "test_chain_group_materialized.py",
         "test_xmm_store128_native.py",
         "test_xfg_virtualization_preflight.py",
         "test_native_exe_exports.py",
@@ -274,13 +275,13 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_known_references.py",
         "test_native_entry_metadata.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 31
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 38
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert ("tests/test_native_known_references.py::"
             "test_materialized_known_reference_admission_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert ("tests/test_native_entry_metadata.py::"
             "test_materialized_export_entry_metadata_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 31
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 38
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
@@ -293,6 +294,16 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "tests/test_native_virtualization_runtime.py::"
         "test_packed_dll_calls_source_bound_virtualized_padded_leaf"
     ) in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    for node in (
+        "tests/test_native_virtualization_runtime.py::test_padded_dll_address_taken_entry_rejects_before_output",
+        "tests/test_chain_group_materialized.py::test_complete_chain_group_materializes_and_runs[exe]",
+        "tests/test_chain_group_materialized.py::test_complete_chain_group_materializes_and_runs[dll]",
+        "tests/test_chain_group_materialized.py::test_address_taken_chain_group_rejects_before_output",
+        "tests/test_xfg_virtualization_preflight.py::test_real_xfg_exe_encoded_entry_pointer_rejects_before_output",
+        "tests/test_xfg_virtualization_preflight.py::test_real_xfg_dll_encoded_entry_pointer_rejects_before_output",
+        "tests/test_native_fp_frame_materialized.py::test_fp_frame_old_address_taken_exe_rejects_before_output",
+    ):
+        assert node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic"

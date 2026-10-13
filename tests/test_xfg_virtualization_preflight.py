@@ -9,9 +9,11 @@ import os
 import runpy
 import shutil
 import subprocess
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
+import pefile
 import pytest
 
 from lifter import direct_control_flow, virtualization_plan
@@ -161,7 +163,13 @@ __declspec(dllexport) __declspec(noinline) int increment(int value)
     return value * 9 + 5;
 }
 
+/* This retained address-taken target exercises the source XFG dispatch.
+   The VM-selected target below has only direct source calls. */
 __declspec(dllexport) operation selected = increment;
+__declspec(dllexport) __declspec(noinline) int direct_increment(int value)
+{
+    return value * 9 + 5;
+}
 """.lstrip(),
         encoding="utf-8",
     )
@@ -170,11 +178,12 @@ __declspec(dllexport) operation selected = increment;
         """
 typedef int (__cdecl *operation)(int);
 extern operation selected;
+extern int direct_increment(int);
 
 int main(void)
 {
     operation current = selected;
-    return current(41) == 374 ? 0 : 1;
+    return current(41) == 374 && direct_increment(41) == 374 ? 0 : 1;
 }
 """.lstrip(),
         encoding="utf-8",
@@ -184,7 +193,7 @@ cmake_minimum_required(VERSION 3.20)
 project(lethe_real_xfg_fixture C)
 add_executable(real_xfg "{source.as_posix()}" "{caller.as_posix()}")
 target_compile_options(real_xfg PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg)
-target_link_options(real_xfg PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO)
+target_link_options(real_xfg PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO /OPT:NOICF)
 """.lstrip()
     (work / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")
     build = work / "build"
@@ -414,7 +423,7 @@ __declspec(dllexport) __declspec(noinline) float __cdecl xfg_mixed_bits(
     return _mm_cvtss_f32(result);
 }
 
-__declspec(noinline) __m128i __vectorcall xfg_v128x6(
+__declspec(dllexport) __declspec(noinline) __m128i __vectorcall xfg_v128x6(
     __m128i first,
     __m128i second,
     __m128i third,
@@ -429,7 +438,7 @@ __declspec(noinline) __m128i __vectorcall xfg_v128x6(
     return _mm_xor_si128(result, sixth);
 }
 
-__declspec(noinline) __m128i __vectorcall xfg_v128x7(
+__declspec(dllexport) __declspec(noinline) __m128i __vectorcall xfg_v128x7(
     __m128i first,
     __m128i second,
     __m128i third,
@@ -448,7 +457,7 @@ __declspec(noinline) __m128i __vectorcall xfg_v128x7(
     return _mm_xor_si128(result, sixth);
 }
 
-__declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
+__declspec(dllexport) __declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
     xfg_hva2 value,
     unsigned __int64 salt)
 {
@@ -456,7 +465,7 @@ __declspec(noinline) unsigned __int64 __vectorcall xfg_hva2_fold(
     return (unsigned __int64)_mm_cvtsi128_si64(folded) ^ salt;
 }
 
-__declspec(noinline) xfg_hva2 __vectorcall xfg_hva2_make(
+__declspec(dllexport) __declspec(noinline) xfg_hva2 __vectorcall xfg_hva2_make(
     __m128i first,
     __m128i second,
     __m128i mask)
@@ -467,7 +476,7 @@ __declspec(noinline) xfg_hva2 __vectorcall xfg_hva2_make(
     return result;
 }
 
-__declspec(noinline) xfg_hfa4 __vectorcall xfg_hfa4_negate(xfg_hfa4 value)
+__declspec(dllexport) __declspec(noinline) xfg_hfa4 __vectorcall xfg_hfa4_negate(xfg_hfa4 value)
 {
     value.first = -value.first;
     value.second = -value.second;
@@ -505,25 +514,45 @@ typedef unsigned __int64 (__cdecl *xfg_u64x6_fn)(
 typedef unsigned int (__cdecl *xfg_ptr_read_fn)(const unsigned int *, unsigned int);
 typedef void (__cdecl *xfg_ptr_write_fn)(unsigned __int64 *, unsigned __int64);
 
-__declspec(dllexport) xfg_i32_fn volatile selected_xfg_i32 = xfg_i32;
-__declspec(dllexport) xfg_u64_fn volatile selected_xfg_u64 = xfg_u64;
-__declspec(dllexport) xfg_i32x3_fn volatile selected_xfg_i32x3 = xfg_i32x3;
-__declspec(dllexport) xfg_noargs_fn volatile selected_xfg_noargs = xfg_noargs;
-__declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = xfg_u64x6;
-__declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = xfg_ptr_read;
-__declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = xfg_ptr_write;
-__declspec(dllexport) xfg_xmm_copy_fn volatile selected_xfg_xmm_copy = xfg_xmm_copy;
-__declspec(dllexport) xfg_xmm_halves_fn volatile selected_xfg_xmm_halves = xfg_xmm_halves;
-__declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = xfg_f32_bits;
-__declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = xfg_f64_bits;
-__declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = xfg_mixed_bits;
-__declspec(dllexport) xfg_v128x6_fn volatile selected_xfg_v128x6 = xfg_v128x6;
-__declspec(dllexport) xfg_v128x7_fn volatile selected_xfg_v128x7 = xfg_v128x7;
-__declspec(dllexport) xfg_hva2_fold_fn volatile selected_xfg_hva2_fold = xfg_hva2_fold;
-__declspec(dllexport) xfg_hva2_make_fn volatile selected_xfg_hva2_make = xfg_hva2_make;
-__declspec(dllexport) xfg_hfa4_negate_fn volatile selected_xfg_hfa4_negate = xfg_hfa4_negate;
-__declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = xfg_pair_fold;
-__declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = xfg_pair_make;
+__declspec(noinline) int __cdecl indirect_xfg_i32(int v) { return xfg_i32(v); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_u64(unsigned __int64 a, unsigned __int64 b) { return xfg_u64(a,b); }
+__declspec(noinline) int __cdecl indirect_xfg_i32x3(int a,int b,int c) { return xfg_i32x3(a,b,c); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_noargs(void) { return xfg_noargs(); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_u64x6(unsigned __int64 a,unsigned __int64 b,unsigned __int64 c,unsigned __int64 d,unsigned __int64 e,unsigned __int64 f) { return xfg_u64x6(a,b,c,d,e,f); }
+__declspec(noinline) unsigned int __cdecl indirect_xfg_ptr_read(const unsigned int *p,unsigned int s) { return xfg_ptr_read(p,s); }
+__declspec(noinline) void __cdecl indirect_xfg_ptr_write(unsigned __int64 *p,unsigned __int64 v) { xfg_ptr_write(p,v); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_xmm_copy(const unsigned char *a,unsigned char *b,const __m128i *c,__m128i *d) { return xfg_xmm_copy(a,b,c,d); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_xmm_halves(const unsigned __int64 *a,const unsigned __int64 *b,unsigned __int64 *c,unsigned __int64 *d) { return xfg_xmm_halves(a,b,c,d); }
+__declspec(noinline) float __cdecl indirect_xfg_f32_bits(float a,float b,float c) { return xfg_f32_bits(a,b,c); }
+__declspec(noinline) double __cdecl indirect_xfg_f64_bits(double a,double b,unsigned __int64 c) { return xfg_f64_bits(a,b,c); }
+__declspec(noinline) float __cdecl indirect_xfg_mixed_bits(unsigned int a,float b,unsigned int c,float d) { return xfg_mixed_bits(a,b,c,d); }
+__declspec(noinline) __m128i __vectorcall indirect_xfg_v128x6(__m128i a,__m128i b,__m128i c,__m128i d,__m128i e,__m128i f) { return xfg_v128x6(a,b,c,d,e,f); }
+__declspec(noinline) __m128i __vectorcall indirect_xfg_v128x7(__m128i a,__m128i b,__m128i c,__m128i d,__m128i e,__m128i f,__m128i g) { return xfg_v128x7(a,b,c,d,e,f,g); }
+__declspec(noinline) unsigned __int64 __vectorcall indirect_xfg_hva2_fold(xfg_hva2 v,unsigned __int64 s) { return xfg_hva2_fold(v,s); }
+__declspec(noinline) xfg_hva2 __vectorcall indirect_xfg_hva2_make(__m128i a,__m128i b,__m128i c) { return xfg_hva2_make(a,b,c); }
+__declspec(noinline) xfg_hfa4 __vectorcall indirect_xfg_hfa4_negate(xfg_hfa4 v) { return xfg_hfa4_negate(v); }
+__declspec(noinline) unsigned __int64 __cdecl indirect_xfg_pair_fold(xfg_pair16 v,unsigned __int64 s) { return xfg_pair_fold(v,s); }
+__declspec(noinline) xfg_pair16 __cdecl indirect_xfg_pair_make(unsigned __int64 a,unsigned __int64 b) { return xfg_pair_make(a,b); }
+
+__declspec(dllexport) xfg_i32_fn volatile selected_xfg_i32 = indirect_xfg_i32;
+__declspec(dllexport) xfg_u64_fn volatile selected_xfg_u64 = indirect_xfg_u64;
+__declspec(dllexport) xfg_i32x3_fn volatile selected_xfg_i32x3 = indirect_xfg_i32x3;
+__declspec(dllexport) xfg_noargs_fn volatile selected_xfg_noargs = indirect_xfg_noargs;
+__declspec(dllexport) xfg_u64x6_fn volatile selected_xfg_u64x6 = indirect_xfg_u64x6;
+__declspec(dllexport) xfg_ptr_read_fn volatile selected_xfg_ptr_read = indirect_xfg_ptr_read;
+__declspec(dllexport) xfg_ptr_write_fn volatile selected_xfg_ptr_write = indirect_xfg_ptr_write;
+__declspec(dllexport) xfg_xmm_copy_fn volatile selected_xfg_xmm_copy = indirect_xfg_xmm_copy;
+__declspec(dllexport) xfg_xmm_halves_fn volatile selected_xfg_xmm_halves = indirect_xfg_xmm_halves;
+__declspec(dllexport) xfg_f32_bits_fn volatile selected_xfg_f32_bits = indirect_xfg_f32_bits;
+__declspec(dllexport) xfg_f64_bits_fn volatile selected_xfg_f64_bits = indirect_xfg_f64_bits;
+__declspec(dllexport) xfg_mixed_bits_fn volatile selected_xfg_mixed_bits = indirect_xfg_mixed_bits;
+__declspec(dllexport) xfg_v128x6_fn volatile selected_xfg_v128x6 = indirect_xfg_v128x6;
+__declspec(dllexport) xfg_v128x7_fn volatile selected_xfg_v128x7 = indirect_xfg_v128x7;
+__declspec(dllexport) xfg_hva2_fold_fn volatile selected_xfg_hva2_fold = indirect_xfg_hva2_fold;
+__declspec(dllexport) xfg_hva2_make_fn volatile selected_xfg_hva2_make = indirect_xfg_hva2_make;
+__declspec(dllexport) xfg_hfa4_negate_fn volatile selected_xfg_hfa4_negate = indirect_xfg_hfa4_negate;
+__declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = indirect_xfg_pair_fold;
+__declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = indirect_xfg_pair_make;
 
 __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
 {
@@ -1073,7 +1102,7 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
     pytest.importorskip("lief")
     source_bytes = real_msvc_xfg_image.read_bytes()
     source_image = assemble._StubImage(source_bytes)
-    target_rva = source_image.find_export_rva("increment")
+    target_rva = source_image.find_export_rva("direct_increment")
     assert target_rva is not None
     target_window = source_image.read_at_rva(target_rva, 32)
     ret_offset = target_window.find(b"\xC3")
@@ -1095,7 +1124,7 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
     source_offset = target_rva - source_owner.rva
 
     function_spec = virtualization_plan.FunctionSpec(
-        "increment", target_rva, target_size
+        "direct_increment", target_rva, target_size
     )
     discovery = direct_control_flow.analyze_direct_control_flow(
         parsed, (function_spec,), production=False
@@ -1130,7 +1159,7 @@ def test_real_xfg_selected_function_pack_preserves_indirect_call_parity(
             stub_path=str(xfg_virtualization_stub),
             virtualization_specs=(
                 orchestrator.VirtualizationSpec(
-                    "increment", target_rva, target_size
+                    "direct_increment", target_rva, target_size
                 ),
             ),
             virtualization_gap_acknowledgements=gap_acknowledgements,
@@ -1248,21 +1277,27 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
     )
     pointer_targets = {
         name: _exported_pointer_target_rva(source_image, f"selected_{name}")
-        for name in (
-            "xfg_v128x6",
-            "xfg_v128x7",
-            "xfg_hva2_fold",
-            "xfg_hva2_make",
-            "xfg_hfa4_negate",
-        )
+        for name in names
     }
+    assert set(pointer_targets) == set(names)
+    # Export metadata permits exact entry calls. /vectorcall appends an ABI
+    # suffix (e.g. @@96), so resolve the unique symbol by decoded base name.
+    pe_exports = pefile.PE(data=dll.read_bytes()).DIRECTORY_ENTRY_EXPORT.symbols
+    export_rvas: dict[str, int] = {}
+    for symbol in pe_exports:
+        if not symbol.name or symbol.forwarder:
+            continue
+        base = symbol.name.decode("ascii").split("@@", 1)[0]
+        if base in names:
+            assert base not in export_rvas
+            export_rvas[base] = int(symbol.address)
+    assert set(export_rvas) == set(names)
     specs: list[virtualization_plan.FunctionSpec] = []
     for name in names:
-        if name in pointer_targets:
-            target_rva = pointer_targets[name][1]
-        else:
-            target_rva = source_image.find_export_rva(name)
-            assert target_rva is not None
+        target_rva = export_rvas[name]
+        # Every exported pointer slot targets a retained typed forwarder,
+        # not this selected body or another selected body's entry.
+        assert target_rva != pointer_targets[name][1]
         target_size = _straight_line_leaf_size(
             source_image,
             target_rva,
@@ -1272,6 +1307,10 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         specs.append(
             virtualization_plan.FunctionSpec(name, target_rva, target_size)
         )
+    selected_rvas = {spec.rva for spec in specs}
+    assert len(selected_rvas) == len(names)
+    assert all(target_rva not in selected_rvas
+               for _slot_rva, target_rva in pointer_targets.values())
     from iced_x86 import Decoder, Mnemonic, OpKind, Register
     xmm_copy = next(spec for spec in specs if spec.name == "xfg_xmm_copy")
     xmm_copy_instructions = tuple(Decoder(
@@ -1586,3 +1625,82 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
     for target_rva, source_gfid in source_gfids.items():
         assert packed_targets[target_rva] == source_gfid.metadata
     assert thunk_rvas.isdisjoint(packed_targets)
+
+
+def test_real_xfg_exe_encoded_entry_pointer_rejects_before_output(
+    real_msvc_xfg_image: Path, xfg_virtualization_stub: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The original selected=increment slot remains a live XFG negative."""
+    image = assemble._StubImage(real_msvc_xfg_image.read_bytes())
+    rva = image.find_export_rva("increment")
+    assert rva is not None
+    window = image.read_at_rva(rva, 32)
+    size = window.find(b"\xC3") + 1
+    assert size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
+    spec = virtualization_plan.FunctionSpec("increment", rva, size)
+    parsed = pe_analyze.analyze_pe(str(real_msvc_xfg_image))
+    with pytest.raises(direct_control_flow.DirectControlFlowError,
+                       match="known source reference: DIR64 address"):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+    monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+    output = tmp_path / "must-not-exist.exe"
+    outcome = orchestrator.pack_file(str(real_msvc_xfg_image),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=False,
+            stub_path=str(xfg_virtualization_stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size),),
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ))
+    assert not outcome.ok and "known source reference: DIR64 address" in outcome.error
+    assert not output.exists()
+
+
+def test_real_xfg_dll_encoded_entry_pointer_rejects_before_output(
+    real_msvc_xfg_dll_bundle: SimpleNamespace, xfg_virtualization_stub: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Recreate one old DIR64 selected-function pointer in an isolated DLL."""
+    source = real_msvc_xfg_dll_bundle.dll
+    image = assemble._StubImage(source.read_bytes())
+    slot_rva = image.find_export_rva("selected_xfg_i32")
+    target_rva = image.find_export_rva("xfg_i32")
+    assert slot_rva is not None and target_rva is not None
+    raw = bytearray(source.read_bytes())
+    pe = pefile.PE(data=bytes(raw))
+    struct.pack_into("<Q", raw, pe.get_offset_from_rva(slot_rva),
+                     image.image_base + target_rva)
+    pe = pefile.PE(data=bytes(raw))
+    struct.pack_into("<I", raw,
+                     pe.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"),
+                     pe.generate_checksum())
+    negative = tmp_path / "xfg_old_entry_pointer.dll"
+    negative.write_bytes(raw)
+    original = subprocess.run(
+        [str(real_msvc_xfg_dll_bundle.host), str(negative)],
+        capture_output=True, timeout=30, check=False)
+    assert original.returncode == 0, (original.stdout, original.stderr)
+    parsed = pe_analyze.analyze_pe(str(negative))
+    size = _straight_line_leaf_size(image, target_rva, limit=96)
+    spec = virtualization_plan.FunctionSpec("xfg_i32", target_rva, size)
+    with pytest.raises(direct_control_flow.DirectControlFlowError,
+                       match="known source reference: DIR64 address"):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+    monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+    monkeypatch.setenv(_DLL_GATE, "1")
+    output = tmp_path / "must-not-exist.dll"
+    outcome = orchestrator.pack_file(str(negative),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=True,
+            stub_path=str(xfg_virtualization_stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size),),
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ))
+    assert not outcome.ok and "known source reference: DIR64 address" in outcome.error
+    assert not output.exists()

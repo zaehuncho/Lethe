@@ -557,7 +557,20 @@ __declspec(noinline) double native_mix(double a,uint64_t b,double c,uint64_t d,
 { return a+(double)b+c+(double)d+e+(double)f+g+(double)h; }
 double (*const native_mix_slot)(double,uint64_t,double,uint64_t,double,uint64_t,double,uint64_t)=native_mix;
 """
-_EXE = _COMMON + _CONVERSION_CHECK + _CONDITIONAL_ALIAS_CHECK + r"""__declspec(noreturn) void fixture_entry(void)
+# Keep the original address-taking C fixture as a mandatory negative.
+# The positive EXE invokes selected functions directly; the DLL host still
+# exercises typed dynamic GetProcAddress calls from outside the protected PE.
+_CONVERSION_CHECK_EXE = _CONVERSION_CHECK.replace(
+    "static int conversion_check(ConversionFn convert)",
+    "static int conversion_check(void)").replace(
+    "convert(input,output);", "vm_int_pair(input,output);")
+_CONDITIONAL_ALIAS_CHECK_EXE = _CONDITIONAL_ALIAS_CHECK.replace(
+    "static int conditional_alias_check(ConditionalAliasFn direct,ConditionalAliasFn spilled)",
+    "static int conditional_alias_check(void)").replace(
+    "const ConditionalAliasFn functions[]={direct,spilled};", "").replace(
+    "const uint64_t value=functions[function](&output,selector,7U,11U,31U);",
+    "    const uint64_t value=function?vm_alias_choose_spill(&output,selector,7U,11U,31U):vm_alias_choose(&output,selector,7U,11U,31U);")
+_EXE_BODY = r"""__declspec(noreturn) void fixture_entry(void)
 {
  const double answer=vm_fp_call(1.25,7,-3.5,11,5.75,13,-0.5,17);
  uint64_t output=0;
@@ -576,6 +589,16 @@ _EXE = _COMMON + _CONVERSION_CHECK + _CONDITIONAL_ALIAS_CHECK + r"""__declspec(n
  ExitProcess(valid?0U:19U);
 }
 """
+_EXE_ADDRESS_TAKEN = (_COMMON + _CONVERSION_CHECK
+                      + _CONDITIONAL_ALIAS_CHECK + _EXE_BODY)
+_EXE = (_COMMON + _CONVERSION_CHECK_EXE + _CONDITIONAL_ALIAS_CHECK_EXE
+        + _EXE_BODY.replace("conversion_check(vm_int_pair)", "conversion_check()")
+        .replace("conditional_alias_check(vm_alias_choose,vm_alias_choose_spill)",
+                 "conditional_alias_check()"))
+assert "convert(input,output);" not in _CONVERSION_CHECK_EXE
+assert "functions[function]" not in _CONDITIONAL_ALIAS_CHECK_EXE
+assert "conversion_check(vm_int_pair)" not in _EXE
+assert "conditional_alias_check(vm_alias_choose,vm_alias_choose_spill)" not in _EXE
 _DLL = _COMMON + r"""BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID reserved)
 {
  (void)module;(void)reason;(void)reserved;
@@ -630,10 +653,10 @@ int wmain(int argc,wchar_t **argv)
 """
 
 
-def _build(work: Path, *, asm: str = _ASM) -> tuple[Path, Path, Path]:
+def _build(work: Path, *, asm: str = _ASM, exe_source: str = _EXE) -> tuple[Path, Path, Path]:
     source, build = work / "fp_source", work / "fp_build"
     source.mkdir()
-    for name, content in (("frame.asm", asm), ("exe.c", _EXE),
+    for name, content in (("frame.asm", asm), ("exe.c", exe_source),
                           ("dll.c", _DLL), ("host.cpp", _HOST)):
         (source / name).write_text(content, encoding="ascii")
     (source / "CMakeLists.txt").write_text("""cmake_minimum_required(VERSION 3.20)
@@ -775,3 +798,42 @@ def test_materialized_fp_stack_frame_exe_and_dll_parity(tmp_path: Path, monkeypa
         assert (after.returncode, after.stdout, after.stderr) == (
             before.returncode, before.stdout, before.stderr)
         assert hashlib.sha256(stub.read_bytes()).hexdigest() == stub_pin
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows x64 materialization only")
+def test_fp_frame_old_address_taken_exe_rejects_before_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Old C conversion helper passed vm_int_pair as an escaping pointer."""
+    if os.environ.get(runtime._RUN_GATE) != "1":
+        pytest.skip(f"set {runtime._RUN_GATE}=1 to run the native virtualization proof")
+    pytest.importorskip("lief")
+    pytest.importorskip("iced_x86")
+    if not runtime.shutil.which("cmake") or not runtime._visual_studio_available():
+        pytest.skip("CMake + Visual Studio x64 toolchain required")
+    source, _dll, _host = _build(tmp_path, exe_source=_EXE_ADDRESS_TAKEN)
+    before = _run([str(source)])
+    assert before.returncode == 0 and b"passed=true" in before.stdout
+    image = assemble._StubImage(source.read_bytes())
+    rva = image.find_export_rva("vm_int_pair")
+    assert rva is not None
+    parsed = pe_analyze.analyze_pe(str(source))
+    record, = (item for item in parsed.runtime_functions if item.begin_rva == rva)
+    spec = virtualization_plan.FunctionSpec("vm_int_pair", rva,
+                                             record.end_rva - rva)
+    with pytest.raises(direct_control_flow.DirectControlFlowError,
+                       match="known source reference: RIP address"):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+    stub = runtime._candidate_stub_or_build(tmp_path)
+    monkeypatch.setenv(runtime._VIRTUALIZATION_GATE, "1")
+    output = tmp_path / "must-not-exist.exe"
+    outcome = orchestrator.pack_file(str(source), orchestrator.PackOptions(
+        output_path=str(output), is_dll=False, stub_path=str(stub),
+        virtualization_specs=(orchestrator.VirtualizationSpec(
+            spec.name, spec.rva, spec.size),),
+        acknowledge_unproven_indirect_targets=True,
+        _allow_unverified_stub_for_tests=True,
+    ))
+    assert not outcome.ok and "known source reference: RIP address" in outcome.error
+    assert not output.exists()

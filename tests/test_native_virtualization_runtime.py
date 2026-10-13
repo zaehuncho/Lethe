@@ -281,7 +281,7 @@ def _build_stub(work: Path) -> Path:
     return stub
 
 
-def _build_dll_fixture(work: Path) -> tuple[Path, Path]:
+def _build_dll_fixture(work: Path, *, address_taken_entry: bool = False) -> tuple[Path, Path]:
     source = work / "dll_fixture_source"
     build = work / "dll_fixture_build"
     source.mkdir()
@@ -306,7 +306,7 @@ OPTION CASEMAP:NONE
 .data
 ALIGN 8
 PUBLIC vm_dll_anchor
-vm_dll_anchor QWORD OFFSET vm_dll_leaf
+vm_dll_anchor QWORD OFFSET {anchor_target}
 .code
 PUBLIC vm_dll_leaf
 vm_dll_leaf PROC FRAME
@@ -320,7 +320,8 @@ vm_dll_leaf PROC FRAME
     DB 0CCh, 0CCh
 vm_dll_leaf ENDP
 END
-""".lstrip(),
+""".replace("{anchor_target}",
+            "vm_dll_leaf" if address_taken_entry else "vm_dll_anchor").lstrip(),
         encoding="ascii",
     )
     (source / "host.cpp").write_text(
@@ -923,3 +924,45 @@ def test_packed_dll_calls_source_bound_virtualized_padded_leaf(
         if (work.parent == root and work.name.startswith(".native_vm_dll_")
                 and work.exists()):
             shutil.rmtree(work)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
+def test_padded_dll_address_taken_entry_rejects_before_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The old exported anchor-to-selected-leaf layout is not a positive."""
+    if os.environ.get(_RUN_GATE) != "1":
+        pytest.skip(f"set {_RUN_GATE}=1 to run the native virtualization proof")
+    pytest.importorskip("lief")
+    pytest.importorskip("iced_x86")
+    if not shutil.which("cmake") or not _visual_studio_available():
+        pytest.skip("CMake + Visual Studio x64 toolchain required")
+    source, host = _build_dll_fixture(tmp_path, address_taken_entry=True)
+    original = subprocess.run([str(host), str(source)], capture_output=True,
+                              timeout=30, check=False)
+    assert (original.returncode, original.stdout, original.stderr) == (
+        0, b"dll-answer=42\r\n", b"")
+    image = assemble._StubImage(source.read_bytes())
+    rva = image.find_export_rva("vm_dll_leaf")
+    assert rva is not None
+    parsed = pe_analyze.analyze_pe(str(source))
+    record, = (item for item in parsed.runtime_functions if item.begin_rva == rva)
+    spec = virtualization_plan.FunctionSpec("vm_dll_leaf", rva,
+                                             record.end_rva - rva)
+    with pytest.raises(direct_control_flow.DirectControlFlowError,
+                       match="known source reference: DIR64 address"):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+    stub = _candidate_stub_or_build(tmp_path)
+    monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+    output = tmp_path / "must-not-exist.dll"
+    outcome = orchestrator.pack_file(str(source), orchestrator.PackOptions(
+        output_path=str(output), is_dll=True, stub_path=str(stub),
+        virtualization_specs=(orchestrator.VirtualizationSpec(
+            spec.name, spec.rva, spec.size),),
+        acknowledge_unproven_indirect_targets=True,
+        _allow_unverified_stub_for_tests=True,
+    ))
+    assert not outcome.ok and "known source reference: DIR64 address" in outcome.error
+    assert not output.exists()

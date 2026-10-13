@@ -32,7 +32,8 @@ def built_runtime():
     work = Path(tempfile.mkdtemp(prefix=".chain_group_e2e_", dir=_ROOT)).resolve()
     assert work.parent == _ROOT.resolve() and work.name.startswith(".chain_group_e2e_")
     try:
-        candidate = os.environ.get("LETHE_CHAIN_GROUP_CANDIDATE_PATH")
+        candidate = (os.environ.get("LETHE_CHAIN_GROUP_CANDIDATE_PATH")
+                     or os.environ.get(native_fixture._STUB_PATH_ENV))
         if candidate:
             from tools.promote_stub import validate_candidate_bundle
             stub = Path(candidate).resolve()
@@ -197,3 +198,37 @@ def test_complete_chain_group_materializes_and_runs(kind: str, built_runtime, mo
     after = _run(kind, packed_path, host)
     assert (after.returncode, after.stdout, after.stderr) == (0, expected, b"")
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows loader only")
+def test_address_taken_chain_group_rejects_before_output(built_runtime, monkeypatch):
+    """The old exported DIR64 entry pointer remains an explicit negative."""
+    work, stub, allow_override = built_runtime
+    case = work / "address-taken-negative"
+    case.mkdir()
+    source, host = native_fixture._build_dll_fixture(
+        case, address_taken_entry=True)
+    assert _run("dll", source, host).returncode == 0
+    chained = case / "chained-address-taken.dll"
+    begin, _split, end = _mutate_chain(source, chained, "dll")
+    original = _run("dll", chained, host)
+    assert (original.returncode, original.stdout, original.stderr) == (
+        0, b"dll-answer=42\r\n", b"")
+    parsed = pe_analyze.analyze_pe(str(chained))
+    spec = virtualization_plan.FunctionSpec("vm_dll_leaf", begin, end - begin)
+    with pytest.raises(direct_control_flow.DirectControlFlowError,
+                       match="known source reference: DIR64 address"):
+        direct_control_flow.analyze_direct_control_flow(
+            parsed, (spec,), production=False)
+    output = case / "must-not-exist.dll"
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+    outcome = orchestrator.pack_file(str(chained), orchestrator.PackOptions(
+        output_path=str(output), is_dll=True, stub_path=str(stub),
+        virtualization_specs=(orchestrator.VirtualizationSpec(
+            spec.name, begin, end - begin),),
+        acknowledge_unproven_indirect_targets=True,
+        _allow_unverified_stub_for_tests=allow_override,
+    ))
+    assert not outcome.ok and "known source reference: DIR64 address" in outcome.error
+    assert not output.exists()

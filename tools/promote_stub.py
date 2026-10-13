@@ -56,6 +56,7 @@ REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
 REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_runtime_hardening_stress.py",
     "test_native_virtualization_runtime.py",
+    "test_chain_group_materialized.py",
     "test_xmm_store128_native.py",
     "test_xfg_virtualization_preflight.py",
     "test_native_exe_exports.py",
@@ -83,6 +84,14 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_packed_executable_calls_virtualized_native_callee",
     "tests/test_native_virtualization_runtime.py::"
     "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
+    "tests/test_native_virtualization_runtime.py::"
+    "test_padded_dll_address_taken_entry_rejects_before_output",
+    "tests/test_chain_group_materialized.py::"
+    "test_complete_chain_group_materializes_and_runs[exe]",
+    "tests/test_chain_group_materialized.py::"
+    "test_complete_chain_group_materializes_and_runs[dll]",
+    "tests/test_chain_group_materialized.py::"
+    "test_address_taken_chain_group_rejects_before_output",
     "tests/test_xmm_store128_native.py::"
     "test_store128_helper_is_one_movdqu_and_guard_fault_is_atomic",
     "tests/test_xmm_store128_native.py::"
@@ -97,6 +106,10 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_real_xfg_selected_function_pack_preserves_indirect_call_parity",
     "tests/test_xfg_virtualization_preflight.py::"
     "test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_exe_encoded_entry_pointer_rejects_before_output",
+    "tests/test_xfg_virtualization_preflight.py::"
+    "test_real_xfg_dll_encoded_entry_pointer_rejects_before_output",
     "tests/test_native_exe_exports.py::"
     "test_packed_exe_preserves_exports_after_startup",
     "tests/test_native_exe_exports.py::"
@@ -123,6 +136,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_native_frame_call_boundary[unwind]",
     "tests/test_native_fp_frame_materialized.py::"
     "test_materialized_fp_stack_frame_exe_and_dll_parity",
+    "tests/test_native_fp_frame_materialized.py::"
+    "test_fp_frame_old_address_taken_exe_rejects_before_output",
     "tests/test_native_known_references.py::"
     "test_materialized_known_reference_admission_exe_and_dll",
     "tests/test_native_entry_metadata.py::"
