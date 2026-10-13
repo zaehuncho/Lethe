@@ -429,13 +429,17 @@ def parse_pe_exports(parsed: Any) -> tuple[ExportSymbol, ...]:
             raise FunctionDiscoveryError("input is not PE32+")
         directory_count, = struct.unpack_from("<I", image, optional + 0x6C)
         if directory_count == 0:
-            return ()
-        if optional + 0x78 > optional + optional_size:
-            raise FunctionDiscoveryError("input lacks an export directory slot")
-        export_rva, export_size = struct.unpack_from("<II", image, optional + 0x70)
+            export_rva, export_size = 0, 0
+        else:
+            if optional + 0x78 > optional + optional_size:
+                raise FunctionDiscoveryError("input lacks an export directory slot")
+            export_rva, export_size = struct.unpack_from("<II", image, optional + 0x70)
     except (OSError, struct.error) as exc:
         raise FunctionDiscoveryError(f"cannot read PE export directory: {exc}") from exc
 
+    if (getattr(parsed, "export_directory_rva", export_rva),
+            getattr(parsed, "export_directory_size", export_size)) != (export_rva, export_size):
+        raise FunctionDiscoveryError("ParsedPE export directory disagrees with source PE header")
     if export_rva == 0 and export_size == 0:
         return ()
     if export_rva <= 0 or export_size < 40 or export_rva + export_size > parsed.size_of_image:
@@ -858,10 +862,6 @@ def _padding_metadata_rejection(
                 ("volatile access target", target, 1)
                 for target in volatile.access_rvas
             )
-            ranges.extend(
-                ("volatile info range", start, size)
-                for start, size in volatile.info_ranges
-            )
             if len(volatile.raw) >= 24:
                 access_rva, access_size, info_rva, info_size = struct.unpack_from(
                     "<IIII", volatile.raw, 8
@@ -1183,6 +1183,7 @@ def discover_functions(
         reference_index = source_references.SourceReferenceIndex((
             *source_references.instruction_references(reference_instructions),
             *source_references.dir64_references(parsed),
+            *source_references.metadata_references(parsed, exports=export_records),
         ))
         direct_status = "passed"
     except (FunctionDiscoveryError, source_references.SourceReferenceError) as exc:

@@ -1,13 +1,16 @@
 """Non-waivable negative facts about references to overwritten source bytes.
 
-This is not indirect/address-taken closure. Only decoded RIP operands and
-validated, file-backed DIR64 pointer values participate. An entry address may
-remain a callable pointer; a direct memory access to entry bytes may not.
+This is not indirect/address-taken closure. Decoded RIP operands, validated
+file-backed DIR64 pointer values, exact PE invocation entries and metadata
+storage spans participate. An exact selected entry may remain callable;
+interior entries and reads of overwritten source bytes may not.
 """
 from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass
+import os
+import struct
 from typing import Any, Iterable
 
 from iced_x86 import MemorySizeExt, Mnemonic, OpKind, Register
@@ -103,6 +106,305 @@ def dir64_references(parsed: Any) -> tuple[SourceReference, ...]:
         target = int.from_bytes(section.raw[offset:offset + 8], "little") - base
         if 0 < target < 1 << 32:
             references.append(SourceReference(target, 1, rva, "DIR64 address", True))
+    return tuple(references)
+
+
+def metadata_references(parsed: Any, *, exports: Iterable[Any] | None = None) -> tuple[SourceReference, ...]:
+    """Known PE entry targets and metadata storage in overwritten source bytes.
+
+    This is a negative inventory, not a proof of unknown indirect targets.
+    Callable targets at the selected entry remain valid; storage bytes do not.
+    """
+    references: list[SourceReference] = []
+    image_size = getattr(parsed, "size_of_image", None)
+    if image_size is None and not hasattr(parsed, "reloc_blob"):
+        path = getattr(parsed, "path", None)
+        has_file = isinstance(path, str) and os.path.isfile(path)
+        material_fields = (
+            "oep_rva", "tls", "load_config", "export_directory_rva",
+            "export_directory_size", "rsrc_directory_rva",
+            "rsrc_directory_size", "delay_import_rva", "delay_import_size",
+            "pdata_rva", "pdata_count", "dir64_relocations",
+        )
+        if not has_file and not any(getattr(parsed, field, None)
+                                    for field in material_fields):
+            # A decoded-code-only synthetic model has no PE metadata to
+            # inventory. Real PE materialization always supplies SizeOfImage.
+            return ()
+    if type(image_size) is not int or not 0 < image_size <= 1 << 32:
+        raise SourceReferenceError("source reference: invalid PE image size")
+
+    def add(kind: str, rva: Any, size: Any = 1, *, entry: bool = False) -> None:
+        if (type(rva) is not int or type(size) is not int
+                or rva < 0 or size < 0 or rva + size > image_size
+                or (rva == 0 and size > 1) or (rva > 0 and size == 0)):
+            raise SourceReferenceError(f"source reference: invalid {kind} RVA span")
+        if rva and size:
+            references.append(SourceReference(rva, size, rva, kind, entry))
+
+    # The strict reader uses the source PE header and current ParsedPE section
+    # bytes, so a stale EAT in a persisted manifest is checked at commit too.
+    export_rva = getattr(parsed, "export_directory_rva", 0)
+    export_size = getattr(parsed, "export_directory_size", 0)
+    if export_rva or export_size:
+        if not export_rva or not export_size:
+            raise SourceReferenceError("source reference: incomplete export directory")
+        add("export directory", export_rva, export_size)
+    source_path = getattr(parsed, "path", None)
+    has_source_path = isinstance(source_path, str) and os.path.isfile(source_path)
+    # A caller-supplied export inventory may help name candidates, but it must
+    # never hide a real PE export target from the overwrite safety proof.
+    supplied_exports = () if exports is None else tuple(exports)
+    if export_rva or export_size or has_source_path:
+        if has_source_path or exports is None:
+            try:
+                from . import function_discovery
+                source_exports = function_discovery.parse_pe_exports(parsed)
+            except (ImportError, OSError, ValueError) as exc:
+                raise SourceReferenceError(
+                    f"source reference: strict export metadata unavailable: {exc}"
+                ) from exc
+        else:
+            source_exports = ()
+    else:
+        source_exports = ()
+    for item in (*source_exports, *supplied_exports):
+        add(f"PE export {item.name!r}", item.rva, entry=True)
+
+    add("image entry point", getattr(parsed, "oep_rva", 0), entry=True)
+    tls = getattr(parsed, "tls", None)
+    if tls is not None:
+        for rva in tuple(getattr(tls, "callback_rvas", ())):
+            add("TLS callback", rva, entry=True)
+        add("TLS index", getattr(tls, "index_rva", 0), 4)
+        raw_begin = getattr(tls, "raw_start_rva", 0)
+        raw_end = getattr(tls, "raw_end_rva", 0)
+        if type(raw_begin) is not int or type(raw_end) is not int or raw_end < raw_begin:
+            raise SourceReferenceError("source reference: invalid TLS raw-data span")
+        if raw_end > raw_begin:
+            add("TLS raw-data", raw_begin, raw_end - raw_begin)
+
+    # The loader writes ordinary import thunks through their full pointer
+    # slots.  They are storage, never executable entry references.
+    try:
+        from . import native_tail_calls
+        import_slots = tuple(
+            function.iat_rva
+            for dll in getattr(parsed, "imports", ())
+            for function in dll.funcs
+        )
+        native_tail_calls.validated_import_iat_rvas(import_slots)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SourceReferenceError(
+            f"source reference: invalid ordinary import IAT inventory: {exc}"
+        ) from exc
+    for rva in import_slots:
+        add("ordinary import IAT slot", rva, 8)
+
+    relocations = getattr(parsed, "dir64_relocations", ())
+    for item in relocations:
+        add("source DIR64 relocation site", getattr(item, "target_rva", None), 8)
+    def source_bytes(rva: int, size: int, kind: str) -> bytes:
+        if type(rva) is not int or type(size) is not int or not 0 < rva <= image_size - size:
+            raise SourceReferenceError(f"source reference: invalid {kind} byte span")
+        matches = [section for section in getattr(parsed, "sections", ())
+                   if section.rva <= rva and rva + size <= section.rva + len(section.raw)]
+        if len(matches) != 1:
+            raise SourceReferenceError(f"source reference: {kind} is not uniquely file-backed")
+        owner = matches[0]
+        return owner.raw[rva - owner.rva:rva - owner.rva + size]
+
+    if has_source_path and export_rva:
+        # The release assembler snapshots only the declared export span. Its
+        # EAT/name/ordinal arrays and strings must live inside that span, not
+        # merely elsewhere in a file-backed section. Check this before a
+        # low-level proof or commit can misclassify external table storage.
+        from . import function_discovery
+        try:
+            directory = function_discovery._slice_at_rva(
+                parsed.sections, export_rva, 40, "export directory")
+            (module_name_rva, _ordinal_base, function_count, name_count,
+             functions_rva, names_rva, ordinals_rva) = struct.unpack_from(
+                 "<IIIIIII", directory, 12)
+
+            def within_export(label: str, rva: int, size: int) -> None:
+                if rva < export_rva or rva + size > export_rva + export_size:
+                    raise SourceReferenceError(
+                        f"source reference: export-table storage escapes "
+                        f"declared directory: {label}")
+
+            module_name = function_discovery._read_c_string(
+                parsed.sections, module_name_rva, "export module name")
+            within_export("module name", module_name_rva, len(module_name) + 1)
+            if function_count:
+                within_export("address table", functions_rva, function_count * 4)
+            if name_count:
+                within_export("name-pointer table", names_rva, name_count * 4)
+                within_export("name-ordinal table", ordinals_rva, name_count * 2)
+                name_rvas = struct.unpack(
+                    f"<{name_count}I",
+                    function_discovery._slice_at_rva(
+                        parsed.sections, names_rva, name_count * 4,
+                        "export name table"))
+                for index, name_rva in enumerate(name_rvas):
+                    name = function_discovery._read_c_string(
+                        parsed.sections, name_rva, f"export name[{index}]")
+                    within_export(f"name[{index}]", name_rva, len(name) + 1)
+        except (ValueError, struct.error) as exc:
+            if isinstance(exc, SourceReferenceError):
+                raise
+            raise SourceReferenceError(
+                f"source reference: invalid export-table storage: {exc}") from exc
+
+    # A real ParsedPE has validated unwind records. Re-read their complete
+    # header/code/handler-or-chain spans, not merely the first header byte.
+    # Partial discovery fixtures without source bytes retain a conservative
+    # four-byte header negative fact rather than inventing an unwind payload.
+    seen_unwind: set[int] = set()
+    active_unwind: set[int] = set()
+
+    def add_unwind(rva: int, depth: int = 0) -> None:
+        if rva in active_unwind:
+            raise SourceReferenceError("source reference: cyclic unwind chain")
+        if rva in seen_unwind:
+            return
+        if depth > 64:
+            raise SourceReferenceError("source reference: unwind chain exceeds bound")
+        active_unwind.add(rva)
+        try:
+            if not hasattr(parsed, "reloc_blob"):
+                add("source unwind info", rva, 4)
+            else:
+                header = source_bytes(rva, 4, "UNWIND_INFO header")
+                version, flags = header[0] & 7, header[0] >> 3
+                if version in (1, 2):
+                    payload_size = ((header[2] + 1) & ~1) * 2
+                    tail = rva + 4 + payload_size
+                elif version == 3:
+                    payload_size = header[2] * 2
+                    tail = (rva + 4 + payload_size + 3) & ~3
+                else:
+                    raise SourceReferenceError(
+                        "source reference: unsupported UNWIND_INFO version")
+                tail_size = 12 if flags & 4 else (4 if flags & 3 else 0)
+                size = tail + tail_size - rva
+                payload = source_bytes(rva, size, "UNWIND_INFO")
+                add("source unwind info", rva, size)
+                if flags & 4:
+                    chain_begin = int.from_bytes(payload[-12:-8], "little")
+                    chain_unwind = int.from_bytes(payload[-4:], "little")
+                    add("chained runtime entry", chain_begin, entry=True)
+                    add_unwind(chain_unwind, depth + 1)
+                elif flags & 3:
+                    handler_rva = int.from_bytes(payload[-4:], "little")
+                    add("unwind handler entry", handler_rva, entry=True)
+                    # EH/UH language data begins immediately after the handler
+                    # RVA and has no generic PE-bounded length. Until its
+                    # handler-specific format is proven, no later source RVA
+                    # can safely be selected for overwrite.
+                    language_rva = tail + 4
+                    if language_rva < image_size:
+                        add("unbounded unwind handler data", language_rva,
+                            image_size - language_rva)
+        finally:
+            active_unwind.remove(rva)
+        seen_unwind.add(rva)
+
+    runtime_records = tuple(getattr(parsed, "runtime_functions", ()))
+    if hasattr(parsed, "reloc_blob"):
+        from packer import pe_analyze
+        for item in runtime_records:
+            try:
+                pe_analyze._validate_runtime_function(
+                    item.begin_rva, item.end_rva, item.unwind_info_rva,
+                    image_size, parsed.sections, set())
+            except (TypeError, ValueError) as exc:
+                raise SourceReferenceError(
+                    f"source reference: current unwind metadata is invalid: {exc}"
+                ) from exc
+    for item in runtime_records:
+        add_unwind(getattr(item, "unwind_info_rva", None))
+    pdata_rva = getattr(parsed, "pdata_rva", 0)
+    pdata_count = getattr(parsed, "pdata_count", 0)
+    if type(pdata_count) is not int or pdata_count < 0:
+        raise SourceReferenceError("source reference: invalid PDATA count")
+    if pdata_count:
+        add("source exception table", pdata_rva, pdata_count * 12)
+    for label, rva, size in (
+        ("resource directory", getattr(parsed, "rsrc_directory_rva", 0),
+         getattr(parsed, "rsrc_directory_size", 0)),
+        ("delay-import directory", getattr(parsed, "delay_import_rva", 0),
+         getattr(parsed, "delay_import_size", 0)),
+    ):
+        if rva or size:
+            add(label, rva, size)
+
+    config = getattr(parsed, "load_config", None)
+    if config is not None:
+        add("load-config directory", getattr(config, "directory_rva", 0),
+            getattr(config, "directory_size", 0))
+        flags = getattr(config, "guard_flags", 0)
+        if type(flags) is not int or not 0 <= flags < 1 << 32:
+            raise SourceReferenceError("source reference: invalid GuardFlags")
+        stride = 4 + ((flags >> 28) & 15)
+        for label, table, targets, callable_target in (
+            ("Guard CF", "guard_cf_function_table_rva", "guard_cf_targets", True),
+            ("Guard address-taken IAT", "guard_address_taken_iat_entry_table_rva",
+             "guard_address_taken_iat_entries", False),
+            ("Guard long-jump", "guard_long_jump_target_table_rva",
+             "guard_long_jump_targets", True),
+            ("Guard EH-continuation", "guard_eh_continuation_table_rva",
+             "guard_eh_continuation_targets", True),
+        ):
+            rows = tuple(getattr(config, targets, ()))
+            table_rva = getattr(config, table, 0)
+            if table_rva and rows:
+                add(f"{label} table", table_rva, len(rows) * stride)
+            for item in rows:
+                add(f"{label} target", getattr(item, "rva", None),
+                    1 if callable_target else 8, entry=callable_target)
+        for item in getattr(config, "guard_cf_targets", ()):
+            metadata = getattr(item, "metadata", b"")
+            if metadata and metadata[0] & 0x08:
+                add("XFG function hash", item.rva - 8, 8)
+        for field in (
+            "security_cookie_rva", "guard_cf_check_function_pointer_rva",
+            "guard_cf_dispatch_function_pointer_rva",
+            "guard_xfg_check_function_pointer_rva",
+            "guard_xfg_dispatch_function_pointer_rva",
+            "guard_xfg_table_dispatch_function_pointer_rva",
+            "cast_guard_os_determined_failure_mode_rva",
+            "guard_memcpy_function_pointer_rva",
+        ):
+            rva = getattr(config, field, 0)
+            if rva:
+                add(f"load-config {field}", rva, 8)
+        volatile = getattr(config, "volatile_metadata", None)
+        if volatile is not None:
+            raw = getattr(volatile, "raw", b"")
+            if not isinstance(raw, bytes) or len(raw) < 24:
+                raise SourceReferenceError("source reference: invalid volatile metadata header")
+            volatile_rva = getattr(volatile, "rva", None)
+            if hasattr(parsed, "reloc_blob") and source_bytes(
+                    volatile_rva, len(raw), "volatile metadata") != raw:
+                raise SourceReferenceError(
+                    "source reference: volatile metadata changed after analysis")
+            add("volatile metadata", volatile_rva, len(raw))
+            access_rva, access_size, info_rva, info_size = struct.unpack_from(
+                "<IIII", raw, 8)
+            for label, rva, size in (
+                ("volatile access table", access_rva, access_size),
+                ("volatile info table", info_rva, info_size),
+            ):
+                if bool(rva) != bool(size):
+                    raise SourceReferenceError(f"source reference: incomplete {label}")
+                if rva:
+                    add(label, rva, size)
+            for rva in getattr(volatile, "access_rvas", ()):
+                add("volatile access target", rva)
+            # Info ranges classify executable code for emulation. They are not
+            # byte storage, and overlap alone does not name an instruction or
+            # alternate entry into a selected body. Exact access RVAs do.
     return tuple(references)
 
 

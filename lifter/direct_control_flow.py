@@ -972,6 +972,7 @@ def _validate_known_references(parsed, decodes, selected):
                 instruction for decoded in decodes for instruction in decoded.instructions
             ),
             *source_references.dir64_references(parsed),
+            *source_references.metadata_references(parsed),
         ))
         index.validate(selected)
     except source_references.SourceReferenceError as exc:

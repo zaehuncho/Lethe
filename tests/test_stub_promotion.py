@@ -272,12 +272,15 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_lifter_frame_call_native.py",
         "test_native_fp_frame_materialized.py",
         "test_native_known_references.py",
+        "test_native_entry_metadata.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 30
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 31
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert ("tests/test_native_known_references.py::"
             "test_materialized_known_reference_admission_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 30
+    assert ("tests/test_native_entry_metadata.py::"
+            "test_materialized_export_entry_metadata_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 31
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"

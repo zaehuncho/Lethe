@@ -194,6 +194,20 @@ both exact-entry function-pointer controls must still pack and match originals.
 The default tracked prebuilt is not promoted by adding this contract. Older
 candidate attestations are historical evidence and do not claim the new node.
 
+Known PE invocation metadata is also a non-waivable source reference, distinct
+from speculative indirect-target closure. A selected function may retain an
+export, OEP, TLS callback, Guard CF/long-jump or EH-continuation target at its
+exact entry; a known target in any overwritten interior byte is rejected.
+Source metadata storage spans (including relocation sites, exception/unwind
+bytes, export and load-config tables) cannot be overwritten at all. Discovery
+caches the negative inventory, preflight checks the selected extent, and
+materialization rereads current source bytes and metadata at commit. The
+mandatory `tests/test_native_entry_metadata.py` node builds an exact-entry
+EXE/DLL positive pair and an RVA+1 exported-alias negative pair: originals
+run, positives pack and run with parity, negatives reject before output.
+Static rejection does not prove unknown computed targets are closed. Older
+candidate attestations do not claim this added native node.
+
 An optional exact-PDB path now proves direct-reference executable coverage for
 one explicitly selected image by binding the PE RSDS GUID/age to DIA function
 extents and strictly decoding every remaining byte as a narrow canonical

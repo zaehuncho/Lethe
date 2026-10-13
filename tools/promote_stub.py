@@ -62,6 +62,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_lifter_frame_call_native.py",
     "test_native_fp_frame_materialized.py",
     "test_native_known_references.py",
+    "test_native_entry_metadata.py",
 )
 REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_runtime_hardening_stress.py::"
@@ -124,6 +125,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_materialized_fp_stack_frame_exe_and_dll_parity",
     "tests/test_native_known_references.py::"
     "test_materialized_known_reference_admission_exe_and_dll",
+    "tests/test_native_entry_metadata.py::"
+    "test_materialized_export_entry_metadata_exe_and_dll",
 
 )
 REQUIRED_NATIVE_RUNTIME_PASS_COUNT = len(REQUIRED_NATIVE_RUNTIME_NODE_IDS)

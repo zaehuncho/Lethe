@@ -318,10 +318,6 @@ def _validate_padding_suffix_bindings(
             bindings.extend(
                 ("volatile access target", rva, 1) for rva in volatile.access_rvas
             )
-            bindings.extend(
-                ("volatile info range", rva, size)
-                for rva, size in volatile.info_ranges
-            )
             if len(volatile.raw) >= 24:
                 access_rva, access_size, info_rva, info_size = struct.unpack_from(
                     "<IIII", volatile.raw, 8
