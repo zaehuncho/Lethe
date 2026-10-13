@@ -66,6 +66,36 @@ def publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     }
     _json(manifest_path, manifest)
     assert release_attestation.validate_candidate_identity(stub, manifest_path) == manifest
+    release_dir = stub.parent / "release-evidence"
+    release_dir.mkdir()
+    scanner_subjects = []
+    release_backings = []
+    for role in ("exe", "dll"):
+        subject = {}
+        for label in ("subject", "pack_report", "protection_profile"):
+            relative = f"subjects/{role}-{label}.json"
+            backing = release_dir / relative
+            _json(backing, {"role": role, "label": label})
+            subject[f"{label}_path"] = relative
+            subject[f"{label}_sha256"] = release_attestation.sha256_file(backing)
+            release_backings.append("stub/prebuilt/release-evidence/" + relative)
+        scanner_subjects.append({**subject, "scans": []})
+    scanner_path = release_dir / "scanner.json"
+    _json(scanner_path, {"subjects": scanner_subjects})
+    signature_path = release_dir / "provider-signatures/scanner.json"
+    _json(signature_path, {"fixture": "signed-provider-backing"})
+    external_path = release_dir / "external-manifest.json"
+    _json(external_path, {"records": [{
+        "kind": "scanner",
+        "provider_signature_path": "provider-signatures/scanner.json",
+        "provider_signature_sha256": release_attestation.sha256_file(signature_path),
+    }]})
+    release_records = [
+        {"kind": kind, "path": "release-evidence/" + path.name,
+         "sha256": release_attestation.sha256_file(path)}
+        for kind, path in (("scanner", scanner_path),
+                           ("external-manifest", external_path))
+    ]
     # This return value represents an authenticated release payload. Changes
     # made by individual tests model drift after that verification boundary.
     verified_payload = {
@@ -75,12 +105,17 @@ def publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "manifest_sha256": release_attestation.sha256_file(manifest_path),
         },
         "release_source_commit": RELEASE_COMMIT,
+        "evidence": release_records,
     }
     state = SimpleNamespace(
         root=root, stub=stub, manifest_path=manifest_path, manifest=manifest,
         payload=verified_payload, assessment=["docs/production_compatibility.json"],
         published=sorted(release_check.RELEASE_OUTPUT_PATHS),
         candidate_paths=["stub/prebuilt/" + record["path"] for record in evidence],
+        release_paths=["stub/prebuilt/release-evidence/scanner.json",
+                       "stub/prebuilt/release-evidence/external-manifest.json",
+                       "stub/prebuilt/release-evidence/provider-signatures/scanner.json",
+                       *release_backings],
         verification_calls=[],
     )
 
@@ -121,11 +156,26 @@ def test_publication_accepts_all_authenticated_candidate_backings(publication):
     assert publication.verification_calls == [publication.stub]
 
 
-def test_publication_keeps_existing_release_output_policy(publication):
-    publication.published += ["stub/prebuilt/release-evidence/scanner.json"]
+def test_publication_accepts_exact_signed_release_records_and_backings(publication):
+    publication.published += publication.release_paths
     errors = []
     assert release_check._check_manifest(errors) == publication.payload
     assert errors == []
+
+
+@pytest.mark.parametrize("relative", [
+    "release-evidence/scanner.json",
+    "release-evidence/subjects/exe-subject.json",
+    "release-evidence/provider-signatures/scanner.json",
+])
+def test_publication_rechecks_release_backing_hashes_after_verification(
+    publication, relative,
+):
+    (publication.stub.parent / relative).write_bytes(b"changed after verification\n")
+    errors = []
+    assert release_check._check_manifest(errors) is None
+    assert any("signed prebuilt release is invalid" in error and "hash mismatch" in error
+               for error in errors)
 
 
 @pytest.mark.parametrize("unexpected", [
@@ -133,6 +183,8 @@ def test_publication_keeps_existing_release_output_policy(publication):
     "stub/prebuilt/evidence/unlisted/nested.json",
     "stub/prebuilt/evidence-extra/candidate-policy.json",
     "stub/prebuilt/evidence2/candidate-policy.json",
+    "stub/prebuilt/release-evidence/unlisted.json",
+    "stub/prebuilt/release-evidence/unlisted/nested.json",
     "stub/prebuilt/release-evidence-extra/scanner.json",
     "packer/assemble.py",
 ])

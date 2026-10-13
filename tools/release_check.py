@@ -112,11 +112,65 @@ def _candidate_publication_paths(payload: dict) -> set[str]:
     return paths
 
 
+def _release_publication_paths(payload: dict) -> set[str]:
+    """Allow only signed release records and their hash-bound backing files.
+
+    Release creation copies some evidence (subjects, logs, provider signatures)
+    beneath release-evidence/ without listing every backing in the top-level
+    attestation.  The signed documents name and hash each such file, so derive
+    the publication allowance from that authenticated graph, never the prefix.
+    Rehash on this read after verify_release_bundle to reject intervening drift.
+    """
+    paths: set[str] = set()
+    evidence_documents: dict[str, dict] = {}
+    evidence_paths: dict[str, Path] = {}
+
+    def include(root: Path, relative: str, digest: str) -> Path:
+        backing = release_attestation._validate_backing_file(
+            root, relative, digest, "signed release publication backing")
+        try:
+            repository_path = backing.relative_to(ROOT.resolve()).as_posix()
+        except ValueError as exc:
+            raise release_attestation.ReleaseAttestationError(
+                "signed release publication backing escapes the source tree") from exc
+        if not repository_path.startswith(RELEASE_EVIDENCE_PREFIX):
+            raise release_attestation.ReleaseAttestationError(
+                "signed release publication backing is outside release-evidence")
+        paths.add(repository_path)
+        return backing
+
+    for record in payload["evidence"]:
+        kind = record["kind"]
+        backing = include(STUB.parent, record["path"], record["sha256"])
+        evidence_paths[kind] = backing
+        if kind in {"authenticode", "scanner", "clean-vm", "application", "external-manifest"}:
+            evidence_documents[kind] = release_attestation._read_json_object(
+                backing, f"signed release publication {kind}")
+
+    for kind in ("authenticode", "scanner", "clean-vm", "application"):
+        if kind not in evidence_documents:
+            continue
+        document = evidence_documents[kind]
+        for reference in release_attestation._document_file_references(kind, document):
+            include(evidence_paths[kind].parent,
+                    reference["path"], reference["sha256"])
+
+    if "external-manifest" in evidence_documents:
+        external = evidence_documents["external-manifest"]
+        for record in external["records"]:
+            if record["kind"] in release_attestation.PROVIDER_SIGNED_KINDS:
+                include(evidence_paths["external-manifest"].parent,
+                        record["provider_signature_path"],
+                        record["provider_signature_sha256"])
+    return paths
+
+
 def _check_manifest(errors: list[str]) -> dict | None:
     try:
         payload = release_attestation.verify_release_bundle(STUB)
         candidate_publication_paths = _candidate_publication_paths(payload)
-    except (OSError, release_attestation.ReleaseAttestationError) as exc:
+        release_publication_paths = _release_publication_paths(payload)
+    except (OSError, KeyError, TypeError, release_attestation.ReleaseAttestationError) as exc:
         errors.append(f"signed prebuilt release is invalid: {exc}")
         return None
     source_commit = payload["candidate"]["source_commit"]
@@ -145,7 +199,7 @@ def _check_manifest(errors: list[str]) -> dict | None:
         path for path in publication_drift.splitlines()
         if path not in RELEASE_OUTPUT_PATHS
         and path not in candidate_publication_paths
-        and not path.startswith(RELEASE_EVIDENCE_PREFIX)
+        and path not in release_publication_paths
     ]
     if unexpected_publication:
         errors.append(
