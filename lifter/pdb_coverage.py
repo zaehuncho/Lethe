@@ -9,6 +9,7 @@ module never acknowledges an arbitrary executable gap.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, fields, is_dataclass, replace
 from hashlib import sha256
 from pathlib import Path
@@ -334,7 +335,26 @@ def prove_pdb_executable_coverage(
     slots = _source_iat_slots(parsed)
     entries = frozenset(begin for begin, _ in known)
     tokens = _classify_residual(sections, gaps, entries, slots)
-    supplement = tuple(sorted((*bound.supplemental_ranges, *((g.rva, g.end_rva) for g in gaps))))
+    try:
+        selected = direct_control_flow._normalize_selected(selected_specs)
+    except direct_control_flow.DirectControlFlowError as exc:
+        raise PdbCoverageError(str(exc)) from exc
+    # A PDB-only leaf selected for virtualization is already strictly decoded
+    # as a selected source extent by analyze_direct_control_flow. Keep its
+    # exact PDB span in `known` for coverage and edge-entry classification,
+    # but do not submit it a second time as supplemental code. This exception
+    # is PDB-bound; raw supplements and every partial overlap still reject.
+    pdb_occurrences = Counter(bound.supplemental_ranges)
+    selected_pdb_leaves = {
+        (item.rva, item.end_rva)
+        for item in selected
+        if pdb_occurrences[(item.rva, item.end_rva)] == 1
+        and all(end <= item.rva or begin >= item.end_rva for begin, end in pdata)
+    }
+    supplement = tuple(sorted((
+        *(span for span in bound.supplemental_ranges if span not in selected_pdb_leaves),
+        *((g.rva, g.end_rva) for g in gaps),
+    )))
     try:
         proof = direct_control_flow.analyze_direct_control_flow(
             parsed,
