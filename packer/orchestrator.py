@@ -1020,6 +1020,7 @@ def pack_file(input_path: str, options: PackOptions,
                 acknowledge_no_interior_entries=True,
                 rolling=False,
                 rolling_seed=None,
+                pdb_coverage_proof=(coverage if all(pdb_inputs) else None),
             )
             parsed = materialized.parsed
             _emit(

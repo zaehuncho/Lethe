@@ -9,8 +9,10 @@ module never acknowledges an arbitrary executable gap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
+from hashlib import sha256
 from pathlib import Path
+import re
 from typing import Any, Sequence
 
 from . import direct_control_flow, native_tail_calls, pdb_function_inventory
@@ -39,6 +41,173 @@ class PdbCoverageProof:
     residual_ranges: tuple[direct_control_flow.CoverageGap, ...]
     tokens: tuple[CanonicalCodeToken, ...]
     direct_flow: direct_control_flow.DirectControlFlowProof
+    source_parsed_sha256: str
+
+
+@dataclass(frozen=True)
+class PdbCommitBinding:
+    """Immutable preflight facts that the materializer must recheck at commit."""
+
+    image_sha256: str
+    pdb_sha256: str
+    helper_sha256: str
+    msdia_sha256: str
+    source_parsed_sha256: str
+    selected_functions: tuple[tuple[str, int, int, int], ...]
+    supplemental_ranges: tuple[tuple[int, int], ...]
+    tail_exit_policy: direct_control_flow.TailExitPolicy
+    direct_flow: direct_control_flow.DirectControlFlowProof
+    binding_sha256: str
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def parsed_source_sha256(parsed: Any) -> str:
+    """Pin every parsed source field, including nonselected bytes and metadata."""
+    digest = sha256()
+
+    def feed(value: Any) -> None:
+        if value is None:
+            digest.update(b"N")
+        elif type(value) is bool:
+            digest.update(b"B1" if value else b"B0")
+        elif type(value) is int:
+            data = str(value).encode("ascii")
+            digest.update(b"I" + len(data).to_bytes(8, "little") + data)
+        elif type(value) is str:
+            data = value.encode("utf-8")
+            digest.update(b"S" + len(data).to_bytes(8, "little") + data)
+        elif type(value) is bytes:
+            digest.update(b"Y" + len(value).to_bytes(8, "little") + value)
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"L" if isinstance(value, list) else b"T")
+            digest.update(len(value).to_bytes(8, "little"))
+            for item in value:
+                feed(item)
+        elif is_dataclass(value) and not isinstance(value, type):
+            members = tuple((item.name, getattr(value, item.name)) for item in fields(value))
+            feed((type(value).__module__, type(value).__qualname__, members))
+        elif type(value).__name__ == "SimpleNamespace" and type(value).__module__ == "types":
+            feed(tuple(sorted(vars(value).items())))
+        else:
+            raise PdbCoverageError("source PE contains an unsupported field type")
+
+    feed(parsed)
+    return digest.hexdigest()
+
+
+def _image_sha256(parsed: Any) -> str:
+    try:
+        path = Path(parsed.path)
+        digest = sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (AttributeError, TypeError, ValueError, OSError) as exc:
+        raise PdbCoverageError("PDB source image is unavailable at commit") from exc
+
+
+def _selected_identity(selected: Sequence[Any]) -> tuple[tuple[str, int, int, int], ...]:
+    try:
+        normalized = direct_control_flow._normalize_selected(selected)
+    except direct_control_flow.DirectControlFlowError as exc:
+        raise PdbCoverageError(str(exc)) from exc
+    return tuple((item.name, item.rva, item.size, item.body_size) for item in normalized)
+
+
+def _binding_sha256(binding: PdbCommitBinding) -> str:
+    return parsed_source_sha256((
+        binding.image_sha256, binding.pdb_sha256,
+        binding.helper_sha256, binding.msdia_sha256,
+        binding.source_parsed_sha256, binding.selected_functions,
+        binding.supplemental_ranges, binding.tail_exit_policy,
+        binding.direct_flow,
+    ))
+
+
+def bind_pdb_commit_proof(
+    parsed: Any, proof: PdbCoverageProof, selected_specs: Sequence[Any]
+) -> PdbCommitBinding:
+    """Bind a completed exact-PDB proof to its unchanged parsed/file source."""
+    if not isinstance(proof, PdbCoverageProof):
+        raise PdbCoverageError("PDB materialization requires a bound coverage proof")
+    inventory = proof.inventory
+    digests = (
+        inventory.image_sha256, inventory.pdb_sha256,
+        inventory.helper_sha256, inventory.msdia_sha256,
+        proof.source_parsed_sha256,
+    )
+    if any(type(item) is not str or not _SHA256.fullmatch(item) for item in digests):
+        raise PdbCoverageError("PDB commit proof has invalid source digests")
+    if _image_sha256(parsed) != inventory.image_sha256:
+        raise PdbCoverageError("PDB source image changed after preflight")
+    if parsed_source_sha256(parsed) != proof.source_parsed_sha256:
+        raise PdbCoverageError("PDB parsed source changed after preflight")
+    selected = _selected_identity(selected_specs)
+    if selected != _selected_identity(proof.direct_flow.selected_functions):
+        raise PdbCoverageError("PDB selected functions differ from the proof")
+    ranges = tuple(
+        (item.begin_rva, item.end_rva)
+        for item in proof.direct_flow.decoded_supplemental_ranges
+    )
+    if proof.direct_flow.coverage_gaps or not proof.direct_flow.direct_reference_gate_passed:
+        raise PdbCoverageError("PDB direct-reference proof is incomplete")
+    approvals = tuple(sorted({
+        approval
+        for item in proof.direct_flow.selected_flows
+        for approval in item.approved_tail_exits
+    }, key=lambda item: (item.function_rva, item.instruction_rva, item.target_rva)))
+    binding = PdbCommitBinding(
+        *digests, selected, ranges,
+        direct_control_flow.TailExitPolicy(approvals), proof.direct_flow, "",
+    )
+    binding = replace(binding, binding_sha256=_binding_sha256(binding))
+    validate_pdb_commit_binding(parsed, selected_specs, binding)
+    return binding
+
+
+def validate_pdb_commit_binding(
+    parsed: Any, selected_specs: Sequence[Any], binding: PdbCommitBinding
+) -> None:
+    """Re-decode the exact supplemental ranges at low-level commit, fail closed."""
+    if not isinstance(binding, PdbCommitBinding):
+        raise PdbCoverageError("PDB commit binding is missing or malformed")
+    if (
+        type(binding.binding_sha256) is not str
+        or not _SHA256.fullmatch(binding.binding_sha256)
+        or binding.binding_sha256 != _binding_sha256(binding)
+    ):
+        raise PdbCoverageError("PDB commit binding changed after preflight")
+    if (
+        _selected_identity(selected_specs) != binding.selected_functions
+        or _selected_identity(binding.direct_flow.selected_functions) != binding.selected_functions
+    ):
+        raise PdbCoverageError("PDB commit selected functions differ from preflight")
+    if (
+        tuple((item.begin_rva, item.end_rva)
+              for item in binding.direct_flow.decoded_supplemental_ranges)
+        != binding.supplemental_ranges
+    ):
+        raise PdbCoverageError("PDB supplemental ranges differ from preflight")
+    if (
+        _image_sha256(parsed) != binding.image_sha256
+        or parsed_source_sha256(parsed) != binding.source_parsed_sha256
+    ):
+        raise PdbCoverageError("PDB source changed after preflight")
+    try:
+        replay = direct_control_flow.analyze_direct_control_flow(
+            parsed,
+            binding.direct_flow.selected_functions,
+            tail_exit_policy=binding.tail_exit_policy,
+            production=True,
+            _supplemental_code_ranges=binding.supplemental_ranges,
+        )
+    except direct_control_flow.DirectControlFlowError as exc:
+        raise PdbCoverageError(f"PDB commit direct-reference check failed: {exc}") from exc
+    if replay != binding.direct_flow or not replay.direct_reference_gate_passed:
+        raise PdbCoverageError("PDB commit direct-reference proof changed")
 
 
 def _source_iat_slots(parsed: Any) -> frozenset[int]:
@@ -178,4 +347,4 @@ def prove_pdb_executable_coverage(
         raise PdbCoverageError(str(exc)) from exc
     if proof.coverage_gaps or not proof.direct_reference_gate_passed:
         raise PdbCoverageError("PDB-bound executable coverage remains incomplete")
-    return PdbCoverageProof(bound, gaps, tokens, proof)
+    return PdbCoverageProof(bound, gaps, tokens, proof, parsed_source_sha256(parsed))

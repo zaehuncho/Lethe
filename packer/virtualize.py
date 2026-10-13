@@ -13,11 +13,11 @@ import hashlib
 import hmac
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
 from lifter import virtualization_plan as plan
-from lifter import direct_control_flow, win64_thunk
+from lifter import direct_control_flow, pdb_coverage, win64_thunk
 
 from . import bytecode_pages, cfg_preservation, pe_analyze
 from .assemble import AssembleError, _StubImage
@@ -1053,6 +1053,17 @@ def _commit_manifest(
                           function.lifted_body_size)
         for function in manifest.functions
     )
+    if manifest.source_coverage_mode == "pdb":
+        if manifest.pdb_commit_binding is None:
+            raise _fail("PDB commit binding is missing")
+        try:
+            pdb_coverage.validate_pdb_commit_binding(
+                parsed, selected_specs, manifest.pdb_commit_binding
+            )
+        except pdb_coverage.PdbCoverageError as exc:
+            raise _fail(f"PDB commit binding rejected: {exc}") from exc
+    elif manifest.source_coverage_mode != "legacy" or manifest.pdb_commit_binding is not None:
+        raise _fail("virtualization manifest has inconsistent coverage mode")
     _validate_padding_suffix_bindings(parsed, selected_specs)
     _validate_direct_only_references(parsed, manifest)
     cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed, manifest)
@@ -1215,6 +1226,7 @@ def materialize_selected_functions(
     acknowledge_no_interior_entries: bool = False,
     rolling: bool = False,
     rolling_seed: bytes | None = None,
+    pdb_coverage_proof: pdb_coverage.PdbCoverageProof | None = None,
 ) -> MaterializationResult:
     """Compile and atomically materialize explicit first-party function specs."""
     if not isinstance(parsed, pe_analyze.ParsedPE):
@@ -1223,6 +1235,15 @@ def materialize_selected_functions(
     if len(page_master_key) != bytecode_pages.MASTER_KEY_SIZE:
         raise _fail("authenticated paging master key must be exactly 32 bytes")
     source_relocations, source_runtime_functions = _validate_source_image(parsed)
+    if pdb_coverage_proof is None:
+        pdb_binding = None
+    else:
+        try:
+            pdb_binding = pdb_coverage.bind_pdb_commit_proof(
+                parsed, pdb_coverage_proof, specs
+            )
+        except pdb_coverage.PdbCoverageError as exc:
+            raise _fail(f"PDB preflight binding rejected: {exc}") from exc
     stub, common_export_rva, exported_hash, exported_handler_hash = _read_stub_provenance(
         stub_bytes,
         opcode_table,
@@ -1243,6 +1264,10 @@ def materialize_selected_functions(
         rolling_seed=rolling_seed,
         page_master_key=page_master_key,
     )
+    if pdb_binding is not None:
+        manifest = replace(
+            manifest, source_coverage_mode="pdb", pdb_commit_binding=pdb_binding
+        )
     committed = _commit_manifest(
         parsed,
         manifest,

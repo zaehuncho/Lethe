@@ -76,7 +76,7 @@ def test_explicit_pdb_coverage_branch_is_bound_to_private_source_snapshot(
         captures.update(parsed=parsed, image=image, pdb=actual_pdb,
                         helper=actual_helper, msdia=actual_msdia,
                         specs=specs, tail_policy=kwargs["tail_exit_policy"])
-        return SimpleNamespace(
+        coverage_proof = SimpleNamespace(
             inventory=SimpleNamespace(
                 supplemental_ranges=((0x2000, 0x2010),),
                 image_sha256="a" * 64, pdb_sha256="b" * 64,
@@ -90,19 +90,22 @@ def test_explicit_pdb_coverage_branch_is_bound_to_private_source_snapshot(
                 indirect_target_closure_proven=False,
             ),
         )
+        captures["coverage_proof"] = coverage_proof
+        return coverage_proof
 
     monkeypatch.setattr(pdb_coverage, "prove_pdb_executable_coverage", fake_coverage)
     monkeypatch.setattr(
         direct_control_flow, "analyze_direct_control_flow",
         lambda *_args, **_kwargs: pytest.fail("legacy proof used in PDB mode"),
     )
-    monkeypatch.setattr(
-        virtualize, "materialize_selected_functions",
-        lambda _parsed, _specs, **_kwargs: SimpleNamespace(
+    def materialize_with_capture(_parsed, _specs, **kwargs):
+        captures["materializer_pdb_proof"] = kwargs.get("pdb_coverage_proof")
+        return SimpleNamespace(
             parsed=materialized_parsed,
             manifest=SimpleNamespace(functions=(object(),)),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(virtualize, "materialize_selected_functions", materialize_with_capture)
     _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
     progress = []
     result = orchestrator.pack_file(
@@ -125,6 +128,7 @@ def test_explicit_pdb_coverage_branch_is_bound_to_private_source_snapshot(
     assert (captures["pdb"], captures["helper"], captures["msdia"]) == (
         pdb, helper, msdia)
     assert captures["specs"] == (virtualization_plan.FunctionSpec("Init", 0x1000, 16),)
+    assert captures["materializer_pdb_proof"] is captures["coverage_proof"]
     assert any("PDB-bound virtualization control-flow proof" in x for x in progress)
 
 

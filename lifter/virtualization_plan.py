@@ -14,7 +14,10 @@ import re
 import struct
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from . import pdb_coverage
 
 from iced_x86 import Decoder, Mnemonic, OpKind
 
@@ -549,9 +552,11 @@ class VirtualizationManifest:
     source_exception_metadata_complete: bool
     exception_table: ExceptionTablePlan
     functions: tuple[VirtualizedFunction, ...]
+    source_coverage_mode: str = "legacy"
+    pdb_commit_binding: pdb_coverage.PdbCommitBinding | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        record = {
             "version": self.version,
             "generated_text_rva": self.generated_text_rva,
             "generated_text_size": self.generated_text_size,
@@ -576,6 +581,20 @@ class VirtualizationManifest:
             "external_entry_assumption": EXTERNAL_ENTRY_ASSUMPTION,
             "functions": [function.to_dict() for function in self.functions],
         }
+        if self.source_coverage_mode != "legacy" or self.pdb_commit_binding is not None:
+            record["source_coverage_mode"] = self.source_coverage_mode
+            binding = self.pdb_commit_binding
+            record["pdb_commit_binding"] = None if binding is None else {
+                "image_sha256": binding.image_sha256,
+                "pdb_sha256": binding.pdb_sha256,
+                "helper_sha256": binding.helper_sha256,
+                "msdia_sha256": binding.msdia_sha256,
+                "source_parsed_sha256": binding.source_parsed_sha256,
+                "binding_sha256": binding.binding_sha256,
+                "selected_functions": [list(item) for item in binding.selected_functions],
+                "supplemental_ranges": [list(item) for item in binding.supplemental_ranges],
+            }
+        return record
 
     def to_json(self, *, indent: int | None = None) -> str:
         return json.dumps(
