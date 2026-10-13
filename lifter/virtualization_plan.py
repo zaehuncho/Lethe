@@ -1067,12 +1067,18 @@ def _compile_one(
     image_sections: Sequence[Any] | None,
     selected_extents: Sequence[tuple[int, int]],
     native_call_targets=frozenset(),
+    retained_pdata_entries: frozenset[int] = frozenset(),
     guard_cf_dispatch_rva: int | None = None,
     native_runtime_ranges: Sequence[tuple[int, int]] = (),
     source_import_iat_rvas: frozenset[int] = frozenset(),
     mutate_level: int = 0,
     mutate_master: bytes | None = None,
 ) -> _Compiled:
+    # Private callers cannot reinstate a retained PDATA target by supplying
+    # an admission set, including when no section inventory is available.
+    # Only this function's exact normal-import tail proof may add targets.
+    if not isinstance(native_call_targets, frozenset) or native_call_targets:
+        raise FunctionRejected(spec, "caller-supplied native CALL targets are not admissible")
     try:
         original = bytes(reader.read_file_backed_executable(spec.rva, spec.size))
     except FunctionRejected:
@@ -1101,6 +1107,19 @@ def _compile_one(
                 "INT3/NOP padding suffix",
             )
     _decode_exact(spec, lifted_body)
+    rejected_pdata_sites = native_tail_calls.retained_pdata_call_sites(
+        lifted_body, base=spec.rva, sections=image_sections,
+        retained_entries=retained_pdata_entries,
+        runtime_ranges=native_runtime_ranges,
+        selected_extents=selected_extents,
+        import_iat_rvas=source_import_iat_rvas,
+    )
+    if rejected_pdata_sites:
+        raise FunctionRejected(
+            spec,
+            "retained PDATA native CALL lacks physical return-slot and stack "
+            f"identity proof at 0x{rejected_pdata_sites[0]:X}",
+        )
     if image_sections is not None:
         native_call_targets |= native_tail_calls.proven_tail_call_targets(
             lifted_body, base=spec.rva, sections=image_sections,
@@ -1305,20 +1324,17 @@ def compile_virtualization_manifest(
     except ValueError as exc:
         raise VirtualizationPlanError(str(exc)) from exc
 
-    # A direct near call may be bridged to a first-party callee left native only
-    # when its target is a proven function entry outside every selected extent.
-    # Source pdata BeginAddresses are exactly such proven entries; the ones not
-    # being virtualized here stay native and are the sound direct-call targets.
+    # A PDATA entry proves a code extent, not parity of the physical return
+    # slot, private stack, registers, or FLAGS when a VM caller uses the native
+    # bridge. Keep retained PDATA calls fail-closed until that ABI contract is
+    # proven. Neutral E9 chains may still end at an exact normal-import FF25.
     native_call_targets: frozenset[int] = frozenset()
-    if source_exception_metadata is not None:
-        native_call_targets = frozenset(
-            record.begin_rva
-            for record in source_exception_metadata.records
-            if not any(
-                rva <= record.begin_rva < rva + size
-                for rva, size in selected_extents
-            )
-        )
+    retained_pdata_entries = frozenset(
+        record.begin_rva
+        for record in source_exception_metadata.records
+        if not any(rva <= record.begin_rva < rva + size
+                   for rva, size in selected_extents)
+    ) if source_exception_metadata is not None else frozenset()
     if guard_cf_dispatch_rva is not None:
         guard_cf_dispatch_rva = int(guard_cf_dispatch_rva)
         _validate_rva_range(guard_cf_dispatch_rva, 1, "GuardCF dispatch pointer")
@@ -1336,6 +1352,7 @@ def compile_virtualization_manifest(
             image_sections=image_sections,
             selected_extents=selected_extents,
             native_call_targets=native_call_targets,
+            retained_pdata_entries=retained_pdata_entries,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
             native_runtime_ranges=runtime_ranges,
             source_import_iat_rvas=import_iat_rvas,

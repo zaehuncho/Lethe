@@ -1,14 +1,8 @@
-"""Discovery + selection wiring for the direct-near-call -> native bridge.
+"""Retained PDATA call admission versus low-level diagnostic bridge behavior.
 
-Cut 17 taught the lifter to bridge a ``call rel32`` whose target is a proven
-first-party function entry OUTSIDE the selected extent to the untouched native
-callee.  This suite proves the *discovery/selection* wiring that feeds it:
-``function_discovery`` now supplies, per candidate, the set of proven pdata
-BeginAddress RVAs lying outside that candidate's own extent as
-``native_call_targets``.  A function that previously bailed SOLELY on such an
-out-of-extent call therefore now reports liftable and passes the selection gate,
-and its lifted bytecode is differential-checked byte-identical to native with
-the bridged callee executed natively -- the same oracle discipline as every cut.
+The direct bridge can match scalar fixtures in a diagnostic interpreter, but
+that does not prove physical return-slot identity for a materialized program.
+Discovery and planning therefore reject this exact caller by default.
 """
 
 from __future__ import annotations
@@ -89,7 +83,7 @@ def _candidate(report, rva):
     return next(item for item in report.candidates if item.rva == rva)
 
 
-def test_direct_internal_call_flips_liftable_and_selectable_via_discovery():
+def test_direct_retained_pdata_call_is_not_selectable_via_discovery():
     caller = _asm(_CALLER_SRC, CALLER_RVA)
     callee = _asm(_CALLEE_SRC, CALLEE_RVA)
     parsed = _parsed([(CALLER_RVA, caller), (CALLEE_RVA, callee)])
@@ -98,19 +92,20 @@ def test_direct_internal_call_flips_liftable_and_selectable_via_discovery():
     caller_c = _candidate(report, CALLER_RVA)
     callee_c = _candidate(report, CALLEE_RVA)
 
-    # AFTER the wiring: the caller is liftable and passes every selection gate.
-    assert caller_c.liftable is True
+    # A matching PDATA entry proves an extent, not the physical CALL frame.
+    assert caller_c.liftable is False
+    assert "retained PDATA native CALL lacks physical return-slot" in caller_c.rejection_reason
     assert caller_c.direct_control_proof_status == "passed"
     assert caller_c.exact_extent is True
     assert caller_c.extent_kind == "runtime_function"
     assert caller_c.unwind_flags == 0
-    # The bridged call is external, so it is NOT counted as an internal call.
+    # This never becomes an admitted internal or native call.
     assert caller_c.internal_direct_call_count == 0
     assert callee_c.liftable is True
 
-    # The starter selection manifest (what the report emits) now includes it.
+    # Only the independently liftable callee may appear in starter selection.
     selected = {entry["rva"] for entry in report.starter_selection_manifest()["functions"]}
-    assert CALLER_RVA in selected and CALLEE_RVA in selected
+    assert CALLER_RVA not in selected and CALLEE_RVA in selected
 
 
 def test_direct_internal_call_bailed_before_wiring():

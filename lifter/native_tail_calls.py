@@ -107,3 +107,41 @@ def proven_tail_call_targets(
             if target not in retained_entries and prove(target):
                 targets.add(target)
     return frozenset(targets)
+
+
+def retained_pdata_call_sites(
+    code: bytes, *, base: int, sections: Sequence[Any] | None,
+    retained_entries: frozenset[int], runtime_ranges: Sequence[tuple[int, int]],
+    selected_extents: Sequence[tuple[int, int]],
+    import_iat_rvas: frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
+    """Find exact direct/E9-chain calls ending at retained PDATA entries.
+
+    PDATA entry identity is useful for a typed rejection, not native bridge
+    admission. An IAT-only neutral tail remains separately admissible.
+    Without section geometry, direct retained entries still reject; no tail
+    target gains admission from missing metadata.
+    """
+    pdata_tails = frozenset()
+    if sections is not None and retained_entries:
+        all_tails = proven_tail_call_targets(
+            code, base=base, sections=sections,
+            retained_entries=retained_entries, runtime_ranges=runtime_ranges,
+            selected_extents=selected_extents, import_iat_rvas=import_iat_rvas,
+        )
+        iat_tails = proven_tail_call_targets(
+            code, base=base, sections=sections,
+            retained_entries=frozenset(), runtime_ranges=runtime_ranges,
+            selected_extents=selected_extents, import_iat_rvas=import_iat_rvas,
+        )
+        pdata_tails = all_tails - iat_tails
+    rejected_targets = retained_entries | pdata_tails
+    sites = []
+    for instruction in Decoder(64, bytes(code), ip=base):
+        offset = instruction.ip - base
+        if (instruction.len == 5 and code[offset] == 0xE8 and
+                instruction.mnemonic == Mnemonic.CALL and instruction.op_count == 1 and
+                instruction.op_kind(0) == OpKind.NEAR_BRANCH64 and
+                int(instruction.near_branch_target) in rejected_targets):
+            sites.append(int(instruction.ip))
+    return tuple(sites)

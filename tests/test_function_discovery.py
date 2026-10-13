@@ -307,7 +307,9 @@ def test_materialized_stack_preflight_rejects_native_pointer_escape_at_call():
         _parsed([(0x1000, caller, 0), (0x1200, callee, 0)]), exports=())
     item = report.candidates[0]
     assert item.liftable is False
-    assert "unmodeled native source stack pointer escape" in item.rejection_reason
+    # A retained PDATA target now rejects before a narrower pointer-escape
+    # preflight can run; the original input remains an explicit negative.
+    assert "retained PDATA native CALL lacks physical return-slot" in item.rejection_reason
     assert item.first_unsupported_instruction is not None
     assert "call" in item.first_unsupported_instruction.text
     assert {row["rva"] for row in report.starter_selection_manifest()["functions"]} == {0x1200}
@@ -383,8 +385,11 @@ def test_materialized_stack_preflight_bounded_native_caller_preserves_incoming_p
     callee = _asm("mov rax,[rcx]; add rax,1; ret", 0x1200)
     report = discovery.discover_functions(
         _parsed([(0x1000, caller, 0), (0x1200, callee, 0)]), exports=())
-    assert all(item.liftable for item in report.candidates)
-    assert {row["rva"] for row in report.starter_selection_manifest()["functions"]} == {0x1000, 0x1200}
+    caller_status, callee_status = report.candidates
+    assert caller_status.liftable is False
+    assert "retained PDATA native CALL lacks physical return-slot" in caller_status.rejection_reason
+    assert callee_status.liftable is True
+    assert {row["rva"] for row in report.starter_selection_manifest()["functions"]} == {0x1200}
 
 
 def test_candidate_overlap_and_export_aliases_fail_closed():

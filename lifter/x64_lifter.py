@@ -1975,6 +1975,37 @@ class _Lifter:
             raise LiftUnsupported("branch target outside lifted function")
         return tgt
 
+    def _source_native_call_return_slot(self, instr) -> None:
+        """Reproduce the source CALL's stack write before a proven native bridge.
+
+        The bridge performs its own physical CALL on a separate stack.  The
+        source caller can nevertheless observe its architectural return slot
+        through an incoming alias (or after the native call returns).  The
+        512-byte materialized-stack preflight proves a unique aligned outgoing
+        frame at this call: depth is 40..504 bytes, so [source RSP-8] lies
+        within the reserved source window and above shim control state.  The
+        loader-relocated next RIP is written without changing the VM RSP local
+        or its modeled flags.  This does not change what a native callee sees
+        at its own physical [RSP] inside the trampoline.
+
+        Bare diagnostic lifts without the production span proof retain their
+        legacy bridge behavior; they do not claim this source-slot contract.
+        """
+        if self.native_call_stack_bytes is None:
+            return
+        span = self.native_call_stack_bytes.get(instr.ip)
+        if type(span) is not int or not 8 <= span <= 472 or span % 16 != 8:
+            raise LiftUnsupported(
+                f"unproven Win64 native CALL return slot at 0x{instr.ip:X}"
+            )
+        self.rd_reg(Register.RSP)
+        self.push_imm(8)
+        self.a("sub")
+        self.rd_local(IMAGE_BASE)
+        self.push_imm(instr.ip + instr.len)
+        self.a("add")
+        self.a("store64")
+
     def _import_call(self, instr) -> None:
         """Bridge a direct RIP-relative import call through the Win64 native-
         call trampoline (the DVM ``n_call_frame`` path).
@@ -1994,9 +2025,11 @@ class _Lifter:
         A near call/RET pair is RSP-neutral for the caller, so the VM RSP local
         remains unchanged. Nonvolatiles follow the normal Win64 callee contract;
         output-parameter memory is written by the real callee through its inputs.
-        This is positional Win64 with at most eight arguments, not vectorcall,
-        arbitrary arity, source-return-address identity or exception bridging."""
+        The proven materialized path also reproduces the source CALL's return
+        slot write.  This does not reproduce a callee's physical [RSP] return
+        address while it executes through the separate trampoline."""
         slot_rva = int(instr.ip_rel_memory_address)
+        self._source_native_call_return_slot(instr)
         self._marshal_win64_argv(instr)
         # func_ptr = *(runtime image base + slot RVA). The slot RVA is decoded
         # RIP-relative so ASLR never bakes a preferred VA into the bytecode.
@@ -2051,6 +2084,7 @@ class _Lifter:
         target in RAX, and captures its return state. The original guard thunk
         performs its check; the lifter never substitutes a direct target call.
         """
+        self._source_native_call_return_slot(instr)
         self._marshal_win64_argv(instr)
         self.rd_local(IMAGE_BASE)
         self.push_imm(int(instr.ip_rel_memory_address))
@@ -2066,6 +2100,7 @@ class _Lifter:
         direct-address variant of Cut 16 that skips the slot dereference. The
         caller's Win64 argument setup is already lifted, so the marshalling is
         identical; the callee runs natively and its RAX return is committed."""
+        self._source_native_call_return_slot(instr)
         self._marshal_win64_argv(instr)
         self.rd_local(IMAGE_BASE)
         self.push_imm(int(target_rva))
@@ -3100,6 +3135,8 @@ def validate_materialized_stack_window(
                 if native_call_stack_bytes is not None:
                     if depth < 32 or depth % 16 != 8:
                         raise LiftUnsupported(f"unproven Win64 native outgoing frame at 0x{ip:X}")
+                    if depth + 8 > window_size:
+                        raise LiftUnsupported(f"native CALL return slot exceeds stack window at 0x{ip:X}")
                     span_size = depth - 32
                     if span_size > 480:
                         raise LiftUnsupported(f"native outgoing span exceeds 480 bytes at 0x{ip:X}")
@@ -3110,6 +3147,11 @@ def validate_materialized_stack_window(
                     overlaps(-depth + 0x20, span_size, slot) for slot in spills
                 ):
                     raise LiftUnsupported(f"unmodeled native source stack pointer escape at 0x{ip:X}")
+                if native_call_stack_bytes is not None:
+                    # The materialized CALL overwrites its original return slot
+                    # even though the bridge's own physical CALL is elsewhere.
+                    # Do not keep a stale stack-pointer spill provenance there.
+                    store(spills, -depth - 8, 8, None, ip=ip)
                 for index in volatile:
                     aliases[index] = None
                 enqueue(next_ip)

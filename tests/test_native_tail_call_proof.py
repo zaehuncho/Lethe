@@ -51,9 +51,17 @@ def _compile(f, rolling=False):
 @pytest.mark.parametrize(("kind", "hops"),
                          [("pdata", n) for n in (0, 1, 2, 4, 15, 16)] +
                          [("iat", n) for n in (0, 1, 2, 14, 15)])
-def test_integration_tail_alias_positive(kind, hops, rolling):
-    manifest = _compile(_fixture(kind, hops), rolling)
-    assert [function.name for function in manifest.functions] == ["caller"]
+def test_integration_tail_alias_admission_contract(kind, hops, rolling):
+    fixture = _fixture(kind, hops)
+    if kind == "pdata":
+        # Neutral E9 links cannot make a retained PDATA CALL frame equivalent
+        # to the source return site. Preserve each former positive as a typed
+        # fail-closed regression, including the direct zero-hop target.
+        with pytest.raises(plan.FunctionRejected, match="retained PDATA native CALL lacks physical return-slot"):
+            _compile(fixture, rolling)
+    else:
+        manifest = _compile(fixture, rolling)
+        assert [function.name for function in manifest.functions] == ["caller"]
 
 
 @pytest.mark.parametrize("kind", ["pdata", "iat"])
@@ -126,10 +134,18 @@ def test_integration_discovery_and_planner_agree(kind):
         imports=(SimpleNamespace(funcs=(SimpleNamespace(iat_rva=f["slot"]),)),))
     report=discovery.discover_functions(parsed,exports=())
     caller=next(row for row in report.candidates if row.rva==0x1000)
-    assert caller.liftable, caller.rejection_reason
+    if kind == "pdata":
+        assert not caller.liftable
+        assert "retained PDATA native CALL lacks physical return-slot" in caller.rejection_reason
+    else:
+        assert caller.liftable, caller.rejection_reason
     assert caller.indirect_target_closure_proven is False
     assert caller.direct_reference_gate_passed is False
-    assert [function.name for function in _compile(f).functions]==["caller"]
+    if kind == "pdata":
+        with pytest.raises(plan.FunctionRejected, match="retained PDATA native CALL lacks physical return-slot"):
+            _compile(f)
+    else:
+        assert [function.name for function in _compile(f).functions]==["caller"]
 
 
 @pytest.mark.parametrize("entries", [None, [], {}, "", (True,), (0,), (-1,), (0x100000000,),
@@ -142,11 +158,11 @@ def test_import_metadata_types_and_spans_fail_closed(entries):
             generated_text_rva=0x6000,generated_data_rva=0x8000,source_import_iat_rvas=entries)
 
 
-def test_pure_proof_preserves_native_pointer_escape_rejection():
+def test_retained_pdata_call_rejects_before_pointer_escape_proof():
     f=_fixture()
     caller=_asm(f"sub rsp,0x48; lea rcx,[rsp+0x20]; call {f['entry']:#x}; add rsp,0x48; ret")
     section=f["sections"][0];raw=bytearray(section.raw);raw[:len(caller)]=caller
     f["caller"]=caller;f["sections"][0]=replace(section,raw=bytes(raw))
     f["records"]=(replace(f["records"][0],end_rva=0x1000+len(caller)),f["records"][1])
-    with pytest.raises(plan.FunctionRejected,match="native source stack pointer escape"):
+    with pytest.raises(plan.FunctionRejected,match="retained PDATA native CALL lacks physical return-slot"):
         _compile(f)
