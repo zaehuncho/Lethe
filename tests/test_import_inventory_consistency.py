@@ -41,19 +41,22 @@ def test_discovery_rejects_every_inventory_the_planner_rejects(kind,split,entrie
     (), (0x3000,), (0x3000,0x3008), (0x3008,0x3000),
     (0x3000,0x3009), (0x3000,0xfffffff8), (1,0x3000),
 ])
-def test_valid_inventory_keeps_exact_previous_tail_admission(kind,split,entries):
+def test_valid_inventory_preserves_fail_closed_callee_contract(kind,split,entries):
     f=_fixture(kind);f["imports"]=entries
     report=discovery.discover_functions(_parsed(f,entries,split),exports=())
     caller=next(c for c in report.candidates if c.rva==0x1000)
-    expected=kind=="pdata" or 0x3000 in entries
-    assert caller.liftable is expected
+    assert not caller.liftable
     assert caller.indirect_target_closure_proven is False
     assert caller.direct_reference_gate_passed is False
-    if expected:
-        assert [v.name for v in _compile(f).functions]==["caller"]
+    if kind == "pdata":
+        reason = "retained PDATA native CALL lacks physical return-slot"
+    elif 0x3000 in entries:
+        reason = "opaque native CALL lacks physical callee return-address"
     else:
-        with pytest.raises(plan.FunctionRejected,match="call target outside"):
-            _compile(f)
+        reason = "call target outside"
+    assert reason in caller.rejection_reason
+    with pytest.raises(plan.FunctionRejected,match=reason):
+        _compile(f)
 
 
 @pytest.mark.parametrize("imports",[
@@ -73,7 +76,11 @@ def test_absent_optional_import_inventory_preserves_previous_behavior(kind):
     parsed=_parsed(f,());del parsed.imports
     report=discovery.discover_functions(parsed,exports=())
     caller=next(c for c in report.candidates if c.rva==0x1000)
-    assert caller.liftable is (kind=="pdata")
+    assert not caller.liftable
+    if kind == "pdata":
+        assert "retained PDATA native CALL lacks physical return-slot" in caller.rejection_reason
+    else:
+        assert "call target outside" in caller.rejection_reason
 
 
 @pytest.mark.parametrize("delta",[0,4,7])

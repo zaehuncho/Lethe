@@ -1076,7 +1076,7 @@ def _compile_one(
 ) -> _Compiled:
     # Private callers cannot reinstate a retained PDATA target by supplying
     # an admission set, including when no section inventory is available.
-    # Only this function's exact normal-import tail proof may add targets.
+    # Exact native tail proofs identify typed rejections, not admissions.
     if not isinstance(native_call_targets, frozenset) or native_call_targets:
         raise FunctionRejected(spec, "caller-supplied native CALL targets are not admissible")
     try:
@@ -1120,11 +1120,23 @@ def _compile_one(
             "retained PDATA native CALL lacks physical return-slot and stack "
             f"identity proof at 0x{rejected_pdata_sites[0]:X}",
         )
+    # A neutral import thunk proves only its destination, not the imported
+    # callee's physical return address or mutations to caller shadow space.
+    # Likewise an opaque RIP-relative call may be an import or GuardCF target.
+    # Do not silently marshal such calls through a non-equivalent frame.
+    iat_tail_targets = frozenset()
     if image_sections is not None:
-        native_call_targets |= native_tail_calls.proven_tail_call_targets(
+        iat_tail_targets = native_tail_calls.proven_tail_call_targets(
             lifted_body, base=spec.rva, sections=image_sections,
-            retained_entries=native_call_targets, runtime_ranges=native_runtime_ranges,
+            retained_entries=frozenset(), runtime_ranges=native_runtime_ranges,
             selected_extents=selected_extents, import_iat_rvas=source_import_iat_rvas)
+    opaque_sites = native_tail_calls.opaque_native_call_sites(
+        lifted_body, base=spec.rva, iat_tail_targets=iat_tail_targets)
+    if opaque_sites:
+        raise FunctionRejected(
+            spec, "opaque native CALL lacks physical callee return-address "
+            f"and shadow-space effects proof at 0x{opaque_sites[0]:X}",
+        )
     try:
         call_analysis = x64_lifter.analyze_internal_calls(
             lifted_body,
@@ -1324,10 +1336,9 @@ def compile_virtualization_manifest(
     except ValueError as exc:
         raise VirtualizationPlanError(str(exc)) from exc
 
-    # A PDATA entry proves a code extent, not parity of the physical return
-    # slot, private stack, registers, or FLAGS when a VM caller uses the native
-    # bridge. Keep retained PDATA calls fail-closed until that ABI contract is
-    # proven. Neutral E9 chains may still end at an exact normal-import FF25.
+    # PDATA and import metadata prove target identity, not parity of the
+    # callee's physical return address or caller shadow-space side effects.
+    # Native bridge admissions remain empty in materialized plans.
     native_call_targets: frozenset[int] = frozenset()
     retained_pdata_entries = frozenset(
         record.begin_rva
@@ -1499,19 +1510,18 @@ def compile_virtualization_manifest(
             "cfg_target_declared": False,
             "direct_only_thunk": True,
             "exception_handlers_supported": False,
-            # The Cut 16 bridge covers three bounded call shapes: a
-            # RIP-relative import slot, a proven direct first-party function
-            # entry left native, and the MSVC CFG dispatch idiom. Other
-            # indirect call shapes still fail closed in x64_lifter.
-            "external_calls_supported": True,
-            "direct_native_calls_supported": True,
-            "rip_relative_import_calls_supported": True,
-            "guard_cf_dispatch_calls_supported": True,
-            "native_call_volatile_frame_round_trip": True,
-            "native_call_positional_fp_supported": True,
+            # Diagnostic lifting retains the native bridge, but production
+            # planning admits no opaque callee until physical [RSP] and mutable
+            # Win64 home-slot effects have a validated equivalent.
+            "external_calls_supported": False,
+            "direct_native_calls_supported": False,
+            "rip_relative_import_calls_supported": False,
+            "guard_cf_dispatch_calls_supported": False,
+            "native_call_volatile_frame_round_trip": False,
+            "native_call_positional_fp_supported": False,
             "native_call_bounded_eight_argument_abi": False,
-            "native_call_bounded_outgoing_span_abi": True,
-            "guard_cf_original_dispatch_invoked": True,
+            "native_call_bounded_outgoing_span_abi": False,
+            "guard_cf_original_dispatch_invoked": False,
             "external_interior_entries_supported": False,
             "direct_internal_calls_supported": True,
             "leaf_only": not has_internal_calls,

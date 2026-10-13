@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
 
-from iced_x86 import Decoder, Mnemonic, OpKind
+from iced_x86 import Decoder, MemorySizeExt, Mnemonic, OpKind, Register
 
 MAX_TAIL_INSTRUCTIONS = 16
 _LIMIT = 0x1_0000_0000
@@ -118,7 +118,7 @@ def retained_pdata_call_sites(
     """Find exact direct/E9-chain calls ending at retained PDATA entries.
 
     PDATA entry identity is useful for a typed rejection, not native bridge
-    admission. An IAT-only neutral tail remains separately admissible.
+    admission. An IAT-only neutral tail has a separate opaque-callee rejection.
     Without section geometry, direct retained entries still reject; no tail
     target gains admission from missing metadata.
     """
@@ -143,5 +143,33 @@ def retained_pdata_call_sites(
                 instruction.mnemonic == Mnemonic.CALL and instruction.op_count == 1 and
                 instruction.op_kind(0) == OpKind.NEAR_BRANCH64 and
                 int(instruction.near_branch_target) in rejected_targets):
+            sites.append(int(instruction.ip))
+    return tuple(sites)
+
+
+def opaque_native_call_sites(
+    code: bytes, *, base: int, iat_tail_targets: frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
+    """Exact source sites requiring an unproven physical native-callee frame.
+
+    A RIP-relative qword CALL can invoke an opaque imported target or GuardCF
+    dispatch.  A proven neutral E9/FF25 chain still ends in an opaque import.
+    Neither provenance supplies a contract for the callee's physical [RSP]
+    return address or mutable Win64 home slots.  Materialized planning must
+    reject these sites before emitting bytecode; low-level diagnostic lifting
+    remains available to study and repair the bridge.
+    """
+    sites = []
+    for instruction in Decoder(64, bytes(code), ip=base):
+        if instruction.mnemonic != Mnemonic.CALL or instruction.op_count != 1:
+            continue
+        kind = instruction.op_kind(0)
+        if (kind == OpKind.MEMORY and instruction.is_ip_rel_memory_operand
+                and instruction.memory_base == Register.RIP
+                and instruction.segment_prefix == Register.NONE
+                and MemorySizeExt.size(instruction.memory_size) == 8):
+            sites.append(int(instruction.ip))
+        elif (kind == OpKind.NEAR_BRANCH64 and
+              int(instruction.near_branch_target) in iat_tail_targets):
             sites.append(int(instruction.ip))
     return tuple(sites)

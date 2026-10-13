@@ -60,8 +60,10 @@ def test_integration_tail_alias_admission_contract(kind, hops, rolling):
         with pytest.raises(plan.FunctionRejected, match="retained PDATA native CALL lacks physical return-slot"):
             _compile(fixture, rolling)
     else:
-        manifest = _compile(fixture, rolling)
-        assert [function.name for function in manifest.functions] == ["caller"]
+        # An exact neutral IAT tail proves destination identity, not the
+        # imported callee's physical return/home-slot behavior.
+        with pytest.raises(plan.FunctionRejected, match="opaque native CALL lacks physical callee return-address"):
+            _compile(fixture, rolling)
 
 
 @pytest.mark.parametrize("kind", ["pdata", "iat"])
@@ -138,14 +140,16 @@ def test_integration_discovery_and_planner_agree(kind):
         assert not caller.liftable
         assert "retained PDATA native CALL lacks physical return-slot" in caller.rejection_reason
     else:
-        assert caller.liftable, caller.rejection_reason
+        assert not caller.liftable
+        assert "opaque native CALL lacks physical callee return-address" in caller.rejection_reason
     assert caller.indirect_target_closure_proven is False
     assert caller.direct_reference_gate_passed is False
     if kind == "pdata":
         with pytest.raises(plan.FunctionRejected, match="retained PDATA native CALL lacks physical return-slot"):
             _compile(f)
     else:
-        assert [function.name for function in _compile(f).functions]==["caller"]
+        with pytest.raises(plan.FunctionRejected, match="opaque native CALL lacks physical callee return-address"):
+            _compile(f)
 
 
 @pytest.mark.parametrize("entries", [None, [], {}, "", (True,), (0,), (-1,), (0x100000000,),

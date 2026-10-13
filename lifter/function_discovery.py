@@ -656,16 +656,15 @@ def _lift_status(
     *,
     padding_rejection: str | None = None,
     native_call_targets: frozenset[int] = frozenset(),
-    retained_call_rejection: tuple[int, str] | None = None,
+    native_call_rejection: tuple[int, str] | None = None,
 ) -> tuple[
     bool,
     str | None,
     UnsupportedInstruction | None,
     tuple[x64_lifter.RipRelativeReference, ...],
 ]:
-    # Only neutral chains to exact normal-import IAT slots may be native
-    # targets. Retained PDATA targets carry a typed rejection below; all other
-    # out-of-extent calls retain the ordinary unsupported-call diagnostic.
+    # Every materialized native bridge requires a physical callee-frame
+    # proof. PDATA and exact IAT identity alone do not provide that proof.
     if extent.unresolved_reason:
         return False, extent.unresolved_reason, None, ()
     if padding_rejection is not None:
@@ -690,8 +689,8 @@ def _lift_status(
     _instructions, decode_error, decode_instruction = _strict_decode(code, extent.rva)
     if decode_error:
         return False, decode_error, decode_instruction, ()
-    if retained_call_rejection is not None:
-        site, reason = retained_call_rejection
+    if native_call_rejection is not None:
+        site, reason = native_call_rejection
         instruction = next((item for item in _instructions if item.ip == site), None)
         first = (UnsupportedInstruction(site, str(instruction))
                  if instruction is not None else None)
@@ -1209,11 +1208,11 @@ def discover_functions(
         padding_rejection = _padding_metadata_rejection(
             parsed, extent, export_records, runtime, direct_transfers
         )
-        # PDATA proves function bounds but not bridge return-site semantics.
-        # Discovery must match the planner's fail-closed native-call set.
-        # The neutral-tail proof below still permits exact import FF25 tails.
+        # Discovery and planning share the same fail-closed native-call
+        # admission. PDATA and exact import thunks identify targets but do not
+        # prove the callee's physical return/home-slot contract.
         native_call_targets = frozenset()
-        retained_call_rejection = None
+        native_call_rejection = None
         if not extent.unwind_flags and not extent.unresolved_reason and padding_rejection is None:
             try:
                 candidate_body = _read_executable(sections, extent.rva, extent.lifted_body_size, "candidate")
@@ -1231,21 +1230,32 @@ def discover_functions(
                     import_iat_rvas=import_iat_rvas,
                 )
                 if pdata_sites:
-                    retained_call_rejection = (
+                    native_call_rejection = (
                         pdata_sites[0],
                         "retained PDATA native CALL lacks physical return-slot "
                         f"and stack identity proof at 0x{pdata_sites[0]:X}",
                     )
-                native_call_targets |= native_tail_calls.proven_tail_call_targets(
-                    candidate_body, base=extent.rva, sections=sections,
-                    retained_entries=native_call_targets, runtime_ranges=runtime_pairs,
-                    selected_extents=((extent.rva, extent.size),), import_iat_rvas=import_iat_rvas)
+                else:
+                    iat_tail_targets = native_tail_calls.proven_tail_call_targets(
+                        candidate_body, base=extent.rva, sections=sections,
+                        retained_entries=frozenset(), runtime_ranges=runtime_pairs,
+                        selected_extents=((extent.rva, extent.size),),
+                        import_iat_rvas=import_iat_rvas)
+                    opaque_sites = native_tail_calls.opaque_native_call_sites(
+                        candidate_body, base=extent.rva,
+                        iat_tail_targets=iat_tail_targets)
+                    if opaque_sites:
+                        native_call_rejection = (
+                            opaque_sites[0],
+                            "opaque native CALL lacks physical callee return-address "
+                            f"and shadow-space effects proof at 0x{opaque_sites[0]:X}",
+                        )
         liftable, rejection, first, rip_references = _lift_status(
             extent,
             sections,
             padding_rejection=padding_rejection,
             native_call_targets=native_call_targets,
-            retained_call_rejection=retained_call_rejection,
+            native_call_rejection=native_call_rejection,
         )
         internal_call_count = 0
         max_internal_call_depth = 0
