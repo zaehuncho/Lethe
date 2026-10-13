@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -399,6 +400,107 @@ def validate_candidate_identity(
     if sha256_file(stub_path.parent / promoter_snapshot) != manifest["promotion_tool_sha256"]:
         raise ReleaseAttestationError("candidate promoter snapshot binding is invalid")
     return manifest
+
+
+def validate_current_candidate_source(
+    manifest: dict[str, Any], *, candidate_root: Path,
+    source_root: Path | None = None,
+) -> None:
+    """Bind experimental packing to the clean source that built its runtime.
+
+    A candidate manifest can remain valid for historical release verification;
+    only *new* experimental virtualization needs the current compiler/runtime
+    pair.  An extracted source distribution has no authenticated source-commit
+    identity, so its candidate path fails closed.  Signed default releases use
+    the separate release-bundle verifier and do not enter this check.
+    """
+    expected = manifest.get("source_commit")
+    if not isinstance(expected, str) or COMMIT_RE.fullmatch(expected) is None:
+        raise ReleaseAttestationError(
+            "candidate manifest has no full source commit")
+    root = (source_root or ROOT).resolve()
+    if not (root / ".git").exists():
+        raise ReleaseAttestationError(
+            "current candidate source requires an exact Git checkout")
+
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.startswith("GIT_")}
+
+    def git(*arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                capture_output=True, text=True, encoding="utf-8",
+                timeout=10, check=False, env=environment,
+            )
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+            raise ReleaseAttestationError(
+                "current candidate source Git verification failed") from exc
+        if result.returncode != 0:
+            raise ReleaseAttestationError(
+                "current candidate source Git verification failed")
+        return result.stdout.strip()
+
+    if Path(git("rev-parse", "--show-toplevel")).resolve() != root:
+        raise ReleaseAttestationError(
+            "current candidate source is not the exact Git checkout root")
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    if head != expected:
+        raise ReleaseAttestationError(
+            "candidate source commit does not match the current checkout")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ReleaseAttestationError(
+            "current candidate source checkout is not clean")
+
+    # The schema-2 identity checker preserves historical candidate replay and
+    # therefore does not interpret evidence content.  For a *new* pack, the
+    # manifest cannot merely retag an older stub with today's Git commit:
+    # these three hash-pinned producer records must agree with both the source
+    # and the exact candidate artifact.  Rehash here to close the gap between
+    # the earlier bundle validation and these file reads.
+    records = manifest.get("evidence")
+    if not isinstance(records, list):
+        raise ReleaseAttestationError(
+            "current candidate has no source-bound evidence inventory")
+    by_path = {record.get("path"): record for record in records
+               if isinstance(record, dict) and isinstance(record.get("path"), str)}
+    artifact_hash = manifest.get("sha256")
+    for filename, label in (
+        ("production-evidence.json", "production evidence"),
+        ("runtime-hardening.json", "native runtime evidence"),
+        ("roundtrip.json", "round-trip evidence"),
+    ):
+        relative = f"evidence/{filename}"
+        record = by_path.get(relative)
+        if (not isinstance(record, dict)
+                or SHA256_RE.fullmatch(str(record.get("sha256", ""))) is None):
+            raise ReleaseAttestationError(
+                f"current candidate lacks hash-pinned {label}")
+        path = _contained_evidence_path(candidate_root, relative)
+        try:
+            raw = path.read_bytes()
+            evidence = json.loads(raw.decode("utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ReleaseAttestationError(
+                f"current candidate {label} is unreadable") from exc
+        if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+            raise ReleaseAttestationError(
+                f"current candidate {label} hash changed")
+        if (not isinstance(evidence, dict)
+                or evidence.get("source_commit") != expected
+                or evidence.get("schema") != 1):
+            raise ReleaseAttestationError(
+                f"current candidate {label} source commit mismatches")
+        if filename == "production-evidence.json":
+            if (evidence.get("stub_sha256") != artifact_hash
+                    or evidence.get("tracked_source_dirty") is not False
+                    or evidence.get("ready") is not True):
+                raise ReleaseAttestationError(
+                    "current candidate production evidence is not artifact-bound green")
+        elif (evidence.get("artifact_sha256") != artifact_hash
+              or evidence.get("exit_code") != 0):
+            raise ReleaseAttestationError(
+                f"current candidate {label} is not artifact-bound green")
 
 
 def _contained_evidence_path(bundle_root: Path, relative: Any) -> Path:

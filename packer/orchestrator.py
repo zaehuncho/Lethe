@@ -580,6 +580,13 @@ def _load_virtualization_build(
         try:
             metadata = release_attestation.validate_candidate_identity(
                 Path(stub_path), candidate_path)
+            if not allow_unverified_stub_for_tests:
+                try:
+                    release_attestation.validate_current_candidate_source(
+                        metadata, candidate_root=Path(stub_path).parent)
+                except release_attestation.ReleaseAttestationError as exc:
+                    raise ValueError(
+                        f"verified candidate source is invalid: {exc}") from exc
             verified_candidate = True
         except release_attestation.ReleaseAttestationError as exc:
             if not allow_unverified_stub_for_tests or not runtime_path.is_file():
