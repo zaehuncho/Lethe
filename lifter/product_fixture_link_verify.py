@@ -29,6 +29,10 @@ from .source_link_product_admission import (
     ProductSourceInputs, ProductSourceProofError, _reject_reparse_components,
 )
 from .source_link_product_fixture import ProductFixtureError, emit_product_fixture
+from .selected_wrapper_binding import (
+    SelectedWrapperLinkInputs, SelectedWrapperProofError, _MaterializedWrapperEntry,
+    validate_inputs as _validate_selected_wrapper_inputs, prove_selected_wrapper,
+)
 
 
 class ProductLinkProofError(ValueError):
@@ -54,7 +58,7 @@ _IMPLIB = re.compile(r"/implib:\.\\[A-Za-z0-9_.@+\-$]+\.lib\Z", re.I)
 _PDBMAP = re.compile(r"/pdbmap:[^\"\r\n=]+?=\.\\vc143(?:\.[0-9]+)?\.pdb\Z", re.I)
 _FLAGS = {
     "/incremental:no", "/nologo", "/manifest", "/manifest:embed",
-    "/debug:full", "/map", "/subsystem:console", "/opt:noicf",
+    "/debug:full", "/map", "/subsystem:console", "/opt:noicf", "/opt:ref",
     "/tlbid:1", "/machine:x64", "/cetcompat", "/guard:cf",
     "/guard:xfg", "/brepro", "/verbose:lib", "/dll",
     "/manifestuac:level='asInvoker' uiAccess='false'".casefold(),
@@ -328,10 +332,15 @@ def replay_exact_pe(inputs: ReplayInputs, *, required_objects: tuple[str, ...] =
 def verify_product_fixture_final_link(
     source: ProductSourceInputs, header: Path, generated_dir: Path,
     replay: ReplayInputs, *, synthetic_fixture_key: bytes,
+    selected_reference_inputs: SelectedWrapperLinkInputs,
 ) -> dict[str, object]:
     """Re-prove current source and synthetic VM output, then replay exact PE."""
     if type(synthetic_fixture_key) is not bytes or len(synthetic_fixture_key) != 32:
         raise ProductLinkProofError("exact synthetic fixture key required")
+    try:
+        _validate_selected_wrapper_inputs(selected_reference_inputs)
+    except SelectedWrapperProofError as exc:
+        raise ProductLinkProofError(str(exc)) from exc
     replay_root = Path(replay.replay_dir)
     # The fresh generated copy is distinct from the replay capture copy.
     if replay_root.exists() and any(replay_root.iterdir()):
@@ -467,6 +476,17 @@ def verify_product_fixture_final_link(
                           "daedalus_x64_thunk.obj"),
         forbidden_object=Path(source.helper_object).name,
     )
+    entry = _MaterializedWrapperEntry(
+        symbol, prefix, wrapper_rva, wrapper_size, thunk_rva,
+        common_va - final.image_base, descriptor_rva,
+        _sha(final_raw), _sha(final_pdb_raw), _sha(final_map_raw),
+    )
+    try:
+        selected_binding = prove_selected_wrapper(
+            source, replay, selected_reference_inputs, entry, replay_root / "selected_calls")
+    except (SelectedWrapperProofError, ProductSourceProofError,
+            ValueError, OSError) as exc:
+        raise ProductLinkProofError(f"selected wrapper reference proof failed: {exc}") from exc
     if any(_sha(_read(actual / name, "generated fixture")) != digest
            for name, digest in generated_pins.items()):
         raise ProductLinkProofError("generated fixture changed during replay")
@@ -494,14 +514,19 @@ def verify_product_fixture_final_link(
         "linked_fixture_structure_verified": True,
         "wrapper_guard_cf_target_present": wrapper_rva in cf_targets,
         "source_reference_closure_proven": False,
-        "original_helper_object_omission_proven": False,
+        "original_helper_object_omission_proven": selected_binding["original_helper_object_omission_proven"],
+        "authenticated_selected_wrapper_reference_binding_proven": True,
+        "selected_direct_source_output_equivalence_proven": True,
+        "global_source_output_reference_equivalence_proven": False,
+        "runtime_source_compile_binding_proven": False,
         "indirect_target_closure_proven": False,
         "xfg_enforcement_proven": False,
         "production_key_service_configured": False,
         "production_admitted": False,
         "replay": result,
+        "selected_reference_binding": selected_binding,
     }
 
 
-__all__ = ["ProductLinkProofError", "ReplayInputs", "replay_exact_pe",
+__all__ = ["ProductLinkProofError", "ReplayInputs", "SelectedWrapperLinkInputs", "replay_exact_pe",
            "verify_product_fixture_final_link"]

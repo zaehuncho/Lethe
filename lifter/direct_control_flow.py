@@ -231,6 +231,65 @@ class _RuntimeDecode:
     starts: frozenset[int]
 
 
+@dataclass(frozen=True)
+class _EntryThunkRange:
+    """Internal exact-template descriptor island, never an arbitrary range waiver."""
+
+    rva: int
+    common_rva: int
+    descriptor_rva: int
+
+
+def _entry_thunk_decodes(parsed: Any, sections, specs: tuple) -> dict:
+    if type(specs) is not tuple or len(specs) > 1:
+        raise DirectControlFlowError("entry thunk inventory must be a bounded tuple")
+    if not specs:
+        return {}
+    from . import win64_thunk
+    from .structured_vm_thunk import decode_stack512_thunk, StructuredThunkError
+    result = {}
+    for spec in specs:
+        if type(spec) is not _EntryThunkRange:
+            raise DirectControlFlowError("exact entry thunk input required")
+        for value in (spec.rva, spec.common_rva, spec.descriptor_rva):
+            _validate_range(value, 1, "entry thunk address")
+        end = spec.rva + win64_thunk.THUNK_CODE_SIZE
+        raw = _read_executable(sections, spec.rva, end - spec.rva, "entry thunk")
+        if any(s.characteristics & 0x02000000 and s.rva <= spec.rva < s.mapped_end for s in sections):
+            raise DirectControlFlowError("entry thunk is discardable")
+        try:
+            decoded = decode_stack512_thunk(raw, rva=spec.rva,
+                common_rva=spec.common_rva, descriptor_va=parsed.image_base + spec.descriptor_rva)
+        except StructuredThunkError as exc:
+            raise DirectControlFlowError(str(exc)) from exc
+        records = [item for item in parsed.runtime_functions if item.begin_rva == spec.rva]
+        if len(records) != 1 or records[0].end_rva != end:
+            raise DirectControlFlowError("entry thunk requires exact PDATA extent")
+        common = [item for item in parsed.runtime_functions if item.begin_rva == spec.common_rva]
+        if len(common) != 1 or common[0].end_rva <= spec.common_rva:
+            raise DirectControlFlowError("entry thunk common bridge is not an exact runtime entry")
+        _read_executable(sections, spec.common_rva, common[0].end_rva - spec.common_rva, "common bridge")
+        if any(s.characteristics & 0x02000000 and s.rva <= spec.common_rva < s.mapped_end for s in sections):
+            raise DirectControlFlowError("entry thunk common bridge is discardable")
+        unwind = records[0].unwind_info_rva
+        owners = [s for s in sections if s.rva <= unwind and
+                  unwind + len(win64_thunk.THUNK_UNWIND_INFO) <= s.raw_end]
+        if len(owners) != 1 or owners[0].raw[unwind - owners[0].rva:
+                unwind - owners[0].rva + len(win64_thunk.THUNK_UNWIND_INFO)] != win64_thunk.THUNK_UNWIND_INFO:
+            raise DirectControlFlowError("entry thunk unwind metadata differs")
+        if sum(item.target_rva == spec.rva + 15 for item in parsed.dir64_relocations) != 1:
+            raise DirectControlFlowError("entry thunk descriptor DIR64 differs")
+        if any(item.target_rva < end and spec.rva < item.target_rva + 8 and
+               item.target_rva != spec.rva + 15 for item in parsed.dir64_relocations):
+            raise DirectControlFlowError("entry thunk has an extra or crossing DIR64")
+        cf = getattr(parsed, "load_config", None)
+        if cf is not None and any(spec.rva < item.rva < end for item in cf.guard_cf_targets):
+            raise DirectControlFlowError("entry thunk has an internal guard entry")
+        result[(spec.rva, end)] = _RuntimeDecode(
+            spec.rva, end, decoded.instructions, decoded.instruction_starts)
+    return result
+
+
 def _validate_range(rva: int, size: int, label: str) -> None:
     if type(rva) is not int or type(size) is not int:
         raise DirectControlFlowError(f"{label} RVA and size must be integers")
@@ -571,6 +630,7 @@ def _decode_runtime_inventory(
     subsumed_ranges: set[tuple[int, int]],
     selected: Sequence[SelectedFunctionRange],
     chain_primary: dict[tuple[int, int], int],
+    structured: dict | None = None,
 ) -> tuple[
     dict[tuple[int, int], _RuntimeDecode], tuple[IsolatedRuntimeFunction, ...]
 ]:
@@ -592,7 +652,8 @@ def _decode_runtime_inventory(
         if rng in subsumed_ranges:
             continue
         try:
-            decoded[rng] = _decode_extent(sections, rng[0], rng[1])
+            decoded[rng] = (structured[rng] if structured and rng in structured
+                            else _decode_extent(sections, rng[0], rng[1]))
         except jump_table.JumpTableUnresolved as exc:
             failures[rng] = exc
         except jump_table.JumpTableError as exc:
@@ -897,8 +958,11 @@ def _validate_direct_targets(
                 )
 
 
-def _decode_source_inventory(parsed, sections, selected):
+def _decode_source_inventory(parsed, sections, selected, structured_thunks=()):
     runtime_ranges = _normalize_runtime_functions(parsed)
+    structured = _entry_thunk_decodes(parsed, sections, structured_thunks)
+    if any(rng not in runtime_ranges for rng in structured):
+        raise DirectControlFlowError("structured entry thunk is not an exact runtime range")
 
     exact_runtime = set(runtime_ranges)
     if any(spec.body_size < spec.size for spec in selected):
@@ -946,7 +1010,7 @@ def _decode_source_inventory(parsed, sections, selected):
 
     chain_primary = _chain_primary_map(parsed, runtime_ranges)
     runtime_decode_map, isolated_runtime = _decode_runtime_inventory(
-        sections, runtime_ranges, subsumed_ranges, selected, chain_primary
+        sections, runtime_ranges, subsumed_ranges, selected, chain_primary, structured
     )
     runtime_decodes = tuple(runtime_decode_map.values())
     isolated_spans = frozenset(
@@ -1005,6 +1069,7 @@ def analyze_direct_control_flow(
     coverage_acknowledgements: Sequence[CoverageGapAcknowledgement] = (),
     production: bool = True,
     _supplemental_code_ranges: tuple[tuple[int, int], ...] = (),
+    _structured_entry_thunks: tuple[_EntryThunkRange, ...] = (),
 ) -> DirectControlFlowProof:
     """Analyze direct x64 transfers that could bypass selected entry patches.
 
@@ -1020,7 +1085,7 @@ def analyze_direct_control_flow(
     selected = _normalize_selected(selected_specs)
     (runtime_ranges, runtime_decodes, isolated_spans,
      extra_selected_ranges, selected_decodes, isolated_runtime) = _decode_source_inventory(
-        parsed, sections, selected
+        parsed, sections, selected, _structured_entry_thunks
     )
     # Internal entry point for exact-PDB-bound and byte-classified residual
     # coverage. Public callers never receive a raw range waiver. Every added

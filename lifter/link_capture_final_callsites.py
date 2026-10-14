@@ -376,7 +376,8 @@ def _require_clean_linker_replay(proc: _ReplayProcess) -> None:
              "verbose linker replay failed or emitted diagnostics")
 
 
-def _required_response(inventory: dict, output: str) -> None:
+def _required_response(inventory: dict, output: str, *,
+                       _require_import_library: bool = True) -> None:
     switches = inventory.get("switches")
     _require(type(switches) is list and all(type(item) is str for item in switches),
              "LINKREPRO switch inventory is malformed")
@@ -395,7 +396,8 @@ def _required_response(inventory: dict, output: str) -> None:
              1 <= folded.count("/machine:x64") <= 2 and
              1 <= folded.count("/guard:cf") <= 2 and
              sum(item.startswith("/pdb:") for item in folded) == 1 and
-             sum(item.startswith("/implib:") for item in folded) == 1 and
+             (sum(item.startswith("/implib:") for item in folded) == 1 if _require_import_library
+              else sum(item.startswith("/implib:") for item in folded) <= 1) and
              sum(item.startswith("/pdbmap:") for item in folded) <= 2,
              "LINKREPRO has unknown, conflicting or duplicated linker options")
     outputs = [match.group(1) for item in switches if (match := _OUT.fullmatch(item))]
@@ -429,7 +431,7 @@ def _reject_archive_caller_label_aliases(inventory: dict,
 def _copy_and_replay(capture: Path, inventory: dict,
                      source_inputs: ProductSourceInputs,
                      replay_parent: Path, label: str,
-                     link: str) -> dict:
+                     link: str, *, _bound_pdb_path: str | None = None) -> dict:
     """Direct absolute-link replay with bounded IO and bound output sidecars."""
     root = _capture_root(capture)
     files = inventory.get("capture_file_sha256")
@@ -470,7 +472,13 @@ def _copy_and_replay(capture: Path, inventory: dict,
                  for name, digest in retained_inputs.items()),
              "isolated linker input changed before execution")
     environment, env_receipt = _replay_environment(capture, work, Path(link))
+    if _bound_pdb_path is not None:
+        _require(type(_bound_pdb_path) is str and 1 <= len(_bound_pdb_path) <= 260 and
+                 re.fullmatch(r"[A-Za-z]:\\[^\x00-\x1f\"%!]+", _bound_pdb_path) is not None,
+                 "bound replay PDB path is malformed")
     argv = (link, "@link.rsp", "/VERBOSE:REF", "/VERBOSE:ICF")
+    if _bound_pdb_path is not None:
+        argv += ("/PDBALTPATH:" + _bound_pdb_path,)
     proc = _run_bounded(argv, work, environment)
     log_path = replay_parent / f"{label}.verbose.stdout.txt"
     stderr_path = replay_parent / f"{label}.verbose.stderr.txt"
@@ -714,6 +722,82 @@ def _linked_callsite(section: _CallerSection, rows: tuple,
                       "rel32_fields": len(section.reloc_fields)}
 
 
+def _attribute_selected_callers(capture: Path, selected: dict, rows: tuple,
+                                coverage, parsed, entry_rva: int, log: bytes,
+                                *, data_islands: tuple = ()) -> tuple:
+    """Entry-neutral attribution; caller identity and all output direct edges bind."""
+    executable_sections = direct_control_flow._normalize_sections(parsed)
+    refs = selected.get("references")
+    explicit = selected.get("response_input_hashes")
+    _require(type(refs) is list and 1 <= len(refs) <= _MAX_REFERENCES and
+             type(explicit) is dict,
+             "selected caller inventory is missing or excessive")
+    seen: set[tuple[str, int, int]] = set()
+    sections: list[_CallerSection] = []
+    cache: dict[str, bytes] = {}
+    for ref in refs:
+        _require(type(ref) is dict and
+                 ref.get("classification") == "decoded_call_rel32_zero_addend" and
+                 type(ref.get("object")) is str and
+                 ref["object"] in explicit and ref["object"].lower().endswith(".obj") and
+                 type(ref.get("section_index")) is int and
+                 type(ref.get("relocation_field")) is int and
+                 ref.get("relocation_kind") == 4,
+                 "selected archive extraction or relocation is ambiguous")
+        key = (ref["object"], ref["section_index"], ref["relocation_field"])
+        _require(key not in seen, "selected caller relocation is duplicated")
+        seen.add(key)
+        if ref["object"] not in cache:
+            cache[ref["object"]] = _capture_regular_file(
+                _capture_root(capture), ref["object"])
+        raw = cache[ref["object"]]
+        _require(_sha(raw) == explicit[ref["object"]],
+                 "caller COFF differs from selected input report")
+        item = _coff_primary(raw, ref["object"], ref["section_index"],
+                             ref["relocation_field"])
+        _require(_sha(item.body) == ref["section_sha256"],
+                 "caller COFF section differs from selected input report")
+        sections.append(item)
+    expected: set[int] = set()
+    outcomes = []
+    for section in sections:
+        call, result = _linked_callsite(
+            section, rows, coverage, parsed, entry_rva, log)
+        if call is not None:
+            _require(call not in expected, "two caller sections alias one output call")
+            expected.add(call)
+        outcomes.append(result)
+    edges = [item for item in coverage.direct_flow.direct_transfers
+             if item.target_rva == entry_rva]
+    _require(all(item.kind == "call" and item.target_is_selected_entry
+                 for item in edges) and
+             {item.source_rva for item in edges} == expected and
+             len(edges) == len(expected) and expected,
+             "decoded final executable has missing, extra or non-CALL selected edge")
+    # An E8-looking byte sequence in data/operands can only make this stricter:
+    # the raw executable sweep cannot miss a real E8 encoding to this target.
+    raw_calls: set[int] = set()
+    for executable in executable_sections:
+        if not executable.characteristics & direct_control_flow.IMAGE_SCN_MEM_EXECUTE:
+            continue
+        body = executable.raw
+        for offset in range(max(0, len(body) - 4)):
+            if any(begin <= executable.rva + offset < end for begin, end in data_islands):
+                continue
+            if body[offset] != 0xE8:
+                continue
+            ip = executable.rva + offset
+            displacement = struct.unpack_from("<i", body, offset + 1)[0]
+            if ip + 5 + displacement == entry_rva:
+                raw_calls.add(ip)
+    _require(raw_calls == expected,
+             "raw executable contains an extra or missing E8 to selected helper")
+    _require(coverage.direct_flow.direct_reference_gate_passed and
+             not coverage.direct_flow.coverage_gaps,
+             "selected final executable coverage is incomplete")
+    return refs, expected, outcomes
+
+
 def _one_image(capture: Path, source_inputs: ProductSourceInputs,
                selected: dict, replay: dict) -> dict:
     log = replay["stdout"]
@@ -772,72 +856,8 @@ def _one_image(capture: Path, source_inputs: ProductSourceInputs,
                      source_inputs.helper_object.name.encode("ascii"))
     _require(not any(helper_marker in line for line in log.splitlines()),
              "selected helper appears in REF/ICF discard or fold log")
-    refs = selected.get("references")
-    explicit = selected.get("response_input_hashes")
-    _require(type(refs) is list and 1 <= len(refs) <= _MAX_REFERENCES and
-             type(explicit) is dict,
-             "selected caller inventory is missing or excessive")
-    seen: set[tuple[str, int, int]] = set()
-    sections: list[_CallerSection] = []
-    cache: dict[str, bytes] = {}
-    for ref in refs:
-        _require(type(ref) is dict and
-                 ref.get("classification") == "decoded_call_rel32_zero_addend" and
-                 type(ref.get("object")) is str and
-                 ref["object"] in explicit and ref["object"].lower().endswith(".obj") and
-                 type(ref.get("section_index")) is int and
-                 type(ref.get("relocation_field")) is int and
-                 ref.get("relocation_kind") == 4,
-                 "selected archive extraction or relocation is ambiguous")
-        key = (ref["object"], ref["section_index"], ref["relocation_field"])
-        _require(key not in seen, "selected caller relocation is duplicated")
-        seen.add(key)
-        if ref["object"] not in cache:
-            cache[ref["object"]] = _capture_regular_file(
-                _capture_root(capture), ref["object"])
-        raw = cache[ref["object"]]
-        _require(_sha(raw) == explicit[ref["object"]],
-                 "caller COFF differs from selected input report")
-        item = _coff_primary(raw, ref["object"], ref["section_index"],
-                             ref["relocation_field"])
-        _require(_sha(item.body) == ref["section_sha256"],
-                 "caller COFF section differs from selected input report")
-        sections.append(item)
-    expected: set[int] = set()
-    outcomes = []
-    for section in sections:
-        call, result = _linked_callsite(
-            section, rows, coverage, parsed, source["rva"], log)
-        if call is not None:
-            _require(call not in expected, "two caller sections alias one output call")
-            expected.add(call)
-        outcomes.append(result)
-    edges = [item for item in coverage.direct_flow.direct_transfers
-             if item.target_rva == source["rva"]]
-    _require(all(item.kind == "call" and item.target_is_selected_entry
-                 for item in edges) and
-             {item.source_rva for item in edges} == expected and
-             len(edges) == len(expected) and expected,
-             "decoded final executable has missing, extra or non-CALL selected edge")
-    # An E8-looking byte sequence in data/operands can only make this stricter:
-    # the raw executable sweep cannot miss a real E8 encoding to this target.
-    raw_calls: set[int] = set()
-    for executable in executable_sections:
-        if not executable.characteristics & direct_control_flow.IMAGE_SCN_MEM_EXECUTE:
-            continue
-        body = executable.raw
-        for offset in range(max(0, len(body) - 4)):
-            if body[offset] != 0xE8:
-                continue
-            ip = executable.rva + offset
-            displacement = struct.unpack_from("<i", body, offset + 1)[0]
-            if ip + 5 + displacement == source["rva"]:
-                raw_calls.add(ip)
-    _require(raw_calls == expected,
-             "raw executable contains an extra or missing E8 to selected helper")
-    _require(coverage.direct_flow.direct_reference_gate_passed and
-             not coverage.direct_flow.coverage_gaps,
-             "selected final executable coverage is incomplete")
+    refs, expected, outcomes = _attribute_selected_callers(
+        capture, selected, rows, coverage, parsed, source["rva"], log)
     return {"source_pe_sha256": source["source_pe_sha256"],
             "source_pdb_sha256": source["source_pdb_sha256"],
             "source_map_sha256": source["source_map_sha256"],

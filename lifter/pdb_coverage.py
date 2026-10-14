@@ -309,6 +309,7 @@ def prove_pdb_executable_coverage(
     selected_specs: Sequence[Any],
     *,
     tail_exit_policy: direct_control_flow.TailExitPolicy = direct_control_flow.TailExitPolicy(),
+    _structured_entry_thunks: tuple[direct_control_flow._EntryThunkRange, ...] = (),
 ) -> PdbCoverageProof:
     """Prove direct-reference coverage without a handwritten gap waiver.
 
@@ -401,6 +402,7 @@ def prove_pdb_executable_coverage(
             tail_exit_policy=tail_exit_policy,
             production=True,
             _supplemental_code_ranges=supplement,
+            _structured_entry_thunks=_structured_entry_thunks,
         )
     except direct_control_flow.DirectControlFlowError as exc:
         raise PdbCoverageError(str(exc)) from exc
