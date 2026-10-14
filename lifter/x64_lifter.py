@@ -43,7 +43,11 @@ PXOR/XORPS/XORPD,
 PAND/ANDPS/ANDPD, PANDN/ANDNPS/ANDNPD, and POR/ORPS/ORPD accept register
 sources and aligned 128-bit memory sources. Register-target BT/BTS/BTR/BTC are
 supported; memory bit strings remain closed. Legacy CVTDQ2PD converts two signed
-int32 values exactly to binary64 without host floating-point state. General FP/SIMD arithmetic,
+int32 values exactly to binary64 without host floating-point state. Legacy
+CVTSI2SD supports signed32 GPR/memory inputs and signed64 registers only when a
+whole-CFG must-proof establishes exact binary64 representability; upper XMM64,
+integer flags and MXCSR are untouched. Arbitrary signed64 memory/rounded inputs
+remain closed. General FP/SIMD arithmetic,
 VEX/EVEX encodings, atomic XCHG/LOCK forms, register/base-indirect and far
 calls, recursive calls, and unmodeled widths remain explicit whole-function
 bailouts.
@@ -342,6 +346,149 @@ class _Asm:
 
 def _lbl(addr: int) -> str:
     return f"L_{addr:X}"
+
+
+def _cvtsi2sd_exact_inputs(instructions, base: int) -> frozenset[int]:
+    """Must-prove exact signed64 inputs over the complete reachable CFG.
+
+    Facts are signed64 intervals, not lexical producer guesses. Entry registers
+    are unknown; joins take the interval hull and unknown dominates. We retain
+    only full-width copies, exact constants and guaranteed narrow extensions.
+    Every other full/partial write kills its parent, except unconditional 32-bit
+    writes, which architecturally zero-extend. Conditional writes join the old
+    fact with the produced fact. CALL deliberately kills *all* register facts
+    both at the return continuation and at an internal callee entry: no ABI or
+    return-summary assumption can silently retain a proof. Unreachable r64
+    conversions have no proof. Finite producer endpoints make loops converge.
+    """
+    conversions = [i for i in instructions if i.mnemonic == Mnemonic.CVTSI2SD
+                   and i.op_count == 2 and i.op_kind(1) == OpKind.REGISTER
+                   and i.op_register(1) in REG_OFF]
+    if not conversions:
+        return frozenset()
+    parents = {reg: n for registers in (_R64, _R32, _R16, _R8)
+               for n, reg in enumerate(registers)}
+    parents.update({reg: off // 8 for reg, off in _HIGH8_OFF.items()})
+    widths = {reg: width for registers, width in
+              ((_R64, 64), (_R32, 32), (_R16, 16), (_R8, 8))
+              for reg in registers}
+    widths.update({reg: 8 for reg in _HIGH8_OFF})
+    unknown = (None,) * 16
+    u32 = (0, (1 << 32) - 1)
+    writes = {OpAccess.WRITE, OpAccess.COND_WRITE, OpAccess.READ_WRITE,
+              OpAccess.READ_COND_WRITE}
+    factory = InstructionInfoFactory()
+    by_ip = {i.ip: i for i in instructions}
+    incoming = {base: unknown}
+    pending = [base]
+
+    def join(left, right):
+        if left is None or right is None:
+            return None
+        return min(left[0], right[0]), max(left[1], right[1])
+
+    def source_fact(item, state):
+        kind = item.op_kind(1)
+        if kind == OpKind.REGISTER and item.op_register(1) in REG_OFF:
+            return state[parents[item.op_register(1)]]
+        if kind in (OpKind.IMMEDIATE64, OpKind.IMMEDIATE32TO64):
+            value = (item.immediate64 if kind == OpKind.IMMEDIATE64
+                     else item.immediate32to64) & MASK64
+            value = value if value < (1 << 63) else value - (1 << 64)
+            return value, value
+        return None
+
+    def transfer(item, state):
+        if item.mnemonic == Mnemonic.CALL:
+            return unknown
+        result = list(state)
+        info = factory.info(item)
+        for used in info.used_registers():
+            if used.access in writes and used.register in parents:
+                result[parents[used.register]] = None
+        for n in range(item.op_count):
+            if (item.op_kind(n) != OpKind.REGISTER or
+                    item.op_register(n) not in parents or
+                    info.op_access(n) not in writes):
+                continue
+            register = item.op_register(n)
+            parent = parents[register]
+            fact = u32 if widths[register] == 32 else None
+            if n == 0 and widths[register] == 64:
+                if item.mnemonic == Mnemonic.MOV:
+                    fact = source_fact(item, state)
+                elif item.mnemonic == Mnemonic.MOVSXD:
+                    fact = (-(1 << 31), (1 << 31) - 1)
+                elif item.mnemonic in (Mnemonic.MOVSX, Mnemonic.MOVZX):
+                    if item.op_kind(1) == OpKind.REGISTER:
+                        source_width = widths.get(item.op_register(1))
+                    elif item.op_kind(1) == OpKind.MEMORY:
+                        source_width = MemorySizeExt.size(item.memory_size) * 8
+                    else:
+                        source_width = None
+                    if source_width in (8, 16):
+                        fact = ((-(1 << (source_width - 1)),
+                                 (1 << (source_width - 1)) - 1)
+                                if item.mnemonic == Mnemonic.MOVSX else
+                                (0, (1 << source_width) - 1))
+                elif (item.mnemonic in (Mnemonic.XOR, Mnemonic.SUB)
+                      and item.op_kind(1) == OpKind.REGISTER
+                      and item.op_register(1) == register):
+                    fact = (0, 0)
+                elif item.mnemonic in _CMOVCC:
+                    fact = source_fact(item, state)
+            conditional = (item.mnemonic in _CMOVCC or
+                           info.op_access(n) in (OpAccess.COND_WRITE,
+                                                 OpAccess.READ_COND_WRITE))
+            result[parent] = join(state[parent], fact) if conditional else fact
+        if item.mnemonic == Mnemonic.CDQE:
+            result[0] = (-(1 << 31), (1 << 31) - 1)
+        return tuple(result)
+
+    def enqueue(ip, state):
+        if ip not in by_ip:
+            return  # topology/targets are independently validated first
+        old = incoming.get(ip)
+        merged = state if old is None else tuple(join(a, b) for a, b in zip(old, state))
+        if old != merged:
+            incoming[ip] = merged
+            pending.append(ip)
+
+    steps = 0
+    while pending:
+        steps += 1
+        if steps > 100_000:
+            raise LiftUnsupported("cvtsi2sd exact-input analysis exceeded its state bound")
+        ip = pending.pop()
+        item = by_ip[ip]
+        state = transfer(item, incoming[ip])
+        next_ip = item.ip + item.len
+        if item.mnemonic == Mnemonic.CALL:
+            enqueue(next_ip, unknown)
+            if item.op_kind(0) == OpKind.NEAR_BRANCH64:
+                enqueue(item.near_branch_target, unknown)
+        elif item.mnemonic == Mnemonic.JMP:
+            enqueue(item.near_branch_target, state)
+        elif item.mnemonic in _CC:
+            enqueue(item.near_branch_target, state)
+            enqueue(next_ip, state)
+        elif item.mnemonic != Mnemonic.RET:
+            enqueue(next_ip, state)
+
+    def exact(fact):
+        if fact is None:
+            return False
+        low, high = fact
+        if -(1 << 53) <= low <= high <= (1 << 53):
+            return True
+        if low != high:
+            return False
+        magnitude = abs(low)
+        discarded = max(0, magnitude.bit_length() - 53)
+        return not (magnitude & ((1 << discarded) - 1))
+
+    return frozenset(i.ip for i in conversions if i.ip in incoming
+                     and exact(incoming[i.ip][parents[i.op_register(1)]]))
 
 
 class _Lifter:
@@ -763,6 +910,76 @@ class _Lifter:
             self.push_imm(0)
             self.a.label(done)
             self.wr_local(destination + lane)
+
+    def _cvtsi2sd(self, instr) -> None:
+        """Legacy exact integer-to-binary64 conversion, with no FP-state use.
+
+        Signed32 values are all exact. A signed64 register requires the CFG
+        must-proof above; arbitrary m64 and inexact integers remain closed.
+        The integer construction preserves MXCSR, flags and upper XMM64.
+        Snapshot a memory source before any destination write or scratch use.
+        """
+        self._require_legacy_binary(instr, "cvtsi2sd")
+        if instr.op_kind(0) != OpKind.REGISTER:
+            raise LiftUnsupported("cvtsi2sd destination must be an XMM register")
+        destination = self._xmm_offset(instr.op_register(0))
+        if instr.op_kind(1) == OpKind.REGISTER:
+            source = instr.op_register(1)
+            _offset, width = self._reg_info(source)
+            if width not in (32, 64):
+                raise LiftUnsupported("cvtsi2sd source must be a 32/64-bit GPR")
+            if width == 64 and instr.ip not in self._exact_cvtsi2sd_inputs:
+                raise LiftUnsupported(f"cvtsi2sd signed64 input is not proven exact at 0x{instr.ip:X}")
+            self.rd_reg(source)
+        elif instr.op_kind(1) == OpKind.MEMORY:
+            width = self._memory_width(instr)
+            if width != 32:
+                raise LiftUnsupported("cvtsi2sd memory source must be signed32; m64 is unproven")
+            self._emit_effective_address(instr); self.a("load32")
+        else:
+            raise LiftUnsupported("cvtsi2sd source must be a GPR or signed32 memory")
+        self.wr_local(T0)
+        positive, loop, normalized, right, fraction, zero, done = (
+            self._new_label() for _ in range(7)
+        )
+        self.rd_local(T0); self.push_imm(width - 1); self.a("shr")
+        self.push_imm(63); self.a("shl"); self.wr_local(T2)
+        self.rd_local(T0); self.wr_local(T1)
+        self.rd_local(T2); self.push_imm(0); self.a("cmp_eq")
+        self.a(f"jnz {positive}")
+        self.rd_local(T1); self.a("neg")
+        if width == 32:
+            self.push_imm(MASK32); self.a("and")
+        self.wr_local(T1)
+        self.a.label(positive)
+        self.rd_local(T1); self.push_imm(0); self.a("cmp_eq")
+        self.a(f"jnz {zero}")
+        self.push_imm(0); self.wr_local(T3)
+        self.rd_local(T1); self.wr_local(T4)
+        self.a.label(loop)
+        self.rd_local(T4); self.push_imm(1); self.a("cmp_gt")
+        self.push_imm(0); self.a("cmp_eq"); self.a(f"jnz {normalized}")
+        self.rd_local(T4); self.push_imm(1); self.a("shr"); self.wr_local(T4)
+        self.rd_local(T3); self.push_imm(1); self.a("add"); self.wr_local(T3)
+        self.a(f"jmp {loop}")
+        self.a.label(normalized)
+        self.rd_local(T3); self.push_imm(1023); self.a("add")
+        self.push_imm(52); self.a("shl"); self.wr_local(T4)
+        self.rd_local(T3); self.push_imm(52); self.a("cmp_gt")
+        self.a(f"jnz {right}")
+        self.rd_local(T1); self.push_imm(52); self.rd_local(T3)
+        self.a("sub"); self.a("shl"); self.a(f"jmp {fraction}")
+        self.a.label(right)
+        self.rd_local(T1); self.rd_local(T3); self.push_imm(52)
+        self.a("sub"); self.a("shr")
+        self.a.label(fraction)
+        self.push_imm((1 << 52) - 1); self.a("and")
+        self.rd_local(T4); self.a("or"); self.rd_local(T2); self.a("or")
+        self.a(f"jmp {done}")
+        self.a.label(zero)
+        self.push_imm(0)
+        self.a.label(done)
+        self.wr_local(destination)
 
     def _xmm_scalar_move(self, instr, mnemonic: str, width: int) -> None:
         """Lift legacy MOVSS/MOVSD with their asymmetric upper-lane rules."""
@@ -2199,6 +2416,7 @@ class _Lifter:
         )
         internal_returns = frozenset(call_analysis.internal_return_rvas)
         top_level_returns = frozenset(call_analysis.top_level_return_rvas)
+        self._exact_cvtsi2sd_inputs = _cvtsi2sd_exact_inputs(instructions, self.base)
         for instr in instructions:
             self.a.label(_lbl(instr.ip))
             m = instr.mnemonic
@@ -2261,6 +2479,8 @@ class _Lifter:
                 self._xmm_integer_compare(instr, mnemonic, width, signed_greater)
             elif m == Mnemonic.CVTDQ2PD:
                 self._cvtdq2pd(instr)
+            elif m == Mnemonic.CVTSI2SD:
+                self._cvtsi2sd(instr)
             elif m == Mnemonic.PUSH:
                 self._push(instr)
             elif m == Mnemonic.POP:
