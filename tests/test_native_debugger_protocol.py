@@ -165,6 +165,8 @@ def test_real_runner_wait_failure_reports_context_and_stays_failed(monkeypatch, 
     continued = []
     pending = [event(code=3), event()] if prior_events else []
     pipe_counter = [1000]
+    terminated = [False]
+    cleanup_waits = []
 
     class Function:
         def __init__(self, callback):
@@ -190,6 +192,12 @@ def test_real_runner_wait_failure_reports_context_and_stays_failed(monkeypatch, 
         return 1
 
     def wait(output, timeout_ms):
+        if terminated[0]:
+            cleanup_waits.append(timeout_ms)
+            target = output._obj
+            target.dwDebugEventCode = 5
+            target.dwProcessId, target.dwThreadId = 101, 202
+            return 1
         waits.append(timeout_ms)
         if pending:
             current = pending.pop(0)
@@ -205,6 +213,11 @@ def test_real_runner_wait_failure_reports_context_and_stays_failed(monkeypatch, 
         closed.append(handle.value if hasattr(handle, "value") else handle)
         return 1
 
+    def terminate(handle, code):
+        assert handle == 0x100000001 and code == 0xE014
+        terminated[0] = True
+        return 1
+
     library = SimpleNamespace(**{
         "CreatePipe": Function(create_pipe),
         "InitializeProcThreadAttributeList": Function(attributes),
@@ -213,7 +226,10 @@ def test_real_runner_wait_failure_reports_context_and_stays_failed(monkeypatch, 
         "CreateProcessW": Function(create_process),
         "CloseHandle": Function(close),
         "GetStdHandle": Function(lambda *_: 123),
-        "WaitForSingleObject": Function(lambda *_: pytest.fail("unexpected extra wait")),
+        "WaitForSingleObject": Function(lambda *_: 0 if terminated[0] else 258),
+        "TerminateProcess": Function(terminate),
+        "DebugActiveProcessStop": Function(lambda *_: pytest.fail("unexpected detach")),
+        "ReadFile": Function(lambda *_: pytest.fail("unexpected pipe read")),
         "WaitForDebugEvent": Function(wait),
         "ContinueDebugEvent": Function(lambda *args: continued.append(args) or 1),
         "GetExitCodeProcess": Probe(259, 0, last_error),
@@ -233,7 +249,11 @@ def test_real_runner_wait_failure_reports_context_and_stays_failed(monkeypatch, 
     assert context["primary_thread"]["value"] == 0
     assert 0 < context["remaining_ms"] <= 30000
     assert len(waits) == (3 if prior_events else 1)  # No retry after failed wait.
-    assert len(continued) == (2 if prior_events else 0)
+    assert len(continued) == (3 if prior_events else 1)
+    assert continued[-1] == (101, 202, DBG_CONTINUE)
+    assert len(cleanup_waits) == 1 and terminated[0]
+    report = json.loads(failure.value.__notes__[-1].split(": ", 1)[1])["child"]
+    assert report["reaped"] and report["exit_event_continued"]
     assert 0x100000001 in closed and 0x100000002 in closed
     assert len(closed) == 6
     assert last_error[0] == 121

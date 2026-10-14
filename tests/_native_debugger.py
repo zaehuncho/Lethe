@@ -35,19 +35,21 @@ class NativeDebugProtocol:
         }
         self.event_count += 1
         self.history.append(row)
-        assert row["pid"] == self.process_id, (
-            "debug event belongs to another process", self.snapshot()
-        )
-        assert 1 <= code <= 9, ("invalid debug event", self.snapshot())
+        if row["pid"] != self.process_id:
+            raise AssertionError(("debug event belongs to another process", self.snapshot()))
+        if not 1 <= code <= 9:
+            raise AssertionError(("invalid debug event", self.snapshot()))
         if code != 1:  # EXCEPTION_DEBUG_EVENT
             return DBG_CONTINUE
 
         raw = bytes(event.payload.raw)
-        assert len(raw) >= 156, "truncated Win64 EXCEPTION_DEBUG_INFO"
+        if len(raw) < 156:
+            raise AssertionError("truncated Win64 EXCEPTION_DEBUG_INFO")
         exception = int.from_bytes(raw[:4], "little")
         first_chance = int.from_bytes(raw[152:156], "little")
         row.update(exception=exception, first_chance=first_chance)
-        assert first_chance in (0, 1), ("invalid exception chance", self.snapshot())
+        if first_chance not in (0, 1):
+            raise AssertionError(("invalid exception chance", self.snapshot()))
         if (exception == EXCEPTION_BREAKPOINT and first_chance == 1
                 and not self.initial_breakpoint_seen
                 and row["tid"] == self.primary_thread_id):
@@ -59,12 +61,12 @@ class NativeDebugProtocol:
         return DBG_EXCEPTION_NOT_HANDLED
 
     def validate_exit(self, exit_code: int) -> None:
-        assert self.initial_breakpoint_seen, (
-            "debugger did not observe the initial loader breakpoint", self.snapshot()
-        )
-        assert not (self.second_chance_count and exit_code == 0), (
-            "fatal debug exception reported a successful exit", self.snapshot()
-        )
+        if not self.initial_breakpoint_seen:
+            raise AssertionError((
+                "debugger did not observe the initial loader breakpoint", self.snapshot()))
+        if self.second_chance_count and exit_code == 0:
+            raise AssertionError((
+                "fatal debug exception reported a successful exit", self.snapshot()))
 
     def snapshot(self) -> dict:
         return {

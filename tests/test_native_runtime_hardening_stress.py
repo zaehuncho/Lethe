@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import shutil
 import struct
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from _native_debugger import DEBUGGER_FAULT_CODE, NativeDebugProtocol, debug_wait_error
+from _native_child_lifetime import reap_failed_native_child
 from packer import orchestrator, pe_analyze
 from tools import handler_shape_audit
 
@@ -485,116 +487,133 @@ def _run_packed_forced_aslr(
     )
     kernel32.ContinueDebugEvent.restype = wintypes.BOOL
 
-    security = SecurityAttributes(
-        ctypes.sizeof(SecurityAttributes), None, True
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.DebugActiveProcessStop.argtypes = (wintypes.DWORD,)
+    kernel32.DebugActiveProcessStop.restype = wintypes.BOOL
+    kernel32.CreatePipe.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE),
+        ctypes.POINTER(SecurityAttributes), wintypes.DWORD,
     )
-    stdout_read = wintypes.HANDLE()
-    stdout_write = wintypes.HANDLE()
-    stderr_read = wintypes.HANDLE()
-    stderr_write = wintypes.HANDLE()
-    assert kernel32.CreatePipe(
-        ctypes.byref(stdout_read), ctypes.byref(stdout_write),
-        ctypes.byref(security), 0,
+    kernel32.CreatePipe.restype = wintypes.BOOL
+    kernel32.SetHandleInformation.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
     )
-    assert kernel32.CreatePipe(
-        ctypes.byref(stderr_read), ctypes.byref(stderr_write),
-        ctypes.byref(security), 0,
+    kernel32.SetHandleInformation.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = (
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
     )
-    for read_handle in (stdout_read, stderr_read):
-        assert kernel32.SetHandleInformation(read_handle, 1, 0)
+    kernel32.ReadFile.restype = wintypes.BOOL
 
-    attribute_size = ctypes.c_size_t()
-    kernel32.InitializeProcThreadAttributeList(
-        None, 1, 0, ctypes.byref(attribute_size)
-    )
-    attribute_storage = ctypes.create_string_buffer(attribute_size.value)
-    attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
-    assert kernel32.InitializeProcThreadAttributeList(
-        attribute_list, 1, 0, ctypes.byref(attribute_size)
-    )
-    force_relocations_require_relocs = ctypes.c_ulonglong(0x300)
-    assert kernel32.UpdateProcThreadAttribute(
-        attribute_list,
-        0,
-        0x00020007,
-        ctypes.byref(force_relocations_require_relocs),
-        ctypes.sizeof(force_relocations_require_relocs),
-        None,
-        None,
-    )
-
-    startup = StartupInfoExW()
-    startup.StartupInfo.cb = ctypes.sizeof(StartupInfoExW)
-    startup.StartupInfo.dwFlags = 0x00000100
-    startup.StartupInfo.hStdInput = kernel32.GetStdHandle(-10)
-    startup.StartupInfo.hStdOutput = stdout_write
-    startup.StartupInfo.hStdError = stderr_write
-    startup.lpAttributeList = attribute_list
+    security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
+    stdout_read, stdout_write = wintypes.HANDLE(), wintypes.HANDLE()
+    stderr_read, stderr_write = wintypes.HANDLE(), wintypes.HANDLE()
     process = ProcessInformation()
-    command_line = ctypes.create_unicode_buffer(f'"{executable}"')
-    env = os.environ.copy()
-    env.pop("LETHE_EXPECT_MEMGUARD", None)
-    env.pop("LETHE_EXPECT_PROCESS_HARDENING", None)
-    if memory_guard:
-        env["LETHE_EXPECT_MEMGUARD"] = "1"
-    if process_hardening:
-        env["LETHE_EXPECT_PROCESS_HARDENING"] = "1"
-    env_text = "\0".join(
-        f"{key}={value}" for key, value in sorted(
-            env.items(), key=lambda item: item[0].upper()
-        )
-    ) + "\0\0"
-    env_block = ctypes.create_unicode_buffer(env_text)
+    attribute_list = ctypes.c_void_p()
+    attribute_initialized = created = terminal = False
+    pending_event = None
+    pending_status = None
+    failure = None
+
+    def checked(ok, operation):
+        if not ok:
+            raise AssertionError(f"{operation} failed: {ctypes.WinError(ctypes.get_last_error())}")
+
+    def close_event_file(event):
+        if event.dwDebugEventCode in (3, 6) and event.payload.file:
+            checked(kernel32.CloseHandle(event.payload.file), "debug event hFile CloseHandle")
+            event.payload.file = None
 
     try:
-        created = kernel32.CreateProcessW(
-            str(executable),
-            command_line,
-            None,
-            None,
-            True,
+        checked(kernel32.CreatePipe(
+            ctypes.byref(stdout_read), ctypes.byref(stdout_write),
+            ctypes.byref(security), 0), "stdout CreatePipe")
+        checked(kernel32.CreatePipe(
+            ctypes.byref(stderr_read), ctypes.byref(stderr_write),
+            ctypes.byref(security), 0), "stderr CreatePipe")
+        for read_handle in (stdout_read, stderr_read):
+            checked(kernel32.SetHandleInformation(read_handle, 1, 0), "SetHandleInformation")
+        attribute_size = ctypes.c_size_t()
+        kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attribute_size))
+        if not attribute_size.value:
+            checked(False, "attribute-list size query")
+        attribute_storage = ctypes.create_string_buffer(attribute_size.value)
+        attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
+        checked(kernel32.InitializeProcThreadAttributeList(
+            attribute_list, 1, 0, ctypes.byref(attribute_size)), "attribute-list initialization")
+        attribute_initialized = True
+        force_relocations_require_relocs = ctypes.c_ulonglong(0x300)
+        checked(kernel32.UpdateProcThreadAttribute(
+            attribute_list, 0, 0x00020007,
+            ctypes.byref(force_relocations_require_relocs),
+            ctypes.sizeof(force_relocations_require_relocs), None, None),
+            "forced-ASLR attribute update")
+        startup = StartupInfoExW()
+        startup.StartupInfo.cb = ctypes.sizeof(StartupInfoExW)
+        startup.StartupInfo.dwFlags = 0x00000100
+        startup.StartupInfo.hStdInput = kernel32.GetStdHandle(-10)
+        startup.StartupInfo.hStdOutput = stdout_write
+        startup.StartupInfo.hStdError = stderr_write
+        startup.lpAttributeList = attribute_list
+        command_line = ctypes.create_unicode_buffer(f'"{executable}"')
+        env = os.environ.copy()
+        env.pop("LETHE_EXPECT_MEMGUARD", None)
+        env.pop("LETHE_EXPECT_PROCESS_HARDENING", None)
+        if memory_guard:
+            env["LETHE_EXPECT_MEMGUARD"] = "1"
+        if process_hardening:
+            env["LETHE_EXPECT_PROCESS_HARDENING"] = "1"
+        env_text = "\0".join(
+            f"{key}={value}" for key, value in sorted(
+                env.items(), key=lambda item: item[0].upper())) + "\0\0"
+        env_block = ctypes.create_unicode_buffer(env_text)
+        created = bool(kernel32.CreateProcessW(
+            str(executable), command_line, None, None, True,
             0x00080400 | (0x00000002 if debugged else 0),
-            ctypes.cast(env_block, ctypes.c_void_p),
-            str(executable.parent),
-            ctypes.byref(startup.StartupInfo),
-            ctypes.byref(process),
-        )
-        assert created, ctypes.WinError(ctypes.get_last_error())
-        kernel32.CloseHandle(stdout_write)
+            ctypes.cast(env_block, ctypes.c_void_p), str(executable.parent),
+            ctypes.byref(startup.StartupInfo), ctypes.byref(process)))
+        checked(created, "CreateProcessW")
+        checked(kernel32.CloseHandle(stdout_write), "stdout writer CloseHandle")
         stdout_write = wintypes.HANDLE()
-        kernel32.CloseHandle(stderr_write)
+        checked(kernel32.CloseHandle(stderr_write), "stderr writer CloseHandle")
         stderr_write = wintypes.HANDLE()
         if debugged:
             protocol = NativeDebugProtocol(process.dwProcessId, process.dwThreadId)
             deadline = time.monotonic() + 30.0
             while True:
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
-                assert remaining_ms > 0, (
-                    "debugged child timed out", protocol.snapshot()
-                )
+                if remaining_ms <= 0:
+                    raise AssertionError(("debugged child timed out", protocol.snapshot()))
                 event = DebugEvent()
-                if not kernel32.WaitForDebugEvent(
-                    ctypes.byref(event), remaining_ms
-                ):
+                if not kernel32.WaitForDebugEvent(ctypes.byref(event), remaining_ms):
                     raise debug_wait_error(kernel32, process, remaining_ms, protocol)
-                continue_status = protocol.continue_status(event)
-                if event.dwDebugEventCode in (3, 6) and event.payload.file:
-                    kernel32.CloseHandle(event.payload.file)
+                # Save ownership before any hFile/protocol/continue operation can fail.
+                pending_event, pending_status = event, None
+                pending_status = protocol.continue_status(event)
+                # Resource/control ownership must also survive optimized Python
+                # or an injected protocol callback returning an invalid verdict.
+                if event.dwProcessId != process.dwProcessId:
+                    raise AssertionError(("debug event belongs to another process", protocol.snapshot()))
+                if not 1 <= event.dwDebugEventCode <= 9:
+                    raise AssertionError(("invalid debug event", protocol.snapshot()))
+                close_event_file(event)
                 exited = event.dwDebugEventCode == 5
-                assert kernel32.ContinueDebugEvent(
-                    event.dwProcessId, event.dwThreadId, continue_status
-                )
+                checked(kernel32.ContinueDebugEvent(
+                    event.dwProcessId, event.dwThreadId, pending_status), "ContinueDebugEvent")
+                pending_event, pending_status = None, None
                 if exited:
                     break
-        else:
-            wait_result = kernel32.WaitForSingleObject(process.hProcess, 30000)
-            assert wait_result == 0, (
-                f"forced-ASLR child wait failed: {wait_result}"
-            )
+        wait_result = kernel32.WaitForSingleObject(process.hProcess, 30000)
+        if wait_result != 0:
+            error = AssertionError(f"forced-ASLR child wait failed: {wait_result}")
+            if wait_result == 0xFFFFFFFF:
+                error.add_note(f"WaitForSingleObject winerror={ctypes.get_last_error()}")
+            raise error
+        terminal = True
         exit_code = wintypes.DWORD()
-        assert kernel32.GetExitCodeProcess(
-            process.hProcess, ctypes.byref(exit_code)
-        )
+        checked(kernel32.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code)),
+                "GetExitCodeProcess")
         if debugged:
             protocol.validate_exit(exit_code.value)
 
@@ -603,33 +622,54 @@ def _run_packed_forced_aslr(
             while True:
                 buffer = ctypes.create_string_buffer(4096)
                 read = wintypes.DWORD()
-                if not kernel32.ReadFile(
-                    handle, buffer, len(buffer), ctypes.byref(read), None
-                ):
-                    assert ctypes.get_last_error() == 109
+                if not kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
+                    if ctypes.get_last_error() != 109:
+                        checked(False, "ReadFile")
                     break
                 if read.value == 0:
                     break
                 chunks.append(buffer.raw[:read.value])
             return b"".join(chunks)
 
-        stdout = read_pipe(stdout_read)
-        stderr = read_pipe(stderr_read)
         return subprocess.CompletedProcess(
-            [str(executable)], exit_code.value, stdout, stderr
-        )
+            [str(executable)], exit_code.value, read_pipe(stdout_read), read_pipe(stderr_read))
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        kernel32.DeleteProcThreadAttributeList(attribute_list)
-        for handle in (
-            stdout_read,
-            stdout_write,
-            stderr_read,
-            stderr_write,
-            process.hThread,
-            process.hProcess,
-        ):
+        original_last_error = ctypes.get_last_error()
+        cleanup_errors = []
+        cleanup_report = None
+        if created and not terminal:
+            try:
+                cleanup_report = reap_failed_native_child(
+                    kernel32, process, debugged=debugged, event_factory=DebugEvent,
+                    pending_event=pending_event, pending_status=pending_status,
+                    close_event_file=close_event_file)
+            except BaseException as exc:
+                cleanup_errors.append(f"owned-child reaper raised {type(exc).__name__}: {exc}")
+        if attribute_initialized:
+            try:
+                kernel32.DeleteProcThreadAttributeList(attribute_list)
+            except BaseException as exc:
+                cleanup_errors.append(f"attribute deletion raised {type(exc).__name__}: {exc}")
+        handles = [stdout_read, stdout_write, stderr_read, stderr_write]
+        if created:
+            handles.extend((process.hThread, process.hProcess))
+        for handle in handles:
             if handle:
-                kernel32.CloseHandle(handle)
+                try:
+                    if not kernel32.CloseHandle(handle):
+                        cleanup_errors.append(f"CloseHandle failed winerror={ctypes.get_last_error()}")
+                except BaseException as exc:
+                    cleanup_errors.append(f"CloseHandle raised {type(exc).__name__}: {exc}")
+        ctypes.set_last_error(original_last_error)
+        details = {"child": cleanup_report, "resource_errors": cleanup_errors}
+        if failure is not None and (cleanup_report is not None or cleanup_errors):
+            failure.add_note("native child cleanup: " + json.dumps(details, sort_keys=True))
+        elif cleanup_errors:
+            raise AssertionError("forced-ASLR resource cleanup failed: " + json.dumps(details))
+
 
 
 def _build_cwd_probe_fixture(work: Path) -> tuple[Path, Path]:
