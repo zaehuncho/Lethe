@@ -70,14 +70,18 @@ replay. It runs `test_native_runtime_hardening_stress.py`,
 the six required post-startup/export-tamper nodes in `test_native_exe_exports.py`
 against the exact rebuilt artifact. Six additional mandatory nodes in
 `test_lifter_frame_call_native.py` compile source-level primitive fixtures from
-the same release source; these six do not execute the candidate DLL. The command
-requires all thirty cases without
-skips, and proves the selected EXE leaf emits
+the same release source; these six do not execute the candidate DLL. The command requires every node in `REQUIRED_NATIVE_RUNTIME_NODE_IDS` from
+[`tools/promote_stub.py`](../tools/promote_stub.py), without skips. Its required
+pass count is derived by `REQUIRED_NATIVE_RUNTIME_PASS_COUNT`, not duplicated
+here. The selected EXE leaf emits
 a paged-v1 program whose eager and memory-guard packed outputs match the
 original. The DLL E2E case additionally proves a source-bound schema-v3
-selection with a canonical padded suffix preserves host-visible behavior. A
-separate candidate-bound EXE case virtualizes a caller while leaving its
-PDATA-proven direct callee native, then proves forced-ASLR packed parity.
+selection with a canonical padded suffix preserves host-visible behavior. The required node
+`tests/test_native_virtualization_runtime.py::test_retained_native_callee_discovery_rejects_forced_aslr_exe`
+checks original forced-ASLR success (`vm-answer=42`) alongside the typed
+discovery rejection `retained PDATA native CALL lacks physical return-slot`
+and no packed output. It does not admit or execute a packed native CALL;
+retained PDATA identity alone does not prove the physical callee-frame contract.
 The separate EXE/DLL round-trip gate requires its complete nineteen-check
 contract and rejects reduced, duplicated, nested, or contradictory summaries.
 The optional early-dependency-attach EXE export characterization remains
@@ -112,6 +116,14 @@ DLL without terminating the host process.
 The harness captures the packer's stdout and stderr independently. Runtime
 stdout, stderr, and exit code are recorded in JSON even when the packed process
 fails before `main`.
+
+Default pytest faulthandler diagnostics remain enabled. Known Unicorn 2.1.4
+oracle stderr can contain access-violation-labelled `unicorn.py:831 mem_map`
+diagnostics even when its process completes with exit 0; retain the raw stderr
+and terminal outcome. A no-Lethe dependency probe reproduces the label before
+its expected result. The internal root cause remains unidentified and is
+not fixed. These dependency diagnostics are distinct from real native fixture
+faults, and no suppression or runtime repair is claimed.
 
 ```powershell
 .\tests\build_production_corpus.ps1 -OutDir .test-production-corpus

@@ -33,6 +33,10 @@ from .selected_wrapper_binding import (
     SelectedWrapperLinkInputs, SelectedWrapperProofError, _MaterializedWrapperEntry,
     validate_inputs as _validate_selected_wrapper_inputs, prove_selected_wrapper,
 )
+from .runtime_coff_compile import (
+    RuntimeCompileError, require_runtime_compile_ready,
+    prove_runtime_coff_compilation,
+)
 
 
 class ProductLinkProofError(ValueError):
@@ -333,6 +337,7 @@ def verify_product_fixture_final_link(
     source: ProductSourceInputs, header: Path, generated_dir: Path,
     replay: ReplayInputs, *, synthetic_fixture_key: bytes,
     selected_reference_inputs: SelectedWrapperLinkInputs,
+    runtime_compile_session=None,
 ) -> dict[str, object]:
     """Re-prove current source and synthetic VM output, then replay exact PE."""
     if type(synthetic_fixture_key) is not bytes or len(synthetic_fixture_key) != 32:
@@ -341,6 +346,15 @@ def verify_product_fixture_final_link(
         _validate_selected_wrapper_inputs(selected_reference_inputs)
     except SelectedWrapperProofError as exc:
         raise ProductLinkProofError(str(exc)) from exc
+    try:
+        require_runtime_compile_ready(runtime_compile_session)
+    except RuntimeCompileError as exc:
+        raise ProductLinkProofError(f"runtime compilation preflight failed: {exc}") from exc
+    if (type(replay) is not ReplayInputs or not all(
+            isinstance(getattr(replay, name), Path) for name in (
+                "capture_dir", "built_image", "built_pdb", "built_map",
+                "replay_dir", "link_exe", "vsdevcmd"))):
+        raise ProductLinkProofError("exact replay paths required")
     replay_root = Path(replay.replay_dir)
     # The fresh generated copy is distinct from the replay capture copy.
     if replay_root.exists() and any(replay_root.iterdir()):
@@ -373,6 +387,13 @@ def verify_product_fixture_final_link(
         ("source_map", source.link_map), ("source_coff", source.helper_object),
         ("source_header", header),
     )}
+    capture_pins = {
+        path: {name: _sha(raw) for name, raw in _capture_files(path).items()}
+        for path in (selected_reference_inputs.original_capture, replay.capture_dir)
+    }
+    tool_pins = {Path(path): _sha(_read(Path(path), "public proof tool"))
+                 for path in (source.dia_helper, source.msdia, source.typed_abi_helper,
+                              replay.link_exe, replay.vsdevcmd)}
     final_raw = _read(Path(replay.built_image), "built VM PE")
     final_pdb_raw = _read(Path(replay.built_pdb), "built VM PDB")
     final_map_raw = _read(Path(replay.built_map), "built VM MAP")
@@ -487,6 +508,27 @@ def verify_product_fixture_final_link(
     except (SelectedWrapperProofError, ProductSourceProofError,
             ValueError, OSError) as exc:
         raise ProductLinkProofError(f"selected wrapper reference proof failed: {exc}") from exc
+    try:
+        runtime_compilation = prove_runtime_coff_compilation(
+            runtime_compile_session, selected_reference_inputs.generated_inputs,
+            Path(replay.capture_dir))
+    except (RuntimeCompileError, OSError) as exc:
+        raise ProductLinkProofError(f"runtime compilation proof failed: {exc}") from exc
+    for path, raw in ((replay.built_image, final_raw), (replay.built_pdb, final_pdb_raw),
+                      (replay.built_map, final_map_raw)):
+        if _read(Path(path), "post-compile final artifact") != raw:
+            raise ProductLinkProofError("final VM artifact changed during compilation")
+    for path, pins in capture_pins.items():
+        if {name: _sha(raw) for name, raw in _capture_files(path).items()} != pins:
+            raise ProductLinkProofError("LINK capture changed during runtime compilation")
+    if capture_pins[replay.capture_dir] != result["capture_file_sha256"]:
+        raise ProductLinkProofError("runtime compilation and replay capture pins differ")
+    for path, digest in selected_binding["compiled_input_sha256"].items():
+        if _sha(_read(Path(path), "post-compile generated object")) != digest:
+            raise ProductLinkProofError("generated object changed during runtime compilation")
+    for path, digest in tool_pins.items():
+        if _sha(_read(path, "post-compile public proof tool")) != digest:
+            raise ProductLinkProofError("public proof tool changed during runtime compilation")
     if any(_sha(_read(actual / name, "generated fixture")) != digest
            for name, digest in generated_pins.items()):
         raise ProductLinkProofError("generated fixture changed during replay")
@@ -518,13 +560,15 @@ def verify_product_fixture_final_link(
         "authenticated_selected_wrapper_reference_binding_proven": True,
         "selected_direct_source_output_equivalence_proven": True,
         "global_source_output_reference_equivalence_proven": False,
-        "runtime_source_compile_binding_proven": False,
+        "runtime_source_compile_binding_proven":
+            runtime_compilation["runtime_source_compile_binding_proven"],
         "indirect_target_closure_proven": False,
         "xfg_enforcement_proven": False,
         "production_key_service_configured": False,
         "production_admitted": False,
         "replay": result,
         "selected_reference_binding": selected_binding,
+        "runtime_compilation": runtime_compilation,
     }
 
 

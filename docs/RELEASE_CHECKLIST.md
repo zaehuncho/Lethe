@@ -35,18 +35,28 @@ experimental.
 
 ```powershell
 uv sync --frozen --group dev
-uv run pytest -q -p no:cacheprovider `
+uv run pytest -q -p no:cacheprovider -o addopts= `
   --ignore=tests/test_lifter.py `
   --ignore=tests/test_lifter_internal_calls.py `
   --ignore=tests/test_lifter_native_runtime.py `
   --ignore=tests/test_lifter_scalar_batch.py
 uv run pytest tests/test_lifter.py tests/test_lifter_internal_calls.py `
   tests/test_lifter_native_runtime.py tests/test_lifter_scalar_batch.py `
-  -q -p no:cacheprovider -p no:faulthandler
+  -q -p no:cacheprovider -o addopts=
 ```
 
-Record the command output and exact pass/skip counts. A skipped optional
-dependency is not a validated subsystem.
+Record stdout, stderr, process exit status and exact pass/skip counts. Keep
+pytest and Python faulthandler enabled; the explicit `-o addopts=` avoids an
+inherited repository addopts suppression. A skipped optional dependency is not
+a validated subsystem.
+
+Observed Unicorn 2.1.4 oracle runs can emit access-violation-labelled faulthandler
+diagnostics at `unicorn.py:831 mem_map` while the corresponding process
+continues to exit 0. Retain the complete stderr and terminal outcome. A separate
+no-Lethe map/write/read/execute probe also reproduces that diagnostic before
+returning the expected result. The internal root cause remains unidentified and
+is not fixed; do not suppress the diagnostic or confuse it with a native
+fixture fault.
 
 The isolated scalar oracle covers every combination of incoming CF/PF/ZF/SF/OF
 through register, XMM, memory, complete-function and relocated-data boundaries.
@@ -317,7 +327,7 @@ and never enables the unverified-stub test override:
 $env:LETHE_RUN_NATIVE_VM_CORPUS = "1"
 $env:LETHE_NATIVE_CORPUS_STUB_PATH = "C:\path\to\candidate\lethe_stub_x64.dll"
 .\.venv\Scripts\python.exe -m pytest tests/test_native_virtualization_corpus.py `
-  -q -p no:cacheprovider
+  -q -p no:cacheprovider -o addopts=
 ```
 
 The run exercises narrow extensions, SET/CMOV selection, ADC/SBB carry,
@@ -528,15 +538,15 @@ also bind `dvm_rolling=true`, `dvm_roll_poison=false`, and
 `dvm_paged_runtime=true`. Conflicting or omitted
 values invalidate the candidate. Rolling support serves internal VM programs,
 while selected-function virtualization continues to use authenticated paging.
-The candidate-bound native runtime record must name the frozen list of forty-two
-node IDs spanning hardening stress, selected-function virtualization E2E,
+The candidate-bound native runtime record must name the exact
+`REQUIRED_NATIVE_RUNTIME_NODE_IDS` inventory in `tools/promote_stub.py`, spanning hardening stress, selected-function virtualization E2E,
 plain and shuffled-rolling STORE128 atomic-fault checks, captured frame calls
 and unwind recovery, XFG preflight, and post-startup EXE exports (one positive plus five directory/snapshot mutations).
 The count-zero mutation may be rejected by Windows before the stub executes;
 it is not proof that the stub's own verifier ran. The optional early-attach
 characterization is excluded and does not establish support. The mandatory
-terminal pytest summary must report exactly forty-two passes
-with no other outcome against the exact candidate hash; the EXE E2E pair must
+terminal pytest summary must report exactly the derived
+`REQUIRED_NATIVE_RUNTIME_PASS_COUNT` passes with no other outcome against the exact candidate hash; the EXE E2E pair must
 execute paged-v1 output in eager and memory-guard modes, and the DLL E2E node
 must execute a source-bound schema-v3 selection with a canonical padded suffix.
 Release replay repeats that same command against the byte-identical rebuilt stub.
