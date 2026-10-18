@@ -96,7 +96,7 @@ Invoke-Tool 'cl.exe' @(
     '/nologo', '/W4', '/WX', '/O2', '/MD', '/GS-', '/guard:cf-', '/c',
     "/Fo:$dependencyObject", $dependencySource)
 Invoke-Tool 'link.exe' @(
-    '/NOLOGO', '/DLL', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA',
+    '/Brepro', '/NOLOGO', '/DLL', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA',
     "/OUT:$dependencyDll", "/IMPLIB:$dependencyLib", $dependencyObject)
 
 Invoke-Tool 'rc.exe' @('/nologo', "/fo$resourceObject", $resourceSource)
@@ -104,7 +104,7 @@ Invoke-Tool 'cl.exe' @(
     '/nologo', '/W4', '/WX', '/O2', '/GS-', '/guard:cf-', '/c',
     "/Fo:$coreObject", $coreSource)
 Invoke-Tool 'link.exe' @(
-    '/NOLOGO', '/NODEFAULTLIB', '/SUBSYSTEM:CONSOLE', '/ENTRY:compat_core_entry',
+    '/Brepro', '/NOLOGO', '/NODEFAULTLIB', '/SUBSYSTEM:CONSOLE', '/ENTRY:compat_core_entry',
     '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/BASE:0x146000000',
     "/OUT:$coreExe", $coreObject, $resourceObject, 'kernel32.lib')
 
@@ -112,7 +112,7 @@ Invoke-Tool 'cl.exe' @(
     '/nologo', '/W4', '/WX', '/O2', '/MD', '/guard:cf', '/c',
     "/Fo:$exeObject", $exeSource)
 Invoke-Tool 'link.exe' @(
-    '/NOLOGO', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf',
+    '/Brepro', '/NOLOGO', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf',
     '/BASE:0x145000000', '/DELAYLOAD:compat_dependency.dll',
     "/OUT:$delayExe", "/LIBPATH:$OutDir", $exeObject, $resourceObject,
     'compat_dependency.lib', 'delayimp.lib')
@@ -121,7 +121,7 @@ Invoke-Tool 'cl.exe' @(
     '/nologo', '/W4', '/WX', '/O2', '/MD', '/guard:cf', '/c',
     "/Fo:$delayDllObject", $delayDllSource)
 Invoke-Tool 'link.exe' @(
-    '/NOLOGO', '/DLL', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA',
+    '/Brepro', '/NOLOGO', '/DLL', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA',
     '/guard:cf', '/DELAYLOAD:compat_dependency.dll', '/DELAY:UNLOAD',
     "/OUT:$delayDll", "/IMPLIB:$delayDllLib", "/LIBPATH:$OutDir",
     $delayDllObject, 'compat_dependency.lib', 'delayimp.lib')
@@ -129,7 +129,7 @@ Invoke-Tool 'cl.exe' @(
     '/nologo', '/W4', '/WX', '/O2', '/MD', '/guard:cf', '/c',
     "/Fo:$delayDllHostObject", $delayDllHostSource)
 Invoke-Tool 'link.exe' @(
-    '/NOLOGO', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf',
+    '/Brepro', '/NOLOGO', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf',
     "/OUT:$delayDllHost", $delayDllHostObject)
 
 foreach ($artifact in @($dependencyDll, $dependencyLib, $coreExe, $delayExe,

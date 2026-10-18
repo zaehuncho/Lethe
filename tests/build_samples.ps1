@@ -84,7 +84,7 @@ New-Item -ItemType Directory -Force -Path $ObjDir | Out-Null
 # Hardening flags shared with the real Orion binaries (plan: /guard:cf etc.).
 $CommonC   = @('/nologo', '/W4', '/WX', '/Gy', '/guard:cf')
 $OptC      = if ($Config -eq 'Release') { @('/O2', '/MD', '/DNDEBUG') } else { @('/Od', '/MDd', '/Zi') }
-$LinkFlags = @('/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf')
+$LinkFlags = @('/Brepro', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/guard:cf')
 
 function Invoke-Cl {
     # NB: do NOT name this parameter $Args -- that shadows PowerShell's automatic
@@ -211,7 +211,7 @@ try {
         @('/nologo', '/W4', '/WX', '/O2', '/GS-', '/guard:cf-', '/c',
           "/Fo:$ObjDir\return_entry_exe.obj", $returnEntrySrc))
     Write-Step 'link return_entry_exe.exe'
-    & link.exe /NOLOGO /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:return_37 `
+    & link.exe /Brepro /NOLOGO /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:return_37 `
         /FIXED /NXCOMPAT `
         "/OUT:return_entry_exe.exe" "$ObjDir\return_entry_exe.obj" kernel32.lib
     if ($LASTEXITCODE -ne 0) {
