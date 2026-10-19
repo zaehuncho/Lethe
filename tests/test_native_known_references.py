@@ -38,9 +38,12 @@ def _build(work):
         segment_body = (
             "segment_probe PROC FRAME\n .endprolog\n movzx eax,byte ptr " + kind +
             ":[reference_slot]\n ret\nsegment_probe ENDP\n" if kind in ("fs", "gs") else "")
+        # Keep the fixture's ASLR relocation directory, but do not introduce an
+        # unrelated relocation into the function selected for virtualization.
+        slot_target = {"lea_entry": "native_probe", "lea_compare": "native_probe"}.get(kind, "vm_probe")
         assembly = ("OPTION CASEMAP:NONE\nPUBLIC vm_probe\nPUBLIC reference_slot\nPUBLIC native_probe\n" +
                     ("PUBLIC segment_probe\n" if segment_body else "") + ".data\n" +
-                    "reference_slot QWORD " + ("native_probe" if kind == "lea_entry" else "vm_probe") + ("+" + str(offset) if offset else "") +
+                    "reference_slot QWORD " + slot_target + ("+" + str(offset) if offset else "") +
                     "\n.code\nvm_probe PROC FRAME\n .endprolog\n nop\n mov eax,42\n ret\nvm_probe ENDP\n"
                     "native_probe PROC FRAME\n" + body + "\nnative_probe ENDP\n" + segment_body + "END\n")
         (source / (kind + ".asm")).write_text(assembly)
