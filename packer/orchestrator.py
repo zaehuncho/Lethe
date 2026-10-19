@@ -128,6 +128,7 @@ class PackOptions:
     virtualization_pdb_path: Optional[str] = None
     virtualization_dia_helper_path: Optional[str] = None
     virtualization_msdia_path: Optional[str] = None
+    virtualization_native_import_contract_path: Optional[str] = None
 
 
 @dataclass
@@ -724,6 +725,17 @@ def pack_file(input_path: str, options: PackOptions,
             raise ValueError(
                 "virtualization selection manifest is incompatible with explicit "
                 "function/proof options")
+        native_import_contract_path = getattr(
+            options, "virtualization_native_import_contract_path", None)
+        if native_import_contract_path is not None and (
+                not isinstance(native_import_contract_path, str)
+                or not native_import_contract_path or "\0" in native_import_contract_path):
+            raise ValueError(
+                "virtualization_native_import_contract_path must be a nonempty path")
+        if native_import_contract_path is not None and (
+                not virtualization_specs or selection_manifest):
+            raise ValueError(
+                "native import call contracts require explicit selected functions")
         has_virtualization_selection = bool(
             virtualization_specs or selection_manifest)
         pdb_inputs = (
@@ -818,6 +830,14 @@ def pack_file(input_path: str, options: PackOptions,
                 or _same_file_or_path(pdb_inputs[1], pdb_inputs[2])
             ):
                 raise ValueError("PDB coverage inputs must be distinct files")
+        if native_import_contract_path is not None:
+            for other_path, label in (
+                    (input_path, "input"), (output_path, "output"),
+                    (getattr(options, "stub_path", None), "stub")):
+                if other_path and _same_file_or_path(
+                        native_import_contract_path, other_path):
+                    raise ValueError(
+                        f"native import contract must not alias {label}")
         out_dir = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1028,8 +1048,16 @@ def pack_file(input_path: str, options: PackOptions,
                 rolling=False,
                 rolling_seed=None,
                 pdb_coverage_proof=(coverage if all(pdb_inputs) else None),
+                native_import_contract_path=native_import_contract_path,
             )
             parsed = materialized.parsed
+            if materialized.manifest.native_import_call_proofs:
+                _emit(
+                    progress,
+                    "verified "
+                    f"{len(materialized.manifest.native_import_call_proofs)} "
+                    "native import leaf call site(s) against exact dependency hashes",
+                )
             _emit(
                 progress,
                 f"virtualized {len(materialized.manifest.functions)} selected "

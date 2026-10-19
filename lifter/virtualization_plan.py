@@ -554,6 +554,7 @@ class VirtualizationManifest:
     functions: tuple[VirtualizedFunction, ...]
     source_coverage_mode: str = "legacy"
     pdb_commit_binding: pdb_coverage.PdbCommitBinding | None = None
+    native_import_call_proofs: tuple[native_tail_calls.VerifiedNativeImportCallProof, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         record = {
@@ -581,6 +582,10 @@ class VirtualizationManifest:
             "external_entry_assumption": EXTERNAL_ENTRY_ASSUMPTION,
             "functions": [function.to_dict() for function in self.functions],
         }
+        if self.native_import_call_proofs:
+            record["native_import_call_proofs"] = [
+                proof.to_dict() for proof in self.native_import_call_proofs
+            ]
         if self.source_coverage_mode != "legacy" or self.pdb_commit_binding is not None:
             record["source_coverage_mode"] = self.source_coverage_mode
             binding = self.pdb_commit_binding
@@ -1071,6 +1076,7 @@ def _compile_one(
     guard_cf_dispatch_rva: int | None = None,
     native_runtime_ranges: Sequence[tuple[int, int]] = (),
     source_import_iat_rvas: frozenset[int] = frozenset(),
+    native_import_call_proofs: tuple[native_tail_calls.VerifiedNativeImportCallProof, ...] = (),
     mutate_level: int = 0,
     mutate_master: bytes | None = None,
 ) -> _Compiled:
@@ -1132,10 +1138,22 @@ def _compile_one(
             selected_extents=selected_extents, import_iat_rvas=source_import_iat_rvas)
     opaque_sites = native_tail_calls.opaque_native_call_sites(
         lifted_body, base=spec.rva, iat_tail_targets=iat_tail_targets)
-    if opaque_sites:
+    approved_sites = tuple(
+        proof.call_rva for proof in native_import_call_proofs
+        if proof.function_rva == spec.rva
+    )
+    if len(set(approved_sites)) != len(approved_sites):
+        raise FunctionRejected(spec, "duplicate native import call-frame proof")
+    stale_sites = tuple(site for site in approved_sites if site not in opaque_sites)
+    if stale_sites:
+        raise FunctionRejected(
+            spec, f"native import call-frame proof is stale at 0x{stale_sites[0]:X}"
+        )
+    unproven_sites = tuple(site for site in opaque_sites if site not in approved_sites)
+    if unproven_sites:
         raise FunctionRejected(
             spec, "opaque native CALL lacks physical callee return-address "
-            f"and shadow-space effects proof at 0x{opaque_sites[0]:X}",
+            f"and shadow-space effects proof at 0x{unproven_sites[0]:X}",
         )
     try:
         call_analysis = x64_lifter.analyze_internal_calls(
@@ -1249,6 +1267,7 @@ def compile_virtualization_manifest(
     guard_cf_dispatch_rva: int | None = None,
     program_sealer: Callable[[FunctionSpec, bytes], tuple[bytes, bytes]] | None = None,
     source_import_iat_rvas: tuple[int, ...] = (),
+    native_import_call_proofs: tuple[native_tail_calls.VerifiedNativeImportCallProof, ...] = (),
     mutate_level: int = 0,
     mutate_master: bytes | None = None,
 ) -> VirtualizationManifest:
@@ -1335,6 +1354,50 @@ def compile_virtualization_manifest(
         import_iat_rvas = native_tail_calls.validated_import_iat_rvas(source_import_iat_rvas)
     except ValueError as exc:
         raise VirtualizationPlanError(str(exc)) from exc
+    if type(native_import_call_proofs) is not tuple or any(
+        type(proof) is not native_tail_calls.VerifiedNativeImportCallProof
+        for proof in native_import_call_proofs
+    ):
+        raise VirtualizationPlanError(
+            "native import call-frame proofs must be verified immutable records"
+        )
+    specs_by_rva = {spec.rva: spec for spec in ordered}
+    seen_proof_sites: set[int] = set()
+    for proof in native_import_call_proofs:
+        spec = specs_by_rva.get(proof.function_rva)
+        if (spec is None
+                or any(type(value) is not int for value in (
+                    proof.function_rva, proof.call_rva, proof.iat_rva,
+                    proof.export_rva, proof.export_ordinal, proof.body_size,
+                ))
+                or not spec.rva <= proof.call_rva < spec.rva + spec.body_size
+                or proof.call_rva in seen_proof_sites
+                or proof.iat_rva not in import_iat_rvas
+                or not 0 < proof.export_rva < _RVA_LIMIT
+                or not 1 <= proof.export_ordinal <= 0xFFFF
+                or not 1 <= proof.body_size <= 256
+                or type(proof.module) is not str or not proof.module
+                or type(proof.symbol) is not str or not proof.symbol
+                or type(proof.dependency_sha256) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", proof.dependency_sha256)
+                or type(proof.body_sha256) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", proof.body_sha256)):
+            raise VirtualizationPlanError(
+                "native import call-frame proof is malformed or outside the selection"
+            )
+        try:
+            body = reader.read_file_backed_executable(spec.rva, spec.body_size)
+        except (TypeError, ValueError, VirtualizationPlanError) as exc:
+            raise VirtualizationPlanError(
+                f"native import proof source body cannot be read: {exc}"
+            ) from exc
+        if native_tail_calls.rip_relative_import_call_target(
+            body, base=spec.rva, call_rva=proof.call_rva
+        ) != proof.iat_rva:
+            raise VirtualizationPlanError(
+                "native import call-frame proof does not match the source CALL"
+            )
+        seen_proof_sites.add(proof.call_rva)
 
     # PDATA and import metadata prove target identity, not parity of the
     # callee's physical return address or caller shadow-space side effects.
@@ -1367,6 +1430,7 @@ def compile_virtualization_manifest(
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
             native_runtime_ranges=runtime_ranges,
             source_import_iat_rvas=import_iat_rvas,
+            native_import_call_proofs=native_import_call_proofs,
             mutate_level=mutate_level,
             mutate_master=mutate_master,
         )
@@ -1505,6 +1569,10 @@ def compile_virtualization_manifest(
             ),
         )
         has_internal_calls = bool(item.call_analysis.internal_call_rvas)
+        has_verified_native_import_call = any(
+            proof.function_rva == item.spec.rva
+            for proof in native_import_call_proofs
+        )
         capabilities = {
             "cet_shadow_stack_balanced": True,
             "cfg_target_declared": False,
@@ -1515,12 +1583,13 @@ def compile_virtualization_manifest(
             # Win64 home-slot effects have a validated equivalent.
             "external_calls_supported": False,
             "direct_native_calls_supported": False,
-            "rip_relative_import_calls_supported": False,
+            "rip_relative_import_calls_supported": has_verified_native_import_call,
+            "native_import_leaf_call_frame_proven": has_verified_native_import_call,
             "guard_cf_dispatch_calls_supported": False,
-            "native_call_volatile_frame_round_trip": False,
-            "native_call_positional_fp_supported": False,
+            "native_call_volatile_frame_round_trip": has_verified_native_import_call,
+            "native_call_positional_fp_supported": has_verified_native_import_call,
             "native_call_bounded_eight_argument_abi": False,
-            "native_call_bounded_outgoing_span_abi": False,
+            "native_call_bounded_outgoing_span_abi": has_verified_native_import_call,
             "guard_cf_original_dispatch_invoked": False,
             "external_interior_entries_supported": False,
             "direct_internal_calls_supported": True,
@@ -1666,6 +1735,7 @@ def compile_virtualization_manifest(
         source_exception_metadata_complete=source_exception_metadata_complete,
         exception_table=exception_table,
         functions=tuple(functions),
+        native_import_call_proofs=native_import_call_proofs,
     )
 
 

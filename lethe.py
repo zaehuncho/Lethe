@@ -346,6 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
               "tools/virtualization_report.py"),
     )
     parser.add_argument(
+        "--virtualization-native-import-contract",
+        default=None,
+        metavar="PATH",
+        help=("exact-source, exact-dependency contract for narrowly proven "
+              "normal-import leaf calls"),
+    )
+    parser.add_argument(
         "--virtualization-pdb", metavar="PATH", default=None,
         help="exact source PDB for RSDS-bound executable coverage proof",
     )
@@ -470,6 +477,12 @@ def main(
         return EXIT_USAGE
     has_virtualization_selection = bool(
         args.virtualize_function or args.virtualization_selection_manifest)
+    if args.virtualization_native_import_contract and (
+            not args.virtualize_function or args.virtualization_selection_manifest):
+        print("error: --virtualization-native-import-contract requires explicit "
+              "--virtualize-function selections and cannot be combined with a "
+              "selection manifest", file=sys.stderr)
+        return EXIT_USAGE
     if has_virtualization_selection and not args.enable_experimental_virtualization:
         print("error: selected-function virtualization requires "
               "--enable-experimental-virtualization", file=sys.stderr)
@@ -561,6 +574,8 @@ def main(
         stub_path=args.stub_path,
         virtualization_selection_manifest=(
             args.virtualization_selection_manifest),
+        virtualization_native_import_contract_path=(
+            args.virtualization_native_import_contract),
         virtualization_pdb_path=args.virtualization_pdb,
         virtualization_dia_helper_path=args.virtualization_dia_helper,
         virtualization_msdia_path=args.virtualization_msdia,

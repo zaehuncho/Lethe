@@ -17,9 +17,9 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
 from lifter import virtualization_plan as plan
-from lifter import direct_control_flow, pdb_coverage, win64_thunk
+from lifter import direct_control_flow, native_tail_calls, pdb_coverage, win64_thunk
 
-from . import bytecode_pages, cfg_preservation, pe_analyze
+from . import bytecode_pages, cfg_preservation, native_import_contract, pe_analyze
 from .assemble import AssembleError, _StubImage
 
 
@@ -501,6 +501,7 @@ def _compile_manifest(
     rolling: bool,
     rolling_seed: bytes | None,
     page_master_key: bytes,
+    native_import_call_proofs: tuple[native_tail_calls.VerifiedNativeImportCallProof, ...] = (),
 ) -> tuple[plan.VirtualizationManifest, StubVirtualizationProvenance]:
     _validate_padding_suffix_bindings(parsed, specs)
     text_rva, data_rva = _next_generated_rvas(parsed, len(specs))
@@ -563,6 +564,7 @@ def _compile_manifest(
         guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         source_import_iat_rvas=tuple(function.iat_rva
                                     for dll in parsed.imports for function in dll.funcs),
+        native_import_call_proofs=native_import_call_proofs,
         program_sealer=seal_program,
     )
     try:
@@ -1227,6 +1229,7 @@ def materialize_selected_functions(
     rolling: bool = False,
     rolling_seed: bytes | None = None,
     pdb_coverage_proof: pdb_coverage.PdbCoverageProof | None = None,
+    native_import_contract_path: str | None = None,
 ) -> MaterializationResult:
     """Compile and atomically materialize explicit first-party function specs."""
     if not isinstance(parsed, pe_analyze.ParsedPE):
@@ -1244,6 +1247,17 @@ def materialize_selected_functions(
             )
         except pdb_coverage.PdbCoverageError as exc:
             raise _fail(f"PDB preflight binding rejected: {exc}") from exc
+    if native_import_contract_path is None:
+        native_import_call_proofs = ()
+    else:
+        try:
+            native_import_call_proofs = native_import_contract.load_and_verify(
+                native_import_contract_path,
+                parsed=parsed,
+                specs=tuple(specs),
+            )
+        except native_import_contract.NativeImportContractError as exc:
+            raise _fail(f"native import contract rejected: {exc}") from exc
     stub, common_export_rva, exported_hash, exported_handler_hash = _read_stub_provenance(
         stub_bytes,
         opcode_table,
@@ -1263,6 +1277,7 @@ def materialize_selected_functions(
         rolling=rolling,
         rolling_seed=rolling_seed,
         page_master_key=page_master_key,
+        native_import_call_proofs=native_import_call_proofs,
     )
     if pdb_binding is not None:
         manifest = replace(

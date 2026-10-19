@@ -52,11 +52,13 @@ def test_cli_defaults_are_release_safe():
     assert args.enable_experimental_virtualization is False
     assert args.virtualize_function == []
     assert args.virtualization_selection_manifest is None
+    assert args.virtualization_native_import_contract is None
     assert args.virtualization_gap == []
     assert args.virtualization_tail_exit == []
     assert args.acknowledge_unproven_indirect_targets is False
     assert orchestrator.PackOptions().virtualization_specs == ()
     assert orchestrator.PackOptions().virtualization_selection_manifest is None
+    assert orchestrator.PackOptions().virtualization_native_import_contract_path is None
     assert orchestrator.PackOptions().virtualization_gap_acknowledgements == ()
     assert orchestrator.PackOptions().virtualization_tail_exit_approvals == ()
     assert orchestrator.PackOptions().acknowledge_unproven_indirect_targets is False
@@ -92,6 +94,46 @@ def test_virtualization_specs_accept_decimal_and_hex():
         ("Init", 0x1200, 64),
         ("Tick", 8192, 0x20),
     ]
+
+
+def test_cli_routes_native_import_contract_with_explicit_function_selection(
+        monkeypatch, tmp_path):
+    input_path = tmp_path / "app.dll"
+    input_path.write_bytes(b"fixture")
+    captured = {}
+
+    def fake_pack(_path, options, progress=None):
+        captured["options"] = options
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    rc = lethe.main([
+        str(input_path), "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll", "--virtualize-function", "Init:0x1000:16",
+        "--acknowledge-unproven-indirect-targets",
+        "--virtualization-native-import-contract", "native-imports.json",
+    ])
+    assert rc == lethe.EXIT_OK
+    assert captured["options"].virtualization_native_import_contract_path ==         "native-imports.json"
+
+
+@pytest.mark.parametrize("selection", [
+    ["--virtualization-native-import-contract", "native-imports.json"],
+    ["--virtualization-selection-manifest", "selection.json",
+     "--virtualization-native-import-contract", "native-imports.json"],
+])
+def test_cli_rejects_native_import_contract_without_explicit_selection(
+        selection, monkeypatch, tmp_path, capsys):
+    input_path = tmp_path / "app.exe"
+    input_path.write_bytes(b"fixture")
+    monkeypatch.setattr(orchestrator, "pack_file", lambda *_args, **_kwargs:
+                        pytest.fail("packer reached after invalid contract options"))
+    rc = lethe.main([
+        str(input_path), "--enable-experimental-virtualization",
+        "--stub-path", "fresh.dll", *selection,
+    ])
+    assert rc == lethe.EXIT_USAGE
+    assert "native-import-contract requires explicit" in capsys.readouterr().err
 
 
 def test_cli_routes_exact_pdb_coverage_paths_to_packer(monkeypatch, tmp_path):

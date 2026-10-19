@@ -6,11 +6,40 @@ the chain. No arbitrary native leaf, register jump, prefix or body is admitted.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 from iced_x86 import Decoder, MemorySizeExt, Mnemonic, OpKind, Register
 
 MAX_TAIL_INSTRUCTIONS = 16
+@dataclass(frozen=True)
+class VerifiedNativeImportCallProof:
+    """Packer-verified exact source import and dependency leaf identity."""
+
+    function_rva: int
+    call_rva: int
+    iat_rva: int
+    module: str
+    symbol: str
+    dependency_sha256: str
+    export_rva: int
+    export_ordinal: int
+    body_size: int
+    body_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "function_rva": self.function_rva,
+            "call_rva": self.call_rva,
+            "iat_rva": self.iat_rva,
+            "module": self.module,
+            "symbol": self.symbol,
+            "dependency_sha256": self.dependency_sha256,
+            "export_rva": self.export_rva,
+            "export_ordinal": self.export_ordinal,
+            "body_size": self.body_size,
+            "body_sha256": self.body_sha256,
+        }
 _LIMIT = 0x1_0000_0000
 _EXECUTE = 0x20000000
 _DISCARDABLE = 0x02000000
@@ -146,6 +175,21 @@ def retained_pdata_call_sites(
             sites.append(int(instruction.ip))
     return tuple(sites)
 
+
+def rip_relative_import_call_target(code: bytes, *, base: int, call_rva: int) -> int | None:
+    """Return the exact IAT RVA for one canonical indirect import CALL."""
+    for instruction in Decoder(64, bytes(code), ip=base):
+        if instruction.ip != call_rva:
+            continue
+        if (instruction.mnemonic != Mnemonic.CALL or instruction.op_count != 1
+                or instruction.op_kind(0) != OpKind.MEMORY
+                or not instruction.is_ip_rel_memory_operand
+                or instruction.memory_base != Register.RIP
+                or instruction.segment_prefix != Register.NONE
+                or MemorySizeExt.size(instruction.memory_size) != 8):
+            return None
+        return int(instruction.ip_rel_memory_address)
+    return None
 
 def opaque_native_call_sites(
     code: bytes, *, base: int, iat_tail_targets: frozenset[int] = frozenset(),
