@@ -1197,6 +1197,15 @@ def discover_functions(
                 known_entry_targets=(item.target_rva for item in references
                                      if item.address_only),
             ),
+            proven_entry_comparisons=(
+                source_references.proven_entry_address_comparisons(
+                    reference_groups,
+                    known_entry_targets=(
+                        {item.begin for item in runtime}
+                        | {item.rva for item in extents}
+                    ),
+                )
+            ),
         )
         direct_status = "passed"
     except (FunctionDiscoveryError, source_references.SourceReferenceError) as exc:
@@ -1325,6 +1334,15 @@ def discover_functions(
                             known_entry_targets=(item.target_rva for item in
                                                  (*reference_index.references, *leaf_references)
                                                  if item.address_only),
+                        ),
+                        proven_entry_comparisons=(
+                            source_references.proven_entry_address_comparisons(
+                                (*reference_groups, tuple(body.instructions)),
+                                known_entry_targets=(
+                                    {item.begin for item in runtime}
+                                    | {item.rva for item in extents}
+                                ),
+                            )
                         ),
                     ).validate((extent,))
                 except (jump_table.JumpTableUnresolved, source_references.SourceReferenceError) as exc:

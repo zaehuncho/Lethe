@@ -2,9 +2,10 @@
 
 This is not indirect/address-taken closure. Decoded RIP operands, validated
 file-backed DIR64 pointer values, exact PE invocation entries and metadata
-storage spans participate. Exact metadata invocation entries and a bounded
-LEA-to-immediate-CALL use may remain callable. Other address-taken selected
-entries, interior entries and reads of overwritten source bytes may not.
+storage spans participate. Exact metadata invocation entries, a bounded
+LEA-to-immediate-CALL use, and a locally proven LEA-to-CMP-only use of an exact
+function entry may remain valid. Other address-taken selected entries,
+interior entries and reads of overwritten source bytes may not.
 """
 from __future__ import annotations
 
@@ -15,7 +16,16 @@ import re
 import struct
 from typing import Any, Iterable
 
-from iced_x86 import FlowControl, MemorySizeExt, Mnemonic, OpKind, Register
+from iced_x86 import (
+    FlowControl,
+    InstructionInfoFactory,
+    MemorySizeExt,
+    Mnemonic,
+    OpAccess,
+    OpKind,
+    Register,
+    RegisterExt,
+)
 
 
 class SourceReferenceError(ValueError):
@@ -346,6 +356,151 @@ def proven_immediate_entry_calls(
                     and following.op_kind(0) == OpKind.REGISTER
                     and following.op0_register == instruction.op0_register):
                 proven.add((int(instruction.ip), int(instruction.ip_rel_memory_address)))
+    return frozenset(proven)
+
+
+def proven_entry_address_comparisons(
+    decoded_groups: Iterable[Any], *,
+    known_entry_targets: Iterable[int] = (),
+) -> frozenset[tuple[int, int]]:
+    """Prove a local LEA-to-CMP use that only observes an exact entry address.
+
+    The comparison is safe after an entry is replaced by its dispatch thunk,
+    but only if the LEA destination cannot later be dereferenced, stored,
+    passed to a call, or otherwise observed before a full-register overwrite.
+    The proof is deliberately local to one already-decoded function/extent and
+    never establishes indirect-call target closure.
+    """
+    groups = tuple(tuple(getattr(group, "instructions", group))
+                   for group in decoded_groups)
+    entries = frozenset(
+        target for target in known_entry_targets
+        if type(target) is int and target > 0
+    )
+    if not entries:
+        return frozenset()
+    factory = InstructionInfoFactory()
+    reads = {
+        OpAccess.READ, OpAccess.COND_READ,
+        OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE,
+    }
+    writes = {OpAccess.WRITE, OpAccess.COND_WRITE,
+              OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE}
+    proven: set[tuple[int, int]] = set()
+
+    for instructions in groups:
+        by_ip = {int(item.ip): item for item in instructions}
+        for lea in instructions:
+            if (lea.mnemonic != Mnemonic.LEA
+                    or not lea.is_ip_rel_memory_operand
+                    or lea.memory_base != Register.RIP
+                    or lea.op_count != 2
+                    or lea.op_kind(0) != OpKind.REGISTER
+                    or lea.op0_register not in _POINTER_REGISTERS):
+                continue
+            target = int(lea.ip_rel_memory_address)
+            if target not in entries:
+                continue
+            register = lea.op0_register
+            parent = RegisterExt.full_register(register)
+            compare = None
+            cursor = int(lea.next_ip)
+            prelude_seen: set[int] = set()
+            while cursor in by_ip and cursor not in prelude_seen:
+                prelude_seen.add(cursor)
+                item = by_ip[cursor]
+                if (item.mnemonic == Mnemonic.CMP and item.op_count == 2
+                        and any(item.op_kind(i) == OpKind.REGISTER and
+                                RegisterExt.full_register(item.op_register(i)) == parent
+                                for i in range(2))):
+                    compare = item
+                    break
+                info = factory.info(item)
+                if any(RegisterExt.full_register(used.register) == parent
+                       for used in info.used_registers()):
+                    break
+                if item.flow_control != FlowControl.NEXT:
+                    break
+                cursor = int(item.next_ip)
+            if compare is None:
+                continue
+
+            # The CMP is the only permitted read of the address value. Walk
+            # both sides of every local branch until RET or a full-width
+            # overwrite kills that value. Any additional read, partial write,
+            # external edge, or call keeps the reference fail-closed.
+            pending = [int(compare.next_ip)]
+            visited: set[int] = set()
+            safe = True
+            while pending and safe:
+                ip = pending.pop()
+                if ip in visited:
+                    continue
+                visited.add(ip)
+                item = by_ip.get(ip)
+                if item is None:
+                    safe = False
+                    break
+                if item.flow_control == FlowControl.RETURN:
+                    continue
+                if item.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
+                    safe = False
+                    break
+                info = factory.info(item)
+                accesses = [
+                    (used.register, used.access)
+                    for used in info.used_registers()
+                    if RegisterExt.full_register(used.register) == parent
+                ]
+                if any(access in reads for _, access in accesses):
+                    safe = False
+                    break
+                writes_parent = [
+                    (used_register, access)
+                    for used_register, access in accesses
+                    if access in writes
+                ]
+                if writes_parent:
+                    # Conditional and partial writes may retain some or all of
+                    # the selected address. Only unconditional 32/64-bit GPR
+                    # writes are a proven kill (32-bit writes zero-extend).
+                    if (len(writes_parent) != 1
+                            or writes_parent[0][1] != OpAccess.WRITE
+                            or not (RegisterExt.is_gpr32(writes_parent[0][0])
+                                    or RegisterExt.is_gpr64(writes_parent[0][0]))):
+                        safe = False
+                    continue
+                next_ip = int(item.next_ip)
+                if item.flow_control == FlowControl.UNCONDITIONAL_BRANCH:
+                    if (item.op_count != 1
+                            or item.op_kind(0) not in {
+                                OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32,
+                                OpKind.NEAR_BRANCH64,
+                            }
+                            or int(item.near_branch_target) not in by_ip):
+                        safe = False
+                    else:
+                        pending.append(int(item.near_branch_target))
+                elif item.flow_control == FlowControl.CONDITIONAL_BRANCH:
+                    if (item.op_count != 1
+                            or item.op_kind(0) not in {
+                                OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32,
+                                OpKind.NEAR_BRANCH64,
+                            }
+                            or int(item.near_branch_target) not in by_ip
+                            or next_ip not in by_ip):
+                        safe = False
+                    else:
+                        pending.extend((int(item.near_branch_target), next_ip))
+                elif item.flow_control == FlowControl.NEXT:
+                    if next_ip not in by_ip:
+                        safe = False
+                    else:
+                        pending.append(next_ip)
+                else:
+                    safe = False
+            if safe:
+                proven.add((int(lea.ip), target))
     return frozenset(proven)
 
 
@@ -744,11 +899,13 @@ class SourceReferenceIndex:
     """Build once; query candidate extents without rescanning the image."""
 
     def __init__(self, references: Iterable[SourceReference], *,
-                 proven_entry_calls: Iterable[tuple[int, int]] = ()) -> None:
+                 proven_entry_calls: Iterable[tuple[int, int]] = (),
+                 proven_entry_comparisons: Iterable[tuple[int, int]] = ()) -> None:
         self.references = tuple(sorted(references))
         self.starts = tuple(item.target_rva for item in self.references)
         self.max_size = max((item.size for item in self.references), default=1)
         self.proven_entry_calls = frozenset(proven_entry_calls)
+        self.proven_entry_comparisons = frozenset(proven_entry_comparisons)
 
     def rejection(self, name: str, rva: int, size: int) -> str | None:
         start = bisect_left(self.starts, rva - self.max_size + 1)
@@ -760,6 +917,9 @@ class SourceReferenceIndex:
                 continue
             if (item.target_rva == rva and item.kind == "RIP address"
                     and (item.source_rva, rva) in self.proven_entry_calls):
+                continue
+            if (item.target_rva == rva and item.kind == "RIP address"
+                    and (item.source_rva, rva) in self.proven_entry_comparisons):
                 continue
             return (
                 f"known source reference: {item.kind} at RVA 0x{item.source_rva:X} "

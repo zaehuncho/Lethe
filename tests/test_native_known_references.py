@@ -15,6 +15,7 @@ from tests import test_native_virtualization_runtime as runtime
 _C = 'typedef unsigned long DWORD;\n__declspec(dllimport) void* __stdcall GetStdHandle(DWORD);\n__declspec(dllimport) int __stdcall WriteFile(void*,const void*,DWORD,DWORD*,void*);\n__declspec(dllimport) void __stdcall ExitProcess(unsigned int);\nextern int vm_probe(void);\nextern unsigned int native_probe(void);\nstatic char* append(char* p,const char* s){while(*s)*p++=*s++;return p;}\nstatic char* number(char* p,unsigned int n){char t[12];unsigned int k=0;do{t[k++]=(char)(\'0\'+n%10);n/=10;}while(n);while(k)*p++=t[--k];return p;}\n__declspec(dllexport) int fixture_run(void){char b[128];char* p=b;DWORD count;unsigned int v=(unsigned int)vm_probe();unsigned int n=native_probe();int ok=v==42&&n==EXPECTED;\np=append(p,"KNOWN_REFERENCE result=");p=number(p,v);p=append(p," observed=");p=number(p,n);p=append(p,ok?" passed=true\\n":" passed=false\\n");\nWriteFile(GetStdHandle((DWORD)-11),b,(DWORD)(p-b),&count,0);return ok?0:7;}\n#ifdef BUILD_DLL\nint __stdcall DllMain(void* module,DWORD reason,void* reserved){(void)module;(void)reason;(void)reserved;return 1;}\n#else\nvoid fixture_entry(void){ExitProcess((unsigned int)fixture_run());}\n#endif\n'
 _HOST = '#include <windows.h>\nint wmain(int argc,wchar_t** argv){if(argc!=2)return 90;HMODULE module=LoadLibraryW(argv[1]);if(!module)return 91;auto f=reinterpret_cast<int(*)()>(GetProcAddress(module,"fixture_run"));if(!f){FreeLibrary(module);return 92;}int result=f();if(!FreeLibrary(module))return 93;return result;}\n'
 _KINDS = {'rip': (' .endprolog\n movzx eax,byte ptr [vm_probe+5]\n ret', 0, 0), 'lea': (' .endprolog\n lea rax,vm_probe+5\n movzx eax,byte ptr [rax]\n ret', 0, 0), 'reloc': (' .endprolog\n mov rax,qword ptr [reference_slot]\n movzx eax,byte ptr [rax]\n ret', 5, 0), 'entry': (' sub rsp,28h\n .allocstack 28h\n .endprolog\n mov rax,qword ptr [reference_slot]\n call rax\n add rsp,28h\n ret', 0, 42), 'lea_entry': (' sub rsp,28h\n .allocstack 28h\n .endprolog\n lea rax,vm_probe\n call rax\n add rsp,28h\n ret', 0, 42)}
+_KINDS['lea_compare'] = (' .endprolog\n lea r10,vm_probe\n lea r11,vm_probe\n cmp r10,r11\n sete al\n movzx eax,al\n ret', 0, 1)
 _KINDS.update({segment: (' .endprolog\n xor eax,eax\n ret', 0, 0) for segment in ('fs', 'gs')})
 
 def _execute(command, cwd):
@@ -125,6 +126,13 @@ def test_materialized_known_reference_admission_exe_and_dll(tmp_path, monkeypatc
             # Preserve an accepted unsafe fixture even if its assertion fails.
             (tmp_path / "native-reference-receipt.json").write_text(json.dumps({"candidate_pins": pinned, "records": records}, indent=2))
             if kind == "lea_entry":
+                assert packed.ok, packed.error
+                proof = direct_control_flow.analyze_direct_control_flow(parsed, (spec,), production=False)
+                assert proof.indirect_target_closure_proven is False
+                after = _execute([str(host), str(output)] if role == "dll" else [str(output)], tmp_path)
+                record["packed"] = after
+                assert after["stdout"] == before["stdout"] and after["exit_status"] == 0 and not after["stderr"], after
+            elif kind == "lea_compare":
                 assert packed.ok, packed.error
                 proof = direct_control_flow.analyze_direct_control_flow(parsed, (spec,), production=False)
                 assert proof.indirect_target_closure_proven is False

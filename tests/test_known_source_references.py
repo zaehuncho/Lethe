@@ -89,11 +89,52 @@ def _bounded_entry_call(branch_to_call):
     return prefix + branch + lea + suffix
 
 
+def _bounded_entry_compare(*, unsafe_suffix=""):
+    # Both address values are consumed only by CMP. The VM entry remains at the
+    # same RVA as its native dispatch thunk, so this equality observation is
+    # preserved without proving any indirect target closure.
+    first = _rip("lea r10,{mem}", 0x1000, source=0x1100)
+    second = _rip("lea r11,{mem}", 0x1000, source=0x1100 + len(first))
+    compare_ip = 0x1100 + len(first) + len(second)
+    compare = bytes(_KS.asm("cmp r10,r11; sete al; movzx eax,al",
+                            addr=compare_ip)[0])
+    suffix = (bytes(_KS.asm(unsafe_suffix, addr=compare_ip + len(compare))[0])
+              if unsafe_suffix else b"")
+    return first + second + compare + suffix
+
+
 @pytest.mark.parametrize("interface", ["preflight", "discovery"])
 @pytest.mark.parametrize("branch_to_call", [False, True])
 def test_bounded_exact_entry_call_and_alternate_predecessor_agree(
         interface, branch_to_call):
     _admit(_image(_bounded_entry_call(branch_to_call)), interface, branch_to_call)
+
+
+@pytest.mark.parametrize("interface", ["preflight", "discovery"])
+def test_exact_entry_address_used_only_for_comparison_is_admitted(interface):
+    image = _image(_bounded_entry_compare())
+    _admit(image, interface, False)
+    code = _bounded_entry_compare() + b"\xc3"
+    decoded = tuple(Decoder(64, code, ip=0x1100))
+    proven = source_references.proven_entry_address_comparisons(
+        (decoded,), known_entry_targets=(0x1000,))
+    refs = source_references.instruction_references(decoded)
+    assert len(proven) == 2
+    assert all((ref.source_rva, ref.target_rva) in proven for ref in refs)
+
+
+@pytest.mark.parametrize("interface", ["preflight", "discovery"])
+@pytest.mark.parametrize("suffix", [
+    "mov rdx,[r10]",
+    "mov [rsp+8],r10",
+    "mov r10w,1; mov rdx,[r10]",
+])
+def test_entry_comparison_does_not_allow_later_pointer_escape_or_read(
+        interface, suffix):
+    # Use a fresh exact source suffix; the analyzer must follow the only local
+    # path after CMP and reject every later read/store/partial-register escape.
+    unsafe = _bounded_entry_compare(unsafe_suffix=suffix)
+    _admit(_image(unsafe), interface, True)
 
 
 def test_unresolved_native_prefix_cannot_prove_exact_entry_call(monkeypatch):

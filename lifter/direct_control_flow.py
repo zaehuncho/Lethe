@@ -1070,6 +1070,11 @@ def _validate_known_references(parsed, decodes, selected):
             proven_entry_calls=source_references.proven_immediate_entry_calls(
                 decodes, known_entry_targets=(item.target_rva for item in references
                                                if item.address_only)),
+            proven_entry_comparisons=(
+                source_references.proven_entry_address_comparisons(
+                    decodes, known_entry_targets=callable_entries,
+                )
+            ),
         )
         index.validate(selected)
     except source_references.SourceReferenceError as exc:
