@@ -261,6 +261,11 @@ typedef struct xfg_pair16 {
     unsigned __int64 high;
 } xfg_pair16;
 
+typedef struct xfg_aggregate56 {
+    unsigned __int64 words[7];
+} xfg_aggregate56;
+typedef char xfg_aggregate56_must_be_56[(sizeof(xfg_aggregate56) == 56) ? 1 : -1];
+
 typedef struct xfg_hva2 {
     __m128i first;
     __m128i second;
@@ -300,6 +305,7 @@ typedef unsigned __int64 (__cdecl *xfg_pair_fold_fn)(
     xfg_pair16, unsigned __int64);
 typedef xfg_pair16 (__cdecl *xfg_pair_make_fn)(
     unsigned __int64, unsigned __int64);
+typedef xfg_aggregate56 (__cdecl *xfg_aggregate56_make_fn)(unsigned __int64);
 typedef unsigned __int64 (__cdecl *xfg_xmm_copy_fn)(
     const unsigned char *, unsigned char *, const __m128i *, __m128i *);
 typedef unsigned __int64 (__cdecl *xfg_xmm_halves_fn)(
@@ -513,6 +519,20 @@ __declspec(dllexport) __declspec(noinline) xfg_pair16 __cdecl xfg_pair_make(
     return result;
 }
 
+__declspec(dllexport) __declspec(noinline) xfg_aggregate56 __cdecl xfg_aggregate56_make(
+    unsigned __int64 seed)
+{
+    xfg_aggregate56 result;
+    result.words[0] = seed;
+    result.words[1] = seed ^ 0x1122334455667788ui64;
+    result.words[2] = seed + 0x8877665544332211ui64;
+    result.words[3] = ~seed;
+    result.words[4] = (seed << 3) + (seed >> 2);
+    result.words[5] = seed - 0x1020304050607080ui64;
+    result.words[6] = seed | 0x8000000000000001ui64;
+    return result;
+}
+
 typedef int (__cdecl *xfg_i32_fn)(int);
 typedef unsigned __int64 (__cdecl *xfg_u64_fn)(unsigned __int64, unsigned __int64);
 typedef int (__cdecl *xfg_i32x3_fn)(int, int, int);
@@ -526,6 +546,7 @@ typedef unsigned __int64 (__cdecl *xfg_u64x6_fn)(
     unsigned __int64);
 typedef unsigned int (__cdecl *xfg_ptr_read_fn)(const unsigned int *, unsigned int);
 typedef void (__cdecl *xfg_ptr_write_fn)(unsigned __int64 *, unsigned __int64);
+typedef xfg_aggregate56 (__cdecl *xfg_aggregate56_make_fn)(unsigned __int64);
 
 __declspec(noinline) int __cdecl indirect_xfg_i32(int v) { return xfg_i32(v); }
 __declspec(noinline) unsigned __int64 __cdecl indirect_xfg_u64(unsigned __int64 a, unsigned __int64 b) { return xfg_u64(a,b); }
@@ -546,6 +567,7 @@ __declspec(noinline) xfg_hva2 __vectorcall indirect_xfg_hva2_make(__m128i a,__m1
 __declspec(noinline) xfg_hfa4 __vectorcall indirect_xfg_hfa4_negate(xfg_hfa4 v) { return xfg_hfa4_negate(v); }
 __declspec(noinline) unsigned __int64 __cdecl indirect_xfg_pair_fold(xfg_pair16 v,unsigned __int64 s) { return xfg_pair_fold(v,s); }
 __declspec(noinline) xfg_pair16 __cdecl indirect_xfg_pair_make(unsigned __int64 a,unsigned __int64 b) { return xfg_pair_make(a,b); }
+__declspec(noinline) xfg_aggregate56 __cdecl indirect_xfg_aggregate56(unsigned __int64 seed) { return xfg_aggregate56_make(seed); }
 
 __declspec(dllexport) xfg_i32_fn volatile selected_xfg_i32 = indirect_xfg_i32;
 __declspec(dllexport) xfg_u64_fn volatile selected_xfg_u64 = indirect_xfg_u64;
@@ -566,6 +588,7 @@ __declspec(dllexport) xfg_hva2_make_fn volatile selected_xfg_hva2_make = indirec
 __declspec(dllexport) xfg_hfa4_negate_fn volatile selected_xfg_hfa4_negate = indirect_xfg_hfa4_negate;
 __declspec(dllexport) xfg_pair_fold_fn volatile selected_xfg_pair_fold = indirect_xfg_pair_fold;
 __declspec(dllexport) xfg_pair_make_fn volatile selected_xfg_pair_make = indirect_xfg_pair_make;
+__declspec(dllexport) xfg_aggregate56_make_fn volatile selected_xfg_aggregate56_make = indirect_xfg_aggregate56;
 
 __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
 {
@@ -594,6 +617,7 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
     xfg_f64_word f64_result;
     xfg_pair16 pair_value;
     xfg_pair16 pair_result;
+    xfg_aggregate56 aggregate_result;
     __m128i vector_first = _mm_set_epi32(1, 2, 3, 4);
     __m128i vector_second = _mm_set_epi32(5, 6, 7, 8);
     __m128i vector_third = _mm_set_epi32(9, 10, 11, 12);
@@ -721,6 +745,19 @@ __declspec(dllexport) __declspec(noinline) int __cdecl xfg_run_all(void)
         0x1020304050607080ui64, 0x8877665544332211ui64);
     ok = ok && pair_result.low == 0x1020304050607080ui64;
     ok = ok && pair_result.high == 0x8877665544332211ui64;
+    aggregate_result = selected_xfg_aggregate56_make(0x0123456789ABCDEFui64);
+    ok = ok && aggregate_result.words[0] == 0x0123456789ABCDEFui64;
+    ok = ok && aggregate_result.words[1]
+        == (0x0123456789ABCDEFui64 ^ 0x1122334455667788ui64);
+    ok = ok && aggregate_result.words[2]
+        == (0x0123456789ABCDEFui64 + 0x8877665544332211ui64);
+    ok = ok && aggregate_result.words[3] == ~0x0123456789ABCDEFui64;
+    ok = ok && aggregate_result.words[4]
+        == ((0x0123456789ABCDEFui64 << 3) + (0x0123456789ABCDEFui64 >> 2));
+    ok = ok && aggregate_result.words[5]
+        == (0x0123456789ABCDEFui64 - 0x1020304050607080ui64);
+    ok = ok && aggregate_result.words[6]
+        == (0x0123456789ABCDEFui64 | 0x8000000000000001ui64);
     return ok;
 }
 """.lstrip(),
@@ -764,6 +801,7 @@ static int run_once(const char *path)
     xfg_v128x6_fn volatile *v128x6_slot;
     xfg_pair_fold_fn pair_fold;
     xfg_pair_make_fn pair_make;
+    xfg_aggregate56_make_fn aggregate56_make;
     xfg_run_all_fn run_all;
     const unsigned int input[2] = { 13u, 29u };
     unsigned __int64 written = 0;
@@ -776,6 +814,7 @@ static int run_once(const char *path)
     xfg_f64_word f64_result;
     xfg_pair16 pair_value;
     xfg_pair16 pair_result;
+    xfg_aggregate56 aggregate_result;
     __m128i vector_first = _mm_set_epi32(1, 2, 3, 4);
     __m128i vector_second = _mm_set_epi32(5, 6, 7, 8);
     __m128i vector_third = _mm_set_epi32(9, 10, 11, 12);
@@ -803,11 +842,14 @@ static int run_once(const char *path)
     v128x6 = v128x6_slot == NULL ? NULL : *v128x6_slot;
     pair_fold = (xfg_pair_fold_fn)GetProcAddress(module, "xfg_pair_fold");
     pair_make = (xfg_pair_make_fn)GetProcAddress(module, "xfg_pair_make");
+    aggregate56_make = (xfg_aggregate56_make_fn)GetProcAddress(
+        module, "xfg_aggregate56_make");
     run_all = (xfg_run_all_fn)GetProcAddress(module, "xfg_run_all");
     if (i32 == NULL || u64 == NULL || i32x3 == NULL || noargs == NULL ||
         u64x6 == NULL || ptr_read == NULL || ptr_write == NULL ||
         f32_bits == NULL || f64_bits == NULL || mixed_bits == NULL ||
         v128x6 == NULL || pair_fold == NULL || pair_make == NULL ||
+        aggregate56_make == NULL ||
         run_all == NULL) {
         FreeLibrary(module);
         return 11;
@@ -856,6 +898,19 @@ static int run_once(const char *path)
         0x1020304050607080ui64, 0x8877665544332211ui64);
     ok = ok && pair_result.low == 0x1020304050607080ui64;
     ok = ok && pair_result.high == 0x8877665544332211ui64;
+    aggregate_result = aggregate56_make(0x0123456789ABCDEFui64);
+    ok = ok && aggregate_result.words[0] == 0x0123456789ABCDEFui64;
+    ok = ok && aggregate_result.words[1]
+        == (0x0123456789ABCDEFui64 ^ 0x1122334455667788ui64);
+    ok = ok && aggregate_result.words[2]
+        == (0x0123456789ABCDEFui64 + 0x8877665544332211ui64);
+    ok = ok && aggregate_result.words[3] == ~0x0123456789ABCDEFui64;
+    ok = ok && aggregate_result.words[4]
+        == ((0x0123456789ABCDEFui64 << 3) + (0x0123456789ABCDEFui64 >> 2));
+    ok = ok && aggregate_result.words[5]
+        == (0x0123456789ABCDEFui64 - 0x1020304050607080ui64);
+    ok = ok && aggregate_result.words[6]
+        == (0x0123456789ABCDEFui64 | 0x8000000000000001ui64);
     ok = ok && run_all() == 1;
     if (!FreeLibrary(module)) {
         return 12;
@@ -1287,6 +1342,7 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         "xfg_hfa4_negate",
         "xfg_pair_fold",
         "xfg_pair_make",
+        "xfg_aggregate56_make",
     )
     pointer_targets = {
         name: _exported_pointer_target_rva(source_image, f"selected_{name}")
@@ -1314,7 +1370,8 @@ def test_real_xfg_dll_selected_signatures_preserve_indirect_call_parity(
         target_size = _straight_line_leaf_size(
             source_image,
             target_rva,
-            limit=224 if name in ("xfg_xmm_copy", "xfg_xmm_halves") else 96,
+            limit=224 if name in ("xfg_xmm_copy", "xfg_xmm_halves")
+            else 128 if name == "xfg_aggregate56_make" else 96,
         )
         assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
         specs.append(
