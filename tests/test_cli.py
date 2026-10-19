@@ -53,6 +53,9 @@ def test_cli_defaults_are_release_safe():
     assert args.virtualize_function == []
     assert args.virtualization_selection_manifest is None
     assert args.virtualization_native_import_contract is None
+    assert args.dll_export_name is None
+    assert args.dll_export_ordinal_only is False
+    assert orchestrator.PackOptions().dll_export_name_allowlist is None
     assert args.virtualization_gap == []
     assert args.virtualization_tail_exit == []
     assert args.acknowledge_unproven_indirect_targets is False
@@ -82,6 +85,40 @@ def test_unverified_stub_capability_is_internal_and_ignores_environment(
     assert lethe.main(
         [str(input_path)], _allow_unverified_stub_for_tests=True) == lethe.EXIT_OK
     assert observed == [False, True]
+
+
+def test_cli_routes_dll_export_name_allowlist(monkeypatch, tmp_path):
+    input_path = tmp_path / "vision.dll"
+    input_path.write_bytes(b"fixture")
+    captured = {}
+
+    def fake_pack(_path, options, progress=None):
+        captured["options"] = options
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    rc = lethe.main([
+        str(input_path), "--dll-export-name", "?applyConfig@@",
+        "--dll-export-name", "??0MeterDetector@@",
+    ])
+    assert rc == lethe.EXIT_OK
+    assert captured["options"].dll_export_name_allowlist == (
+        "?applyConfig@@", "??0MeterDetector@@")
+
+
+def test_cli_routes_ordinal_only_dll_export_policy(monkeypatch, tmp_path):
+    input_path = tmp_path / "vision.dll"
+    input_path.write_bytes(b"fixture")
+    captured = {}
+
+    def fake_pack(_path, options, progress=None):
+        captured["options"] = options
+        return _result()
+
+    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
+    rc = lethe.main([str(input_path), "--dll-export-ordinal-only"])
+    assert rc == lethe.EXIT_OK
+    assert captured["options"].dll_export_name_allowlist == ()
 
 
 def test_virtualization_specs_accept_decimal_and_hex():

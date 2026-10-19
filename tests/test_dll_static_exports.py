@@ -125,6 +125,80 @@ def test_dll_export_snapshot_rejects_reference_outside_declared_span() -> None:
         assemble._dll_export_snapshot(parsed, orig)
 
 
+def _multi_name_fixture():
+    parsed, orig, _ = _fixture()
+    section = parsed.sections[0]
+    parsed.export_directory_rva = orig.export_rva
+    parsed.export_directory_size = orig.export_size
+    raw = bytearray(section.raw)
+    export_rva = orig.export_rva
+    off = export_rva - section.rva
+    # Three ordinal entries and a sorted export name table.
+    struct.pack_into("<IIIIIII", raw, off + 12,
+                     0x2090, 1, 3, 3, 0x2068, 0x2074, 0x2080)
+    struct.pack_into("<III", raw, 0x68, 0x1000, 0x1100, 0x1200)
+    struct.pack_into("<III", raw, 0x74, 0x20A0, 0x20A6, 0x20AC)
+    struct.pack_into("<HHH", raw, 0x80, 0, 1, 2)
+    raw[0xA0:0xA6] = b"Alpha\0"
+    raw[0xA6:0xAC] = b"Bravo\0"
+    raw[0xAC:0xB4] = b"Charlie\0"
+    section.raw = bytes(raw)
+    parsed.sections[1].virtual_size = 0x300
+    parsed.sections[1].raw = b"\x90" * 0x300
+    return parsed, orig
+
+
+def test_filter_dll_exports_removes_only_unlisted_names_and_keeps_ordinals():
+    parsed, orig = _multi_name_fixture()
+    assemble.filter_dll_export_names(parsed, ("Bravo",))
+    section = parsed.sections[0]
+    raw = section.raw
+    export_off = orig.export_rva - section.rva
+    assert struct.unpack_from("<I", raw, export_off + 24)[0] == 1
+    assert struct.unpack_from("<III", raw, 0x68) == (0x1000, 0x1100, 0x1200)
+    assert struct.unpack_from("<III", raw, 0x74) == (0x20A6, 0, 0)
+    assert struct.unpack_from("<HHH", raw, 0x80) == (1, 0, 0)
+    assert raw[0xA0:0xA6] == bytes(6)
+    assert raw[0xA6:0xAC] == b"Bravo\0"
+    assert raw[0xAC:0xB4] == bytes(8)
+    assert b"Alpha\0" not in raw and b"Charlie\0" not in raw
+    snapshot = assemble._dll_export_snapshot(parsed, orig)
+    assert snapshot[0x2000][0x40:0xC0] == raw[0x40:0xC0]
+
+
+def test_filter_dll_exports_supports_ordinal_only_and_rejects_missing_names():
+    parsed, orig = _multi_name_fixture()
+    assemble.filter_dll_export_names(parsed, ())
+    raw = parsed.sections[0].raw
+    assert struct.unpack_from("<I", raw, 0x2040 - 0x2000 + 24)[0] == 0
+    assert struct.unpack_from("<III", raw, 0x68) == (0x1000, 0x1100, 0x1200)
+    assert raw[0xA0:0xB4] == bytes(0x14)
+    assert b"Alpha" not in raw and b"Bravo" not in raw and b"Charlie" not in raw
+
+    untouched, _ = _multi_name_fixture()
+    before = untouched.sections[0].raw
+    with pytest.raises(assemble.AssembleError, match="absent"):
+        assemble.filter_dll_export_names(untouched, ("NotThere",))
+    assert untouched.sections[0].raw == before
+
+
+def test_filter_dll_exports_rejects_duplicate_allowlist_and_aliased_names():
+    parsed, _ = _multi_name_fixture()
+    before = parsed.sections[0].raw
+    with pytest.raises(assemble.AssembleError, match="duplicates"):
+        assemble.filter_dll_export_names(parsed, ("Alpha", "Alpha"))
+    assert parsed.sections[0].raw == before
+
+    parsed, _ = _multi_name_fixture()
+    raw = bytearray(parsed.sections[0].raw)
+    struct.pack_into("<I", raw, 0x78, 0x20A2)  # alias into Alpha's string
+    parsed.sections[0].raw = bytes(raw)
+    before = parsed.sections[0].raw
+    with pytest.raises(assemble.AssembleError, match="overlapping or aliased"):
+        assemble.filter_dll_export_names(parsed, ("Alpha",))
+    assert parsed.sections[0].raw == before
+
+
 def test_dll_without_exports_needs_no_snapshot() -> None:
     parsed = SimpleNamespace(size_of_image=0x3000, sections=[])
     assert assemble._dll_export_snapshot(

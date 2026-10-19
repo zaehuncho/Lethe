@@ -104,6 +104,9 @@ class PackOptions:
     compression_level: int = 9
     output_path: Optional[str] = None   # default: <input>.packed<ext>
     is_dll: Optional[bool] = None       # None => auto-detect from the PE header
+    # None preserves the complete source export-name table; () keeps ordinal
+    # exports only; otherwise only these exact named DLL exports remain visible.
+    dll_export_name_allowlist: Optional[tuple[str, ...]] = None
     server_shard: bool = False          # Tier 3: XOR a server-held shard into the key
     shard_url: Optional[str] = None     # experimental shard gate base URL
     shard_auth: Optional[str] = None    # Bearer token for shard upload
@@ -852,6 +855,19 @@ def pack_file(input_path: str, options: PackOptions,
             _emit(progress, "detecting PE type")
             is_dll = detect_is_dll(source_snapshot_path)
         eff = replace(options, is_dll=is_dll, output_path=output_path)
+        if eff.dll_export_name_allowlist is not None:
+            if not is_dll:
+                raise ValueError(
+                    "DLL export-name filtering is supported only for DLL inputs")
+            names = eff.dll_export_name_allowlist
+            if not isinstance(names, tuple):
+                raise ValueError("dll_export_name_allowlist must be a tuple or None")
+            if any(not isinstance(name, str) or not name or "\0" in name
+                   for name in names):
+                raise ValueError(
+                    "DLL export names must be nonempty strings without NUL")
+            if len(set(names)) != len(names):
+                raise ValueError("DLL export-name allowlist contains duplicates")
         if is_dll and eff.memory_guard:
             raise ValueError(
                 "memory guard is unsupported for DLLs because loader-lock "
@@ -1063,6 +1079,14 @@ def pack_file(input_path: str, options: PackOptions,
                 f"virtualized {len(materialized.manifest.functions)} selected "
                 "function(s)",
             )
+
+        # The optional exact DLL export allowlist changes the authenticated
+        # plaintext as well as the loader-visible pre-entry snapshot. Applying
+        # it here, after source-bound analysis/materialization and before payload
+        # construction, means dropped names do not reappear after decryption.
+        if eff.dll_export_name_allowlist is not None:
+            assemble.filter_dll_export_names(
+                parsed, eff.dll_export_name_allowlist)
 
         # --- 2. build payload (compress + encrypt + serialize metadata) ------
         _emit(progress, "building payload (compress + AES-256-GCM)")

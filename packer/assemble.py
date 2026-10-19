@@ -1471,7 +1471,10 @@ def _extract_rsrc(parsed) -> Tuple[int, bytes, int, int]:
     return (section_rva, section_bytes, directory_rva, directory_size)
 
 
-def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
+def _dll_export_snapshot(
+        parsed, orig: _OrigHeader, *,
+        export_name_allowlist: Optional[tuple[str, ...]] = None,
+) -> dict[int, bytes]:
     """Build the minimal loader-visible export bytes for either EXEs or DLLs.
 
     The helper and PackInfo fields retain their historical DLL names. For EXEs,
@@ -1553,25 +1556,129 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
     if function_count > export_size // 4 or name_count > export_size // 2:
         raise AssembleError("DLL export table count exceeds its declared span")
     export_cstr(module_name_rva, "module name")
-    functions = export_slice(
+    functions = (export_slice(
         functions_rva, function_count * 4, "address table")
-    names = export_slice(names_rva, name_count * 4, "name-pointer table")
-    ordinals = export_slice(
+        if function_count else b"")
+    names = (export_slice(
+        names_rva, name_count * 4, "name-pointer table")
+        if name_count else b"")
+    ordinals = (export_slice(
         ordinals_rva, name_count * 2, "name-ordinal table")
+        if name_count else b"")
+    name_records = []
     for index in range(name_count):
         ordinal = struct.unpack_from("<H", ordinals, index * 2)[0]
         if ordinal >= function_count:
             raise AssembleError("DLL export name ordinal exceeds address table")
         name_rva = struct.unpack_from("<I", names, index * 4)[0]
         export_cstr(name_rva, f"name[{index}]")
+        name_tail = export_slice(
+            name_rva, export_end - name_rva, f"name[{index}]")
+        nul = name_tail.find(b"\0")
+        if nul < 0:  # export_cstr above enforces this; keep indexing explicit.
+            raise AssembleError(f"DLL export name[{index}] is not NUL-terminated")
+        name_records.append((name_tail[:nul], name_rva, nul + 1, ordinal, index))
+    forwarder_ranges = []
     for index in range(function_count):
         target_rva = struct.unpack_from("<I", functions, index * 4)[0]
         if export_rva <= target_rva < export_end:
             export_cstr(target_rva, f"forwarder[{index}]")
+            forwarder_tail = export_slice(
+                target_rva, export_end - target_rva, f"forwarder[{index}]")
+            nul = forwarder_tail.find(b"\0")
+            forwarder_ranges.append((target_rva, target_rva + nul + 1))
         elif target_rva and not any(
                 start <= target_rva < end for start, end in mapped_ranges):
             raise AssembleError(
                 f"export direct target[{index}] does not name a mapped source section")
+
+    if export_name_allowlist is not None:
+        if not isinstance(export_name_allowlist, tuple):
+            raise AssembleError("DLL export-name allowlist must be a tuple")
+        requested = []
+        for name in export_name_allowlist:
+            if not isinstance(name, str) or not name or "\0" in name:
+                raise AssembleError(
+                    "DLL export names must be nonempty strings without NUL")
+            try:
+                encoded = name.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise AssembleError(
+                    "DLL export names must be ASCII") from exc
+            requested.append(encoded)
+        if len(set(requested)) != len(requested):
+            raise AssembleError("DLL export-name allowlist contains duplicates")
+        by_name = {}
+        for record in name_records:
+            by_name.setdefault(record[0], []).append(record)
+        if any(len(matches) > 1 for matches in by_name.values()):
+            raise AssembleError("cannot filter ambiguous duplicate DLL export names")
+        for name in requested:
+            matches = by_name.get(name, ())
+            if not matches:
+                raise AssembleError(
+                    "DLL export-name allowlist entry is absent: "
+                    f"{name.decode('ascii')!r}")
+            if len(matches) != 1:
+                raise AssembleError(
+                    "DLL export-name allowlist entry is ambiguous: "
+                    f"{name.decode('ascii')!r}")
+
+        selected = [by_name[name][0] for name in requested]
+        selected.sort(key=lambda record: record[0])
+        if any(not record[0] for record in name_records):
+            raise AssembleError("cannot filter an empty DLL export name")
+        string_ranges = sorted(
+            (record[1], record[1] + record[2]) for record in name_records)
+        for previous, current in zip(string_ranges, string_ranges[1:]):
+            if current[0] < previous[1]:
+                raise AssembleError(
+                    "cannot filter overlapping or aliased DLL export-name strings")
+        module_tail = export_slice(
+            module_name_rva, export_end - module_name_rva, "module name")
+        module_nul = module_tail.find(b"\0")
+        fixed_ranges = [(export_rva, export_rva + 40)]
+        if function_count:
+            fixed_ranges.append((functions_rva, functions_rva + function_count * 4))
+        if name_count:
+            fixed_ranges.extend((
+                (names_rva, names_rva + name_count * 4),
+                (ordinals_rva, ordinals_rva + name_count * 2),
+            ))
+        fixed_ranges.append((module_name_rva, module_name_rva + module_nul + 1))
+        fixed_ranges.extend(forwarder_ranges)
+        ordered_fixed = sorted(
+            (start, end) for start, end in fixed_ranges if end > start)
+        for previous, current in zip(ordered_fixed, ordered_fixed[1:]):
+            if current[0] < previous[1]:
+                raise AssembleError("cannot filter overlapping DLL export metadata")
+        for name_range in string_ranges:
+            if any(name_range[0] < end and start < name_range[1]
+                   for start, end in fixed_ranges):
+                raise AssembleError(
+                    "cannot filter DLL export-name string overlapping export metadata")
+
+        owner_mutable = bytearray(owner_raw)
+        for record in name_records:
+            if record not in selected:
+                offset = record[1] - owner_rva
+                owner_mutable[offset:offset + record[2]] = bytes(record[2])
+        if name_count:
+            name_table_offset = names_rva - owner_rva
+            ordinal_table_offset = ordinals_rva - owner_rva
+            compact_names = b"".join(struct.pack("<I", row[1]) for row in selected)
+            compact_ordinals = b"".join(struct.pack("<H", row[3]) for row in selected)
+            name_table_size = name_count * 4
+            ordinal_table_size = name_count * 2
+            owner_mutable[name_table_offset:name_table_offset + name_table_size] = (
+                compact_names + bytes(name_table_size - len(compact_names)))
+            owner_mutable[
+                ordinal_table_offset:ordinal_table_offset + ordinal_table_size
+            ] = compact_ordinals + bytes(
+                ordinal_table_size - len(compact_ordinals))
+        struct.pack_into(
+            "<I", owner_mutable, export_rva - owner_rva + 24, len(selected))
+        owner_raw = bytes(owner_mutable)
 
     start = export_rva - owner_rva
     # Only the prefix through the authenticated export span needs file backing.
@@ -1582,6 +1689,40 @@ def _dll_export_snapshot(parsed, orig: _OrigHeader) -> dict[int, bytes]:
     sparse = bytearray(start + export_size)
     sparse[start:start + export_size] = owner_raw[start:start + export_size]
     return {owner_rva: bytes(sparse)}
+
+
+def filter_dll_export_names(parsed, allowlist: tuple[str, ...]) -> None:
+    """Apply an exact export-name allowlist to authenticated DLL plaintext.
+
+    Export ordinals and their address table remain intact. Only unlisted name
+    lookup strings are removed; callers must account for consumers that use
+    GetProcAddress by name. The edited section bytes then flow through payload
+    encryption and the loader-visible early-import snapshot.
+    """
+    export_rva = int(_get(
+        parsed, "export_directory_rva", "export_rva", default=0))
+    export_size = int(_get(
+        parsed, "export_directory_size", "export_size", default=0))
+    if not export_rva or not export_size:
+        raise AssembleError("cannot filter names from a DLL without exports")
+    orig = _read_original_header(None, parsed)
+    snapshot = _dll_export_snapshot(
+        parsed, orig, export_name_allowlist=allowlist)
+    if len(snapshot) != 1:
+        raise AssembleError("filtered DLL export snapshot has ambiguous ownership")
+    owner_rva, sparse = next(iter(snapshot.items()))
+    owner = next((section for section in
+                  _get(parsed, "sections", default=[]) or []
+                  if int(_get(section, "rva", "virtual_address")) == owner_rva), None)
+    if owner is None:
+        raise AssembleError("filtered DLL export owner section disappeared")
+    raw = bytearray(bytes(_get(owner, "raw", "content", "data", default=b"")))
+    offset = export_rva - owner_rva
+    if (offset < 0 or offset + export_size > len(raw)
+            or offset + export_size > len(sparse)):
+        raise AssembleError("filtered DLL export span is outside its owner section")
+    raw[offset:offset + export_size] = sparse[offset:offset + export_size]
+    owner.raw = bytes(raw)
 
 
 def _patch_into_out_sections(out_sections: List[_OutSection], rva: int,

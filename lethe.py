@@ -228,6 +228,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=("explicitly acknowledge the unsupported DLL loader-lock path; "
               "never use for a release build"),
     )
+    export_group = parser.add_mutually_exclusive_group()
+    export_group.add_argument(
+        "--dll-export-name",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=("for DLLs, retain only these exact named exports (repeatable); "
+              "other exports remain available by ordinal"),
+    )
+    export_group.add_argument(
+        "--dll-export-ordinal-only",
+        action="store_true",
+        help=("for DLLs, remove all export-name strings while preserving the "
+              "ordinal address table"),
+    )
     parser.add_argument(
         "--anti-debug",
         choices=("on", "off"),
@@ -561,6 +576,10 @@ def main(
         compression_level=args.level,
         output_path=output_path,
         is_dll=(True if args.dll else None),  # None => auto-detect from the header
+        dll_export_name_allowlist=(
+            tuple(args.dll_export_name) if args.dll_export_name is not None
+            else (() if args.dll_export_ordinal_only else None)
+        ),
         server_shard=args.server_shard,
         shard_url=args.shard_url,
         shard_auth=(args.shard_auth or os.environ.get("LETHE_SHARD_AUTH")),
