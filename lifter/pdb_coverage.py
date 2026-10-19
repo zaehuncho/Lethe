@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 from typing import Any, Sequence
 
+from iced_x86 import Decoder, FlowControl, MemorySizeExt, OpKind, Register
+
 from . import direct_control_flow, native_tail_calls, pdb_function_inventory
 
 
@@ -25,7 +27,7 @@ _DISCARDABLE = 0x02000000
 
 
 class PdbCoverageError(ValueError):
-    """A source-bound executable byte or direct edge remains unproven."""
+    """A source-bound byte or selected indirect import call remains unproven."""
 
 
 @dataclass(frozen=True)
@@ -37,12 +39,41 @@ class CanonicalCodeToken:
 
 
 @dataclass(frozen=True)
+class SelectedIndirectImportCall:
+    """One selected-body indirect call proven to use an exact normal IAT slot.
+
+    This is a scoped outbound-call inventory, not a claim that all indirect
+    targets in the image or all runtime writes to the IAT are closed.
+    """
+
+    function_name: str
+    source_rva: int
+    iat_rva: int
+    module: str
+    symbol: str
+    instruction_bytes_hex: str
+    reachable_from_selected_entry: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "function_name": self.function_name,
+            "source_rva": self.source_rva,
+            "iat_rva": self.iat_rva,
+            "module": self.module,
+            "symbol": self.symbol,
+            "instruction_bytes_hex": self.instruction_bytes_hex,
+            "reachable_from_selected_entry": self.reachable_from_selected_entry,
+        }
+
+
+@dataclass(frozen=True)
 class PdbCoverageProof:
     inventory: pdb_function_inventory.BoundPdbInventory
     residual_ranges: tuple[direct_control_flow.CoverageGap, ...]
     tokens: tuple[CanonicalCodeToken, ...]
     direct_flow: direct_control_flow.DirectControlFlowProof
     source_parsed_sha256: str
+    selected_indirect_import_calls: tuple[SelectedIndirectImportCall, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,7 +89,23 @@ class PdbCommitBinding:
     supplemental_ranges: tuple[tuple[int, int], ...]
     tail_exit_policy: direct_control_flow.TailExitPolicy
     direct_flow: direct_control_flow.DirectControlFlowProof
+    selected_indirect_import_calls: tuple[SelectedIndirectImportCall, ...]
     binding_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "image_sha256": self.image_sha256,
+            "pdb_sha256": self.pdb_sha256,
+            "helper_sha256": self.helper_sha256,
+            "msdia_sha256": self.msdia_sha256,
+            "source_parsed_sha256": self.source_parsed_sha256,
+            "binding_sha256": self.binding_sha256,
+            "selected_functions": [list(item) for item in self.selected_functions],
+            "supplemental_ranges": [list(item) for item in self.supplemental_ranges],
+            "selected_indirect_import_calls": [
+                item.to_dict() for item in self.selected_indirect_import_calls
+            ],
+        }
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -124,7 +171,7 @@ def _binding_sha256(binding: PdbCommitBinding) -> str:
         binding.helper_sha256, binding.msdia_sha256,
         binding.source_parsed_sha256, binding.selected_functions,
         binding.supplemental_ranges, binding.tail_exit_policy,
-        binding.direct_flow,
+        binding.direct_flow, binding.selected_indirect_import_calls,
     ))
 
 
@@ -149,6 +196,9 @@ def bind_pdb_commit_proof(
     selected = _selected_identity(selected_specs)
     if selected != _selected_identity(proof.direct_flow.selected_functions):
         raise PdbCoverageError("PDB selected functions differ from the proof")
+    selected_import_calls = _selected_indirect_import_calls(parsed, proof.direct_flow)
+    if proof.selected_indirect_import_calls != selected_import_calls:
+        raise PdbCoverageError("PDB selected indirect import proof changed")
     ranges = tuple(
         (item.begin_rva, item.end_rva)
         for item in proof.direct_flow.decoded_supplemental_ranges
@@ -162,7 +212,8 @@ def bind_pdb_commit_proof(
     }, key=lambda item: (item.function_rva, item.instruction_rva, item.target_rva)))
     binding = PdbCommitBinding(
         *digests, selected, ranges,
-        direct_control_flow.TailExitPolicy(approvals), proof.direct_flow, "",
+        direct_control_flow.TailExitPolicy(approvals), proof.direct_flow,
+        selected_import_calls, "",
     )
     binding = replace(binding, binding_sha256=_binding_sha256(binding))
     validate_pdb_commit_binding(parsed, selected_specs, binding)
@@ -209,6 +260,8 @@ def validate_pdb_commit_binding(
         raise PdbCoverageError(f"PDB commit direct-reference check failed: {exc}") from exc
     if replay != binding.direct_flow or not replay.direct_reference_gate_passed:
         raise PdbCoverageError("PDB commit direct-reference proof changed")
+    if _selected_indirect_import_calls(parsed, replay) != binding.selected_indirect_import_calls:
+        raise PdbCoverageError("PDB commit selected indirect import inventory changed")
 
 
 def _source_iat_slots(parsed: Any) -> frozenset[int]:
@@ -224,6 +277,146 @@ def _source_iat_slots(parsed: Any) -> frozenset[int]:
         return native_tail_calls.validated_import_iat_rvas(entries)
     except ValueError as exc:
         raise PdbCoverageError(str(exc)) from exc
+
+
+def _source_iat_imports(parsed: Any) -> dict[int, tuple[str, str]]:
+    try:
+        dlls = tuple(parsed.imports)
+        entries = tuple(
+            function.iat_rva for dll in dlls for function in dll.funcs
+        )
+    except (AttributeError, TypeError) as exc:
+        raise PdbCoverageError("source import inventory is malformed") from exc
+    try:
+        slots = native_tail_calls.validated_import_iat_rvas(entries)
+    except ValueError as exc:
+        raise PdbCoverageError(str(exc)) from exc
+    imports: dict[int, tuple[str, str]] = {}
+    for dll in dlls:
+        module = getattr(dll, "name", None)
+        if type(module) is not str or not module or "\x00" in module:
+            raise PdbCoverageError("source import module identity is malformed")
+        try:
+            functions = tuple(dll.funcs)
+        except (AttributeError, TypeError) as exc:
+            raise PdbCoverageError("source import function inventory is malformed") from exc
+        for function in functions:
+            slot = getattr(function, "iat_rva", None)
+            if type(slot) is not int or slot not in slots or slot in imports:
+                raise PdbCoverageError("source import IAT mapping is ambiguous")
+            by_ordinal = getattr(function, "by_ordinal", None)
+            if type(by_ordinal) is not bool:
+                raise PdbCoverageError("source import ordinal mode is malformed")
+            if by_ordinal:
+                ordinal = getattr(function, "ordinal", None)
+                if type(ordinal) is not int or not 0 <= ordinal <= 0xFFFF:
+                    raise PdbCoverageError("source import ordinal identity is malformed")
+                symbol = f"#{ordinal}"
+            else:
+                symbol = getattr(function, "name", None)
+                if type(symbol) is not str or not symbol or "\x00" in symbol:
+                    raise PdbCoverageError("source import symbol identity is malformed")
+            imports[slot] = (module, symbol)
+    if set(imports) != set(slots):
+        raise PdbCoverageError("source import IAT mapping is incomplete")
+    return imports
+
+
+def _selected_indirect_import_calls(
+    parsed: Any,
+    proof: direct_control_flow.DirectControlFlowProof,
+) -> tuple[SelectedIndirectImportCall, ...]:
+    """Bind every selected-body indirect transfer to a canonical normal import.
+
+    Only an unprefixed x64 ``FF 15 disp32`` call through a unique, file-backed,
+    non-executable normal-import IAT slot is admitted. Register calls, computed
+    memory operands, indirect branches, delay-import guesses, and unselected
+    image transfers remain outside this scoped proof.
+    """
+    selected = tuple(proof.selected_functions)
+    selected_transfers = []
+    for transfer in proof.indirect_transfers:
+        owners = [
+            item for item in selected
+            if item.rva <= transfer.source_rva < item.end_rva
+        ]
+        if not owners:
+            if transfer.source_selected_name is not None:
+                raise PdbCoverageError(
+                    f"selected indirect transfer at RVA 0x{transfer.source_rva:X} "
+                    "has no unique selected extent"
+                )
+            continue
+        if len(owners) != 1 or transfer.source_selected_name != owners[0].name:
+            raise PdbCoverageError(
+                f"selected indirect transfer at RVA 0x{transfer.source_rva:X} "
+                "has ambiguous selected ownership"
+            )
+        selected_transfers.append((owners[0], transfer))
+
+    if not selected_transfers:
+        return ()
+
+    sections = direct_control_flow._normalize_sections(parsed)
+    import_map = _source_iat_imports(parsed)
+    slots = frozenset(import_map)
+    records = []
+    seen = set()
+    for spec, transfer in selected_transfers:
+        rva = transfer.source_rva
+        if rva in seen:
+            raise PdbCoverageError(
+                f"selected indirect transfer at RVA 0x{rva:X} is duplicated"
+            )
+        seen.add(rva)
+        if transfer.kind != "indirect_call":
+            raise PdbCoverageError(
+                f"selected indirect transfer at RVA 0x{rva:X} is not an indirect call"
+            )
+        try:
+            code = direct_control_flow._read_executable(
+                sections, rva, 6, "selected indirect import call"
+            )
+        except direct_control_flow.DirectControlFlowError as exc:
+            raise PdbCoverageError(str(exc)) from exc
+        if code is None:
+            raise PdbCoverageError(
+                f"selected indirect call at RVA 0x{rva:X} is not file-backed"
+            )
+        instruction = next(iter(Decoder(64, code, ip=rva)), None)
+        if (
+            instruction is None or instruction.is_invalid
+            or instruction.ip != rva or instruction.len != 6
+            or instruction.flow_control != FlowControl.INDIRECT_CALL
+            or instruction.op_count != 1 or instruction.op0_kind != OpKind.MEMORY
+            or instruction.memory_base != Register.RIP
+            or instruction.memory_index != Register.NONE
+            or MemorySizeExt.size(instruction.memory_size) != 8
+            or code[:2] != b"\xFF\x15"
+        ):
+            raise PdbCoverageError(
+                f"selected indirect call at RVA 0x{rva:X} is not a canonical "
+                "exact normal-import IAT call"
+            )
+        slot = int(instruction.ip_rel_memory_address)
+        if slot not in slots or native_tail_calls._read(
+            sections, slot, 8, executable=False
+        ) is None:
+            raise PdbCoverageError(
+                f"selected indirect call at RVA 0x{rva:X} does not name a "
+                "file-backed normal-import IAT slot"
+            )
+        module, symbol = import_map[slot]
+        records.append(SelectedIndirectImportCall(
+            function_name=spec.name,
+            source_rva=rva,
+            iat_rva=slot,
+            module=module,
+            symbol=symbol,
+            instruction_bytes_hex=code.hex(),
+            reachable_from_selected_entry=transfer.reachable_from_selected_entry,
+        ))
+    return tuple(sorted(records, key=lambda item: (item.source_rva, item.iat_rva)))
 
 
 def _classify_residual(
@@ -408,4 +601,8 @@ def prove_pdb_executable_coverage(
         raise PdbCoverageError(str(exc)) from exc
     if proof.coverage_gaps or not proof.direct_reference_gate_passed:
         raise PdbCoverageError("PDB-bound executable coverage remains incomplete")
-    return PdbCoverageProof(bound, gaps, tokens, proof, parsed_source_sha256(parsed))
+    selected_import_calls = _selected_indirect_import_calls(parsed, proof)
+    return PdbCoverageProof(
+        bound, gaps, tokens, proof, parsed_source_sha256(parsed),
+        selected_import_calls,
+    )

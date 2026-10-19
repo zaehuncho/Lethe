@@ -589,16 +589,9 @@ class VirtualizationManifest:
         if self.source_coverage_mode != "legacy" or self.pdb_commit_binding is not None:
             record["source_coverage_mode"] = self.source_coverage_mode
             binding = self.pdb_commit_binding
-            record["pdb_commit_binding"] = None if binding is None else {
-                "image_sha256": binding.image_sha256,
-                "pdb_sha256": binding.pdb_sha256,
-                "helper_sha256": binding.helper_sha256,
-                "msdia_sha256": binding.msdia_sha256,
-                "source_parsed_sha256": binding.source_parsed_sha256,
-                "binding_sha256": binding.binding_sha256,
-                "selected_functions": [list(item) for item in binding.selected_functions],
-                "supplemental_ranges": [list(item) for item in binding.supplemental_ranges],
-            }
+            record["pdb_commit_binding"] = (
+                None if binding is None else binding.to_dict()
+            )
         return record
 
     def to_json(self, *, indent: int | None = None) -> str:
