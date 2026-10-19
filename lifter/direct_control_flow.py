@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+import os
 from typing import Any, Sequence
 
 from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
@@ -1031,12 +1032,38 @@ def _decode_source_inventory(parsed, sections, selected, structured_thunks=()):
 
 def _validate_known_references(parsed, decodes, selected):
     try:
+        try:
+            from . import function_discovery
+        except ImportError:  # standalone tools/tests
+            import function_discovery  # type: ignore
+
+        image_path = getattr(parsed, "path", None)
+        has_source_file = (
+            isinstance(image_path, (str, os.PathLike))
+            and os.path.isfile(image_path)
+        )
+        export_rva = getattr(parsed, "export_directory_rva", 0)
+        export_size = getattr(parsed, "export_directory_size", 0)
+        exports = (
+            function_discovery.parse_pe_exports(parsed)
+            if export_rva or export_size or has_source_file
+            else ()
+        )
+        callable_entries = {
+            decoded.begin_rva for decoded in decodes
+            if type(getattr(decoded, "begin_rva", None)) is int
+        }
+        callable_entries.update(item.rva for item in selected)
         references = (
             *source_references.instruction_references(
                 instruction for decoded in decodes for instruction in decoded.instructions
             ),
-            *source_references.dir64_references(parsed),
-            *source_references.metadata_references(parsed),
+            *source_references.dir64_references(
+                parsed,
+                known_function_entries=callable_entries,
+                exports=exports,
+            ),
+            *source_references.metadata_references(parsed, exports=exports),
         )
         index = source_references.SourceReferenceIndex(
             references,

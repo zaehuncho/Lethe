@@ -11,6 +11,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass
 import os
+import re
 import struct
 from typing import Any, Iterable
 
@@ -37,6 +38,261 @@ _POINTER_REGISTERS = frozenset({
     Register.R8, Register.R9, Register.R10, Register.R11,
     Register.R12, Register.R13, Register.R14, Register.R15,
 })
+
+_VFTABLE_EXPORT = re.compile(r"\?\?_7(.+?)@@6B@\Z")
+_IMAGE_SCN_MEM_EXECUTE = 0x20000000
+_IMAGE_SCN_MEM_READ = 0x40000000
+_IMAGE_SCN_MEM_WRITE = 0x80000000
+_IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
+_MAX_VFTABLE_SLOTS = 256
+
+
+def _readonly_file_bytes(parsed: Any, rva: int, size: int) -> bytes | None:
+    if type(rva) is not int or type(size) is not int or rva <= 0 or size <= 0:
+        return None
+    matches = [
+        section for section in getattr(parsed, "sections", ())
+        if section.rva <= rva and rva + size <= section.rva + len(section.raw)
+    ]
+    if len(matches) != 1:
+        return None
+    section = matches[0]
+    characteristics = getattr(section, "characteristics", 0)
+    if (
+        type(characteristics) is not int
+        or not characteristics & _IMAGE_SCN_MEM_READ
+        or characteristics & (
+            _IMAGE_SCN_MEM_EXECUTE | _IMAGE_SCN_MEM_WRITE | _IMAGE_SCN_MEM_DISCARDABLE
+        )
+    ):
+        return None
+    offset = rva - section.rva
+    return bytes(section.raw[offset:offset + size])
+
+
+def _metadata_file_bytes(parsed: Any, rva: int, size: int) -> bytes | None:
+    """Read file-backed metadata from a non-executable, retained section.
+
+    MSVC can place RTTI TypeDescriptor objects in writable .data. The
+    descriptor is still useful as a structural identity check, but it must
+    remain fully file-backed and non-executable; the actual COL, hierarchy,
+    base descriptors, vtable, and function slots use the stricter
+    read-only-section predicate above.
+    """
+    if type(rva) is not int or type(size) is not int or rva <= 0 or size <= 0:
+        return None
+    matches = [
+        section for section in getattr(parsed, "sections", ())
+        if section.rva <= rva and rva + size <= section.rva + len(section.raw)
+    ]
+    if len(matches) != 1:
+        return None
+    section = matches[0]
+    characteristics = getattr(section, "characteristics", 0)
+    if (
+        type(characteristics) is not int
+        or not characteristics & _IMAGE_SCN_MEM_READ
+        or characteristics & (_IMAGE_SCN_MEM_EXECUTE | _IMAGE_SCN_MEM_DISCARDABLE)
+    ):
+        return None
+    offset = rva - section.rva
+    return bytes(section.raw[offset:offset + size])
+
+
+def _executable_file_entry(parsed: Any, rva: int) -> bool:
+    if type(rva) is not int or rva <= 0:
+        return False
+    matches = [
+        section for section in getattr(parsed, "sections", ())
+        if section.rva <= rva < section.rva + len(section.raw)
+        and section.characteristics & _IMAGE_SCN_MEM_EXECUTE
+        and not section.characteristics & _IMAGE_SCN_MEM_DISCARDABLE
+    ]
+    return len(matches) == 1
+
+
+def _valid_type_descriptor(
+    parsed: Any, rva: int, *, image_base: int, relocation_sites: frozenset[int]
+) -> bytes | None:
+    header = _metadata_file_bytes(parsed, rva, 16)
+    if header is None:
+        return None
+    type_info_va, spare_va = struct.unpack("<QQ", header)
+    if rva not in relocation_sites or type_info_va < image_base:
+        return None
+    type_info_rva = type_info_va - image_base
+    if _readonly_file_bytes(parsed, type_info_rva, 8) is None:
+        return None
+    # The x64 MSVC TypeDescriptor spare field is reserved/null. Rejecting
+    # non-null variants avoids treating an unvalidated extension as RTTI.
+    if spare_va != 0:
+        return None
+    owners = [
+        section for section in getattr(parsed, "sections", ())
+        if section.rva <= rva and rva + 16 <= section.rva + len(section.raw)
+    ]
+    if len(owners) != 1:
+        return None
+    section = owners[0]
+    start = rva - section.rva + 16
+    suffix = bytes(section.raw[start:min(len(section.raw), start + 1025)])
+    terminator = suffix.find(b"\0")
+    if terminator <= 0 or terminator > 1024:
+        return None
+    name = suffix[:terminator]
+    if any(byte < 0x20 or byte > 0x7E for byte in name):
+        return None
+    return name
+
+
+def validated_msvc_vftable_slots(
+    parsed: Any,
+    known_function_entries: Iterable[int],
+    *,
+    exports: Iterable[Any] | None = None,
+) -> frozenset[tuple[int, int]]:
+    """Prove the callable prefix of exported MSVC vftables.
+
+    A DIR64 pointer to a selected entry is otherwise ambiguous: it might be
+    read as bytes, not called. This exception is limited to relocation slots
+    in an exported MSVC vftable whose immediately preceding Complete Object
+    Locator, type descriptor, and class-hierarchy record validate. Slots are
+    admitted only while each target is an exact known function entry in a
+    retained executable section. The caller still separately rejects every
+    pointer into an entry interior and continues to report indirect closure as
+    unproven.
+    """
+    entries = frozenset(
+        value for value in known_function_entries
+        if type(value) is int and value > 0
+    )
+    if not entries:
+        return frozenset()
+    if exports is None:
+        try:
+            from . import function_discovery
+            exports = function_discovery.parse_pe_exports(parsed)
+        except (ImportError, OSError, ValueError):
+            return frozenset()
+    try:
+        export_rows = tuple(exports)
+        relocations = tuple(
+            item.target_rva for item in parsed.dir64_relocations
+        )
+        image_base = parsed.image_base
+    except (AttributeError, TypeError):
+        return frozenset()
+    if type(image_base) is not int or not 0 <= image_base < 1 << 64:
+        return frozenset()
+    if (
+        any(type(rva) is not int or rva <= 0 for rva in relocations)
+        or len(set(relocations)) != len(relocations)
+    ):
+        return frozenset()
+    relocation_sites = frozenset(relocations)
+    proven: set[tuple[int, int]] = set()
+
+    for export in export_rows:
+        try:
+            match = _VFTABLE_EXPORT.fullmatch(export.name)
+            vtable_rva = export.rva
+        except (AttributeError, TypeError):
+            continue
+        if match is None or type(vtable_rva) is not int or vtable_rva & 7:
+            continue
+
+        # The address point must be preceded by a relocated pointer to an
+        # x64 COL whose self-RVA, primary-subobject offsets, class name, and
+        # hierarchy records all agree. This avoids treating an arbitrary
+        # exported data array as a vftable.
+        col_slot_rva = vtable_rva - 8
+        col_slot = _readonly_file_bytes(parsed, col_slot_rva, 8)
+        if col_slot_rva not in relocation_sites or col_slot is None:
+            continue
+        col_va = int.from_bytes(col_slot, "little")
+        if col_va < image_base:
+            continue
+        col_rva = col_va - image_base
+        col = _readonly_file_bytes(parsed, col_rva, 24)
+        if col is None:
+            continue
+        signature, offset, cd_offset, type_rva, hierarchy_rva, self_rva = struct.unpack(
+            "<IIIIII", col
+        )
+        if signature != 1 or offset != 0 or cd_offset != 0 or self_rva != col_rva:
+            continue
+        type_name = _valid_type_descriptor(
+            parsed, type_rva, image_base=image_base,
+            relocation_sites=relocation_sites,
+        )
+        if type_name is None:
+            continue
+        try:
+            encoded_class = match.group(1).encode("ascii", "strict")
+        except UnicodeEncodeError:
+            continue
+        if type_name not in (b".?AV" + encoded_class + b"@@", b".?AU" + encoded_class + b"@@"):
+            continue
+
+        hierarchy = _readonly_file_bytes(parsed, hierarchy_rva, 16)
+        if hierarchy is None:
+            continue
+        hierarchy_signature, attributes, base_count, base_array_rva = struct.unpack(
+            "<IIII", hierarchy
+        )
+        if hierarchy_signature != 0 or attributes & ~0x0F or not 1 <= base_count <= 128:
+            continue
+        base_array = _readonly_file_bytes(parsed, base_array_rva, base_count * 4)
+        if base_array is None:
+            continue
+        base_descriptors = tuple(
+            struct.unpack_from("<I", base_array, index * 4)[0]
+            for index in range(base_count)
+        )
+        valid_hierarchy = True
+        for index, descriptor_rva in enumerate(base_descriptors):
+            descriptor = _readonly_file_bytes(parsed, descriptor_rva, 28)
+            if descriptor is None:
+                valid_hierarchy = False
+                break
+            (
+                base_type_rva, contained, _mdisp, _pdisp, _vdisp,
+                base_attributes, _class_rva,
+            ) = struct.unpack("<IIiiiII", descriptor)
+            base_type_name = _valid_type_descriptor(
+                parsed, base_type_rva, image_base=image_base,
+                relocation_sites=relocation_sites,
+            )
+            if (
+                base_type_name is None
+                or contained >= base_count
+                or base_attributes & ~0xFFFF
+                or (index == 0 and (base_type_rva != type_rva or contained != base_count - 1))
+            ):
+                valid_hierarchy = False
+                break
+        if not valid_hierarchy:
+            continue
+
+        owner = _readonly_file_bytes(parsed, vtable_rva, 8)
+        if owner is None:
+            continue
+        for index in range(_MAX_VFTABLE_SLOTS):
+            slot_rva = vtable_rva + index * 8
+            if slot_rva not in relocation_sites:
+                break
+            slot = _readonly_file_bytes(parsed, slot_rva, 8)
+            if slot is None:
+                break
+            target_va = int.from_bytes(slot, "little")
+            if target_va < image_base:
+                break
+            target_rva = target_va - image_base
+            if target_rva not in entries or not _executable_file_entry(parsed, target_rva):
+                break
+            proven.add((slot_rva, target_rva))
+
+    return frozenset(proven)
 
 
 def proven_immediate_entry_calls(
@@ -137,7 +393,11 @@ def instruction_references(instructions: Iterable[Any]) -> tuple[SourceReference
     return tuple(references)
 
 
-def dir64_references(parsed: Any) -> tuple[SourceReference, ...]:
+def dir64_references(
+    parsed: Any, *,
+    known_function_entries: Iterable[int] = (),
+    exports: Iterable[Any] | None = None,
+) -> tuple[SourceReference, ...]:
     # Partial analysis records may omit the inventory. This does not prove it
     # empty: the materializer independently requires complete source metadata.
     inventory = getattr(parsed, "dir64_relocations", ())
@@ -157,6 +417,9 @@ def dir64_references(parsed: Any) -> tuple[SourceReference, ...]:
     slots.sort()
     if any(right < left + 8 for left, right in zip(slots, slots[1:])):
         raise SourceReferenceError("source reference: DIR64 slots overlap or duplicate")
+    vftable_slots = validated_msvc_vftable_slots(
+        parsed, known_function_entries, exports=exports
+    )
     references = []
     for rva in slots:
         matches = [s for s in parsed.sections
@@ -169,7 +432,12 @@ def dir64_references(parsed: Any) -> tuple[SourceReference, ...]:
         offset = rva - section.rva
         target = int.from_bytes(section.raw[offset:offset + 8], "little") - base
         if 0 < target < 1 << 32:
-            references.append(SourceReference(target, 1, rva, "DIR64 address", True))
+            is_vftable_entry = (rva, target) in vftable_slots
+            references.append(SourceReference(
+                target, 1, rva,
+                "DIR64 vftable function pointer" if is_vftable_entry else "DIR64 address",
+                True, is_vftable_entry,
+            ))
     return tuple(references)
 
 
