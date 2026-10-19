@@ -1774,3 +1774,308 @@ def test_real_xfg_dll_encoded_entry_pointer_rejects_before_output(
         ))
     assert not outcome.ok and "known source reference: DIR64 address" in outcome.error
     assert not output.exists()
+
+
+@pytest.fixture(scope="module")
+def real_msvc_xfg_cpp_nontrivial_bundle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> SimpleNamespace:
+    """Build a real XFG DLL with a non-trivial 56-byte C++ return type."""
+    if os.name != "nt" or not shutil.which("cmake") or not _visual_studio_available():
+        pytest.skip("CMake + the Visual Studio x64 toolchain are required")
+    work = tmp_path_factory.mktemp("real-msvc-xfg-cpp-nontrivial")
+    header = work / "xfg_cpp_abi.h"
+    header.write_text(
+        """
+#pragma once
+#include <type_traits>
+
+struct XfgNontrivial56 {
+    unsigned __int64 words[7];
+    ~XfgNontrivial56() noexcept {}
+};
+static_assert(sizeof(XfgNontrivial56) == 56, "expected 56-byte return object");
+static_assert(!std::is_trivially_destructible<XfgNontrivial56>::value,
+              "the return type must exercise non-trivial C++ ABI lowering");
+using xfg_nontrivial56_make_fn =
+    XfgNontrivial56 (__cdecl *)(unsigned __int64);
+""".lstrip(),
+        encoding="utf-8",
+    )
+    dll_source = work / "xfg_cpp_dll.cpp"
+    dll_source.write_text(
+        """
+#include "xfg_cpp_abi.h"
+
+#pragma warning(push)
+#pragma warning(disable : 4190)
+extern "C" __declspec(dllexport) __declspec(noinline)
+XfgNontrivial56 __cdecl xfg_cpp_nontrivial56_make(unsigned __int64 seed)
+{
+    return XfgNontrivial56{{
+        seed,
+        seed ^ 0x1122334455667788ui64,
+        seed + 0x8877665544332211ui64,
+        ~seed,
+        (seed << 3) + (seed >> 2),
+        seed - 0x1020304050607080ui64,
+        seed | 0x8000000000000001ui64,
+    }};
+}
+#pragma warning(pop)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    host_source = work / "xfg_cpp_host.cpp"
+    host_source.write_text(
+        """
+#include "xfg_cpp_abi.h"
+#include <windows.h>
+#include <cstdio>
+
+static constexpr unsigned __int64 kSeed = 0x0123456789ABCDEFui64;
+
+extern "C" __declspec(dllexport) __declspec(noinline)
+int __cdecl xfg_cpp_invoke_nontrivial(HMODULE module)
+{
+    auto function = reinterpret_cast<xfg_nontrivial56_make_fn>(
+        GetProcAddress(module, "xfg_cpp_nontrivial56_make"));
+    if (function == nullptr) {
+        return 0;
+    }
+    XfgNontrivial56 result = function(kSeed);
+    return result.words[0] == kSeed
+        && result.words[1] == (kSeed ^ 0x1122334455667788ui64)
+        && result.words[2] == (kSeed + 0x8877665544332211ui64)
+        && result.words[3] == ~kSeed
+        && result.words[4] == ((kSeed << 3) + (kSeed >> 2))
+        && result.words[5] == (kSeed - 0x1020304050607080ui64)
+        && result.words[6] == (kSeed | 0x8000000000000001ui64);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        return 2;
+    }
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        HMODULE module = LoadLibraryA(argv[1]);
+        if (module == nullptr) {
+            return 3;
+        }
+        int ok = xfg_cpp_invoke_nontrivial(module);
+        if (!FreeLibrary(module)) {
+            return 4;
+        }
+        if (!ok) {
+            return 5;
+        }
+    }
+    std::puts("CPP_XFG_NONTRIVIAL56 passed=true");
+    return 0;
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    cmake_source = f"""
+cmake_minimum_required(VERSION 3.20)
+project(lethe_real_xfg_cpp_nontrivial_fixture CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(xfg_cpp_nontrivial SHARED "{dll_source.as_posix()}")
+target_include_directories(xfg_cpp_nontrivial PRIVATE "{work.as_posix()}")
+target_compile_options(xfg_cpp_nontrivial PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg /EHsc)
+target_link_options(xfg_cpp_nontrivial PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO /OPT:NOICF)
+add_executable(xfg_cpp_nontrivial_host "{host_source.as_posix()}")
+target_include_directories(xfg_cpp_nontrivial_host PRIVATE "{work.as_posix()}")
+target_compile_options(xfg_cpp_nontrivial_host PRIVATE /W4 /WX /O2 /guard:cf /guard:xfg /EHsc)
+target_link_options(xfg_cpp_nontrivial_host PRIVATE /guard:cf /guard:xfg /DYNAMICBASE /NXCOMPAT /INCREMENTAL:NO /OPT:NOICF)
+""".lstrip()
+    (work / "CMakeLists.txt").write_text(cmake_source, encoding="utf-8")
+    build = work / "build"
+    configured = subprocess.run(
+        ["cmake", "-S", str(work), "-B", str(build),
+         "-G", "Visual Studio 17 2022", "-A", "x64"],
+        capture_output=True, text=True, check=False,
+    )
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    compiled = subprocess.run(
+        ["cmake", "--build", str(build), "--config", "Release"],
+        capture_output=True, text=True, check=False,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    release = build / "Release"
+    dll = release / "xfg_cpp_nontrivial.dll"
+    host = release / "xfg_cpp_nontrivial_host.exe"
+    assert dll.is_file() and host.is_file()
+    return SimpleNamespace(dll=dll, host=host)
+
+
+def test_real_xfg_cpp_nontrivial_hidden_sret_return_preserves_packed_parity(
+    real_msvc_xfg_cpp_nontrivial_bundle: SimpleNamespace,
+    xfg_virtualization_stub: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A typed XFG host must preserve a non-trivial 56-byte C++ return ABI."""
+    pytest.importorskip("iced_x86")
+    pytest.importorskip("lief")
+    dll = real_msvc_xfg_cpp_nontrivial_bundle.dll
+    host = real_msvc_xfg_cpp_nontrivial_bundle.host
+    source_image = assemble._StubImage(dll.read_bytes())
+    export = next(
+        item for item in pefile.PE(data=dll.read_bytes()).DIRECTORY_ENTRY_EXPORT.symbols
+        if item.name == b"xfg_cpp_nontrivial56_make" and not item.forwarder
+    )
+    target_rva = int(export.address)
+    target_size = _straight_line_leaf_size(source_image, target_rva, limit=256)
+    assert target_size >= virtualization_plan.TARGET_ENTRY_PATCH_SIZE
+    from iced_x86 import Decoder, Mnemonic, OpKind, Register
+    selected_instructions = tuple(Decoder(
+        64, source_image.read_at_rva(target_rva, target_size),
+        ip=source_image.image_base + target_rva,
+    ))
+    sret_stores = {
+        instruction.memory_displacement
+        for instruction in selected_instructions
+        if instruction.mnemonic == Mnemonic.MOV
+        and instruction.op0_kind == OpKind.MEMORY
+        and instruction.memory_base == Register.RCX
+    }
+    assert {0, 8, 16, 24, 32, 40, 48} <= sret_stores
+    assert any(
+        instruction.mnemonic == Mnemonic.MOV
+        and instruction.op0_kind == OpKind.REGISTER
+        and instruction.op0_register == Register.RAX
+        and instruction.op1_kind == OpKind.REGISTER
+        and instruction.op1_register == Register.RCX
+        for instruction in selected_instructions
+    )
+
+    parsed = pe_analyze.analyze_pe(str(dll))
+    assert parsed.is_dll is True
+    assert parsed.load_config is not None
+    assert parsed.load_config.guard_flags & 0x00800000
+    assert parsed.load_config.xfg_present is True
+    source_gfid = next(
+        target for target in parsed.load_config.guard_cf_targets
+        if target.rva == target_rva
+    )
+
+    host_parsed = pe_analyze.analyze_pe(str(host))
+    assert host_parsed.load_config is not None
+    assert host_parsed.load_config.xfg_present is True
+    host_image = assemble._StubImage(host.read_bytes())
+    caller_rva = host_image.find_export_rva("xfg_cpp_invoke_nontrivial")
+    assert caller_rva is not None
+    caller_size = 256
+    dispatch_slot_va = (
+        host_parsed.image_base
+        + host_parsed.load_config.guard_xfg_dispatch_function_pointer_rva
+    )
+    callsite_hashes = _xfg_callsite_hashes(
+        host_image.read_at_rva(caller_rva, caller_size),
+        ip=host_parsed.image_base + caller_rva,
+        dispatch_slot_va=dispatch_slot_va,
+    )
+    assert len(callsite_hashes) == 1
+    assert callsite_hashes[0] != bytes(8)
+
+    original_run = subprocess.run(
+        [str(host), str(dll)], capture_output=True, text=True,
+        check=False, timeout=30,
+    )
+    assert (original_run.returncode, original_run.stdout, original_run.stderr) == (
+        0, "CPP_XFG_NONTRIVIAL56 passed=true\n", "",
+    )
+
+    spec = virtualization_plan.FunctionSpec(
+        "xfg_cpp_nontrivial56_make", target_rva, target_size
+    )
+    discovery = direct_control_flow.analyze_direct_control_flow(
+        parsed, (spec,), production=False
+    )
+    gap_acknowledgements = tuple(
+        orchestrator.VirtualizationGapAcknowledgement(
+            gap.rva, gap.size,
+            "exact generated MSVC C++ XFG fixture code/data boundary",
+        )
+        for gap in discovery.coverage_gaps
+    )
+    captured: dict[str, virtualize.MaterializationResult] = {}
+    materialize = virtualize.materialize_selected_functions
+
+    def capture_materialization(*args, **kwargs):
+        result = materialize(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions", capture_materialization
+    )
+    monkeypatch.setenv(_VIRTUALIZATION_GATE, "1")
+    monkeypatch.setenv(_DLL_GATE, "1")
+    packed = tmp_path / "xfg_cpp_nontrivial.packed.dll"
+    result = orchestrator.pack_file(
+        str(dll),
+        orchestrator.PackOptions(
+            output_path=str(packed),
+            is_dll=True,
+            stub_path=str(xfg_virtualization_stub),
+            virtualization_specs=(
+                orchestrator.VirtualizationSpec(
+                    spec.name, spec.rva, spec.size
+                ),
+            ),
+            virtualization_gap_acknowledgements=gap_acknowledgements,
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ),
+    )
+    assert result.ok, result.error
+    packed_run = subprocess.run(
+        [str(host), str(packed)], capture_output=True, text=True,
+        check=False, timeout=30,
+    )
+    assert (packed_run.returncode, packed_run.stdout, packed_run.stderr) == (
+        original_run.returncode, original_run.stdout, original_run.stderr,
+    )
+
+    materialized = captured["result"]
+    assert materialized.parsed.load_config == parsed.load_config
+    assert materialized.parsed.generated_cfg_targets == ()
+    function = materialized.manifest.functions[0]
+    assert function.name == spec.name
+    assert function.target_rva == target_rva
+    assert function.cfg_target_rvas == ()
+    assert function.capabilities["direct_only_thunk"] is True
+    assert function.capabilities["cfg_target_declared"] is False
+    assert function.capabilities["xfg_function_hash_emitted"] is False
+    thunk_rva = function.generated_executable_ranges[0].rva
+    entry = pe_analyze._slice_at_rva(
+        materialized.parsed.sections, target_rva, target_size,
+        what="materialized non-trivial C++ XFG entry",
+    )
+    assert entry[0] == 0xE9
+    displacement = int.from_bytes(entry[1:5], "little", signed=True)
+    assert target_rva + 5 + displacement == thunk_rva
+
+    packed_image = assemble._StubImage(packed.read_bytes())
+    load_config_rva, load_config_size = packed_image.dir(assemble.DIR_LOAD_CONFIG)
+    packed_load_config = packed_image.read_at_rva(load_config_rva, load_config_size)
+    table_va = int.from_bytes(packed_load_config[128:136], "little")
+    table_count = int.from_bytes(packed_load_config[136:144], "little")
+    guard_flags = int.from_bytes(packed_load_config[144:148], "little")
+    assert guard_flags & 0x00800000
+    metadata_size = (guard_flags >> 28) & 0xF
+    stride = 4 + metadata_size
+    table = packed_image.read_at_rva(
+        table_va - packed_image.image_base, table_count * stride
+    )
+    packed_targets = {
+        int.from_bytes(table[offset:offset + 4], "little"):
+            table[offset + 4:offset + stride]
+        for offset in range(0, len(table), stride)
+    }
+    assert packed_targets[target_rva] == source_gfid.metadata
+    assert thunk_rva not in packed_targets
