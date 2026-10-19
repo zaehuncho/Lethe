@@ -102,7 +102,10 @@ def test_explicit_pdb_coverage_branch_is_bound_to_private_source_snapshot(
         captures["materializer_pdb_proof"] = kwargs.get("pdb_coverage_proof")
         return SimpleNamespace(
             parsed=materialized_parsed,
-            manifest=SimpleNamespace(functions=(object(),)),
+            manifest=SimpleNamespace(
+                functions=(object(),),
+                native_import_call_proofs=(),
+            ),
         )
 
     monkeypatch.setattr(virtualize, "materialize_selected_functions", materialize_with_capture)
@@ -302,7 +305,10 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
         captures["ack"] = kwargs["acknowledge_no_interior_entries"]
         return SimpleNamespace(
             parsed=materialized_parsed,
-            manifest=SimpleNamespace(functions=(object(),)),
+            manifest=SimpleNamespace(
+                functions=(object(),),
+                native_import_call_proofs=(),
+            ),
         )
 
     monkeypatch.setattr(virtualize, "materialize_selected_functions", fake_materialize)
@@ -413,7 +419,10 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
         virtualize, "materialize_selected_functions",
         lambda parsed, specs, **kwargs: SimpleNamespace(
             parsed=materialized_parsed,
-            manifest=SimpleNamespace(functions=(object(),)),
+            manifest=SimpleNamespace(
+                functions=(object(),),
+                native_import_call_proofs=(),
+            ),
         ),
     )
     _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
