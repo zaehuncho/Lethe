@@ -309,7 +309,10 @@ def load_and_verify(contract_path: str, *, parsed,
         dependency = Path(dependency_text)
         if not dependency.is_absolute():
             dependency = path.parent / dependency
-        dependency = dependency.resolve(strict=True)
+        try:
+            dependency = dependency.resolve(strict=True)
+        except OSError as exc:
+            raise _err(f"cannot resolve pinned dependency: {exc}") from exc
         if dependency.name.casefold() != actual_module.casefold():
             raise _err("dependency filename does not match the imported module")
         _verify_dependency(dependency, dep_sha, symbol, export_rva, ordinal,
