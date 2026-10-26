@@ -405,6 +405,10 @@ def validate_selected_canonical_import_call_closure(
         if expected != closure:
             raise PdbCoverageError(
                 "selected canonical import closure does not match manifest proofs")
+        if native_import_call_proofs != closure.native_import_call_proofs:
+            raise PdbCoverageError(
+                "selected canonical import closure does not exactly match the "
+                "canonical manifest proof tuple")
 
 
 def bind_pdb_commit_proof(

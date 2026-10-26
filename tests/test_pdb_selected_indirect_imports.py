@@ -230,6 +230,46 @@ def test_selected_canonical_import_closure_binds_every_call_through_one_iat(
     assert binding.to_dict()["selected_canonical_import_call_closure"] == closure.to_dict()
     assert binding.binding_sha256 == coverage._binding_sha256(binding)
     coverage.validate_pdb_commit_binding(parsed, (spec,), binding)
+    coverage.validate_selected_canonical_import_call_closure(
+        parsed,
+        binding.direct_flow,
+        binding.selected_indirect_import_calls,
+        closure,
+        native_import_call_proofs=closure.native_import_call_proofs,
+    )
+
+
+def test_selected_canonical_import_closure_rejects_reordered_manifest_proofs(
+    monkeypatch, tmp_path
+):
+    """A semantically equal proof set still needs its bound canonical order."""
+    code = (
+        _call_iat(0x2000, ip=0x1000)
+        + _call_iat(0x2000, ip=0x1006)
+        + b"\xc3"
+    )
+    parsed, spec, proof = _case(monkeypatch, tmp_path, code)
+    native_proofs = tuple(
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    )
+    binding = coverage.bind_pdb_commit_proof(
+        parsed,
+        proof,
+        (spec,),
+        native_import_call_proofs=native_proofs,
+    )
+    closure = binding.selected_canonical_import_call_closure
+    assert closure is not None
+    reordered = tuple(reversed(closure.native_import_call_proofs))
+    assert reordered != closure.native_import_call_proofs
+    with pytest.raises(coverage.PdbCoverageError, match="canonical manifest proof tuple"):
+        coverage.validate_selected_canonical_import_call_closure(
+            parsed,
+            binding.direct_flow,
+            binding.selected_indirect_import_calls,
+            closure,
+            native_import_call_proofs=reordered,
+        )
 
 
 @pytest.mark.parametrize(
