@@ -47,6 +47,11 @@ EXTERNAL_EVIDENCE_KINDS = frozenset({
 PROVIDER_SIGNED_KINDS = frozenset({"scanner", "clean-vm", "application"})
 SUBJECT_KINDS = frozenset({"exe", "dll"})
 SUBJECT_FORMAT = "windows-x64-pe32+"
+PROMOTION_RUNTIME_PROVISIONAL_STATUS = "candidate-runtime-provisional"
+PROMOTION_RUNTIME_PROVISIONAL_SCOPE = "promotion-runtime"
+PROMOTION_RUNTIME_PROVISIONAL_FIELD = "promotion_runtime_provisional"
+PROMOTION_RUNTIME_CAPABILITY_FILENAME = ".lethe-promotion-runtime-capability.json"
+PROMOTION_RUNTIME_CAPABILITY_KIND = "lethe-promotion-runtime-capability"
 SUBJECT_BASE_FIELDS = frozenset({
     "subject_id", "subject_kind", "format", "subject_path", "subject_sha256",
     "subject_size_bytes", "input_sha256", "pack_report_path", "pack_report_sha256",
@@ -310,6 +315,273 @@ def _reject_link_chain(path: Path, root: Path) -> None:
                 "trusted bundle cannot contain symlinks or junctions")
 
 
+_PROMOTION_RUNTIME_REQUIRED_EVIDENCE = frozenset({
+    "evidence/candidate-policy.json",
+    "evidence/candidate-production-matrix.json",
+    "evidence/candidate-promoter.py",
+    "evidence/daedalus_opcodes_shuffled.py",
+    "evidence/daedalus_opcodes_shuffled.h",
+    "evidence/uv-sync.json",
+    "evidence/cmake-configure.json",
+    "evidence/cmake-build.json",
+    "evidence/stub-entrypoints.json",
+    "evidence/ctest-inventory.json",
+    "evidence/ctest.json",
+})
+
+
+def _candidate_toolchain_binding(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The source-bound fields shared by final and runtime-provisional bundles."""
+    return {
+        "configuration": manifest.get("configuration"),
+        "cmake_generator": manifest.get("cmake_generator"),
+        "cmake_platform": manifest.get("cmake_platform"),
+        "compiler_id": manifest.get("compiler_id"),
+        "compiler_version": manifest.get("compiler_version"),
+        "warning_policy": manifest.get("warning_policy"),
+        "reproducible_link": manifest.get("reproducible_link"),
+        "python_version": manifest.get("python_version"),
+        "uv_version": manifest.get("uv_version"),
+        "cmake_version": manifest.get("cmake_version"),
+        "ctest_version": manifest.get("ctest_version"),
+        "dependency_locks": manifest.get("dependency_locks"),
+    }
+
+
+def _provisional_evidence_records(
+    stub_path: Path, manifest: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Verify the pre-runtime evidence a promotion is allowed to consume.
+
+    This intentionally names a smaller set than a final candidate: runtime,
+    round-trip, corpus, and gate receipts do not exist until after the runtime
+    pack tests.  The distinct provisional state is never a release candidate.
+    """
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, list):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional has no evidence records")
+    records: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(evidence):
+        if (not isinstance(record, dict)
+                or set(record) != {"path", "sha256"}
+                or not isinstance(record.get("path"), str)
+                or SHA256_RE.fullmatch(str(record.get("sha256", ""))) is None):
+            raise ReleaseAttestationError(
+                f"promotion-runtime provisional evidence[{index}] is malformed")
+        relative = record["path"]
+        if relative in records:
+            raise ReleaseAttestationError(
+                "promotion-runtime provisional repeats an evidence path")
+        path = _contained_evidence_path(stub_path.parent, relative)
+        if sha256_file(path) != record["sha256"]:
+            raise ReleaseAttestationError(
+                f"promotion-runtime provisional evidence hash mismatch: {relative}")
+        records[relative] = record
+    if set(records) != _PROMOTION_RUNTIME_REQUIRED_EVIDENCE:
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional evidence inventory is incomplete")
+
+    policy_path = stub_path.parent / "evidence/candidate-policy.json"
+    matrix_path = stub_path.parent / "evidence/candidate-production-matrix.json"
+    promoter_path = stub_path.parent / "evidence/candidate-promoter.py"
+    policy_document = _read_json_object(policy_path, "candidate policy snapshot")
+    if (hashlib.sha256(canonical_json_bytes(policy_document)).hexdigest()
+            != manifest.get("candidate_policy_sha256")
+            or policy_document.get("policy_id") != manifest.get("candidate_policy_id")):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional policy snapshot binding is invalid")
+    if sha256_file(matrix_path) != manifest.get("production_matrix_sha256"):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional matrix snapshot binding is invalid")
+    if sha256_file(promoter_path) != manifest.get("promotion_tool_sha256"):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional promoter snapshot binding is invalid")
+    if (sha256_file(stub_path.parent / "evidence/daedalus_opcodes_shuffled.py")
+            != manifest.get("dvm_python_map_sha256")
+            or sha256_file(stub_path.parent / "evidence/daedalus_opcodes_shuffled.h")
+            != manifest.get("dvm_native_map_sha256")):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional DVM map binding is invalid")
+
+    expected_commit = manifest["source_commit"]
+    expected_hash = manifest["sha256"]
+    for filename, name, artifact_bound in (
+        ("uv-sync.json", "locked-dependency-sync", False),
+        ("cmake-configure.json", "fresh-cmake-configure", False),
+        ("cmake-build.json", "fresh-w4-wx-stub-build", False),
+        ("ctest-inventory.json", "ctest-inventory", True),
+        ("ctest.json", "ctest", True),
+    ):
+        document = _read_json_object(
+            stub_path.parent / "evidence" / filename,
+            f"promotion-runtime {filename}",
+        )
+        if (document.get("schema") != 1 or document.get("name") != name
+                or document.get("source_commit") != expected_commit
+                or document.get("exit_code") != 0
+                or document.get("artifact_sha256") != (
+                    expected_hash if artifact_bound else None)):
+            raise ReleaseAttestationError(
+                f"promotion-runtime provisional {filename} is not source/artifact bound")
+    try:
+        inventory = json.loads(
+            _read_json_object(
+                stub_path.parent / "evidence/ctest-inventory.json",
+                "promotion-runtime CTest inventory",
+            ).get("stdout", ""))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional CTest inventory is invalid") from exc
+    tests = inventory.get("tests") if isinstance(inventory, dict) else None
+    if (not isinstance(tests, list) or not tests
+            or not all(isinstance(item, dict) and isinstance(item.get("name"), str)
+                       and item["name"] for item in tests)):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional CTest inventory is empty or malformed")
+    result = _read_json_object(
+        stub_path.parent / "evidence/ctest.json", "promotion-runtime CTest result")
+    summary = re.search(
+        r"(?m)^100% tests passed out of (\d+)\s*$", str(result.get("stdout", "")))
+    if summary is None or int(summary.group(1)) != len(tests):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional CTest result disagrees with its inventory")
+    return records
+
+
+def validate_promotion_runtime_provisional_candidate(
+    stub_path: Path,
+    capability_path: Path,
+    capability_nonce: str,
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate the single promotion-only identity accepted during runtime tests.
+
+    A final candidate cannot exist before its own runtime receipt.  This narrow
+    verifier accepts only the build-local, hash-bound provisional state paired
+    with a high-entropy one-run capability.  It deliberately does *not* make
+    the provisional bundle acceptable to regular candidate/release callers.
+    """
+    raw_stub = stub_path.absolute()
+    raw_manifest = (manifest_path or candidate_manifest_path(raw_stub)).absolute()
+    raw_capability = capability_path.absolute()
+    if (raw_stub.parent.name != "runtime-provisional"
+            or raw_capability.name != PROMOTION_RUNTIME_CAPABILITY_FILENAME
+            or raw_capability.parent != raw_stub.parent
+            or _is_linklike(raw_stub) or _is_linklike(raw_manifest)
+            or _is_linklike(raw_capability) or _is_linklike(raw_stub.parent)):
+        raise ReleaseAttestationError(
+            "promotion-runtime capability is not a private build-local bundle")
+    stub = raw_stub.resolve()
+    manifest_file = raw_manifest.resolve()
+    capability_file = raw_capability.resolve()
+    if (stub.parent != manifest_file.parent or stub.parent != capability_file.parent
+            or not stub.is_file() or not manifest_file.is_file()
+            or not capability_file.is_file()):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional bundle is incomplete")
+    manifest = _read_json_object(manifest_file, "promotion-runtime provisional manifest")
+    expected = {
+        "schema": 2,
+        "artifact_status": PROMOTION_RUNTIME_PROVISIONAL_STATUS,
+        "production_ready": False,
+        "candidate_scope": PROMOTION_RUNTIME_PROVISIONAL_SCOPE,
+        "artifact": stub.name,
+        "size_bytes": stub.stat().st_size,
+        "sha256": sha256_file(stub),
+        "source_dirty": False,
+        "provenance_status": "clean",
+    }
+    for field, wanted in expected.items():
+        if manifest.get(field) != wanted:
+            raise ReleaseAttestationError(
+                f"promotion-runtime provisional {field!r} does not match its bundle")
+    if "production_scope" in manifest:
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional claims production scope")
+    if COMMIT_RE.fullmatch(str(manifest.get("source_commit", ""))) is None:
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional has no full source commit")
+    if (not isinstance(manifest.get(PROMOTION_RUNTIME_PROVISIONAL_FIELD), dict)
+            or set(manifest[PROMOTION_RUNTIME_PROVISIONAL_FIELD]) != {
+                "schema", "capability_nonce_sha256"}
+            or manifest[PROMOTION_RUNTIME_PROVISIONAL_FIELD].get("schema") != 1
+            or SHA256_RE.fullmatch(str(
+                manifest[PROMOTION_RUNTIME_PROVISIONAL_FIELD].get(
+                    "capability_nonce_sha256", ""))) is None):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional marker is invalid")
+    for field in (
+        "candidate_policy_sha256", "promotion_tool_sha256",
+        "production_matrix_sha256", "toolchain_binding_sha256",
+        "dvm_opcode_mapping_sha256", "dvm_handler_variant_sha256",
+        "dvm_python_map_sha256", "dvm_native_map_sha256",
+    ):
+        if SHA256_RE.fullmatch(str(manifest.get(field, ""))) is None:
+            raise ReleaseAttestationError(
+                f"promotion-runtime provisional has no valid {field}")
+    seed = manifest.get("dvm_shuffle_seed")
+    if not isinstance(seed, str) or re.fullmatch(r"[0-9a-f]{64}", seed) is None:
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional DVM seed is invalid")
+    if (manifest.get("dvm_rolling") is not True
+            or manifest.get("dvm_roll_poison") is not False
+            or manifest.get("dvm_paged_runtime") is not True):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional DVM policy is invalid")
+    if manifest.get("toolchain_binding_sha256") != hashlib.sha256(
+            canonical_json_bytes(_candidate_toolchain_binding(manifest))).hexdigest():
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional toolchain binding is invalid")
+    locks = manifest.get("dependency_locks")
+    if (not isinstance(locks, dict) or set(locks) != {"pyproject.toml", "uv.lock"}
+            or any(SHA256_RE.fullmatch(str(value)) is None for value in locks.values())):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional dependency locks are incomplete")
+    if (manifest.get("configuration") != "Release"
+            or manifest.get("cmake_generator") != "Visual Studio 17 2022"
+            or str(manifest.get("cmake_platform", "")).lower() != "x64"
+            or manifest.get("compiler_id") != "MSVC"
+            or not str(manifest.get("compiler_version", "")).startswith("19.")
+            or manifest.get("warning_policy") != "/W4 /WX /Brepro"
+            or manifest.get("reproducible_link") != "/Brepro /INCREMENTAL:NO"
+            or manifest.get("uv_version") != "0.11.29"
+            or not str(manifest.get("python_version", "")).startswith("3.12.")):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional toolchain is outside the pinned policy")
+    _provisional_evidence_records(stub, manifest)
+
+    capability = _read_json_object(capability_file, "promotion-runtime capability")
+    expected_capability_fields = {
+        "schema", "kind", "nonce_sha256", "source_commit", "source_root",
+        "bundle_root", "manifest_sha256", "artifact", "artifact_sha256",
+        "artifact_size_bytes",
+    }
+    if set(capability) != expected_capability_fields:
+        raise ReleaseAttestationError("promotion-runtime capability fields are invalid")
+    nonce_hash = capability.get("nonce_sha256")
+    if (capability.get("schema") != 1
+            or capability.get("kind") != PROMOTION_RUNTIME_CAPABILITY_KIND
+            or not isinstance(capability_nonce, str)
+            or SHA256_RE.fullmatch(capability_nonce) is None
+            or SHA256_RE.fullmatch(str(nonce_hash)) is None
+            or capability.get("source_commit") != manifest["source_commit"]
+            or capability.get("source_root") != str(ROOT.resolve())
+            or capability.get("bundle_root") != str(stub.parent)
+            or capability.get("manifest_sha256") != sha256_file(manifest_file)
+            or capability.get("artifact") != stub.name
+            or capability.get("artifact_sha256") != manifest["sha256"]
+            or capability.get("artifact_size_bytes") != manifest["size_bytes"]
+            or hashlib.sha256(capability_nonce.encode("ascii")).hexdigest() != nonce_hash
+            or nonce_hash != (
+                manifest[PROMOTION_RUNTIME_PROVISIONAL_FIELD][
+                    "capability_nonce_sha256"])):
+        raise ReleaseAttestationError(
+            "promotion-runtime capability does not bind this provisional bundle")
+    _require_exact_clean_source(manifest["source_commit"])
+    return manifest
+
+
 def validate_candidate_identity(
     stub_path: Path,
     manifest_path: Path | None = None,
@@ -326,6 +598,11 @@ def validate_candidate_identity(
     if not stub_path.is_file() or not manifest_path.is_file():
         raise ReleaseAttestationError("candidate DLL or manifest is missing")
     manifest = _read_json_object(manifest_path, "candidate manifest")
+    if (PROMOTION_RUNTIME_PROVISIONAL_FIELD in manifest
+            or manifest.get("artifact_status") == PROMOTION_RUNTIME_PROVISIONAL_STATUS
+            or manifest.get("candidate_scope") == PROMOTION_RUNTIME_PROVISIONAL_SCOPE):
+        raise ReleaseAttestationError(
+            "promotion-runtime provisional manifests are not candidate bundles")
     blob_hash = sha256_file(stub_path)
     checks = {
         "schema": 2,
@@ -402,19 +679,10 @@ def validate_candidate_identity(
     return manifest
 
 
-def validate_current_candidate_source(
-    manifest: dict[str, Any], *, candidate_root: Path,
-    source_root: Path | None = None,
-) -> None:
-    """Bind experimental packing to the clean source that built its runtime.
-
-    A candidate manifest can remain valid for historical release verification;
-    only *new* experimental virtualization needs the current compiler/runtime
-    pair.  An extracted source distribution has no authenticated source-commit
-    identity, so its candidate path fails closed.  Signed default releases use
-    the separate release-bundle verifier and do not enter this check.
-    """
-    expected = manifest.get("source_commit")
+def _require_exact_clean_source(
+    expected: Any, *, source_root: Path | None = None,
+) -> Path:
+    """Return the exact clean checkout named by a source-bound manifest."""
     if not isinstance(expected, str) or COMMIT_RE.fullmatch(expected) is None:
         raise ReleaseAttestationError(
             "candidate manifest has no full source commit")
@@ -451,6 +719,31 @@ def validate_current_candidate_source(
     if git("status", "--porcelain=v1", "--untracked-files=all"):
         raise ReleaseAttestationError(
             "current candidate source checkout is not clean")
+    return root
+
+
+def validate_current_promotion_runtime_source(
+    manifest: dict[str, Any], *, source_root: Path | None = None,
+) -> None:
+    """Bind a capability-gated provisional runtime to the current checkout."""
+    _require_exact_clean_source(
+        manifest.get("source_commit"), source_root=source_root)
+
+
+def validate_current_candidate_source(
+    manifest: dict[str, Any], *, candidate_root: Path,
+    source_root: Path | None = None,
+) -> None:
+    """Bind experimental packing to the clean source that built its runtime.
+
+    A candidate manifest can remain valid for historical release verification;
+    only *new* experimental virtualization needs the current compiler/runtime
+    pair.  An extracted source distribution has no authenticated source-commit
+    identity, so its candidate path fails closed.  Signed default releases use
+    the separate release-bundle verifier and do not enter this check.
+    """
+    expected = manifest.get("source_commit")
+    _require_exact_clean_source(expected, source_root=source_root)
 
     # The schema-2 identity checker preserves historical candidate replay and
     # therefore does not interpret evidence content.  For a *new* pack, the

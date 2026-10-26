@@ -197,6 +197,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 _LEAF_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "normal_leaf"
 _FP_LEAF_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "fp_leaf"
 _MEMBER_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "member_sret"
+_PROMOTION_CAPABILITY_PATH_ENV = "LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH"
+_PROMOTION_CAPABILITY_NONCE_ENV = "LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE"
+
+
+def _promotion_runtime_capability() -> tuple[str | None, str | None]:
+    """Return the promoter's explicit pre-final-manifest capability, if any."""
+    path = os.environ.get(_PROMOTION_CAPABILITY_PATH_ENV) or None
+    nonce = os.environ.get(_PROMOTION_CAPABILITY_NONCE_ENV) or None
+    assert (path is None) == (nonce is None), (
+        "promotion runtime capability path and nonce must be paired"
+    )
+    return path, nonce
 
 
 def _run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
@@ -309,6 +321,8 @@ def test_materialized_generated_import_leaf_exe_and_dll(
     assert stub_text, "strict verified stub path required"
     stub = Path(stub_text).resolve()
     assert stub.is_file() and stub.with_suffix(".manifest.json").is_file()
+    promotion_capability_path, promotion_capability_nonce = (
+        _promotion_runtime_capability())
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
 
@@ -368,6 +382,8 @@ def test_materialized_generated_import_leaf_exe_and_dll(
             acknowledge_unproven_indirect_targets=True,
             virtualization_native_import_contract_path=str(contract),
             _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
         ),
     )
     assert result.ok, result.error
@@ -405,6 +421,8 @@ def test_materialized_generated_fp_import_leaf_exe_and_dll(
     assert stub_text, "strict verified stub path required"
     stub = Path(stub_text).resolve()
     assert stub.is_file() and stub.with_suffix(".manifest.json").is_file()
+    promotion_capability_path, promotion_capability_nonce = (
+        _promotion_runtime_capability())
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
 
@@ -474,6 +492,8 @@ def test_materialized_generated_fp_import_leaf_exe_and_dll(
             acknowledge_unproven_indirect_targets=True,
             virtualization_native_import_contract_path=str(contract),
             _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
         ),
     )
     assert packed.ok, packed.error
@@ -516,6 +536,8 @@ def test_materialized_xfg_member_hidden_sret_import_call(
     assert stub_text, "strict verified stub path required"
     stub = Path(stub_text).resolve()
     assert stub.is_file() and stub.with_suffix(".manifest.json").is_file()
+    promotion_capability_path, promotion_capability_nonce = (
+        _promotion_runtime_capability())
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
     monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
 
@@ -684,6 +706,8 @@ def test_materialized_xfg_member_hidden_sret_import_call(
             acknowledge_unproven_indirect_targets=True,
             virtualization_native_import_contract_path=str(contract_path),
             _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
         ),
     )
     assert result.ok, result.error
@@ -777,6 +801,8 @@ def test_materialized_xfg_member_hidden_sret_import_call(
                 tmp_path / "xfg-member-bad-0.json"
             ),
             _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
         ),
     )
     assert not rejected.ok and not bad_output.exists()

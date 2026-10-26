@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
+import lethe
 from tools import promote_stub, release_stub
+from packer import assemble, release_attestation
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -356,8 +358,217 @@ def test_native_runtime_environment_enables_export_proof_for_exact_stub(tmp_path
         "LETHE_RUN_NATIVE_VM_E2E": "1",
         "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
         "LETHE_RUN_NATIVE_IMPORT_CALL_E2E": "1",
+        "LETHE_STRICT_REFERENCE_STUB_PATH": "",
+        "LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH": "",
+        "LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE": "",
+        "LETHE_CHAIN_GROUP_CANDIDATE_PATH": "",
         "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
     }
+
+
+def test_runtime_environment_requires_paired_capability_and_never_records_nonce(
+    tmp_path: Path,
+) -> None:
+    stub = tmp_path / "candidate.dll"
+    capability = tmp_path / ".lethe-promotion-runtime-capability.json"
+    stub.write_bytes(b"candidate")
+    capability.write_text("{}\n", encoding="ascii")
+    nonce = "f" * 64
+    with pytest.raises(promote_stub.PromotionError, match="together"):
+        promote_stub._runtime_hardening_environment(
+            stub, promotion_runtime_capability_path=capability)
+    with pytest.raises(promote_stub.PromotionError, match="malformed"):
+        promote_stub._runtime_hardening_environment(
+            stub, promotion_runtime_capability_path=capability,
+            promotion_runtime_capability_nonce="not-a-nonce")
+    environment = promote_stub._runtime_hardening_environment(
+        stub, promotion_runtime_capability_path=capability,
+        promotion_runtime_capability_nonce=nonce)
+    assert environment["LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH"] == str(
+        capability.resolve())
+    assert environment["LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE"] == nonce
+    assert environment["LETHE_STRICT_REFERENCE_STUB_PATH"] == ""
+    record = promote_stub.CommandRecord(
+        name="candidate-bound-native-runtime-hardening", argv=["python"],
+        exit_code=0, stdout="ok\n", stderr="", source_commit="a" * 40,
+        artifact_sha256="b" * 64)
+    receipt = tmp_path / "runtime.json"
+    promote_stub._record(receipt, record)
+    assert nonce not in receipt.read_text(encoding="utf-8")
+
+
+def test_runtime_provisional_bundle_is_capability_bound_and_never_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-runtime schema-2 state is usable only through its nonce gate."""
+    repo, commit = _clean_repo(tmp_path)
+    stage = tmp_path / "stage"
+    build = stage / "build"
+    evidence = stage / "evidence"
+    build.mkdir(parents=True)
+    evidence.mkdir()
+    raw_stub = build / "Release" / "lethe_stub_x64.dll"
+    raw_stub.parent.mkdir()
+    raw_stub.write_bytes(b"runtime-provisional-stub")
+    (build / "daedalus_opcodes_shuffled.py").write_text(
+        "BUILD_SEED = '11'\n", encoding="ascii")
+    (build / "daedalus_opcodes_shuffled.h").write_text(
+        "#define TEST 1\n", encoding="ascii")
+    artifact_hash = hashlib.sha256(raw_stub.read_bytes()).hexdigest()
+    for filename, name, artifact_bound in (
+        ("uv-sync.json", "locked-dependency-sync", False),
+        ("cmake-configure.json", "fresh-cmake-configure", False),
+        ("cmake-build.json", "fresh-w4-wx-stub-build", False),
+        ("ctest-inventory.json", "ctest-inventory", True),
+        ("ctest.json", "ctest", True),
+    ):
+        record = {
+            "schema": 1, "name": name, "source_commit": commit,
+            "exit_code": 0,
+            "artifact_sha256": artifact_hash if artifact_bound else None,
+        }
+        if filename == "ctest-inventory.json":
+            record["stdout"] = json.dumps({"tests": [{"name": "fixture"}]})
+        elif filename == "ctest.json":
+            record["stdout"] = "100% tests passed out of 1\n"
+        promote_stub.atomic_write_json(evidence / filename, record)
+    promote_stub.atomic_write_json(evidence / "stub-entrypoints.json", {"schema": 1})
+    source = {
+        "source_commit": commit,
+        "locked_files": {"pyproject.toml": "a" * 64, "uv.lock": "b" * 64},
+    }
+    host = {
+        "python_version": "3.12.10", "uv_version": "0.11.29",
+        "cmake_version": "4.4.0", "ctest_version": "4.4.0",
+    }
+    toolchain = {
+        "cmake_generator": "Visual Studio 17 2022", "cmake_platform": "x64",
+        "compiler_id": "MSVC", "compiler_version": "19.44.35219.0",
+        "compile_policy": "/W4 /WX /Brepro",
+        "link_policy": "/Brepro /INCREMENTAL:NO",
+    }
+    dvm = {
+        "dvm_shuffle_seed": "11" * 32,
+        "dvm_opcode_mapping_sha256": "2" * 64,
+        "dvm_handler_variant_sha256": "3" * 64,
+        "dvm_python_map_sha256": hashlib.sha256(
+            (build / "daedalus_opcodes_shuffled.py").read_bytes()).hexdigest(),
+        "dvm_native_map_sha256": hashlib.sha256(
+            (build / "daedalus_opcodes_shuffled.h").read_bytes()).hexdigest(),
+        "dvm_rolling": True, "dvm_roll_poison": False,
+        "dvm_paged_runtime": True,
+    }
+    monkeypatch.setattr(promote_stub, "ROOT", repo)
+    monkeypatch.setattr(release_attestation, "ROOT", repo)
+    monkeypatch.setattr(promote_stub, "PRODUCTION_MATRIX",
+                        promote_stub.PRODUCTION_MATRIX)
+    runtime_stub, capability, nonce = (
+        promote_stub.build_promotion_runtime_provisional_bundle(
+            stage_dir=stage, built_stub=raw_stub, source=source, host=host,
+            toolchain=toolchain, dvm_provenance=dvm,
+            early_evidence_paths=tuple(evidence.iterdir()),
+            entrypoint_evidence_path=evidence / "stub-entrypoints.json",
+            build_dir=build,
+        ))
+    try:
+        manifest = release_attestation.validate_promotion_runtime_provisional_candidate(
+            runtime_stub, capability, nonce)
+        release_attestation.validate_current_promotion_runtime_source(manifest)
+        assert runtime_stub.read_bytes() == raw_stub.read_bytes()
+        assert nonce not in capability.read_text(encoding="utf-8")
+        with pytest.raises(release_attestation.ReleaseAttestationError,
+                           match="not candidate bundles"):
+            release_attestation.validate_candidate_identity(runtime_stub)
+        with pytest.raises(promote_stub.PromotionError,
+                           match="cannot be final candidates"):
+            promote_stub.validate_candidate_bundle(
+                runtime_stub, runtime_stub.with_suffix(".manifest.json"))
+        with pytest.raises(release_attestation.ReleaseAttestationError,
+                           match="does not bind"):
+            release_attestation.validate_promotion_runtime_provisional_candidate(
+                runtime_stub, capability, "0" * 64)
+        (runtime_stub.parent / "evidence" / "ctest.json").write_text(
+            "{}\n", encoding="ascii")
+        with pytest.raises(release_attestation.ReleaseAttestationError,
+                           match="evidence hash mismatch"):
+            release_attestation.validate_promotion_runtime_provisional_candidate(
+                runtime_stub, capability, nonce)
+        # Restore the receipt so this final negative reaches the exact source
+        # provenance gate instead of the earlier evidence-hash check.
+        promote_stub.atomic_write_json(
+            runtime_stub.parent / "evidence" / "ctest.json", {
+                "schema": 1, "name": "ctest", "source_commit": commit,
+                "exit_code": 0, "artifact_sha256": artifact_hash,
+                "stdout": "100% tests passed out of 1\n",
+            })
+        manifest_path = runtime_stub.with_suffix(".manifest.json")
+        manifest_document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for item in manifest_document["evidence"]:
+            if item["path"] == "evidence/ctest.json":
+                item["sha256"] = hashlib.sha256(
+                    (runtime_stub.parent / "evidence" / "ctest.json").read_bytes()).hexdigest()
+        promote_stub.atomic_write_json(manifest_path, manifest_document)
+        capability_document = json.loads(capability.read_text(encoding="utf-8"))
+        capability_document["manifest_sha256"] = hashlib.sha256(
+            manifest_path.read_bytes()).hexdigest()
+        promote_stub.atomic_write_json(capability, capability_document)
+        (repo / "dirty.txt").write_text("dirty\n", encoding="ascii")
+        with pytest.raises(release_attestation.ReleaseAttestationError,
+                           match="checkout is not clean"):
+            release_attestation.validate_promotion_runtime_provisional_candidate(
+                runtime_stub, capability, nonce)
+        (repo / "dirty.txt").unlink()
+    finally:
+        promote_stub.cleanup_promotion_runtime_provisional_bundle(build)
+    assert not (build / promote_stub.PROMOTION_RUNTIME_DIRNAME).exists()
+    (build / "daedalus_opcodes_shuffled.h").unlink()
+    with pytest.raises(promote_stub.PromotionError, match="DVM map inputs"):
+        promote_stub.build_promotion_runtime_provisional_bundle(
+            stage_dir=stage, built_stub=raw_stub, source=source, host=host,
+            toolchain=toolchain, dvm_provenance=dvm,
+            early_evidence_paths=tuple(evidence.iterdir()),
+            entrypoint_evidence_path=evidence / "stub-entrypoints.json",
+            build_dir=build,
+        )
+    assert not (build / promote_stub.PROMOTION_RUNTIME_DIRNAME).exists()
+    monkeypatch.setattr(
+        promote_stub.shutil, "copyfile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fixture copy failure")),
+    )
+    with pytest.raises(promote_stub.PromotionError, match="construction failed"):
+        promote_stub.build_promotion_runtime_provisional_bundle(
+            stage_dir=stage, built_stub=raw_stub, source=source, host=host,
+            toolchain=toolchain, dvm_provenance=dvm,
+            early_evidence_paths=tuple(evidence.iterdir()),
+            entrypoint_evidence_path=evidence / "stub-entrypoints.json",
+            build_dir=build,
+        )
+    assert not (build / promote_stub.PROMOTION_RUNTIME_DIRNAME).exists()
+
+
+def test_runtime_provisional_capability_is_not_an_unverified_escape(tmp_path: Path) -> None:
+    stub = tmp_path / "raw.dll"
+    stub.write_bytes(b"raw")
+    with pytest.raises(assemble.AssembleError, match="must be supplied together"):
+        assemble._load_stub(
+            str(stub), promotion_runtime_capability_path="capability.json")
+    with pytest.raises(assemble.AssembleError, match="cannot combine"):
+        assemble._load_stub(
+            str(stub), allow_unverified_stub_for_tests=True,
+            promotion_runtime_capability_path="capability.json",
+            promotion_runtime_capability_nonce="0" * 64,
+        )
+
+
+def test_public_cli_cannot_derive_promotion_runtime_capability() -> None:
+    parser = lethe.build_parser()
+    destinations = {action.dest for action in parser._actions}
+    assert "_promotion_runtime_capability_path" not in destinations
+    assert "_promotion_runtime_capability_nonce" not in destinations
+    assert not any(
+        "promotion-runtime-capability" in option
+        for action in parser._actions for option in action.option_strings
+    )
 
 
 def test_release_replay_uses_required_export_nodes_and_environment(

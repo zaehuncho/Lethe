@@ -709,7 +709,9 @@ def _validate_release_stub_manifest(stub_path: str, blob: bytes) -> None:
 
 def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
                expected_sha256: Optional[str] = None,
-               allow_unverified_stub_for_tests: bool = False) -> _StubImage:
+                allow_unverified_stub_for_tests: bool = False,
+                promotion_runtime_capability_path: Optional[str] = None,
+                promotion_runtime_capability_nonce: Optional[str] = None) -> _StubImage:
     if not os.path.isfile(stub_path):
         raise AssembleError(
             f"prebuilt stub not found: {stub_path}\n"
@@ -718,6 +720,15 @@ def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
             "production release.")
     with open(stub_path, "rb") as stub_file:
         blob = stub_file.read()
+    if ((promotion_runtime_capability_path is None) != (
+            promotion_runtime_capability_nonce is None)):
+        raise AssembleError(
+            "promotion runtime capability path and nonce must be supplied together")
+    if (allow_unverified_stub_for_tests
+            and promotion_runtime_capability_path is not None):
+        raise AssembleError(
+            "promotion runtime capability cannot combine with the test-only "
+            "unverified-stub override")
     if expected_sha256 is not None:
         normalized = expected_sha256.strip().lower()
         if (len(normalized) != 64
@@ -727,11 +738,19 @@ def _load_stub(stub_path: str, *, require_release_manifest: bool = False,
             raise AssembleError(
                 "stub changed after virtualization geometry was computed")
     if require_release_manifest:
+        if promotion_runtime_capability_path is not None:
+            raise AssembleError(
+                "promotion runtime capability cannot be used for a release stub")
         _validate_release_stub_manifest(stub_path, blob)
     else:
         if not allow_unverified_stub_for_tests:
             try:
-                release_attestation.validate_candidate_identity(Path(stub_path))
+                if promotion_runtime_capability_path is None:
+                    release_attestation.validate_candidate_identity(Path(stub_path))
+                else:
+                    provisional = release_attestation.validate_promotion_runtime_provisional_candidate(
+                        Path(stub_path), Path(promotion_runtime_capability_path),
+                        promotion_runtime_capability_nonce)
             except (OSError, release_attestation.ReleaseAttestationError) as exc:
                 raise AssembleError(
                     "explicit stub is not a verified candidate bundle; raw native "
@@ -785,7 +804,9 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
                     options=None,
                     stub_path: Optional[str] = None,
                     expected_stub_sha256: Optional[str] = None,
-                    allow_unverified_stub_for_tests: bool = False) -> AssembleResult:
+                    allow_unverified_stub_for_tests: bool = False,
+                    promotion_runtime_capability_path: Optional[str] = None,
+                    promotion_runtime_capability_nonce: Optional[str] = None) -> AssembleResult:
     """Assemble and write the packed output PE. Raises ``AssembleError`` on any
     unrecoverable problem (the orchestrator turns that into ``PackResult.ok=False``)."""
     # -- pull the semantic inputs (tolerant to field-name drift) -------------
@@ -817,7 +838,9 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     stub = _load_stub(
         resolved_stub_path, require_release_manifest=(stub_path is None),
         expected_sha256=expected_stub_sha256,
-        allow_unverified_stub_for_tests=allow_unverified_stub_for_tests)
+        allow_unverified_stub_for_tests=allow_unverified_stub_for_tests,
+        promotion_runtime_capability_path=promotion_runtime_capability_path,
+        promotion_runtime_capability_nonce=promotion_runtime_capability_nonce)
     stub_packinfo_rva = stub.find_packinfo_rva()
     stub_packinfo_header = stub.read_at_rva(stub_packinfo_rva, 12)
     if len(stub_packinfo_header) != 12:

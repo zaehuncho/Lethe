@@ -127,6 +127,10 @@ class PackOptions:
     acknowledge_unproven_indirect_targets: bool = False
     # Internal harness capability. The public CLI never exposes or derives it.
     _allow_unverified_stub_for_tests: bool = False
+    # Internal promotion-only capability for a pre-runtime, source-bound stub.
+    # It is distinct from the test-only raw-stub escape hatch above.
+    _promotion_runtime_capability_path: Optional[str] = None
+    _promotion_runtime_capability_nonce: Optional[str] = None
     virtualization_selection_manifest: Optional[str] = None
     virtualization_pdb_path: Optional[str] = None
     virtualization_dia_helper_path: Optional[str] = None
@@ -571,6 +575,8 @@ def _load_virtualization_build(
     stub_path: str,
     *,
     allow_unverified_stub_for_tests: bool = False,
+    promotion_runtime_capability_path: Optional[str] = None,
+    promotion_runtime_capability_nonce: Optional[str] = None,
 ):
     """Load one exact candidate stub and reconstruct its immutable opcode map."""
     if __package__:
@@ -580,7 +586,32 @@ def _load_virtualization_build(
     candidate_path = Path(stub_path).with_suffix(".manifest.json")
     runtime_path = Path(stub_path + ".manifest.json")
     verified_candidate = False
-    if candidate_path.is_file():
+    if (promotion_runtime_capability_path is None) != (
+            promotion_runtime_capability_nonce is None):
+        raise ValueError(
+            "promotion runtime capability path and nonce must be supplied together")
+    if promotion_runtime_capability_path is not None:
+        if (not isinstance(promotion_runtime_capability_path, str)
+                or not promotion_runtime_capability_path
+                or "\0" in promotion_runtime_capability_path
+                or not isinstance(promotion_runtime_capability_nonce, str)
+                or not promotion_runtime_capability_nonce):
+            raise ValueError("promotion runtime capability path is invalid")
+        if allow_unverified_stub_for_tests:
+            raise ValueError(
+                "promotion runtime capability cannot combine with the test-only "
+                "unverified-stub override")
+        try:
+            metadata = release_attestation.validate_promotion_runtime_provisional_candidate(
+                Path(stub_path), Path(promotion_runtime_capability_path),
+                promotion_runtime_capability_nonce,
+                candidate_path,
+            )
+        except release_attestation.ReleaseAttestationError as exc:
+            raise ValueError(
+                f"promotion runtime provisional candidate is invalid: {exc}") from exc
+        verified_candidate = True
+    elif candidate_path.is_file():
         try:
             metadata = release_attestation.validate_candidate_identity(
                 Path(stub_path), candidate_path)
@@ -1041,6 +1072,10 @@ def pack_file(input_path: str, options: PackOptions,
                     eff.stub_path,
                     allow_unverified_stub_for_tests=(
                         eff._allow_unverified_stub_for_tests),
+                    promotion_runtime_capability_path=(
+                        eff._promotion_runtime_capability_path),
+                    promotion_runtime_capability_nonce=(
+                        eff._promotion_runtime_capability_nonce),
                 )
             if rolling:
                 _emit(
@@ -1121,6 +1156,10 @@ def pack_file(input_path: str, options: PackOptions,
             stub_path=eff.stub_path,
             allow_unverified_stub_for_tests=(
                 eff._allow_unverified_stub_for_tests),
+            promotion_runtime_capability_path=(
+                eff._promotion_runtime_capability_path),
+            promotion_runtime_capability_nonce=(
+                eff._promotion_runtime_capability_nonce),
             **assembly_pins)
 
         # Reject a corrupt, truncated, or unpopulated staged PE before deriving

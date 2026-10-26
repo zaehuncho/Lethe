@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import struct
 import subprocess
@@ -194,6 +195,15 @@ REQUIRED_CANDIDATE_EVIDENCE = frozenset({
     "evidence/production-evidence.json",
     "evidence/production-gate.json",
 })
+PROMOTION_RUNTIME_DIRNAME = "runtime-provisional"
+PROMOTION_RUNTIME_CAPABILITY_FILENAME = ".lethe-promotion-runtime-capability.json"
+PROMOTION_RUNTIME_RECORD_NAMES = frozenset({
+    "uv-sync.json",
+    "cmake-configure.json",
+    "cmake-build.json",
+    "ctest-inventory.json",
+    "ctest.json",
+})
 
 
 class PromotionError(RuntimeError):
@@ -246,15 +256,43 @@ def _runtime_hardening_basetemp(stage_dir: Path) -> Path:
     return Path.home() / ".lethe-pytest" / identity
 
 
-def _runtime_hardening_environment(stub: Path) -> dict[str, str]:
+def _runtime_hardening_environment(
+    stub: Path,
+    *,
+    promotion_runtime_capability_path: Path | None = None,
+    promotion_runtime_capability_nonce: str | None = None,
+) -> dict[str, str]:
     """Enable the same artifact-bound mandatory gates in promotion and replay."""
-    return {
+    if ((promotion_runtime_capability_path is None) != (
+            promotion_runtime_capability_nonce is None)):
+        raise PromotionError(
+            "promotion runtime capability path and nonce must be supplied together")
+    environment = {
         "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
         "LETHE_RUN_NATIVE_VM_E2E": "1",
         "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
         "LETHE_RUN_NATIVE_IMPORT_CALL_E2E": "1",
+        # The import-call fixtures prefer this variable when it is present.  A
+        # parent shell may hold an older candidate, so explicitly clear it and
+        # force the runtime lane onto the exact fresh/provisional stub below.
+        "LETHE_STRICT_REFERENCE_STUB_PATH": "",
+        # Do not inherit a prior process's one-run capability into a normal
+        # replay.  The paired values are installed only below.
+        "LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH": "",
+        "LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE": "",
+        "LETHE_CHAIN_GROUP_CANDIDATE_PATH": "",
         "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
     }
+    if promotion_runtime_capability_path is not None:
+        if (not promotion_runtime_capability_path.is_file()
+                or not isinstance(promotion_runtime_capability_nonce, str)
+                or re.fullmatch(r"[0-9a-f]{64}", promotion_runtime_capability_nonce) is None):
+            raise PromotionError("promotion runtime capability is malformed")
+        environment["LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH"] = str(
+            promotion_runtime_capability_path.resolve())
+        environment["LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE"] = (
+            promotion_runtime_capability_nonce)
+    return environment
 
 
 def _runtime_hardening_argv(
@@ -902,6 +940,171 @@ def _toolchain_binding(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_promotion_runtime_provisional_bundle(
+    *,
+    stage_dir: Path,
+    built_stub: Path,
+    source: dict[str, Any],
+    host: dict[str, str],
+    toolchain: dict[str, str],
+    dvm_provenance: dict[str, Any],
+    early_evidence_paths: Iterable[Path],
+    entrypoint_evidence_path: Path,
+    build_dir: Path,
+) -> tuple[Path, Path, str]:
+    """Create the private, one-run identity needed before runtime evidence exists.
+
+    The final candidate manifest is necessarily unavailable while the runtime
+    suite is producing its own receipt.  This function makes a distinct,
+    build-local schema-2 bundle tied to the already-completed configure/build/
+    CTest records.  Its high-entropy nonce is returned only to the caller for
+    an explicit internal PackOptions capability and must be deleted after that
+    one pytest process.  It is never staged as a final candidate.
+    """
+    stage_root = stage_dir.resolve()
+    build_root = build_dir.resolve()
+    try:
+        build_root.relative_to(stage_root)
+    except ValueError as exc:
+        raise PromotionError("runtime provisional build escapes the stage directory") from exc
+    runtime_root = (build_root / PROMOTION_RUNTIME_DIRNAME).resolve()
+    try:
+        runtime_root.relative_to(build_root)
+    except ValueError as exc:
+        raise PromotionError("runtime provisional bundle escapes the build directory") from exc
+    if runtime_root.exists():
+        raise PromotionError(f"runtime provisional directory already exists: {runtime_root}")
+    if (not built_stub.is_file() or not entrypoint_evidence_path.is_file()):
+        raise PromotionError("runtime provisional inputs are missing")
+    try:
+        inspect_repository(ROOT, str(source["source_commit"]))
+        runtime_root.mkdir(parents=True)
+        evidence_root = runtime_root / "evidence"
+        evidence_root.mkdir()
+        runtime_stub = runtime_root / built_stub.name
+        shutil.copyfile(built_stub, runtime_stub)
+        artifact_hash = sha256_file(built_stub)
+        if (sha256_file(runtime_stub) != artifact_hash
+                or runtime_stub.stat().st_size != built_stub.stat().st_size):
+            raise PromotionError("runtime provisional copy does not match the fresh stub")
+
+        copied_records: dict[str, Path] = {}
+        for path in early_evidence_paths:
+            resolved = path.resolve()
+            if resolved.name not in PROMOTION_RUNTIME_RECORD_NAMES:
+                continue
+            if not resolved.is_file() or resolved.name in copied_records:
+                raise PromotionError("runtime provisional records are malformed")
+            destination = evidence_root / resolved.name
+            shutil.copyfile(resolved, destination)
+            copied_records[resolved.name] = destination
+        if set(copied_records) != PROMOTION_RUNTIME_RECORD_NAMES:
+            raise PromotionError("runtime provisional records are incomplete")
+        entrypoint_snapshot = evidence_root / entrypoint_evidence_path.name
+        shutil.copyfile(entrypoint_evidence_path, entrypoint_snapshot)
+
+        policy_snapshot = evidence_root / "candidate-policy.json"
+        matrix_snapshot = evidence_root / "candidate-production-matrix.json"
+        promoter_snapshot = evidence_root / "candidate-promoter.py"
+        atomic_write_json(policy_snapshot, candidate_policy_payload())
+        shutil.copyfile(PRODUCTION_MATRIX, matrix_snapshot)
+        shutil.copyfile(Path(__file__), promoter_snapshot)
+        python_map = build_dir / "daedalus_opcodes_shuffled.py"
+        native_map = build_dir / "daedalus_opcodes_shuffled.h"
+        if not python_map.is_file() or not native_map.is_file():
+            raise PromotionError("runtime provisional DVM map inputs are missing")
+        python_map_snapshot = evidence_root / python_map.name
+        native_map_snapshot = evidence_root / native_map.name
+        shutil.copyfile(python_map, python_map_snapshot)
+        shutil.copyfile(native_map, native_map_snapshot)
+
+        evidence_paths = sorted(evidence_root.iterdir(), key=lambda path: path.name)
+        nonce = secrets.token_hex(32)
+        manifest: dict[str, Any] = {
+            "schema": 2,
+            "artifact_status": "candidate-runtime-provisional",
+            "production_ready": False,
+            "candidate_scope": "promotion-runtime",
+            "artifact": runtime_stub.name,
+            "sha256": artifact_hash,
+            "size_bytes": runtime_stub.stat().st_size,
+            "source_commit": source["source_commit"],
+            "source_dirty": False,
+            "provenance_status": "clean",
+            "configuration": "Release",
+            "cmake_generator": toolchain["cmake_generator"],
+            "cmake_platform": toolchain["cmake_platform"],
+            "compiler_id": toolchain["compiler_id"],
+            "compiler_version": toolchain["compiler_version"],
+            "warning_policy": toolchain["compile_policy"],
+            "reproducible_link": toolchain["link_policy"],
+            "python_version": host["python_version"],
+            "uv_version": host["uv_version"],
+            "cmake_version": host["cmake_version"],
+            "ctest_version": host["ctest_version"],
+            "dependency_locks": source["locked_files"],
+            **dvm_provenance,
+            "candidate_policy_id": CANDIDATE_POLICY_ID,
+            "candidate_policy_sha256": candidate_policy_sha256(),
+            "production_matrix_sha256": sha256_file(matrix_snapshot),
+            "promotion_tool_sha256": sha256_file(Path(__file__)),
+            "promotion_runtime_provisional": {
+                "schema": 1,
+                "capability_nonce_sha256": hashlib.sha256(
+                    nonce.encode("ascii")).hexdigest(),
+            },
+            "evidence": [{
+                "path": path.relative_to(runtime_root).as_posix(),
+                "sha256": sha256_file(path),
+            } for path in evidence_paths],
+        }
+        manifest["toolchain_binding_sha256"] = _canonical_sha256(
+            _toolchain_binding(manifest))
+        manifest_path = runtime_stub.with_suffix(".manifest.json")
+        atomic_write_json(manifest_path, manifest)
+        capability_path = runtime_root / PROMOTION_RUNTIME_CAPABILITY_FILENAME
+        atomic_write_json(capability_path, {
+            "schema": 1,
+            "kind": "lethe-promotion-runtime-capability",
+            "nonce_sha256": manifest["promotion_runtime_provisional"][
+                "capability_nonce_sha256"],
+            "source_commit": manifest["source_commit"],
+            "source_root": str(ROOT.resolve()),
+            "bundle_root": str(runtime_root),
+            "manifest_sha256": sha256_file(manifest_path),
+            "artifact": runtime_stub.name,
+            "artifact_sha256": artifact_hash,
+            "artifact_size_bytes": runtime_stub.stat().st_size,
+        })
+        return runtime_stub, capability_path, nonce
+    except OSError as exc:
+        if runtime_root.exists():
+            shutil.rmtree(runtime_root, ignore_errors=True)
+        raise PromotionError(
+            f"runtime provisional bundle construction failed: {exc}") from exc
+    except Exception:
+        if runtime_root.exists():
+            shutil.rmtree(runtime_root, ignore_errors=True)
+        raise
+
+
+def cleanup_promotion_runtime_provisional_bundle(build_dir: Path) -> None:
+    """Delete the one-run capability bundle and fail closed if it survives."""
+    build_root = build_dir.resolve()
+    runtime_root = (build_root / PROMOTION_RUNTIME_DIRNAME).resolve()
+    try:
+        runtime_root.relative_to(build_root)
+    except ValueError as exc:
+        raise PromotionError("runtime provisional cleanup escapes the build directory") from exc
+    try:
+        if runtime_root.exists():
+            shutil.rmtree(runtime_root)
+    except OSError as exc:
+        raise PromotionError(f"runtime provisional cleanup failed: {exc}") from exc
+    if runtime_root.exists():
+        raise PromotionError("runtime provisional bundle was not removed")
+
+
 def build_manifest(
     *,
     staged_stub: Path,
@@ -986,6 +1189,12 @@ def validate_candidate_bundle(stub: Path, manifest_path: Path) -> dict[str, Any]
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PromotionError(f"cannot read staged manifest: {exc}") from exc
+    if (isinstance(manifest, dict)
+            and ("promotion_runtime_provisional" in manifest
+                 or manifest.get("artifact_status") == "candidate-runtime-provisional"
+                 or manifest.get("candidate_scope") == "promotion-runtime")):
+        raise PromotionError(
+            "promotion-runtime provisional manifests cannot be final candidates")
     if not isinstance(manifest, dict) or manifest.get("schema") != 2:
         raise PromotionError("staged candidate manifest must use schema 2")
     if manifest.get("artifact_status") != "candidate-verified":
@@ -1385,19 +1594,48 @@ def execute(args: argparse.Namespace) -> Path | None:
 
     runtime_basetemp = _runtime_hardening_basetemp(stage_dir)
     runtime_basetemp.parent.mkdir(parents=True, exist_ok=True)
-    runtime_hardening = run_recorded(
-        _runtime_hardening_argv(host, stage_dir),
-        name="candidate-bound-native-runtime-hardening",
-        path_name="runtime-hardening.json",
-        artifact_hash=artifact_hash,
-        env_overrides=_runtime_hardening_environment(built_stub),
-    )
+    runtime_stub: Path | None = None
+    runtime_capability: Path | None = None
     try:
-        validate_runtime_hardening_record(
-            runtime_hardening, artifact_hash,
-            expected_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+        runtime_stub, runtime_capability, runtime_nonce = (
+            build_promotion_runtime_provisional_bundle(
+                stage_dir=stage_dir,
+                built_stub=built_stub,
+                source=source,
+                host=host,
+                toolchain=toolchain,
+                dvm_provenance=dvm_provenance,
+                early_evidence_paths=(path for path, _record_item in records),
+                entrypoint_evidence_path=entrypoint_evidence_path,
+                build_dir=build_dir,
+            ))
+        runtime_hardening = run_recorded(
+            _runtime_hardening_argv(host, stage_dir),
+            name="candidate-bound-native-runtime-hardening",
+            path_name="runtime-hardening.json",
+            artifact_hash=artifact_hash,
+            env_overrides=_runtime_hardening_environment(
+                runtime_stub,
+                promotion_runtime_capability_path=runtime_capability,
+                promotion_runtime_capability_nonce=runtime_nonce,
+            ),
+        )
+        try:
+            validate_runtime_hardening_record(
+                runtime_hardening, artifact_hash,
+                expected_tests=REQUIRED_NATIVE_RUNTIME_PASS_COUNT)
+        except PromotionError as exc:
+            failures.append(str(exc))
+        _require_unchanged_artifact(
+            runtime_stub, artifact_hash,
+            "candidate-bound native runtime provisional copy")
     except PromotionError as exc:
         failures.append(str(exc))
+    finally:
+        try:
+            cleanup_promotion_runtime_provisional_bundle(build_dir)
+        except PromotionError as exc:
+            failures.append(str(exc))
     _require_unchanged_artifact(
         built_stub, artifact_hash, "candidate-bound native runtime hardening")
 
