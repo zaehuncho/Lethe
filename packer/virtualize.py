@@ -1062,6 +1062,13 @@ def _commit_manifest(
             pdb_coverage.validate_pdb_commit_binding(
                 parsed, selected_specs, manifest.pdb_commit_binding
             )
+            pdb_coverage.validate_selected_canonical_import_call_closure(
+                parsed,
+                manifest.pdb_commit_binding.direct_flow,
+                manifest.pdb_commit_binding.selected_indirect_import_calls,
+                manifest.pdb_commit_binding.selected_canonical_import_call_closure,
+                native_import_call_proofs=manifest.native_import_call_proofs,
+            )
         except pdb_coverage.PdbCoverageError as exc:
             raise _fail(f"PDB commit binding rejected: {exc}") from exc
     elif manifest.source_coverage_mode != "legacy" or manifest.pdb_commit_binding is not None:
@@ -1238,15 +1245,6 @@ def materialize_selected_functions(
     if len(page_master_key) != bytecode_pages.MASTER_KEY_SIZE:
         raise _fail("authenticated paging master key must be exactly 32 bytes")
     source_relocations, source_runtime_functions = _validate_source_image(parsed)
-    if pdb_coverage_proof is None:
-        pdb_binding = None
-    else:
-        try:
-            pdb_binding = pdb_coverage.bind_pdb_commit_proof(
-                parsed, pdb_coverage_proof, specs
-            )
-        except pdb_coverage.PdbCoverageError as exc:
-            raise _fail(f"PDB preflight binding rejected: {exc}") from exc
     if native_import_contract_path is None:
         native_import_call_proofs = ()
     else:
@@ -1258,6 +1256,23 @@ def materialize_selected_functions(
             )
         except native_import_contract.NativeImportContractError as exc:
             raise _fail(f"native import contract rejected: {exc}") from exc
+    if pdb_coverage_proof is None:
+        pdb_binding = None
+    else:
+        try:
+            pdb_binding = pdb_coverage.bind_pdb_commit_proof(
+                parsed,
+                pdb_coverage_proof,
+                specs,
+                native_import_call_proofs=native_import_call_proofs,
+            )
+        except pdb_coverage.PdbCoverageError as exc:
+            raise _fail(f"PDB preflight binding rejected: {exc}") from exc
+        closure = pdb_binding.selected_canonical_import_call_closure
+        if closure is not None:
+            # Bind compiler admission and persisted manifest proof material to
+            # the same canonical identity ordering used by the PDB closure.
+            native_import_call_proofs = closure.native_import_call_proofs
     stub, common_export_rva, exported_hash, exported_handler_hash = _read_stub_provenance(
         stub_bytes,
         opcode_table,

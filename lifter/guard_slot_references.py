@@ -264,7 +264,16 @@ def _collect_locked(parsed, binding, pdb_inputs):
         proof = pdb_coverage.prove_pdb_executable_coverage(
             parsed, source, pdb_inputs.pdb, pdb_inputs.helper, pdb_inputs.msdia,
             binding.direct_flow.selected_functions, tail_exit_policy=binding.tail_exit_policy)
-        rebuilt = pdb_coverage.bind_pdb_commit_proof(parsed, proof, binding.direct_flow.selected_functions)
+        closure = binding.selected_canonical_import_call_closure
+        native_import_call_proofs = (
+            () if closure is None else closure.native_import_call_proofs
+        )
+        rebuilt = pdb_coverage.bind_pdb_commit_proof(
+            parsed,
+            proof,
+            binding.direct_flow.selected_functions,
+            native_import_call_proofs=native_import_call_proofs,
+        )
         if rebuilt != binding:
             raise GuardReferenceError("fresh external PDB coverage/binding differs")
         identity = proof.inventory.identity

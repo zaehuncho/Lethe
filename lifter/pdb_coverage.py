@@ -67,6 +67,31 @@ class SelectedIndirectImportCall:
 
 
 @dataclass(frozen=True)
+class SelectedCanonicalImportCallClosure:
+    """A scoped PDB/native proof for every selected canonical import call.
+
+    This is deliberately narrower than
+    :attr:`DirectControlFlowProof.indirect_target_closure_proven`: it proves
+    only the outbound ``FF 15`` calls in selected bodies whose physical native
+    leaf contracts were independently verified.  It does not claim closure
+    over the image's other indirect or address-taken targets.
+    """
+
+    calls: tuple[SelectedIndirectImportCall, ...]
+    native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": [item.to_dict() for item in self.calls],
+            "native_import_call_proofs": [
+                item.to_dict() for item in self.native_import_call_proofs
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class PdbCoverageProof:
     inventory: pdb_function_inventory.BoundPdbInventory
     residual_ranges: tuple[direct_control_flow.CoverageGap, ...]
@@ -91,9 +116,12 @@ class PdbCommitBinding:
     direct_flow: direct_control_flow.DirectControlFlowProof
     selected_indirect_import_calls: tuple[SelectedIndirectImportCall, ...]
     binding_sha256: str
+    selected_canonical_import_call_closure: (
+        SelectedCanonicalImportCallClosure | None
+    ) = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        record = {
             "image_sha256": self.image_sha256,
             "pdb_sha256": self.pdb_sha256,
             "helper_sha256": self.helper_sha256,
@@ -106,6 +134,11 @@ class PdbCommitBinding:
                 item.to_dict() for item in self.selected_indirect_import_calls
             ],
         }
+        if self.selected_canonical_import_call_closure is not None:
+            record["selected_canonical_import_call_closure"] = (
+                self.selected_canonical_import_call_closure.to_dict()
+            )
+        return record
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -172,11 +205,213 @@ def _binding_sha256(binding: PdbCommitBinding) -> str:
         binding.source_parsed_sha256, binding.selected_functions,
         binding.supplemental_ranges, binding.tail_exit_policy,
         binding.direct_flow, binding.selected_indirect_import_calls,
+        binding.selected_canonical_import_call_closure,
     ))
 
 
+def _closure_call_key(
+    call: SelectedIndirectImportCall,
+    selected_by_name: dict[str, Any],
+) -> tuple[int, int, int, str, str]:
+    """Return one exact selected-import identity or reject an ambiguous row."""
+    if type(call) is not SelectedIndirectImportCall:
+        raise PdbCoverageError("selected canonical import closure call is malformed")
+    if type(call.function_name) is not str:
+        raise PdbCoverageError("selected canonical import closure call is malformed")
+    spec = selected_by_name.get(call.function_name)
+    if spec is None:
+        raise PdbCoverageError(
+            "selected canonical import closure names an unselected function")
+    values = (call.source_rva, call.iat_rva)
+    if (any(type(value) is not int for value in values)
+            or not spec.rva <= call.source_rva < spec.rva + spec.body_size
+            or not 0 < call.iat_rva < 0x1_0000_0000 - 7
+            or call.reachable_from_selected_entry is not True
+            or type(call.module) is not str or not call.module or "\x00" in call.module
+            or type(call.symbol) is not str or not call.symbol or "\x00" in call.symbol
+            or type(call.instruction_bytes_hex) is not str
+            or len(call.instruction_bytes_hex) != 12
+            or not re.fullmatch(r"ff15[0-9a-f]{8}", call.instruction_bytes_hex)):
+        raise PdbCoverageError(
+            "selected canonical import closure call is not a reachable exact FF15 import"
+        )
+    encoded_target = call.source_rva + 6 + int.from_bytes(
+        bytes.fromhex(call.instruction_bytes_hex[4:]), "little", signed=True
+    )
+    if encoded_target != call.iat_rva:
+        raise PdbCoverageError(
+            "selected canonical import closure call does not target its exact IAT slot"
+        )
+    return (
+        spec.rva, call.source_rva, call.iat_rva, call.module, call.symbol,
+    )
+
+
+def _closure_proof_key(
+    proof: native_tail_calls.VerifiedNativeImportCallProof,
+) -> tuple[int, int, int, str, str]:
+    """Return the source-call portion of one independently verified leaf proof."""
+    if type(proof) is not native_tail_calls.VerifiedNativeImportCallProof:
+        raise PdbCoverageError(
+            "selected canonical import closure requires verified native import proofs")
+    values = (
+        proof.function_rva, proof.call_rva, proof.iat_rva,
+        proof.export_rva, proof.export_ordinal, proof.body_size,
+    )
+    if (any(type(value) is not int for value in values)
+            or not 0 < proof.function_rva < 0x1_0000_0000
+            or not 0 < proof.call_rva < 0x1_0000_0000
+            or not 0 < proof.iat_rva < 0x1_0000_0000 - 7
+            or not 0 < proof.export_rva < 0x1_0000_0000
+            or not 1 <= proof.export_ordinal <= 0xFFFF
+            or not 1 <= proof.body_size <= 256
+            or type(proof.module) is not str or not proof.module or "\x00" in proof.module
+            or type(proof.symbol) is not str or not proof.symbol or "\x00" in proof.symbol
+            or type(proof.dependency_sha256) is not str
+            or _SHA256.fullmatch(proof.dependency_sha256) is None
+            or type(proof.body_sha256) is not str
+            or _SHA256.fullmatch(proof.body_sha256) is None):
+        raise PdbCoverageError("selected canonical import closure proof is malformed")
+    return (
+        proof.function_rva, proof.call_rva, proof.iat_rva,
+        proof.module, proof.symbol,
+    )
+
+
+def _closure_sort_key(
+    proof: native_tail_calls.VerifiedNativeImportCallProof,
+) -> tuple[int, int, int, str, str, str, int, int, int, str]:
+    """Provide a stable total ordering for immutable native proof records."""
+    return (
+        proof.function_rva, proof.call_rva, proof.iat_rva,
+        proof.module, proof.symbol, proof.dependency_sha256,
+        proof.export_rva, proof.export_ordinal, proof.body_size,
+        proof.body_sha256,
+    )
+
+
+def bind_selected_canonical_import_call_closure(
+    parsed: Any,
+    direct_flow: direct_control_flow.DirectControlFlowProof,
+    selected_import_calls: tuple[SelectedIndirectImportCall, ...],
+    native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ],
+) -> SelectedCanonicalImportCallClosure | None:
+    """Bind selected canonical calls to independently verified native leaves.
+
+    This is intentionally a scoped outbound-call proof.  It never changes the
+    image-wide indirect/address-taken closure verdict, which remains false.
+    Empty native-proof input leaves the optional scoped proof absent so existing
+    PDB-only direct-reference workflows retain their previous contract.
+    """
+    if type(direct_flow) is not direct_control_flow.DirectControlFlowProof:
+        raise PdbCoverageError("selected canonical import closure flow proof is malformed")
+    if direct_flow.indirect_target_closure_proven is not False:
+        raise PdbCoverageError(
+            "selected canonical import closure must not replace the global indirect closure verdict"
+        )
+    if type(selected_import_calls) is not tuple:
+        raise PdbCoverageError(
+            "selected canonical import closure calls must be immutable")
+    if type(native_import_call_proofs) is not tuple:
+        raise PdbCoverageError(
+            "selected canonical import closure proofs must be immutable")
+    current_calls = _selected_indirect_import_calls(parsed, direct_flow)
+    if current_calls != selected_import_calls:
+        raise PdbCoverageError(
+            "selected canonical import closure source inventory changed")
+    if not native_import_call_proofs:
+        return None
+    if not current_calls:
+        raise PdbCoverageError(
+            "selected canonical import closure has proofs but no selected import calls")
+    selected_by_name = {
+        item.name: item for item in direct_flow.selected_functions
+    }
+    if len(selected_by_name) != len(direct_flow.selected_functions):
+        raise PdbCoverageError(
+            "selected canonical import closure selected-function names are ambiguous")
+    expected: dict[tuple[int, int, int, str, str], SelectedIndirectImportCall] = {}
+    seen_call_sites: set[int] = set()
+    for call in current_calls:
+        key = _closure_call_key(call, selected_by_name)
+        if key in expected or call.source_rva in seen_call_sites:
+            raise PdbCoverageError(
+                "selected canonical import closure call identity is duplicated")
+        expected[key] = call
+        seen_call_sites.add(call.source_rva)
+    actual: dict[
+        tuple[int, int, int, str, str],
+        native_tail_calls.VerifiedNativeImportCallProof,
+    ] = {}
+    seen_proof_sites: set[int] = set()
+    for proof in native_import_call_proofs:
+        key = _closure_proof_key(proof)
+        if key in actual or proof.call_rva in seen_proof_sites:
+            raise PdbCoverageError(
+                "selected canonical import closure proof identity is duplicated")
+        actual[key] = proof
+        seen_proof_sites.add(proof.call_rva)
+    if set(actual) != set(expected):
+        raise PdbCoverageError(
+            "selected canonical import closure proofs do not exactly match selected import calls")
+    return SelectedCanonicalImportCallClosure(
+        tuple(sorted(expected.values(), key=lambda item: (
+            item.source_rva, item.iat_rva, item.function_name,
+        ))),
+        tuple(sorted(actual.values(), key=_closure_sort_key)),
+    )
+
+
+def validate_selected_canonical_import_call_closure(
+    parsed: Any,
+    direct_flow: direct_control_flow.DirectControlFlowProof,
+    selected_import_calls: tuple[SelectedIndirectImportCall, ...],
+    closure: SelectedCanonicalImportCallClosure | None,
+    *,
+    native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ] | None = None,
+) -> None:
+    """Rebind a scoped closure and, when supplied, its manifest proof tuple.
+
+    Commit callers pass ``native_import_call_proofs`` from the manifest.  That
+    makes a stale, substituted, missing, or extra proof fail before any PE
+    mutation, while a PDB-only workflow keeps its deliberate ``None`` closure.
+    """
+    if closure is not None and type(closure) is not SelectedCanonicalImportCallClosure:
+        raise PdbCoverageError("selected canonical import closure is malformed")
+    if closure is None:
+        if native_import_call_proofs is None:
+            return
+        expected = bind_selected_canonical_import_call_closure(
+            parsed, direct_flow, selected_import_calls, native_import_call_proofs,
+        )
+        if expected is not None:
+            raise PdbCoverageError(
+                "selected canonical import closure is missing for native import proofs")
+        return
+    rebound = bind_selected_canonical_import_call_closure(
+        parsed, direct_flow, selected_import_calls,
+        closure.native_import_call_proofs,
+    )
+    if rebound != closure:
+        raise PdbCoverageError("selected canonical import closure changed after binding")
+    if native_import_call_proofs is not None:
+        expected = bind_selected_canonical_import_call_closure(
+            parsed, direct_flow, selected_import_calls, native_import_call_proofs,
+        )
+        if expected != closure:
+            raise PdbCoverageError(
+                "selected canonical import closure does not match manifest proofs")
+
+
 def bind_pdb_commit_proof(
-    parsed: Any, proof: PdbCoverageProof, selected_specs: Sequence[Any]
+    parsed: Any, proof: PdbCoverageProof, selected_specs: Sequence[Any], *,
+    native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ] = (),
 ) -> PdbCommitBinding:
     """Bind a completed exact-PDB proof to its unchanged parsed/file source."""
     if not isinstance(proof, PdbCoverageProof):
@@ -205,6 +440,10 @@ def bind_pdb_commit_proof(
     )
     if proof.direct_flow.coverage_gaps or not proof.direct_flow.direct_reference_gate_passed:
         raise PdbCoverageError("PDB direct-reference proof is incomplete")
+    closure = bind_selected_canonical_import_call_closure(
+        parsed, proof.direct_flow, selected_import_calls,
+        native_import_call_proofs,
+    )
     approvals = tuple(sorted({
         approval
         for item in proof.direct_flow.selected_flows
@@ -213,7 +452,7 @@ def bind_pdb_commit_proof(
     binding = PdbCommitBinding(
         *digests, selected, ranges,
         direct_control_flow.TailExitPolicy(approvals), proof.direct_flow,
-        selected_import_calls, "",
+        selected_import_calls, "", closure,
     )
     binding = replace(binding, binding_sha256=_binding_sha256(binding))
     validate_pdb_commit_binding(parsed, selected_specs, binding)
@@ -262,6 +501,10 @@ def validate_pdb_commit_binding(
         raise PdbCoverageError("PDB commit direct-reference proof changed")
     if _selected_indirect_import_calls(parsed, replay) != binding.selected_indirect_import_calls:
         raise PdbCoverageError("PDB commit selected indirect import inventory changed")
+    validate_selected_canonical_import_call_closure(
+        parsed, replay, binding.selected_indirect_import_calls,
+        binding.selected_canonical_import_call_closure,
+    )
 
 
 def _source_iat_slots(parsed: Any) -> frozenset[int]:

@@ -7,6 +7,7 @@ import struct
 import pytest
 
 from lifter import function_discovery
+from lifter import native_tail_calls
 from lifter import pdb_coverage as coverage
 from lifter import pdb_function_inventory as inventory
 from tests.test_pdb_coverage import fixture as base_fixture
@@ -60,6 +61,26 @@ def _case(monkeypatch, tmp_path: Path, code: bytes, *, duplicate_iat: bool = Fal
         tmp_path / "msdia.dll", (spec,),
     )
     return parsed, spec, proof
+
+
+def _native_import_proof(
+    call: coverage.SelectedIndirectImportCall,
+    *,
+    function_rva: int = 0x1000,
+) -> native_tail_calls.VerifiedNativeImportCallProof:
+    """Build an otherwise pinned dependency proof for one selected FF15 site."""
+    return native_tail_calls.VerifiedNativeImportCallProof(
+        function_rva=function_rva,
+        call_rva=call.source_rva,
+        iat_rva=call.iat_rva,
+        module=call.module,
+        symbol=call.symbol,
+        dependency_sha256="a" * 64,
+        export_rva=0x3000,
+        export_ordinal=1,
+        body_size=16,
+        body_sha256="b" * 64,
+    )
 
 
 def test_selected_import_indirect_calls_are_exactly_bound(monkeypatch, tmp_path):
@@ -163,6 +184,7 @@ def test_selected_import_calls_are_replayed_and_bound(monkeypatch, tmp_path):
     )
     binding = coverage.bind_pdb_commit_proof(parsed, proof, (spec,))
     assert binding.selected_indirect_import_calls == proof.selected_indirect_import_calls
+    assert binding.selected_canonical_import_call_closure is None
     assert binding.to_dict()["selected_indirect_import_calls"][0]["iat_rva"] == 0x2000
     coverage.validate_pdb_commit_binding(parsed, (spec,), binding)
 
@@ -174,3 +196,149 @@ def test_selected_import_calls_are_replayed_and_bound(monkeypatch, tmp_path):
     parsed.imports[0].funcs[0].iat_rva = 0x2008
     with pytest.raises(coverage.PdbCoverageError, match="source changed after preflight"):
         coverage.validate_pdb_commit_binding(parsed, (spec,), binding)
+
+
+def test_selected_canonical_import_closure_binds_every_call_through_one_iat(
+    monkeypatch, tmp_path
+):
+    """Two reachable calls may share a slot, but each physical call is bound."""
+    code = (
+        _call_iat(0x2000, ip=0x1000)
+        + _call_iat(0x2000, ip=0x1006)
+        + b"\xc3"
+    )
+    parsed, spec, proof = _case(monkeypatch, tmp_path, code)
+    assert proof.direct_flow.indirect_target_closure_proven is False
+    assert [item.source_rva for item in proof.selected_indirect_import_calls] == [
+        0x1000,
+        0x1006,
+    ]
+    native_proofs = tuple(
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    )
+
+    binding = coverage.bind_pdb_commit_proof(
+        parsed,
+        proof,
+        (spec,),
+        native_import_call_proofs=native_proofs,
+    )
+    closure = binding.selected_canonical_import_call_closure
+    assert isinstance(closure, coverage.SelectedCanonicalImportCallClosure)
+    assert closure.calls == proof.selected_indirect_import_calls
+    assert closure.native_import_call_proofs == native_proofs
+    assert binding.to_dict()["selected_canonical_import_call_closure"] == closure.to_dict()
+    assert binding.binding_sha256 == coverage._binding_sha256(binding)
+    coverage.validate_pdb_commit_binding(parsed, (spec,), binding)
+
+
+@pytest.mark.parametrize(
+    ("kind", "mutate", "message"),
+    [
+        ("missing", lambda items: items[:1], "do not exactly match"),
+        (
+            "extra",
+            lambda items: items + (replace(items[0], call_rva=0x1010),),
+            "do not exactly match",
+        ),
+        (
+            "duplicate",
+            lambda items: items + (items[0],),
+            "identity is duplicated",
+        ),
+        (
+            "function",
+            lambda items: (replace(items[0], function_rva=0x1001),) + items[1:],
+            "do not exactly match",
+        ),
+        (
+            "call",
+            lambda items: (replace(items[0], call_rva=0x1001),) + items[1:],
+            "do not exactly match",
+        ),
+        (
+            "iat",
+            lambda items: (replace(items[0], iat_rva=0x2008),) + items[1:],
+            "do not exactly match",
+        ),
+        (
+            "module",
+            lambda items: (replace(items[0], module="Qt6Gui.dll"),) + items[1:],
+            "do not exactly match",
+        ),
+        (
+            "symbol",
+            lambda items: (replace(items[0], symbol="QOther"),) + items[1:],
+            "do not exactly match",
+        ),
+    ],
+    ids=lambda item: item if isinstance(item, str) else None,
+)
+def test_selected_canonical_import_closure_rejects_nonexact_native_proofs(
+    monkeypatch, tmp_path, kind, mutate, message
+):
+    del kind
+    code = (
+        _call_iat(0x2000, ip=0x1000)
+        + _call_iat(0x2000, ip=0x1006)
+        + b"\xc3"
+    )
+    parsed, spec, proof = _case(monkeypatch, tmp_path, code)
+    native_proofs = tuple(
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    )
+    with pytest.raises(coverage.PdbCoverageError, match=message):
+        coverage.bind_pdb_commit_proof(
+            parsed,
+            proof,
+            (spec,),
+            native_import_call_proofs=mutate(native_proofs),
+        )
+
+
+def test_selected_canonical_import_closure_tamper_rejects_after_binding(
+    monkeypatch, tmp_path
+):
+    parsed, spec, proof = _case(
+        monkeypatch, tmp_path, _call_iat(0x2000) + b"\xc3"
+    )
+    native_proofs = tuple(
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    )
+    binding = coverage.bind_pdb_commit_proof(
+        parsed,
+        proof,
+        (spec,),
+        native_import_call_proofs=native_proofs,
+    )
+    closure = binding.selected_canonical_import_call_closure
+    assert closure is not None
+    altered_proof = replace(closure.native_import_call_proofs[0], symbol="QOther")
+    altered_closure = replace(
+        closure, native_import_call_proofs=(altered_proof,)
+    )
+    forged = replace(
+        binding,
+        selected_canonical_import_call_closure=altered_closure,
+    )
+    forged = replace(forged, binding_sha256=coverage._binding_sha256(forged))
+    with pytest.raises(coverage.PdbCoverageError, match="do not exactly match"):
+        coverage.validate_pdb_commit_binding(parsed, (spec,), forged)
+
+
+def test_selected_canonical_import_closure_requires_an_immutable_proof_tuple(
+    monkeypatch, tmp_path
+):
+    parsed, spec, proof = _case(
+        monkeypatch, tmp_path, _call_iat(0x2000) + b"\xc3"
+    )
+    native_proofs = [
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    ]
+    with pytest.raises(coverage.PdbCoverageError, match="immutable"):
+        coverage.bind_pdb_commit_proof(
+            parsed,
+            proof,
+            (spec,),
+            native_import_call_proofs=native_proofs,  # type: ignore[arg-type]
+        )

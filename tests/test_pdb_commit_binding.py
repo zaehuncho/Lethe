@@ -11,6 +11,7 @@ import pytest
 
 from lifter import function_discovery
 from lifter import direct_control_flow as flow
+from lifter import native_tail_calls
 from lifter import pdb_coverage as coverage
 from lifter import pdb_function_inventory as inventory
 from lifter import virtualization_plan as plan
@@ -63,6 +64,29 @@ def _case(monkeypatch, tmp_path: Path, *, pdb_code: bytes = b"\x90" * 7 + b"\xc3
 def _bound_manifest(image, spec, proof, manifest):
     binding = coverage.bind_pdb_commit_proof(image, proof, spec)
     return replace(manifest, source_coverage_mode="pdb", pdb_commit_binding=binding)
+
+
+def test_pdb_commit_rejects_manifest_native_proof_without_bound_closure(
+    monkeypatch, tmp_path
+):
+    """A manifest proof cannot appear after a PDB-only closure was bound."""
+    image, spec, proof, manifest = _case(monkeypatch, tmp_path)
+    pdb_manifest = _bound_manifest(image, spec, proof, manifest)
+    assert pdb_manifest.pdb_commit_binding.selected_canonical_import_call_closure is None
+    injected = native_tail_calls.VerifiedNativeImportCallProof(
+        0x1000, 0x1000, 0x2000, "leaf.dll", "leaf",
+        "a" * 64, 0x3000, 1, 16, "b" * 64,
+    )
+    forged = replace(pdb_manifest, native_import_call_proofs=(injected,))
+    before = copy.deepcopy(image)
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="selected canonical import closure has proofs but no selected import calls",
+    ):
+        virtualize.apply_virtualization_manifest(
+            image, forged, acknowledge_no_interior_entries=True
+        )
+    assert image == before
 
 
 def test_pdb_unframed_interior_reference_is_rechecked_at_low_level_commit(monkeypatch, tmp_path):
