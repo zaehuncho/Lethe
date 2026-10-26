@@ -271,18 +271,19 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_xfg_virtualization_preflight.py",
         "test_native_exe_exports.py",
         "test_lifter_frame_call_native.py",
+        "test_native_import_call_contract.py",
         "test_native_fp_frame_materialized.py",
         "test_native_known_references.py",
         "test_native_entry_metadata.py",
         "test_candidate_native_contract.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 42
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 47
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert ("tests/test_native_known_references.py::"
             "test_materialized_known_reference_admission_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert ("tests/test_native_entry_metadata.py::"
             "test_materialized_export_entry_metadata_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 42
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 47
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
@@ -301,9 +302,14 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "tests/test_candidate_native_contract.py::test_native_callee_without_physical_frame_rejects_exe_and_dll[return_site]",
         "tests/test_candidate_native_contract.py::test_native_callee_without_physical_frame_rejects_exe_and_dll[home_write]",
         "tests/test_native_fp_frame_materialized.py::test_materialized_frame_aliases_and_native_callers_exe_dll",
+        "tests/test_native_import_call_contract.py::test_materialized_generated_import_leaf_exe_and_dll[exe]",
+        "tests/test_native_import_call_contract.py::test_materialized_generated_import_leaf_exe_and_dll[dll]",
+        "tests/test_native_import_call_contract.py::test_materialized_xfg_member_hidden_sret_import_call",
+        "tests/test_native_import_call_contract.py::test_materialized_generated_fp_import_leaf_exe_and_dll[exe]",
+        "tests/test_native_import_call_contract.py::test_materialized_generated_fp_import_leaf_exe_and_dll[dll]",
     ):
         assert node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert promote_stub.candidate_policy_payload()["required_native_runtime_count"] == 42
+    assert promote_stub.candidate_policy_payload()["required_native_runtime_count"] == 47
     assert len(promote_stub.candidate_policy_payload()["required_native_runtime_nodes_sha256"]) == 64
     for node in (
         "tests/test_native_virtualization_runtime.py::test_padded_dll_address_taken_entry_rejects_before_output",
@@ -349,6 +355,7 @@ def test_native_runtime_environment_enables_export_proof_for_exact_stub(tmp_path
         "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
         "LETHE_RUN_NATIVE_VM_E2E": "1",
         "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
+        "LETHE_RUN_NATIVE_IMPORT_CALL_E2E": "1",
         "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
     }
 

@@ -61,6 +61,7 @@ REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_xfg_virtualization_preflight.py",
     "test_native_exe_exports.py",
     "test_lifter_frame_call_native.py",
+    "test_native_import_call_contract.py",
     "test_native_fp_frame_materialized.py",
     "test_native_known_references.py",
     "test_native_entry_metadata.py",
@@ -135,6 +136,16 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_native_frame_call_boundary[aligned]",
     "tests/test_lifter_frame_call_native.py::"
     "test_native_frame_call_boundary[unwind]",
+    "tests/test_native_import_call_contract.py::"
+    "test_materialized_generated_import_leaf_exe_and_dll[exe]",
+    "tests/test_native_import_call_contract.py::"
+    "test_materialized_generated_import_leaf_exe_and_dll[dll]",
+    "tests/test_native_import_call_contract.py::"
+    "test_materialized_xfg_member_hidden_sret_import_call",
+    "tests/test_native_import_call_contract.py::"
+    "test_materialized_generated_fp_import_leaf_exe_and_dll[exe]",
+    "tests/test_native_import_call_contract.py::"
+    "test_materialized_generated_fp_import_leaf_exe_and_dll[dll]",
     "tests/test_native_fp_frame_materialized.py::"
     "test_materialized_frame_aliases_and_native_callers_exe_dll",
     "tests/test_native_fp_frame_materialized.py::"
@@ -241,6 +252,7 @@ def _runtime_hardening_environment(stub: Path) -> dict[str, str]:
         "LETHE_RUN_NATIVE_RUNTIME_STRESS": "1",
         "LETHE_RUN_NATIVE_VM_E2E": "1",
         "LETHE_RUN_NATIVE_EXE_EXPORTS": "1",
+        "LETHE_RUN_NATIVE_IMPORT_CALL_E2E": "1",
         "LETHE_NATIVE_RUNTIME_STUB_PATH": str(stub.resolve()),
     }
 

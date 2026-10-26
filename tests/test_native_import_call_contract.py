@@ -195,6 +195,7 @@ from packer import assemble, cfg_preservation, orchestrator, pe_analyze, virtual
 
 _ROOT = Path(__file__).resolve().parents[1]
 _LEAF_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "normal_leaf"
+_FP_LEAF_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "fp_leaf"
 _MEMBER_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "member_sret"
 
 
@@ -378,6 +379,119 @@ def test_materialized_generated_import_leaf_exe_and_dll(
     )
     assert hashlib.sha256((output_dir / helper.name).read_bytes()).hexdigest() == \
         hashlib.sha256(helper.read_bytes()).hexdigest()
+
+
+@pytest.mark.skipif(
+    os.name != "nt"
+    or os.environ.get("LETHE_RUN_NATIVE_IMPORT_CALL_E2E") != "1",
+    reason="opt-in generated strict-candidate FP/XMM span import-leaf regression",
+)
+@pytest.mark.parametrize("kind", ("exe", "dll"))
+def test_materialized_generated_fp_import_leaf_exe_and_dll(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-trip volatile XMM arguments and XMM0 output through a span call.
+
+    The selected caller sets positional double arguments in XMM0/XMM1, calls a
+    source-pinned, stack-neutral imported leaf, and consumes the XMM0 return.
+    This is deliberately not a generic floating-point admission: the helper is
+    independently leaf-proven and the materialized EXE/DLL must match its
+    original bit result exactly.
+    """
+    if not shutil.which("cmake"):
+        pytest.skip("CMake and Visual Studio x64 toolchain required")
+    stub_text = (os.environ.get("LETHE_STRICT_REFERENCE_STUB_PATH") or
+                 os.environ.get("LETHE_NATIVE_RUNTIME_STUB_PATH"))
+    assert stub_text, "strict verified stub path required"
+    stub = Path(stub_text).resolve()
+    assert stub.is_file() and stub.with_suffix(".manifest.json").is_file()
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+
+    build_source = tmp_path / "source"
+    shutil.copytree(_FP_LEAF_FIXTURE, build_source)
+    build = tmp_path / "build"
+    for command in (
+        ["cmake", "-S", str(build_source), "-B", str(build),
+         "-G", "Visual Studio 17 2022", "-A", "x64"],
+        ["cmake", "--build", str(build), "--config", "Release"],
+    ):
+        built = _run(command, tmp_path)
+        assert built.returncode == 0, (command, built.stdout, built.stderr)
+
+    release = build / "Release"
+    original = release / ("import_fp_leaf_exe.exe" if kind == "exe"
+                          else "import_fp_leaf_dll.dll")
+    helper = release / "import_fp_leaf_helper.dll"
+    host = release / "reference_host.exe"
+    assert original.is_file() and helper.is_file() and host.is_file()
+    original_bytes = original.read_bytes()
+    expected = b"IMPORT_FP_SPAN bits=bff0000000000000 passed=true\n"
+    original_run = _run([str(original)] if kind == "exe"
+                        else [str(host), str(original)], release)
+    assert (original_run.returncode, original_run.stdout, original_run.stderr) == (
+        0, expected, b""
+    )
+
+    spec, contract = _make_contract(
+        original, helper, tmp_path / f"{kind}-fp-native-import-contract.json",
+        selected_export="vm_fp_probe", dependency_export="helper_fp",
+    )
+    parsed = pe_analyze.analyze_pe(str(original))
+    gaps = direct_control_flow._compute_coverage_gaps(
+        direct_control_flow._normalize_sections(parsed),
+        tuple((item.begin_rva, item.end_rva)
+              for item in parsed.runtime_functions),
+    )
+    captured: dict[str, object] = {}
+    materialize = virtualize.materialize_selected_functions
+
+    def capture_materialization(*args, **kwargs):
+        result = materialize(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions", capture_materialization
+    )
+    output_dir = tmp_path / f"packed-fp-{kind}"
+    output_dir.mkdir()
+    output = output_dir / original.name
+    shutil.copyfile(helper, output_dir / helper.name)
+    packed = orchestrator.pack_file(
+        str(original),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=(kind == "dll"), stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size, spec.body_size
+            ),),
+            virtualization_gap_acknowledgements=tuple(
+                orchestrator.VirtualizationGapAcknowledgement(
+                    gap.rva, gap.size, "exact generated FP import fixture gap"
+                )
+                for gap in gaps
+            ),
+            acknowledge_unproven_indirect_targets=True,
+            virtualization_native_import_contract_path=str(contract),
+            _allow_unverified_stub_for_tests=False,
+        ),
+    )
+    assert packed.ok, packed.error
+    assert output.is_file() and original.read_bytes() == original_bytes
+    packed_run = _run([str(output)] if kind == "exe"
+                      else [str(host), str(output)], output_dir)
+    assert (packed_run.returncode, packed_run.stdout, packed_run.stderr) == (
+        0, expected, b""
+    )
+    assert hashlib.sha256((output_dir / helper.name).read_bytes()).hexdigest() == \
+        hashlib.sha256(helper.read_bytes()).hexdigest()
+
+    from daedalus import daedalus_disasm
+    materialized = captured["result"]
+    assert len(materialized.manifest.native_import_call_proofs) == 1
+    assert "n_call_frame_span" in daedalus_disasm.disassemble(
+        materialized.manifest.functions[0].program
+    )
 
 
 @pytest.mark.skipif(
