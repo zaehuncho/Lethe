@@ -1036,11 +1036,84 @@ def _canonical_relocation_blob(target_rvas: Iterable[int]) -> bytes:
     return b"".join(blocks)
 
 
+def _validate_reverified_native_import_contract(
+    parsed: pe_analyze.ParsedPE,
+    manifest: plan.VirtualizationManifest,
+    *,
+    reverified_native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ] | None,
+) -> None:
+    """Require persisted native-import proof metadata to be freshly verified.
+
+    A ``VirtualizationManifest`` persists only the result of a native import
+    contract verification, not an authenticated capability to reuse it. A
+    caller applying an already compiled manifest must therefore supply a fresh
+    contract result. In PDB mode the manifest tuple is canonicalized by the
+    scoped PDB closure, so the fresh contract tuple is rebound before its
+    canonical proof material is compared.
+    """
+    expected = manifest.native_import_call_proofs
+    if type(expected) is not tuple or any(
+        type(proof) is not native_tail_calls.VerifiedNativeImportCallProof
+        for proof in expected
+    ):
+        raise _fail("manifest native import call proof tuple is malformed")
+    if reverified_native_import_call_proofs is not None and (
+        type(reverified_native_import_call_proofs) is not tuple
+        or any(
+            type(proof) is not native_tail_calls.VerifiedNativeImportCallProof
+            for proof in reverified_native_import_call_proofs
+        )
+    ):
+        raise _fail("fresh native import contract proof tuple is malformed")
+    if not expected:
+        if reverified_native_import_call_proofs:
+            raise _fail(
+                "fresh native import contract has proofs absent from the manifest"
+            )
+        return
+    if reverified_native_import_call_proofs is None:
+        raise _fail(
+            "native import call proofs require fresh native import contract "
+            "verification at commit"
+        )
+    if manifest.source_coverage_mode == "pdb":
+        binding = manifest.pdb_commit_binding
+        if binding is None:
+            raise _fail("PDB commit binding is missing")
+        try:
+            rebound = pdb_coverage.bind_selected_canonical_import_call_closure(
+                parsed,
+                binding.direct_flow,
+                binding.selected_indirect_import_calls,
+                reverified_native_import_call_proofs,
+            )
+        except pdb_coverage.PdbCoverageError as exc:
+            raise _fail(
+                f"native import contract revalidation rejected: {exc}"
+            ) from exc
+        if rebound is None or rebound.native_import_call_proofs != expected:
+            raise _fail(
+                "native import contract revalidation does not exactly match "
+                "the PDB manifest proof tuple"
+            )
+        return
+    if reverified_native_import_call_proofs != expected:
+        raise _fail(
+            "native import contract revalidation does not exactly match "
+            "the manifest proof tuple"
+        )
+
+
 def _commit_manifest(
     parsed: pe_analyze.ParsedPE,
     manifest: plan.VirtualizationManifest,
     *,
     acknowledge_no_interior_entries: bool,
+    reverified_native_import_call_proofs: tuple[
+        native_tail_calls.VerifiedNativeImportCallProof, ...
+    ] | None = None,
 ) -> pe_analyze.ParsedPE:
     if acknowledge_no_interior_entries is not True:
         raise _fail(
@@ -1073,6 +1146,11 @@ def _commit_manifest(
             raise _fail(f"PDB commit binding rejected: {exc}") from exc
     elif manifest.source_coverage_mode != "legacy" or manifest.pdb_commit_binding is not None:
         raise _fail("virtualization manifest has inconsistent coverage mode")
+    _validate_reverified_native_import_contract(
+        parsed,
+        manifest,
+        reverified_native_import_call_proofs=reverified_native_import_call_proofs,
+    )
     _validate_padding_suffix_bindings(parsed, selected_specs)
     _validate_direct_only_references(parsed, manifest)
     cfg_plan = cfg_preservation.build_cfg_preservation_plan(parsed, manifest)
@@ -1207,20 +1285,45 @@ def apply_virtualization_manifest(
     manifest: plan.VirtualizationManifest,
     *,
     acknowledge_no_interior_entries: bool = False,
+    native_import_contract_path: str | None = None,
 ) -> pe_analyze.ParsedPE:
     """Atomically apply a previously compiled manifest to a copied ParsedPE.
 
     This separate commit API makes stale-source detection explicit for callers
-    that persist a plan between the compile and materialize phases.
+    that persist a plan between the compile and materialize phases. A manifest
+    containing native import-call proofs also requires a freshly verified
+    contract path; persisted proof metadata alone is not admission evidence.
     """
     if not isinstance(parsed, pe_analyze.ParsedPE):
         raise _fail("parsed must be a ParsedPE instance")
     if not isinstance(manifest, plan.VirtualizationManifest):
         raise _fail("manifest must be a VirtualizationManifest instance")
+    reverified_native_import_call_proofs = None
+    if native_import_contract_path is not None:
+        selected_specs = tuple(
+            plan.FunctionSpec(
+                function.name,
+                function.target_rva,
+                function.target_size,
+                function.lifted_body_size,
+            )
+            for function in manifest.functions
+        )
+        try:
+            reverified_native_import_call_proofs = (
+                native_import_contract.load_and_verify(
+                    native_import_contract_path,
+                    parsed=parsed,
+                    specs=selected_specs,
+                )
+            )
+        except native_import_contract.NativeImportContractError as exc:
+            raise _fail(f"native import contract rejected: {exc}") from exc
     return _commit_manifest(
         parsed,
         manifest,
         acknowledge_no_interior_entries=acknowledge_no_interior_entries,
+        reverified_native_import_call_proofs=reverified_native_import_call_proofs,
     )
 
 
@@ -1246,16 +1349,17 @@ def materialize_selected_functions(
         raise _fail("authenticated paging master key must be exactly 32 bytes")
     source_relocations, source_runtime_functions = _validate_source_image(parsed)
     if native_import_contract_path is None:
-        native_import_call_proofs = ()
+        reverified_native_import_call_proofs = ()
     else:
         try:
-            native_import_call_proofs = native_import_contract.load_and_verify(
+            reverified_native_import_call_proofs = native_import_contract.load_and_verify(
                 native_import_contract_path,
                 parsed=parsed,
                 specs=tuple(specs),
             )
         except native_import_contract.NativeImportContractError as exc:
             raise _fail(f"native import contract rejected: {exc}") from exc
+    native_import_call_proofs = reverified_native_import_call_proofs
     if pdb_coverage_proof is None:
         pdb_binding = None
     else:
@@ -1302,6 +1406,7 @@ def materialize_selected_functions(
         parsed,
         manifest,
         acknowledge_no_interior_entries=acknowledge_no_interior_entries,
+        reverified_native_import_call_proofs=reverified_native_import_call_proofs,
     )
     return MaterializationResult(
         parsed=committed,

@@ -10,6 +10,7 @@ from lifter import function_discovery
 from lifter import native_tail_calls
 from lifter import pdb_coverage as coverage
 from lifter import pdb_function_inventory as inventory
+from packer import virtualize
 from tests.test_pdb_coverage import fixture as base_fixture
 
 
@@ -269,6 +270,57 @@ def test_selected_canonical_import_closure_rejects_reordered_manifest_proofs(
             binding.selected_indirect_import_calls,
             closure,
             native_import_call_proofs=reordered,
+        )
+
+
+def test_commit_reverification_rebinds_pdb_native_contract_before_metadata_compare(
+    monkeypatch, tmp_path
+):
+    """Fresh contract proofs are canonicalized, then matched byte-for-byte."""
+    code = (
+        _call_iat(0x2000, ip=0x1000)
+        + _call_iat(0x2000, ip=0x1006)
+        + b"\xc3"
+    )
+    parsed, spec, proof = _case(monkeypatch, tmp_path, code)
+    native_proofs = tuple(
+        _native_import_proof(item) for item in proof.selected_indirect_import_calls
+    )
+    binding = coverage.bind_pdb_commit_proof(
+        parsed,
+        proof,
+        (spec,),
+        native_import_call_proofs=native_proofs,
+    )
+    closure = binding.selected_canonical_import_call_closure
+    assert closure is not None
+    manifest = SimpleNamespace(
+        source_coverage_mode="pdb",
+        pdb_commit_binding=binding,
+        native_import_call_proofs=closure.native_import_call_proofs,
+    )
+
+    # Contract declaration order is not a manifest ordering: the fresh proof
+    # must rebind to the same canonical closure rather than be compared as a
+    # loose set or rejected merely for declaration order.
+    virtualize._validate_reverified_native_import_contract(
+        parsed,
+        manifest,
+        reverified_native_import_call_proofs=tuple(reversed(native_proofs)),
+    )
+
+    forged = (
+        replace(native_proofs[0], dependency_sha256="c" * 64),
+        native_proofs[1],
+    )
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="does not exactly match the PDB manifest proof tuple",
+    ):
+        virtualize._validate_reverified_native_import_contract(
+            parsed,
+            manifest,
+            reverified_native_import_call_proofs=forged,
         )
 
 

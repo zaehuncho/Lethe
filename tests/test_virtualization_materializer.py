@@ -20,7 +20,7 @@ pytest.importorskip("lief")
 
 from daedalus import daedalus_ref, daedalus_rolling, shuffle_opcodes  # noqa: E402
 from keystone import KS_ARCH_X86, KS_MODE_64, Ks  # noqa: E402
-from lifter import virtualization_plan as plan  # noqa: E402
+from lifter import native_tail_calls, virtualization_plan as plan  # noqa: E402
 from lifter import win64_thunk  # noqa: E402
 from packer import (  # noqa: E402
     assemble,
@@ -120,6 +120,110 @@ def _parsed(*, selected_unwind_flags: int = 0) -> tuple[pe_analyze.ParsedPE, byt
         ),
         selected,
     )
+
+
+def _manifest_with_persisted_native_import_proof():
+    """Build a precompiled manifest whose persisted proof needs revalidation."""
+    parsed, selected = _parsed()
+    text_rva, data_rva = virtualize._next_generated_rvas(parsed, 1)
+    manifest = plan.compile_virtualization_manifest(
+        (plan.FunctionSpec("answer", 0x1000, len(selected)),),
+        plan.SectionImage.from_parsed_sections(parsed.sections),
+        generated_text_rva=text_rva,
+        generated_data_rva=data_rva,
+        runtime_common_rva=text_rva,
+        source_dir64_relocations=tuple(
+            plan.SourceDir64Relocation(item.target_rva)
+            for item in parsed.dir64_relocations
+        ),
+        require_source_relocation_metadata=True,
+        source_exception_metadata=plan.SourceExceptionMetadata(
+            parsed.pdata_rva,
+            tuple(
+                plan.SourceRuntimeFunction(
+                    item.begin_rva,
+                    item.end_rva,
+                    item.unwind_info_rva,
+                    item.unwind_flags,
+                )
+                for item in parsed.runtime_functions
+            ),
+        ),
+        require_source_exception_metadata=True,
+    )
+    proof = native_tail_calls.VerifiedNativeImportCallProof(
+        0x1000,
+        0x1000,
+        0x2000,
+        "leaf.dll",
+        "leaf",
+        "a" * 64,
+        0x3000,
+        1,
+        16,
+        "b" * 64,
+    )
+    return parsed, dataclasses.replace(
+        manifest, native_import_call_proofs=(proof,)
+    ), proof
+
+
+def test_persisted_native_import_proofs_require_fresh_contract_at_apply() -> None:
+    parsed, manifest, _proof = _manifest_with_persisted_native_import_proof()
+    before = copy.deepcopy(parsed)
+
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="require fresh native import contract verification",
+    ):
+        virtualize.apply_virtualization_manifest(
+            parsed, manifest, acknowledge_no_interior_entries=True
+        )
+
+    assert parsed == before
+
+
+def test_persisted_native_import_proofs_must_match_fresh_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    parsed, manifest, proof = _manifest_with_persisted_native_import_proof()
+    forged = dataclasses.replace(
+        proof,
+        dependency_sha256="c" * 64,
+        export_rva=0x3010,
+        export_ordinal=2,
+        body_size=8,
+        body_sha256="d" * 64,
+    )
+    manifest = dataclasses.replace(
+        manifest, native_import_call_proofs=(forged,)
+    )
+    calls = []
+
+    def fresh_contract(path, *, parsed, specs):
+        calls.append((path, parsed, specs))
+        return (proof,)
+
+    monkeypatch.setattr(
+        virtualize.native_import_contract, "load_and_verify", fresh_contract
+    )
+    before = copy.deepcopy(parsed)
+    with pytest.raises(
+        virtualize.VirtualizationMaterializationError,
+        match="does not exactly match the manifest proof tuple",
+    ):
+        virtualize.apply_virtualization_manifest(
+            parsed,
+            manifest,
+            acknowledge_no_interior_entries=True,
+            native_import_contract_path=str(tmp_path / "native-import-contract.json"),
+        )
+
+    assert len(calls) == 1
+    assert calls[0][0] == str(tmp_path / "native-import-contract.json")
+    assert calls[0][1] is parsed
+    assert calls[0][2] == (plan.FunctionSpec("answer", 0x1000, 6, 6),)
+    assert parsed == before
 
 
 def _visual_studio_available() -> bool:
