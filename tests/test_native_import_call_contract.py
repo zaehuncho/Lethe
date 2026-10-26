@@ -465,6 +465,8 @@ def test_materialized_generated_fp_import_leaf_exe_and_dll(
     materialize = virtualize.materialize_selected_functions
 
     def capture_materialization(*args, **kwargs):
+        captured["page_master_key"] = bytes(kwargs["page_master_key"])
+        captured["opcode_table"] = kwargs["opcode_table"]
         result = materialize(*args, **kwargs)
         captured["result"] = result
         return result
@@ -506,12 +508,32 @@ def test_materialized_generated_fp_import_leaf_exe_and_dll(
     assert hashlib.sha256((output_dir / helper.name).read_bytes()).hexdigest() == \
         hashlib.sha256(helper.read_bytes()).hexdigest()
 
-    from daedalus import daedalus_disasm
+    import struct
+
+    from daedalus import daedalus_ref
+    from packer import bytecode_pages
+
     materialized = captured["result"]
+    function = materialized.manifest.functions[0]
     assert len(materialized.manifest.native_import_call_proofs) == 1
-    assert "n_call_frame_span" in daedalus_disasm.disassemble(
-        materialized.manifest.functions[0].program
+    assert function.program_format == "paged-v1"
+    envelope = bytecode_pages.parse_envelope(function.program)
+    assert envelope.program_id == function.program_id
+    plain_program = bytecode_pages.open_program(
+        function.program, captured["page_master_key"]
     )
+    (data_size,) = struct.unpack_from("<H", plain_program)
+    assert 2 + data_size <= len(plain_program)
+    native_call_frame_ops = [
+        mnemonic
+        for _offset, mnemonic, _width, _kind, _operand in
+        daedalus_ref.iter_instructions(
+            plain_program[2 + data_size:],
+            captured["opcode_table"].decoder_mapping(),
+        )
+        if mnemonic in {"n_call_frame", "n_call_frame_span"}
+    ]
+    assert native_call_frame_ops == ["n_call_frame_span"]
 
 
 @pytest.mark.skipif(
