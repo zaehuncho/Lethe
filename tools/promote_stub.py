@@ -151,6 +151,8 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "tests/test_native_import_call_contract.py::"
     "test_materialized_xfg_member_hidden_sret_two_imported_stringlike_copy_ctors",
     "tests/test_native_import_call_contract.py::"
+    "test_materialized_xfg_member_hidden_sret_qstrlike_two_imported_copy_ctors",
+    "tests/test_native_import_call_contract.py::"
     "test_materialized_generated_fp_import_leaf_exe_and_dll[exe]",
     "tests/test_native_import_call_contract.py::"
     "test_materialized_generated_fp_import_leaf_exe_and_dll[dll]",

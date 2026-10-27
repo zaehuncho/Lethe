@@ -200,6 +200,9 @@ _MEMBER_FIXTURE = _ROOT / "tests" / "fixtures" / "native_import_contract" / "mem
 _MEMBER_TWO_CTOR_FIXTURE = (
     _ROOT / "tests" / "fixtures" / "native_import_contract" / "member_sret_two_ctor"
 )
+_MEMBER_QSTRLIKE_TWO_CTOR_FIXTURE = (
+    _ROOT / "tests" / "fixtures" / "native_import_contract" / "member_sret_qstrlike_two_ctor"
+)
 _PROMOTION_CAPABILITY_PATH_ENV = "LETHE_PROMOTION_RUNTIME_CAPABILITY_PATH"
 _PROMOTION_CAPABILITY_NONCE_ENV = "LETHE_PROMOTION_RUNTIME_CAPABILITY_NONCE"
 
@@ -1113,6 +1116,361 @@ def test_materialized_xfg_member_hidden_sret_two_imported_stringlike_copy_ctors(
                 orchestrator.VirtualizationGapAcknowledgement(
                     gap.rva, gap.size,
                     "exact generated XFG member/two-copy-ctor fixture gap",
+                )
+                for gap in gaps
+            ),
+            acknowledge_unproven_indirect_targets=True,
+            virtualization_native_import_contract_path=str(bad_contracts[0]),
+            _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
+        ),
+    )
+    assert not rejected.ok and not bad_output.exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt"
+    or os.environ.get("LETHE_RUN_NATIVE_IMPORT_CALL_E2E") != "1",
+    reason="opt-in strict-candidate XFG refcounted hidden-sret two-copy-ctor regression",
+)
+def test_materialized_xfg_member_hidden_sret_qstrlike_two_imported_copy_ctors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-trip a bounded QString-shaped refcounted C++ aggregate exactly.
+
+    The selected member returns a 56-byte, nontrivially destructible aggregate
+    through the Win64 hidden-result ABI (RCX) while consuming ``this`` in RDX.
+    Its two 24-byte ``QStrLike`` members each invoke the same exact imported
+    C++ copy constructor, whose conditional ``lock inc`` leaf is proven.  The
+    typed host makes three load/call/unload cycles and verifies refs reach two
+    while the returned result is live, then return to one after its two imported
+    destructors outside the selected function.  The source XFG/GFID entry must
+    remain byte-for-byte preserved in the packed load-config table.
+    """
+    if not shutil.which("cmake"):
+        pytest.skip("CMake and Visual Studio x64 toolchain required")
+    stub_text = (os.environ.get("LETHE_STRICT_REFERENCE_STUB_PATH") or
+                 os.environ.get("LETHE_NATIVE_RUNTIME_STUB_PATH"))
+    assert stub_text, "strict verified stub path required"
+    stub = Path(stub_text).resolve()
+    assert stub.is_file() and stub.with_suffix(".manifest.json").is_file()
+    promotion_capability_path, promotion_capability_nonce = (
+        _promotion_runtime_capability())
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_VIRTUALIZATION", "1")
+    monkeypatch.setenv("LETHE_ENABLE_EXPERIMENTAL_DLL", "1")
+
+    build_source = tmp_path / "source"
+    shutil.copytree(_MEMBER_QSTRLIKE_TWO_CTOR_FIXTURE, build_source)
+    build = tmp_path / "build"
+    for command in (
+        ["cmake", "-S", str(build_source), "-B", str(build),
+         "-G", "Visual Studio 17 2022", "-A", "x64"],
+        ["cmake", "--build", str(build), "--config", "Release"],
+    ):
+        built = _run(command, tmp_path)
+        assert built.returncode == 0, (command, built.stdout, built.stderr)
+
+    release = build / "Release"
+    original = release / "xfg_qstrlike_two.dll"
+    helper = release / "xfg_qstrlike_two_support.dll"
+    host = release / "xfg_qstrlike_two_host.exe"
+    assert original.is_file() and helper.is_file() and host.is_file()
+    original_bytes = original.read_bytes()
+    original_run = _run([str(host), str(original)], release)
+    assert (original_run.returncode, original_run.stdout, original_run.stderr) == (
+        0, b"XFG_QSTRLIKE_TWO_CTOR passed=true\r\n", b""
+    )
+
+    parsed = pe_analyze.analyze_pe(str(original))
+    assert parsed.is_dll is True
+    assert parsed.load_config is not None and parsed.load_config.xfg_present is True
+    member_exports = [item for item in function_discovery.parse_pe_exports(parsed)
+                      if item.name.startswith("?config@DetectorLike@@")]
+    assert len(member_exports) == 1
+    selected_export = member_exports[0].name
+    runtime = next(item for item in parsed.runtime_functions
+                   if item.begin_rva == member_exports[0].rva)
+    spec = plan.FunctionSpec(
+        selected_export, runtime.begin_rva, runtime.end_rva - runtime.begin_rva
+    )
+    source_body = plan.SectionImage.from_parsed_sections(parsed.sections).read_file_backed_executable(
+        spec.rva, spec.body_size
+    )
+    instructions = tuple(Decoder(64, source_body, ip=spec.rva))
+    assert instructions
+    assert any(
+        instruction.memory_base == Register.RDX
+        or any(
+            instruction.op_kind(index) == OpKind.REGISTER
+            and instruction.op_register(index) == Register.RDX
+            for index in range(instruction.op_count)
+        )
+        for instruction in instructions
+    ), "selected member must consume its Win64 this pointer"
+    assert any(
+        instruction.op_kind(index) == OpKind.REGISTER
+        and instruction.op_register(index) == Register.RCX
+        for instruction in instructions
+        for index in range(instruction.op_count)
+    ), "selected member must consume hidden return storage"
+    imports = {
+        function.iat_rva: (dll.name, function.name)
+        for dll in parsed.imports for function in dll.funcs
+        if not function.by_ordinal
+    }
+    copy_ctor = "??0QStrLike@@QEAA@AEBU0@@Z"
+    destructor = "??1QStrLike@@QEAA@XZ"
+    assert any(symbol == destructor for _module, symbol in imports.values())
+    imported_calls = []
+    selected_import_calls = []
+    for instruction in instructions:
+        if instruction.mnemonic != Mnemonic.CALL:
+            continue
+        iat_rva = native_tail_calls.rip_relative_import_call_target(
+            source_body, base=spec.rva, call_rva=instruction.ip
+        )
+        if iat_rva in imports:
+            selected_import_calls.append((instruction.ip, iat_rva))
+        if iat_rva in imports and imports[iat_rva][1] == copy_ctor:
+            imported_calls.append((instruction.ip, iat_rva))
+    assert len(imported_calls) == 2, imported_calls
+    assert selected_import_calls == imported_calls
+    assert len({call_rva for call_rva, _iat_rva in imported_calls}) == 2
+    assert len({iat_rva for _call_rva, iat_rva in imported_calls}) == 1
+    assert all(imports[iat_rva] == ("xfg_qstrlike_two_support.dll", copy_ctor)
+               for _call_rva, iat_rva in imported_calls)
+
+    support_parsed = pe_analyze.analyze_pe(str(helper))
+    destructor_export = next(
+        item for item in function_discovery.parse_pe_exports(support_parsed)
+        if item.name == destructor
+    )
+    destructor_section = next(
+        section for section in support_parsed.sections
+        if section.rva <= destructor_export.rva < section.rva + len(section.raw)
+    )
+    destructor_raw = destructor_section.raw[
+        destructor_export.rva - destructor_section.rva:
+    ]
+    destructor_body = bytearray()
+    for instruction in Decoder(64, destructor_raw, ip=destructor_export.rva):
+        offset = instruction.ip - destructor_export.rva
+        destructor_body.extend(destructor_raw[offset:offset + instruction.len])
+        if instruction.flow_control == FlowControl.RETURN:
+            assert instruction.mnemonic == Mnemonic.RET and instruction.op_count == 0
+            break
+    else:
+        raise AssertionError("QStrLike destructor lacks a bounded plain RET")
+    native_import_contract._prove_leaf(bytes(destructor_body), destructor_export.rva)
+    assert not any(
+        record.begin_rva < destructor_export.rva + len(destructor_body)
+        and destructor_export.rva < record.end_rva
+        for record in support_parsed.runtime_functions
+    )
+
+    invoke_export = next(
+        item for item in function_discovery.parse_pe_exports(parsed)
+        if item.name == "xfg_qstrlike_two_invoke"
+    )
+    invoke_runtime = next(
+        item for item in parsed.runtime_functions if item.begin_rva == invoke_export.rva
+    )
+    invoke_body = plan.SectionImage.from_parsed_sections(parsed.sections).read_file_backed_executable(
+        invoke_runtime.begin_rva, invoke_runtime.end_rva - invoke_runtime.begin_rva
+    )
+    destructor_calls = []
+    for instruction in Decoder(64, invoke_body, ip=invoke_runtime.begin_rva):
+        if instruction.mnemonic != Mnemonic.CALL:
+            continue
+        try:
+            iat_rva = native_tail_calls.rip_relative_import_call_target(
+                invoke_body, base=invoke_runtime.begin_rva, call_rva=instruction.ip
+            )
+        except ValueError:
+            continue
+        if imports.get(iat_rva, (None, None))[1] == destructor:
+            destructor_calls.append((instruction.ip, iat_rva))
+    assert len(destructor_calls) >= 2, destructor_calls
+    assert all(
+        not (spec.rva <= call_rva < spec.rva + spec.body_size)
+        for call_rva, _iat_rva in destructor_calls
+    )
+    source_gfid = next(
+        target for target in parsed.load_config.guard_cf_targets
+        if target.rva == spec.rva
+    )
+
+    discovery = direct_control_flow.analyze_direct_control_flow(
+        parsed, (spec,), production=False
+    )
+    assert all(
+        gap.rva + gap.size <= spec.rva
+        or spec.rva + spec.size <= gap.rva
+        for gap in discovery.coverage_gaps
+    ), discovery.coverage_gaps
+    contract_path = tmp_path / "xfg-member-qstrlike-two-ctor-native-import-contract.json"
+    exact_spec, contract_path = _make_contract(
+        original, helper, contract_path,
+        selected_export=selected_export,
+        dependency_export=copy_ctor,
+        expected_call_count=2,
+    )
+    assert exact_spec == spec
+    contract_doc = json.loads(contract_path.read_text(encoding="utf-8"))
+    records = contract_doc["calls"]
+    assert len(records) == 2
+    assert [
+        (record["function_rva"], record["call_rva"], record["iat_rva"])
+        for record in records
+    ] == [(spec.rva, call_rva, iat_rva) for call_rva, iat_rva in imported_calls]
+    assert len({record["call_rva"] for record in records}) == 2
+    assert len({record["iat_rva"] for record in records}) == 1
+
+    # Each same-IAT CALL has an independent source-site binding.  A valid proof
+    # for one copy construction must not admit the other.
+    bad_contracts = []
+    for index, record in enumerate(records):
+        mutated = json.loads(json.dumps(contract_doc))
+        mutated["calls"][index]["call_rva"] = record["call_rva"] + 1
+        bad_contract = tmp_path / f"xfg-member-qstrlike-two-ctor-bad-{index}.json"
+        bad_contract.write_text(
+            json.dumps(mutated, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(native_import_contract.NativeImportContractError):
+            native_import_contract.load_and_verify(
+                str(bad_contract), parsed=parsed, specs=(spec,)
+            )
+        bad_contracts.append(bad_contract)
+
+    gaps = direct_control_flow._compute_coverage_gaps(
+        direct_control_flow._normalize_sections(parsed),
+        tuple((item.begin_rva, item.end_rva)
+              for item in parsed.runtime_functions),
+    )
+    captured: dict[str, object] = {}
+    materialize = virtualize.materialize_selected_functions
+
+    def capture_materialization(*args, **kwargs):
+        result = materialize(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions", capture_materialization
+    )
+    output_dir = tmp_path / "packed-member-qstrlike-two-ctor"
+    output_dir.mkdir()
+    output = output_dir / original.name
+    shutil.copyfile(helper, output_dir / helper.name)
+    result = orchestrator.pack_file(
+        str(original),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=True, stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size, spec.body_size
+            ),),
+            virtualization_gap_acknowledgements=tuple(
+                orchestrator.VirtualizationGapAcknowledgement(
+                    gap.rva, gap.size,
+                    "exact generated XFG member/qstrlike-two-copy-ctor fixture gap",
+                )
+                for gap in gaps
+            ),
+            acknowledge_unproven_indirect_targets=True,
+            virtualization_native_import_contract_path=str(contract_path),
+            _allow_unverified_stub_for_tests=False,
+            _promotion_runtime_capability_path=promotion_capability_path,
+            _promotion_runtime_capability_nonce=promotion_capability_nonce,
+        ),
+    )
+    assert result.ok, result.error
+    assert output.is_file() and original.read_bytes() == original_bytes
+    packed_run = _run([str(host), str(output)], output_dir)
+    assert (packed_run.returncode, packed_run.stdout, packed_run.stderr) == (
+        original_run.returncode, original_run.stdout, original_run.stderr,
+    )
+    assert hashlib.sha256((output_dir / helper.name).read_bytes()).hexdigest() == \
+        hashlib.sha256(helper.read_bytes()).hexdigest()
+    # Host output is emitted only after three DLL load/call/unload cycles, and
+    # the selected member contained no destructor import; the two refcounted
+    # returned members were therefore destroyed outside the virtualized body.
+    assert packed_run.stdout == b"XFG_QSTRLIKE_TWO_CTOR passed=true\r\n"
+
+    materialized = captured["result"]
+    assert [proof.to_dict() for proof in materialized.manifest.native_import_call_proofs] == [
+        {
+            field: record[field]
+            for field in (
+                "function_rva", "call_rva", "iat_rva", "module", "symbol",
+                "dependency_sha256", "export_rva", "export_ordinal", "body_size",
+                "body_sha256",
+            )
+        }
+        for record in records
+    ]
+    function = materialized.manifest.functions[0]
+    assert function.target_rva == spec.rva
+    assert function.capabilities["direct_only_thunk"] is True
+    assert function.capabilities["cfg_target_declared"] is False
+    assert function.capabilities["xfg_function_hash_emitted"] is False
+    thunk_rva = function.generated_executable_ranges[0].rva
+    assert materialized.parsed.generated_cfg_targets == ()
+    assert materialized.parsed.load_config == parsed.load_config
+    preserved_plan = cfg_preservation.build_cfg_preservation_plan(
+        materialized.parsed, materialized.manifest
+    )
+    assert preserved_plan.preservation_supported is True
+    assert preserved_plan.generated_thunk_targets == ()
+    assert any(
+        target.rva == source_gfid.rva and target.metadata == source_gfid.metadata
+        for target in preserved_plan.merged_declared_targets
+    )
+
+    packed_image = assemble._StubImage(output.read_bytes())
+    load_config_rva, load_config_size = packed_image.dir(assemble.DIR_LOAD_CONFIG)
+    assert load_config_rva and load_config_size >= 148
+    packed_load_config = packed_image.read_at_rva(
+        load_config_rva, load_config_size
+    )
+    table_va = int.from_bytes(packed_load_config[128:136], "little")
+    table_count = int.from_bytes(packed_load_config[136:144], "little")
+    guard_flags = int.from_bytes(packed_load_config[144:148], "little")
+    assert guard_flags & 0x00800000
+    metadata_size = (guard_flags >> 28) & 0xF
+    stride = 4 + metadata_size
+    assert table_count and metadata_size
+    table = packed_image.read_at_rva(
+        table_va - packed_image.image_base, table_count * stride
+    )
+    packed_targets = {
+        int.from_bytes(table[offset:offset + 4], "little"):
+            table[offset + 4:offset + stride]
+        for offset in range(0, len(table), stride)
+    }
+    assert packed_targets[spec.rva] == source_gfid.metadata
+    assert thunk_rva not in packed_targets
+    entry = pe_analyze._slice_at_rva(
+        materialized.parsed.sections, spec.rva, 5,
+        what="materialized XFG member qstrlike-two-copy-ctor entry",
+    )
+    assert entry[0] == 0xE9
+    displacement = int.from_bytes(entry[1:5], "little", signed=True)
+    assert spec.rva + 5 + displacement == thunk_rva
+
+    bad_output = tmp_path / "must-not-exist-qstrlike-two-ctor.dll"
+    rejected = orchestrator.pack_file(
+        str(original),
+        orchestrator.PackOptions(
+            output_path=str(bad_output), is_dll=True, stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                spec.name, spec.rva, spec.size, spec.body_size
+            ),),
+            virtualization_gap_acknowledgements=tuple(
+                orchestrator.VirtualizationGapAcknowledgement(
+                    gap.rva, gap.size,
+                    "exact generated XFG member/qstrlike-two-copy-ctor fixture gap",
                 )
                 for gap in gaps
             ),
