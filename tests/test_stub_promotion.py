@@ -280,13 +280,13 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "test_native_entry_metadata.py",
         "test_candidate_native_contract.py",
     )
-    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 49
+    assert promote_stub.REQUIRED_NATIVE_RUNTIME_PASS_COUNT == 50
     assert promote_stub.REQUIRED_NATIVE_ROUNDTRIP_PASS_COUNT == 19
     assert ("tests/test_native_known_references.py::"
             "test_materialized_known_reference_admission_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
     assert ("tests/test_native_entry_metadata.py::"
             "test_materialized_export_entry_metadata_exe_and_dll") in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 49
+    assert len(set(promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS)) == 50
     assert (
         "tests/test_xmm_store128_native.py::"
         "test_aligned128_helpers_enforce_alignment_and_one_instruction_boundaries"
@@ -315,11 +315,13 @@ def test_release_runtime_gate_mandates_paged_virtualization_e2e() -> None:
         "tests/test_native_import_call_contract.py::test_materialized_generated_import_leaf_exe_and_dll[exe]",
         "tests/test_native_import_call_contract.py::test_materialized_generated_import_leaf_exe_and_dll[dll]",
         "tests/test_native_import_call_contract.py::test_materialized_xfg_member_hidden_sret_import_call",
+        "tests/test_native_import_call_contract.py::"
+        "test_materialized_xfg_member_hidden_sret_two_imported_stringlike_copy_ctors",
         "tests/test_native_import_call_contract.py::test_materialized_generated_fp_import_leaf_exe_and_dll[exe]",
         "tests/test_native_import_call_contract.py::test_materialized_generated_fp_import_leaf_exe_and_dll[dll]",
     ):
         assert node in promote_stub.REQUIRED_NATIVE_RUNTIME_NODE_IDS
-    assert promote_stub.candidate_policy_payload()["required_native_runtime_count"] == 49
+    assert promote_stub.candidate_policy_payload()["required_native_runtime_count"] == 50
     assert len(promote_stub.candidate_policy_payload()["required_native_runtime_nodes_sha256"]) == 64
     for node in (
         "tests/test_native_virtualization_runtime.py::test_padded_dll_address_taken_entry_rejects_before_output",
