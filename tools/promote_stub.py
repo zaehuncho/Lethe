@@ -57,6 +57,7 @@ REQUIRED_LOCKED_FILES = ("pyproject.toml", "uv.lock")
 REQUIRED_NATIVE_RUNTIME_TESTS = (
     "test_native_runtime_hardening_stress.py",
     "test_native_virtualization_runtime.py",
+    "test_native_terminal_tail_exit_materialized.py",
     "test_chain_group_materialized.py",
     "test_xmm_store128_native.py",
     "test_xfg_virtualization_preflight.py",
@@ -89,6 +90,10 @@ REQUIRED_NATIVE_RUNTIME_NODE_IDS = (
     "test_packed_dll_calls_source_bound_virtualized_padded_leaf",
     "tests/test_native_virtualization_runtime.py::"
     "test_padded_dll_address_taken_entry_rejects_before_output",
+    "tests/test_native_terminal_tail_exit_materialized.py::"
+    "test_materialized_terminal_direct_e9_tail_preserves_state_exe_and_dll[exe]",
+    "tests/test_native_terminal_tail_exit_materialized.py::"
+    "test_materialized_terminal_direct_e9_tail_preserves_state_exe_and_dll[dll]",
     "tests/test_chain_group_materialized.py::"
     "test_complete_chain_group_materializes_and_runs[exe]",
     "tests/test_chain_group_materialized.py::"

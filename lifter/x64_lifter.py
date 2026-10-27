@@ -66,6 +66,7 @@ from iced_x86 import (
     OpAccess,
     OpKind,
     Register,
+    RflagsBits,
 )
 
 # --- VM local layout (byte offsets into RefVM.locals) ----------------------
@@ -114,6 +115,14 @@ SA, SB, SR = 160, 168, 176                   # scratch: operand a, b, result
 # extra scratch for the wide (64x64->128) multiply used by imul overflow synthesis
 T0, T1, T2, T3, T4, T5 = 184, 192, 200, 208, 216, 224
 PF = 232                                      # parity flag (even low-byte parity)
+# The normal VM context imports/exports only these architectural arithmetic
+# flags.  Tail-only continuations restore CTX_RFLAGS with POPFQ before jumping
+# into retained native code, so any source instruction that modifies an
+# unmodeled flag would be observable by the native target and must remain
+# outside terminal-tail admission.
+_TAIL_MODELED_RFLAGS = int(
+    RflagsBits.CF | RflagsBits.PF | RflagsBits.ZF | RflagsBits.SF | RflagsBits.OF
+)
 CALL_DEPTH = 240                              # active internal CALL frames
 CALL_RET_BASE = 248                           # 32 x architectural return RIP
 CALL_STACK_CAPACITY = 32
@@ -500,6 +509,7 @@ class _Lifter:
         native_call_targets=frozenset(),
         guard_cf_dispatch_rva: int | None = None,
         native_call_stack_bytes: dict[int, int] | None = None,
+        tail_exit: tuple[int, int] | None = None,
     ) -> None:
         self.native_call_stack_bytes = (None if native_call_stack_bytes is None
                                         else dict(native_call_stack_bytes))
@@ -512,6 +522,7 @@ class _Lifter:
         self.guard_cf_dispatch_rva = (
             None if guard_cf_dispatch_rva is None else int(guard_cf_dispatch_rva)
         )
+        self.tail_exit = tail_exit
 
     def _new_label(self) -> str:
         """A unique intra-instruction label (for CL-shift zero-count guards).
@@ -2192,6 +2203,17 @@ class _Lifter:
             raise LiftUnsupported("branch target outside lifted function")
         return tgt
 
+    def _is_terminal_tail_exit(self, instr) -> bool:
+        """True only for the already-proven final E9 tail instruction."""
+        return (
+            self.tail_exit is not None
+            and instr.ip == self.tail_exit[0]
+            and instr.mnemonic == Mnemonic.JMP
+            and instr.op_count == 1
+            and instr.op_kind(0) == OpKind.NEAR_BRANCH64
+            and instr.near_branch_target == self.tail_exit[1]
+        )
+
     def _source_native_call_return_slot(self, instr) -> None:
         """Reproduce the source CALL's stack write before a proven native bridge.
 
@@ -2404,16 +2426,30 @@ class _Lifter:
         self.a.label(depth_ok)
         self.push_imm(0); self.a("halt")
 
+    def _terminal_tail_exit(self) -> None:
+        """Emit special success status 2 for a planner-proven direct tail."""
+        depth_ok = self._new_label()
+        self.rd_local(CALL_DEPTH); self.push_imm(0); self.a("cmp_eq")
+        self.a(f"jnz {depth_ok}")
+        self.push_imm(1); self.a("halt")
+        self.a.label(depth_ok)
+        self.push_imm(2); self.a("halt")
+
     # -- top-level -------------------------------------------------------
     def lift(self) -> str:
         instructions = _decode_exact(self.code, self.base)
-        call_analysis = _analyze_internal_calls(
-            instructions,
-            self.base,
-            self.end,
-            native_call_targets=self.native_call_targets,
-            guard_cf_dispatch_rva=self.guard_cf_dispatch_rva,
-        )
+        if self.tail_exit is None:
+            call_analysis = _analyze_internal_calls(
+                instructions,
+                self.base,
+                self.end,
+                native_call_targets=self.native_call_targets,
+                guard_cf_dispatch_rva=self.guard_cf_dispatch_rva,
+            )
+        else:
+            # validate_terminal_tail_exit() admits exactly one straight-line
+            # final E9 and no CALL/RET, so there are no VM returns to classify.
+            call_analysis = InternalCallAnalysis((), (), (), 0)
         internal_returns = frozenset(call_analysis.internal_return_rvas)
         top_level_returns = frozenset(call_analysis.top_level_return_rvas)
         self._exact_cvtsi2sd_inputs = _cvtsi2sd_exact_inputs(instructions, self.base)
@@ -2549,7 +2585,10 @@ class _Lifter:
             elif m == Mnemonic.CALL:
                 self._call(instr)
             elif m == Mnemonic.JMP:
-                self.a(f"jmp {_lbl(self._branch_target(instr))}")
+                if self._is_terminal_tail_exit(instr):
+                    self._terminal_tail_exit()
+                else:
+                    self.a(f"jmp {_lbl(self._branch_target(instr))}")
             elif m in _CC:
                 tgt = self._branch_target(instr)
                 self._cc(m)
@@ -2668,6 +2707,127 @@ def validate_lifted_body_extent(
             "lifted body is not a valid prefix of its source extent"
         )
     _decode_exact(bytes(code), base)
+
+
+def _normalize_terminal_tail_exit(
+    tail_exit: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    if tail_exit is None:
+        return None
+    if (
+        type(tail_exit) is not tuple
+        or len(tail_exit) != 2
+        or any(type(value) is not int for value in tail_exit)
+    ):
+        raise LiftUnsupported(
+            "terminal tail exit must be an immutable (instruction_rva, target_rva) pair"
+        )
+    instruction_rva, target_rva = tail_exit
+    if not (0 < instruction_rva < _RVA_LIMIT and 0 < target_rva < _RVA_LIMIT):
+        raise LiftUnsupported("terminal tail exit contains an invalid RVA")
+    return instruction_rva, target_rva
+
+
+def _validate_terminal_tail_shape(
+    code: bytes,
+    base: int,
+    tail_exit: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Prove one body has exactly one final, direct external E9 exit.
+
+    This intentionally accepts no branch/call/RET before the exit.  Tail
+    virtualization uses a distinct physical continuation, so even a locally
+    analyzable alternate control-flow path would require a more complex proof
+    and remains fail-closed here.
+    """
+    normalized = _normalize_terminal_tail_exit(tail_exit)
+    if normalized is None:
+        return None
+    instruction_rva, target_rva = normalized
+    instructions = _decode_exact(bytes(code), base)
+    final = instructions[-1]
+    final_offset = final.ip - base
+    exact_e9 = (
+        final.mnemonic == Mnemonic.JMP
+        and final.op_count == 1
+        and final.op_kind(0) == OpKind.NEAR_BRANCH64
+        and final.len == 5
+        and code[final_offset : final_offset + final.len][:1] == b"\xE9"
+    )
+    if (
+        not exact_e9
+        or final.ip != instruction_rva
+        or final.near_branch_target != target_rva
+        or base <= target_rva < base + len(code)
+    ):
+        raise LiftUnsupported(
+            "terminal tail exit must be the final exact direct external E9"
+        )
+    for instruction in instructions[:-1]:
+        if instruction.flow_control != FlowControl.NEXT:
+            raise LiftUnsupported(
+                "terminal tail exit rejects nonterminal, conditional, indirect, "
+                f"or CALL control flow at 0x{instruction.ip:X}"
+            )
+    return normalized
+
+
+def _validate_terminal_tail_rflags(code: bytes, base: int) -> None:
+    """Reject tail bodies that make an unmodeled flag observable natively."""
+    for instruction in _decode_exact(bytes(code), base)[:-1]:
+        # The v5 tail shim restores the VM frame's arithmetic flags with POPFQ
+        # immediately before its native E9.  AF/DF/IF and every other
+        # unmodeled RFLAGS bit must therefore be preserved exactly unless the
+        # VM models it.  Do not let an apparently straight-line arithmetic
+        # wrapper silently leak an entry-state AF (or any other stale bit) to
+        # its retained target.  Include undefined flags as well: a native
+        # target can observe them with LAHF/PUSHFQ even if the selected wrapper
+        # itself never branches on them.
+        unmodeled_modified_rflags = (
+            int(instruction.rflags_modified) & ~_TAIL_MODELED_RFLAGS
+        )
+        if unmodeled_modified_rflags:
+            raise LiftUnsupported(
+                "terminal tail exit modifies unmodeled RFLAGS "
+                f"at 0x{instruction.ip:X}"
+            )
+        # A modeled flag must be defined too.  VM arithmetic can only export a
+        # concrete bit value to the POPFQ frame; it cannot reproduce the
+        # architecture's undefined-result semantics at the retained target.
+        # For example, variable-count ROL writes only CF/OF, but its OF value
+        # can be undefined, which a target could observe with LAHF/PUSHFQ.
+        undefined_rflags = int(instruction.rflags_undefined)
+        if undefined_rflags:
+            raise LiftUnsupported(
+                "terminal tail exit leaves RFLAGS undefined "
+                f"at 0x{instruction.ip:X}"
+            )
+
+
+def validate_terminal_tail_exit(
+    code: bytes,
+    base: int = 0x1000,
+    *,
+    tail_exit: tuple[int, int],
+    window_size: int,
+) -> int:
+    """Prove a bounded, stack-neutral terminal direct E9 tail transfer.
+
+    In addition to exact E9 shape, reuse the materialized stack dataflow proof
+    and require the terminal state to hold no entry-RSP alias or stack-pointer
+    spill.  This is the only entry point that authorizes lift_function() to
+    emit VM halt status 2.
+    """
+    normalized = _validate_terminal_tail_shape(code, base, tail_exit)
+    assert normalized is not None
+    depth = validate_materialized_stack_window(
+        code,
+        base,
+        window_size=window_size,
+        terminal_tail_exit=normalized,
+    )
+    _validate_terminal_tail_rflags(code, base)
+    return depth
 
 
 def _rip_access(instruction, operand: int) -> tuple[str, bool]:
@@ -3023,6 +3183,7 @@ def validate_materialized_stack_window(
     window_size: int,
     native_call_targets=frozenset(),
     native_call_stack_bytes: dict[int, int] | None = None,
+    terminal_tail_exit: tuple[int, int] | None = None,
 ) -> int:
     """Prove source stack allocation/derived accesses avoid shim control state.
 
@@ -3049,6 +3210,9 @@ def validate_materialized_stack_window(
     if window_size <= 0 or window_size % 16:
         raise ValueError("stack window must be a positive 16-byte multiple")
     instructions = _decode_exact(code, base)
+    terminal_tail_exit = _validate_terminal_tail_shape(
+        code, base, terminal_tail_exit
+    )
     end = base + len(code)
     by_ip = {item.ip: item for item in instructions}
     starts = frozenset(by_ip)
@@ -3394,6 +3558,35 @@ def validate_materialized_stack_window(
             elif depth:
                 raise LiftUnsupported(f"unbalanced top-level RET at 0x{ip:X}")
         elif mnemonic == Mnemonic.JMP:
+            if (
+                terminal_tail_exit is not None
+                and ip == terminal_tail_exit[0]
+                and item.op_kind(0) == OpKind.NEAR_BRANCH64
+                and item.near_branch_target == terminal_tail_exit[1]
+            ):
+                if returns:
+                    raise LiftUnsupported(
+                        f"terminal tail exit has an internal CALL frame at 0x{ip:X}"
+                    )
+                if depth:
+                    raise LiftUnsupported(
+                        f"terminal tail exit has nonzero source stack depth at 0x{ip:X}"
+                    )
+                if any(
+                    value is not None
+                    for index, value in enumerate(aliases)
+                    if index != 4
+                ):
+                    raise LiftUnsupported(
+                        f"terminal tail exit retains a source stack pointer alias at 0x{ip:X}"
+                    )
+                if spills:
+                    raise LiftUnsupported(
+                        f"terminal tail exit retains a source stack pointer spill at 0x{ip:X}"
+                    )
+                # This direct transfer is the proven terminal state.  Do not
+                # enqueue the retained native target into the lifted CFG.
+                continue
             enqueue(target(item))
         elif mnemonic in _CC:
             enqueue(target(item))
@@ -3415,6 +3608,8 @@ def lift_function(
     native_call_targets=frozenset(),
     guard_cf_dispatch_rva: int | None = None,
     native_call_stack_bytes: dict[int, int] | None = None,
+    tail_exit: tuple[int, int] | None = None,
+    tail_stack_window_size: int | None = None,
 ) -> str:
     """Lift x64 machine code into Daedalus VM assembly, or raise LiftUnsupported.
 
@@ -3432,6 +3627,27 @@ def lift_function(
         base,
         len(code) if source_extent_size is None else source_extent_size,
     )
+    if tail_exit is None:
+        if tail_stack_window_size is not None:
+            raise LiftUnsupported(
+                "tail stack window requires an explicit terminal tail exit"
+            )
+        normalized_tail_exit = None
+    else:
+        if type(tail_stack_window_size) is not int:
+            raise LiftUnsupported(
+                "terminal tail exit requires an explicit materialized stack window"
+            )
+        normalized_tail_exit = _validate_terminal_tail_shape(
+            code, base, tail_exit
+        )
+        assert normalized_tail_exit is not None
+        validate_terminal_tail_exit(
+            code,
+            base,
+            tail_exit=normalized_tail_exit,
+            window_size=tail_stack_window_size,
+        )
     validate_rip_relative_references(
         code,
         base,
@@ -3448,6 +3664,7 @@ def lift_function(
         native_call_targets=native_call_targets,
         guard_cf_dispatch_rva=guard_cf_dispatch_rva,
         native_call_stack_bytes=native_call_stack_bytes,
+        tail_exit=normalized_tail_exit,
     ).lift()
 
 

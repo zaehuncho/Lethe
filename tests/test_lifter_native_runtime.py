@@ -120,7 +120,20 @@ def test_lifted_body_executes_through_native_x64_frame(tmp_path: Path) -> None:
     preserve_cf_blob = daedalus_asm.assemble(
         lifter.lift_function(preserve_cf_body, base=oracle.BASE)
     )
-
+    # Status 2 is reserved for a planner-proven terminal native tail transfer.
+    # A generic/raw C caller must preserve its historical zero-only commit
+    # semantics; the v5 bridge exercises the separate paged-tail boundary.
+    tail_status_body = _asm("mov eax, 0x5a; xor edx, edx")
+    tail_status_zero = daedalus_asm.assemble(
+        lifter.lift_function(tail_status_body, base=oracle.BASE)
+    )
+    assert tail_status_zero.endswith(b"\x04" + b"\0" * 9)
+    tail_status_blob = (
+        tail_status_zero[:-10]
+        + b"\x04"
+        + (2).to_bytes(8, "little")
+        + b"\0"
+    )
     flag_programs = []
     flag_expectations = []
     for index, assembly in enumerate((
@@ -194,6 +207,7 @@ uint64_t daedalus_trampoline_call(void *func, int argc, const uint64_t *argv)
 static const uint8_t lifted_program[] = {{ {_c_bytes(blob)} }};
 static const uint8_t lifted_rolling_program[] = {{ {_c_bytes(rolling_blob)} }};
 static const uint8_t preserve_cf_program[] = {{ {_c_bytes(preserve_cf_blob)} }};
+static const uint8_t tail_status_program[] = {{ {_c_bytes(tail_status_blob)} }};
 {flag_declarations}
 typedef struct FlagCase {{
     const uint8_t *plain;
@@ -294,6 +308,15 @@ int main(void)
     if (context.gpr[DVM_X64_RAX] != 42
             || !(context.rflags & DVM_X64_RFLAGS_CF))
         return 51;
+
+    context = initial;
+    snapshot = context;
+    if (daedalus_vm_exec_x64(tail_status_program,
+            (uint32_t)sizeof(tail_status_program), &context,
+            (const uint8_t *)(uintptr_t)UINT64_C(0x180000000)) != 2)
+        return 52;
+    if (memcmp(&context, &snapshot, sizeof(context)) != 0)
+        return 54;
 
     snapshot = context;
     if (daedalus_vm_exec_x64(malformed,

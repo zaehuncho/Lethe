@@ -1169,18 +1169,22 @@ int daedalus_vm_exec_x64(const uint8_t *program, uint32_t program_size,
 
     dvm_x64_import(&vm, context, image_base);
     rc = dvm_run(&vm);
-    if (rc == 0)
+    /* The public/raw boundary preserves its historical contract: only a
+     * successful zero HALT commits the captured architectural frame.  Status
+     * 2 is meaningful solely to the v5 terminal-tail bridge below. */
+    if (rc == DVM_X64_STATUS_OK)
         dvm_x64_export(&vm, context);
     dvm_state_wipe(&vm);
     return rc;
 }
 
 #ifdef DVM_PAGED_RUNTIME
-int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
-                               uint32_t envelope_size,
-                               const uint8_t expected_program_id[16],
-                               DaedalusX64Context *context,
-                               const uint8_t *image_base)
+static int dvm_x64_exec_paged_impl(const uint8_t *envelope,
+                                   uint32_t envelope_size,
+                                   const uint8_t expected_program_id[16],
+                                   DaedalusX64Context *context,
+                                   const uint8_t *image_base,
+                                   int commit_tail_exit)
 {
     DaedalusVM vm;
     int rc;
@@ -1194,9 +1198,34 @@ int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
     }
     dvm_x64_import(&vm, context, image_base);
     rc = dvm_run(&vm);
-    if (rc == 0)
+    if (rc == DVM_X64_STATUS_OK ||
+        (commit_tail_exit && rc == DVM_X64_STATUS_TAIL_EXIT))
         dvm_x64_export(&vm, context);
     dvm_state_wipe(&vm);
     return rc;
+}
+
+int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
+                               uint32_t envelope_size,
+                               const uint8_t expected_program_id[16],
+                               DaedalusX64Context *context,
+                               const uint8_t *image_base)
+{
+    /* v4 and direct users retain the historical "commit only on zero" ABI. */
+    return dvm_x64_exec_paged_impl(
+        envelope, envelope_size, expected_program_id, context, image_base, 0);
+}
+
+int daedalus_vm_exec_x64_paged_tail(const uint8_t *envelope,
+                                    uint32_t envelope_size,
+                                    const uint8_t expected_program_id[16],
+                                    DaedalusX64Context *context,
+                                    const uint8_t *image_base)
+{
+    /* This internal entry is reached only after the assembly bridge selected
+     * descriptor v5.  It lets that authenticated contract receive the
+     * VM-produced frame for status 2 without altering generic callers. */
+    return dvm_x64_exec_paged_impl(
+        envelope, envelope_size, expected_program_id, context, image_base, 1);
 }
 #endif

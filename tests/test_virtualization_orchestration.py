@@ -263,6 +263,245 @@ def _patch_post_materialization_pipeline(monkeypatch, expected_parsed, captures)
     monkeypatch.setattr(orchestrator, "_pe_content_id", lambda _path: "a" * 64)
 
 
+def _terminal_tail_binding_fixture(
+        *, target_flags=0, target_raw=True, target_rva=0x1100):
+    source_rva = 0x1000
+    source = b"\xE9" + (
+        target_rva - (source_rva + 5)
+    ).to_bytes(4, "little", signed=True)
+    target = b"\xB8\x2D\x00\x00\x00\xC3"
+    raw_target = target if target_raw else target[:-1]
+    section_raw = (
+        source
+        + b"\x90" * (target_rva - source_rva - len(source))
+        + raw_target
+    )
+    parsed = SimpleNamespace(
+        is_dll=False,
+        sections=(pe_analyze.ParsedSection(
+            ".text", source_rva, len(section_raw), section_raw, 0x60000020,
+        ),),
+        runtime_functions=(pe_analyze.ParsedRuntimeFunction(
+            target_rva, target_rva + len(target), 0x3000, target_flags,
+        ),),
+    )
+    spec = virtualization_plan.FunctionSpec("terminal_tail", source_rva, len(source))
+    approval = direct_control_flow.TailExitApproval(
+        source_rva, source_rva, target_rva, "reviewed terminal tail",
+    )
+    policy = direct_control_flow.TailExitPolicy((approval,))
+    selected = direct_control_flow.SelectedFunctionRange(
+        spec.name, spec.rva, spec.size, spec.lifted_body_size,
+    )
+    flow = direct_control_flow.SelectedFunctionFlow(
+        spec.name,
+        spec.rva,
+        spec.size,
+        spec.body_size,
+        (source_rva,),
+        (approval,),
+    )
+    transfer = direct_control_flow.DirectControlTransfer(
+        source_rva=source_rva,
+        source_range_begin_rva=source_rva,
+        source_has_runtime_function=False,
+        kind="jump",
+        target_rva=target_rva,
+        source_selected_name=spec.name,
+        target_selected_name=None,
+        target_is_selected_entry=False,
+        reachable_from_selected_entry=True,
+    )
+    proof = direct_control_flow.DirectControlFlowProof(
+        version=direct_control_flow.PROOF_VERSION,
+        selected_functions=(selected,),
+        decoded_runtime_functions=(),
+        direct_transfers=(transfer,),
+        indirect_transfers=(),
+        selected_flows=(flow,),
+        coverage_gaps=(),
+        acknowledged_coverage_gaps=(),
+        direct_runtime_coverage_complete=True,
+        direct_reference_gate_passed=True,
+        indirect_target_closure_proven=False,
+        limitations=(),
+    )
+    return parsed, (spec,), policy, proof, approval, target
+
+
+def _bind_terminal_tail(parsed, specs, policy, proof):
+    return orchestrator._bind_verified_tail_exit_specs(
+        parsed,
+        specs,
+        tail_policy=policy,
+        proof=proof,
+        direct_control_flow=direct_control_flow,
+        virtualization_plan=virtualization_plan,
+    )
+
+
+def test_tail_exit_binder_derives_target_identity_only_from_consumed_proof():
+    parsed, specs, policy, proof, approval, target = _terminal_tail_binding_fixture()
+
+    bound = _bind_terminal_tail(parsed, specs, policy, proof)
+
+    assert bound[0].tail_exit == virtualization_plan.TailExitSpec(
+        instruction_rva=approval.instruction_rva,
+        target_rva=approval.target_rva,
+        target_size=len(target),
+        target_unwind_info_rva=0x3000,
+        target_body_sha256=hashlib.sha256(target).hexdigest(),
+    )
+    assert specs[0].tail_exit is None
+
+
+def test_tail_exit_binder_accepts_real_direct_control_flow_proof():
+    parsed, specs, policy, _proof, approval, target = \
+        _terminal_tail_binding_fixture(target_rva=0x1005)
+
+    proof = direct_control_flow.analyze_direct_control_flow(
+        parsed,
+        specs,
+        tail_exit_policy=policy,
+        production=True,
+    )
+    bound = _bind_terminal_tail(parsed, specs, policy, proof)
+
+    assert proof.selected_flows[0].approved_tail_exits == (approval,)
+    assert bound[0].tail_exit is not None
+    assert bound[0].tail_exit.target_rva == approval.target_rva
+    assert bound[0].tail_exit.target_size == len(target)
+
+
+def test_tail_exit_binder_rejects_unconsumed_or_raw_tail_request():
+    parsed, specs, policy, proof, _approval, target = _terminal_tail_binding_fixture()
+    unconsumed = direct_control_flow.DirectControlFlowProof(
+        version=proof.version,
+        selected_functions=proof.selected_functions,
+        decoded_runtime_functions=proof.decoded_runtime_functions,
+        direct_transfers=proof.direct_transfers,
+        indirect_transfers=proof.indirect_transfers,
+        selected_flows=(direct_control_flow.SelectedFunctionFlow(
+            proof.selected_flows[0].name,
+            proof.selected_flows[0].rva,
+            proof.selected_flows[0].size,
+            proof.selected_flows[0].lifted_body_size,
+            proof.selected_flows[0].reachable_instruction_rvas,
+            (),
+        ),),
+        coverage_gaps=proof.coverage_gaps,
+        acknowledged_coverage_gaps=proof.acknowledged_coverage_gaps,
+        direct_runtime_coverage_complete=proof.direct_runtime_coverage_complete,
+        direct_reference_gate_passed=proof.direct_reference_gate_passed,
+        indirect_target_closure_proven=proof.indirect_target_closure_proven,
+        limitations=proof.limitations,
+    )
+    with pytest.raises(ValueError, match="was not consumed"):
+        _bind_terminal_tail(parsed, specs, policy, unconsumed)
+
+    raw_tail = virtualization_plan.FunctionSpec(
+        specs[0].name,
+        specs[0].rva,
+        specs[0].size,
+        tail_exit=virtualization_plan.TailExitSpec(
+            instruction_rva=specs[0].rva,
+            target_rva=0x1100,
+            target_size=len(target),
+            target_unwind_info_rva=0x3000,
+            target_body_sha256=hashlib.sha256(target).hexdigest(),
+        ),
+    )
+    with pytest.raises(ValueError, match="must be derived"):
+        _bind_terminal_tail(parsed, (raw_tail,), policy, proof)
+
+
+def test_tail_exit_binder_rejects_unsafe_target_pdata_or_body():
+    parsed, specs, policy, proof, _approval, _target = _terminal_tail_binding_fixture(
+        target_flags=1,
+    )
+    with pytest.raises(ValueError, match="handler-free primary"):
+        _bind_terminal_tail(parsed, specs, policy, proof)
+
+    parsed, specs, policy, proof, _approval, _target = _terminal_tail_binding_fixture(
+        target_raw=False,
+    )
+    with pytest.raises(ValueError, match="not wholly file-backed"):
+        _bind_terminal_tail(parsed, specs, policy, proof)
+
+
+def test_core_derives_terminal_tail_spec_after_consumed_proof(
+        monkeypatch, tmp_path):
+    source = tmp_path / "app.exe"
+    output = tmp_path / "app.packed.exe"
+    source.write_bytes(b"source")
+    stub, _stub_bytes, _manifest = _write_candidate(tmp_path, rolling=True)
+    source_parsed, specs, policy, proof, approval, target = \
+        _terminal_tail_binding_fixture()
+    materialized_parsed = SimpleNamespace(is_dll=False, materialized=True)
+    captures = {}
+    monkeypatch.setenv(orchestrator._VIRTUALIZATION_GATE, "1")
+    monkeypatch.setattr(pe_analyze, "analyze_pe", lambda _path: source_parsed)
+
+    def fake_proof(parsed, analyzed_specs, **kwargs):
+        captures["proof_parsed"] = parsed
+        captures["proof_specs"] = analyzed_specs
+        captures["proof_tail_policy"] = kwargs["tail_exit_policy"]
+        return proof
+
+    monkeypatch.setattr(
+        direct_control_flow, "analyze_direct_control_flow", fake_proof,
+    )
+
+    def fake_materialize(parsed, materialized_specs, **kwargs):
+        captures["materialize_parsed"] = parsed
+        captures["materialize_specs"] = materialized_specs
+        captures["tail_exit_proof"] = kwargs["tail_exit_proof"]
+        return SimpleNamespace(
+            parsed=materialized_parsed,
+            manifest=SimpleNamespace(
+                functions=(object(),),
+                native_import_call_proofs=(),
+            ),
+        )
+
+    monkeypatch.setattr(virtualize, "materialize_selected_functions", fake_materialize)
+    _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
+
+    result = orchestrator.pack_file(
+        str(source),
+        orchestrator.PackOptions(
+            output_path=str(output), is_dll=False, stub_path=str(stub),
+            virtualization_specs=(orchestrator.VirtualizationSpec(
+                specs[0].name, specs[0].rva, specs[0].size,
+            ),),
+            virtualization_tail_exit_approvals=(
+                orchestrator.VirtualizationTailExitApproval(
+                    approval.function_rva,
+                    approval.instruction_rva,
+                    approval.target_rva,
+                    approval.rationale,
+                ),
+            ),
+            acknowledge_unproven_indirect_targets=True,
+            _allow_unverified_stub_for_tests=True,
+        ),
+    )
+
+    assert result.ok, result.error
+    assert captures["proof_parsed"] is source_parsed
+    assert captures["proof_specs"] == specs
+    assert captures["proof_tail_policy"] == policy
+    assert captures["materialize_parsed"] is source_parsed
+    assert captures["tail_exit_proof"] is proof
+    assert captures["materialize_specs"][0].tail_exit == virtualization_plan.TailExitSpec(
+        instruction_rva=approval.instruction_rva,
+        target_rva=approval.target_rva,
+        target_size=len(target),
+        target_unwind_info_rva=0x3000,
+        target_body_sha256=hashlib.sha256(target).hexdigest(),
+    )
+
+
 def test_core_materializes_before_payload_and_pins_exact_stub(
         monkeypatch, tmp_path):
     source = tmp_path / "app.exe"
@@ -327,10 +566,6 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
                 orchestrator.VirtualizationGapAcknowledgement(
                     0x2000, 16, "known linker padding"),
             ),
-            virtualization_tail_exit_approvals=(
-                orchestrator.VirtualizationTailExitApproval(
-                    0x1000, 0x1004, 0x2000, "known tail target"),
-            ),
             acknowledge_unproven_indirect_targets=True,
             _allow_unverified_stub_for_tests=True,
         ),
@@ -358,10 +593,7 @@ def test_core_materializes_before_payload_and_pins_exact_stub(
         direct_control_flow.CoverageGapAcknowledgement(
             0x2000, 16, "known linker padding"),
     )
-    assert captures["proof_tail_policy"].approvals == (
-        direct_control_flow.TailExitApproval(
-            0x1000, 0x1004, 0x2000, "known tail target"),
-    )
+    assert captures["proof_tail_policy"].approvals == ()
     assert any("2 direct transfer" in line and "1 coverage gap" in line
                and "1 indirect transfer" in line for line in progress)
     assert any("virtualized 1 selected function" in line for line in progress)
@@ -376,7 +608,8 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
     source.write_bytes(b"source")
     manifest_path.write_text("{}", encoding="ascii")
     stub, _stub_bytes, _manifest = _write_candidate(tmp_path, rolling=True)
-    source_parsed = SimpleNamespace(is_dll=False)
+    source_parsed, expected_specs, expected_policy, proof, approval, target = \
+        _terminal_tail_binding_fixture()
     materialized_parsed = SimpleNamespace(is_dll=False, materialized=True)
     current_report = object()
     captures = {}
@@ -392,11 +625,18 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
         captures["source_sha256"] = kwargs["source_sha256"]
         return virtualization_selection.VerifiedSelection(
             functions=(virtualization_selection.SelectedFunction(
-                "Init", 0x1000, 16, 12),),
+                expected_specs[0].name,
+                expected_specs[0].rva,
+                expected_specs[0].size,
+            ),),
             gaps=(virtualization_selection.GapAcknowledgement(
                 0x2000, 16, "reviewed linker padding"),),
             tail_exits=(virtualization_selection.TailExitApproval(
-                0x1000, 0x1004, 0x3000, "reviewed tail"),),
+                approval.function_rva,
+                approval.instruction_rva,
+                approval.target_rva,
+                approval.rationale,
+            ),),
             acknowledge_unproven_indirect_targets=True,
         )
 
@@ -406,25 +646,23 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
         captures["proof_specs"] = specs
         captures["proof_gaps"] = kwargs["coverage_acknowledgements"]
         captures["proof_tails"] = kwargs["tail_exit_policy"].approvals
-        return SimpleNamespace(
-            direct_transfers=(), coverage_gaps=(),
-            acknowledged_coverage_gaps=(), indirect_transfers=(),
-            direct_reference_gate_passed=True,
-            indirect_target_closure_proven=False,
-        )
+        return proof
 
     monkeypatch.setattr(
         direct_control_flow, "analyze_direct_control_flow", fake_proof)
-    monkeypatch.setattr(
-        virtualize, "materialize_selected_functions",
-        lambda parsed, specs, **kwargs: SimpleNamespace(
+    def fake_materialize(parsed, specs, **kwargs):
+        captures["materialize_specs"] = specs
+        captures["tail_exit_proof"] = kwargs["tail_exit_proof"]
+        return SimpleNamespace(
             parsed=materialized_parsed,
             manifest=SimpleNamespace(
                 functions=(object(),),
                 native_import_call_proofs=(),
             ),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(
+        virtualize, "materialize_selected_functions", fake_materialize)
     _patch_post_materialization_pipeline(monkeypatch, materialized_parsed, captures)
 
     result = orchestrator.pack_file(
@@ -441,16 +679,19 @@ def test_core_consumes_verified_manifest_as_current_direct_only_request(
     assert captures["manifest_parsed"] is source_parsed
     assert captures["manifest_report"] is current_report
     assert captures["source_sha256"] == hashlib.sha256(b"source").hexdigest()
-    assert captures["proof_specs"] == (
-        virtualization_plan.FunctionSpec("Init", 0x1000, 16, 12),
-    )
+    assert captures["proof_specs"] == expected_specs
     assert captures["proof_gaps"] == (
         direct_control_flow.CoverageGapAcknowledgement(
             0x2000, 16, "reviewed linker padding"),
     )
-    assert captures["proof_tails"] == (
-        direct_control_flow.TailExitApproval(
-            0x1000, 0x1004, 0x3000, "reviewed tail"),
+    assert captures["proof_tails"] == expected_policy.approvals
+    assert captures["tail_exit_proof"] is proof
+    assert captures["materialize_specs"][0].tail_exit == virtualization_plan.TailExitSpec(
+        instruction_rva=approval.instruction_rva,
+        target_rva=approval.target_rva,
+        target_size=len(target),
+        target_unwind_info_rva=0x3000,
+        target_body_sha256=hashlib.sha256(target).hexdigest(),
     )
 
 

@@ -571,6 +571,304 @@ def _validate_virtualization_controls(
     return tuple(sorted(normalized_gaps)), tuple(sorted(normalized_tails))
 
 
+def _bind_verified_tail_exit_specs(
+    parsed,
+    specs,
+    *,
+    tail_policy,
+    proof,
+    direct_control_flow,
+    virtualization_plan,
+):
+    """Attach tail metadata only after a consumed source-flow proof.
+
+    A :class:`TailExitApproval` is intentionally only a review request.  It
+    becomes a planner-visible ``TailExitSpec`` here only after the direct-flow
+    analyzer has reported the exact reachable edge as consumed.  The derived
+    identity also binds the native destination to one unchanged, retained PDATA
+    record and its exact file-backed executable bytes.  This keeps raw caller
+    requests from becoming tail exits merely by reaching materialization.
+
+    Normal RET-ending selections have no tail approvals and retain their exact
+    historical ``FunctionSpec`` objects.
+    """
+
+    if type(specs) is not tuple:
+        raise ValueError("virtualization function specs must be an immutable tuple")
+    if any(type(spec) is not virtualization_plan.FunctionSpec for spec in specs):
+        raise ValueError("virtualization function specs are malformed")
+    if any(spec.tail_exit is not None for spec in specs):
+        raise ValueError(
+            "terminal tail exits must be derived from a consumed "
+            "direct-control proof"
+        )
+    if type(tail_policy) is not direct_control_flow.TailExitPolicy:
+        raise ValueError("terminal tail exits require a direct-flow tail policy")
+    approvals = tail_policy.approvals
+    if type(approvals) is not tuple:
+        raise ValueError("terminal tail policy approvals are malformed")
+    if not approvals:
+        return specs
+    if type(proof) is not direct_control_flow.DirectControlFlowProof:
+        raise ValueError(
+            "terminal tail exits require a completed direct-control proof"
+        )
+    if (
+        proof.version != direct_control_flow.PROOF_VERSION
+        or proof.direct_reference_gate_passed is not True
+    ):
+        raise ValueError(
+            "terminal tail exits require a production-valid direct-control proof"
+        )
+
+    specs_by_rva = {spec.rva: spec for spec in specs}
+    if len(specs_by_rva) != len(specs):
+        raise ValueError("virtualization function specs have duplicate RVAs")
+    policy_set = set(approvals)
+    if len(policy_set) != len(approvals):
+        raise ValueError("terminal tail policy approvals are duplicated")
+    if any(type(item) is not direct_control_flow.TailExitApproval
+           for item in approvals):
+        raise ValueError("terminal tail policy approvals are malformed")
+
+    # Bind the proof to the same selected identities before looking at any tail
+    # edge.  This is deliberately stricter than a matching source RVA alone:
+    # a proof over a trimmed body or another source name cannot authorize this
+    # materialization request.
+    selected = proof.selected_functions
+    if type(selected) is not tuple:
+        raise ValueError("direct-control proof selected-function inventory is malformed")
+    expected_selected = {
+        (spec.name, spec.rva, spec.size, spec.body_size)
+        for spec in specs
+    }
+    observed_selected = set()
+    for item in selected:
+        if type(item) is not direct_control_flow.SelectedFunctionRange:
+            raise ValueError("direct-control proof selected-function entry is malformed")
+        identity = (item.name, item.rva, item.size, item.body_size)
+        if identity not in expected_selected or identity in observed_selected:
+            raise ValueError("direct-control proof selected functions differ from request")
+        observed_selected.add(identity)
+    if observed_selected != expected_selected:
+        raise ValueError("direct-control proof selected functions differ from request")
+
+    flows = proof.selected_flows
+    if type(flows) is not tuple:
+        raise ValueError("direct-control proof selected-flow inventory is malformed")
+    flows_by_rva = {}
+    consumed = set()
+    for flow in flows:
+        if type(flow) is not direct_control_flow.SelectedFunctionFlow:
+            raise ValueError("direct-control proof selected-flow entry is malformed")
+        spec = specs_by_rva.get(flow.rva)
+        if (
+            spec is None
+            or (flow.name, flow.rva, flow.size, flow.lifted_body_size)
+            != (spec.name, spec.rva, spec.size, spec.body_size)
+            or flow.rva in flows_by_rva
+        ):
+            raise ValueError("direct-control proof selected flows differ from request")
+        if (
+            type(flow.reachable_instruction_rvas) is not tuple
+            or any(type(rva) is not int for rva in flow.reachable_instruction_rvas)
+            or type(flow.approved_tail_exits) is not tuple
+        ):
+            raise ValueError("direct-control proof tail-flow evidence is malformed")
+        reachable = set(flow.reachable_instruction_rvas)
+        flow_approvals = set()
+        for approval in flow.approved_tail_exits:
+            if (
+                type(approval) is not direct_control_flow.TailExitApproval
+                or approval not in policy_set
+                or approval.function_rva != spec.rva
+                or approval.instruction_rva not in reachable
+                or approval in flow_approvals
+            ):
+                raise ValueError("direct-control proof tail-flow evidence is malformed")
+            flow_approvals.add(approval)
+        flows_by_rva[flow.rva] = flow_approvals
+        consumed.update(flow_approvals)
+    if set(flows_by_rva) != set(specs_by_rva):
+        raise ValueError("direct-control proof selected flows differ from request")
+    if consumed != policy_set:
+        raise ValueError(
+            "terminal tail approval was not consumed by the direct-control proof"
+        )
+    if any(len(items) > 1 for items in flows_by_rva.values()):
+        raise ValueError(
+            "each selected function may have at most one consumed terminal tail exit"
+        )
+
+    try:
+        sections = tuple(parsed.sections)
+        runtime_functions = tuple(parsed.runtime_functions)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError(
+            "terminal tail exits require parsed source section and PDATA inventories"
+        ) from exc
+    if not sections or not runtime_functions:
+        raise ValueError(
+            "terminal tail exits require retained source PDATA and section inventories"
+        )
+
+    rva_limit = 0x1_0000_0000
+
+    def raw_span(rva, size, *, label):
+        if (
+            type(rva) is not int
+            or type(size) is not int
+            or rva <= 0
+            or size <= 0
+            or rva + size > rva_limit
+        ):
+            raise ValueError(f"{label} has an invalid RVA span")
+        matches = []
+        for section in sections:
+            try:
+                section_rva = section.rva
+                raw = section.raw
+                characteristics = section.characteristics
+            except AttributeError as exc:
+                raise ValueError("source section inventory is malformed") from exc
+            if (
+                type(section_rva) is not int
+                or type(characteristics) is not int
+                or not isinstance(raw, bytes)
+            ):
+                raise ValueError("source section inventory is malformed")
+            if section_rva <= rva and rva + size <= section_rva + len(raw):
+                matches.append((section, raw[rva - section_rva : rva - section_rva + size]))
+        if len(matches) != 1:
+            raise ValueError(f"{label} is not wholly file-backed by one source section")
+        return matches[0]
+
+    # A selected flow only proves that a reachable direct edge was consumed.
+    # The tail ABI is narrower: it admits a final raw E9, and only with a full
+    # source body.  Re-read it here rather than trusting the caller's request.
+    approvals_by_source = {
+        rva: next(iter(items))
+        for rva, items in flows_by_rva.items()
+        if items
+    }
+    direct_transfers = proof.direct_transfers
+    if type(direct_transfers) is not tuple:
+        raise ValueError("direct-control proof transfer inventory is malformed")
+    result = []
+    for spec in specs:
+        approval = approvals_by_source.get(spec.rva)
+        if approval is None:
+            result.append(spec)
+            continue
+        if spec.size < 5:
+            raise ValueError(
+                f"terminal tail exit for {spec.name!r} is smaller than its final E9"
+            )
+        if spec.body_size != spec.size:
+            raise ValueError(
+                f"terminal tail exit for {spec.name!r} requires the full selected body"
+            )
+        expected_instruction = spec.rva + spec.size - 5
+        if approval.instruction_rva != expected_instruction:
+            raise ValueError(
+                f"terminal tail approval for {spec.name!r} is not its final E9"
+            )
+        _source_section, source_body = raw_span(
+            spec.rva, spec.size, label=f"selected tail source {spec.name!r}"
+        )
+        if source_body[-5] != 0xE9:
+            raise ValueError(
+                f"terminal tail approval for {spec.name!r} does not name a raw E9"
+            )
+        decoded_target = (
+            approval.instruction_rva
+            + 5
+            + int.from_bytes(source_body[-4:], "little", signed=True)
+        )
+        if decoded_target != approval.target_rva:
+            raise ValueError(
+                f"terminal tail approval for {spec.name!r} target differs from raw E9"
+            )
+        transfer_matches = [
+            transfer
+            for transfer in direct_transfers
+            if (
+                type(transfer) is direct_control_flow.DirectControlTransfer
+                and transfer.kind == "jump"
+                and transfer.source_rva == approval.instruction_rva
+                and transfer.source_range_begin_rva == spec.rva
+                and transfer.target_rva == approval.target_rva
+                and transfer.source_selected_name == spec.name
+                and transfer.reachable_from_selected_entry is True
+            )
+        ]
+        if len(transfer_matches) != 1:
+            raise ValueError(
+                f"terminal tail approval for {spec.name!r} lacks one proven direct jump"
+            )
+
+        target_records = []
+        for record in runtime_functions:
+            try:
+                begin = record.begin_rva
+                end = record.end_rva
+                unwind = record.unwind_info_rva
+                flags = record.unwind_flags
+                chain_primary = record.chain_primary_rva
+            except AttributeError as exc:
+                raise ValueError("source PDATA inventory is malformed") from exc
+            if any(type(value) is not int for value in (
+                    begin, end, unwind, flags, chain_primary)):
+                raise ValueError("source PDATA inventory is malformed")
+            if begin == approval.target_rva:
+                target_records.append(record)
+        if len(target_records) != 1:
+            raise ValueError(
+                f"terminal tail target for {spec.name!r} lacks one exact PDATA record"
+            )
+        target = target_records[0]
+        target_size = target.end_rva - target.begin_rva
+        if (
+            target_size <= 0
+            or target.end_rva > rva_limit
+            or target.unwind_info_rva <= 0
+            or target.unwind_info_rva % 4
+        ):
+            raise ValueError("terminal tail target PDATA record is malformed")
+        if target.unwind_flags or target.chain_primary_rva:
+            raise ValueError(
+                "terminal tail target must be a handler-free primary PDATA function"
+            )
+        target_end = target.begin_rva + target_size
+        if any(
+            target.begin_rva < selected.rva + selected.size
+            and selected.rva < target_end
+            for selected in specs
+        ):
+            raise ValueError(
+                "terminal tail target overlaps a selected function"
+            )
+        owner, target_body = raw_span(
+            target.begin_rva, target_size,
+            label=f"terminal tail target for {spec.name!r}",
+        )
+        if not (owner.characteristics & virtualization_plan.IMAGE_SCN_MEM_EXECUTE):
+            raise ValueError("terminal tail target is not executable")
+        if owner.characteristics & virtualization_plan.IMAGE_SCN_MEM_DISCARDABLE:
+            raise ValueError("terminal tail target lies in a discardable section")
+        result.append(replace(
+            spec,
+            tail_exit=virtualization_plan.TailExitSpec(
+                instruction_rva=approval.instruction_rva,
+                target_rva=target.begin_rva,
+                target_size=target_size,
+                target_unwind_info_rva=target.unwind_info_rva,
+                target_body_sha256=hashlib.sha256(target_body).hexdigest(),
+            ),
+        ))
+    return tuple(result)
+
+
 def _load_virtualization_build(
     stub_path: str,
     *,
@@ -1061,6 +1359,14 @@ def pack_file(input_path: str, options: PackOptions,
                     f"{len(proof.indirect_transfers)} indirect transfer(s) "
                     "(closure unproven, acknowledged)",
                 )
+            function_specs = _bind_verified_tail_exit_specs(
+                parsed,
+                function_specs,
+                tail_policy=tail_policy,
+                proof=proof,
+                direct_control_flow=direct_control_flow,
+                virtualization_plan=virtualization_plan,
+            )
             _emit(
                 progress,
                 f"virtualizing {len(virtualization_specs)} explicitly selected "
@@ -1100,6 +1406,7 @@ def pack_file(input_path: str, options: PackOptions,
                 rolling_seed=None,
                 pdb_coverage_proof=(coverage if all(pdb_inputs) else None),
                 native_import_contract_path=native_import_contract_path,
+                tail_exit_proof=proof,
             )
             parsed = materialized.parsed
             if materialized.manifest.native_import_call_proofs:

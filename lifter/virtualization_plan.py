@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Protocol, Se
 if TYPE_CHECKING:
     from . import pdb_coverage
 
-from iced_x86 import Decoder, Mnemonic, OpKind
+from iced_x86 import Decoder, FlowControl, Mnemonic, OpKind
 
 try:  # package import
     from . import native_tail_calls, win64_thunk, x64_lifter
@@ -36,9 +36,16 @@ except ImportError:  # standalone tests put daedalus/ directly on sys.path
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 MANIFEST_VERSION = 3
 DESCRIPTOR_VERSION_PLAIN = 3
 DESCRIPTOR_VERSION_PAGED = 4
+# Descriptor v5 extends the authenticated paged form with one exact retained
+# native tail target RVA.  It is deliberately not a general native-transfer
+# descriptor: only a terminal direct E9 body carrying TailExitSpec may select
+# it, and the native bridge independently binds the target to the authenticated
+# envelope identity before the tail shim consumes status 2.
+DESCRIPTOR_VERSION_PAGED_TAIL = 5
 TARGET_ENTRY_PATCH_SIZE = 5
 _RVA_LIMIT = 0x1_0000_0000
 _NAME_LIMIT = 128
@@ -75,11 +82,41 @@ class FunctionRejected(VirtualizationPlanError):
 
 
 @dataclass(frozen=True)
+class TailExitSpec:
+    """Immutable identity for one opt-in terminal direct native tail exit.
+
+    ``instruction_rva`` is the selected body's final ``E9 rel32``.  The
+    remaining fields bind its destination to one retained, ordinary PDATA
+    function and its exact file-backed body.  This record is deliberately
+    descriptive rather than an admission token: the planner re-reads and
+    proves every field against the current image and exception inventory.
+    """
+
+    instruction_rva: int
+    target_rva: int
+    target_size: int
+    target_unwind_info_rva: int
+    target_body_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "instruction_rva": self.instruction_rva,
+            "target_rva": self.target_rva,
+            "target_size": self.target_size,
+            "target_unwind_info_rva": self.target_unwind_info_rva,
+            "target_body_sha256": self.target_body_sha256,
+        }
+
+
+@dataclass(frozen=True)
 class FunctionSpec:
     name: str
     rva: int
     size: int
     lifted_body_size: int | None = None
+    # Ordinary RET-ending functions leave this unset and retain the historical
+    # planner/lifter contract unchanged.
+    tail_exit: TailExitSpec | None = None
 
     @property
     def source_extent_size(self) -> int:
@@ -468,6 +505,28 @@ class UnwindPlan:
 
 
 @dataclass(frozen=True)
+class TailExitThunkLayout:
+    """RVA-level map for the split-unwind tail continuation in one shim."""
+
+    status_rva: int
+    restore_rva: int
+    popfq_rva: int
+    jump_rva: int
+    target_rel32_rva: int
+    jump_end_rva: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "status_rva": self.status_rva,
+            "restore_rva": self.restore_rva,
+            "popfq_rva": self.popfq_rva,
+            "jump_rva": self.jump_rva,
+            "target_rel32_rva": self.target_rel32_rva,
+            "jump_end_rva": self.jump_end_rva,
+        }
+
+
+@dataclass(frozen=True)
 class VirtualizedFunction:
     name: str
     target_rva: int
@@ -496,6 +555,15 @@ class VirtualizedFunction:
     internal_call_rvas: tuple[int, ...]
     max_internal_call_depth: int
     rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...]
+    # Present only for an opt-in terminal direct tail exit.  Keeping this
+    # source identity in the manifest lets the packer re-check it while it
+    # materializes the v5 descriptor and retained PDATA table.
+    tail_exit: TailExitSpec | None = None
+    tail_thunk: TailExitThunkLayout | None = None
+    # The primary thunk unwind plan is followed by the POPFQ and final-E9
+    # state ranges for a tail shim.  Ordinary functions keep this immutable
+    # tuple empty.
+    tail_unwind: tuple[UnwindPlan, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -534,6 +602,13 @@ class VirtualizedFunction:
             "rip_relative_references": [
                 reference.to_dict() for reference in self.rip_relative_references
             ],
+            "tail_exit": (
+                None if self.tail_exit is None else self.tail_exit.to_dict()
+            ),
+            "tail_thunk": (
+                None if self.tail_thunk is None else self.tail_thunk.to_dict()
+            ),
+            "tail_unwind": [item.to_dict() for item in self.tail_unwind],
         }
 
 
@@ -616,6 +691,7 @@ class _Compiled:
     call_analysis: x64_lifter.InternalCallAnalysis
     rip_relative_references: tuple[x64_lifter.RipRelativeReference, ...]
     program_id: bytes = b""
+    tail_exit: TailExitSpec | None = None
 
 
 def _validate_rva_range(rva: int, size: int, label: str) -> None:
@@ -667,6 +743,50 @@ def _validate_specs(specs: Sequence[FunctionSpec]) -> tuple[FunctionSpec, ...]:
                 f"function {spec.name!r} lifted body must be a five-byte-or-larger "
                 "prefix of the source extent"
             )
+        tail = spec.tail_exit
+        if tail is not None:
+            if type(tail) is not TailExitSpec:
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} tail exit must be TailExitSpec"
+                )
+            for label, value in (
+                ("tail instruction", tail.instruction_rva),
+                ("tail target", tail.target_rva),
+                ("tail target unwind info", tail.target_unwind_info_rva),
+            ):
+                if type(value) is not int or not 0 < value < _RVA_LIMIT:
+                    raise VirtualizationPlanError(
+                        f"function {spec.name!r} has invalid {label} RVA"
+                    )
+            _validate_rva_range(
+                tail.target_rva, tail.target_size,
+                f"function {spec.name!r} tail target",
+            )
+            if tail.target_unwind_info_rva % 4:
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} tail target unwind-info RVA "
+                    "must be four-byte aligned"
+                )
+            if not (
+                spec.rva <= tail.instruction_rva < spec.rva + spec.body_size
+            ):
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} tail instruction lies outside "
+                    "the lifted body"
+                )
+            if spec.body_size != spec.size:
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} terminal tail exit requires "
+                    "the complete selected extent"
+                )
+            if (
+                type(tail.target_body_sha256) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", tail.target_body_sha256)
+            ):
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} tail target body SHA-256 must be "
+                    "64 lowercase hexadecimal characters"
+                )
         ordered.append(spec)
     ordered.sort(key=lambda item: (item.rva, item.size, item.name))
     for previous, current in zip(ordered, ordered[1:]):
@@ -674,6 +794,17 @@ def _validate_specs(specs: Sequence[FunctionSpec]) -> tuple[FunctionSpec, ...]:
             raise VirtualizationPlanError(
                 f"selected functions {previous.name!r} and {current.name!r} overlap"
             )
+    for spec in ordered:
+        tail = spec.tail_exit
+        if tail is None:
+            continue
+        target_end = tail.target_rva + tail.target_size
+        for selected in ordered:
+            if tail.target_rva < selected.rva + selected.size and selected.rva < target_end:
+                raise VirtualizationPlanError(
+                    f"function {spec.name!r} tail target overlaps selected "
+                    f"function {selected.name!r}"
+                )
     return tuple(ordered)
 
 
@@ -953,14 +1084,15 @@ def _allocate_exception_table(
     generated_drafts = tuple(
         PlannedRuntimeFunction(
             origin="generated",
-            begin_rva=function.unwind.begin_rva,
-            end_rva=function.unwind.end_rva,
-            unwind_info_rva=function.unwind.unwind_info_rva,
+            begin_rva=unwind.begin_rva,
+            end_rva=unwind.end_rva,
+            unwind_info_rva=unwind.unwind_info_rva,
             unwind_flags=0,
             record_rva=None,
             function_name=function.name,
         )
         for function in functions
+        for unwind in (function.unwind, *function.tail_unwind)
     )
     merged_drafts = sorted(
         (*retained, *generated_drafts),
@@ -990,17 +1122,27 @@ def _allocate_exception_table(
     generated_allocated = tuple(
         record for record in allocated if record.origin == "generated"
     )
-    generated_by_begin = {
-        record.begin_rva: record for record in generated_allocated
+    generated_by_unwind = {
+        (record.begin_rva, record.end_rva, record.unwind_info_rva): record
+        for record in generated_allocated
     }
+
+    def allocate_unwind(unwind: UnwindPlan) -> UnwindPlan:
+        record = generated_by_unwind.get(
+            (unwind.begin_rva, unwind.end_rva, unwind.unwind_info_rva)
+        )
+        if record is None or record.record_rva is None:
+            raise VirtualizationPlanError(
+                "generated unwind range is absent from the exception table"
+            )
+        return replace(unwind, runtime_function_rva=record.record_rva)
+
     updated_functions = tuple(
         replace(
             function,
-            unwind=replace(
-                function.unwind,
-                runtime_function_rva=generated_by_begin[
-                    function.unwind.begin_rva
-                ].record_rva,
+            unwind=allocate_unwind(function.unwind),
+            tail_unwind=tuple(
+                allocate_unwind(unwind) for unwind in function.tail_unwind
             ),
         )
         for function in functions
@@ -1022,6 +1164,82 @@ def _allocate_exception_table(
     )
 
 
+def _validate_tail_exit_target(
+    spec: FunctionSpec,
+    reader: ExecutableReader,
+    retained_runtime_functions: Sequence[PlannedRuntimeFunction],
+) -> TailExitSpec | None:
+    """Re-prove an opt-in tail destination from current image/PData bytes.
+
+    A direct E9 alone is never an admission: the target must be one exact,
+    retained, handler-free primary runtime function and its file-backed body
+    must still match the immutable request.  In particular, a selected target,
+    a chained fragment, or a stale hash cannot silently become a native tail.
+    """
+
+    tail = spec.tail_exit
+    if tail is None:
+        return None
+    matches = [
+        record
+        for record in retained_runtime_functions
+        if record.begin_rva == tail.target_rva
+        and record.end_rva == tail.target_rva + tail.target_size
+        and record.unwind_info_rva == tail.target_unwind_info_rva
+    ]
+    if len(matches) != 1:
+        raise FunctionRejected(
+            spec,
+            "terminal tail target lacks one exact retained PDATA record",
+        )
+    target_record = matches[0]
+    if target_record.unwind_flags or target_record.chain_primary_rva:
+        raise FunctionRejected(
+            spec,
+            "terminal tail target must be a handler-free primary PDATA function",
+        )
+
+    # A generic ExecutableReader proves file backing and execute permission, but
+    # cannot prove that the target remains mapped after loader initialization.
+    # Tail transfer needs the latter property too, so require a concrete
+    # non-discardable section inventory rather than guessing it from an RVA.
+    sections = getattr(reader, "sections", None)
+    if not isinstance(sections, tuple):
+        raise FunctionRejected(
+            spec,
+            "terminal tail target requires concrete source section inventory",
+        )
+    target_end = tail.target_rva + tail.target_size
+    owner = next(
+        (
+            section
+            for section in sections
+            if section.rva <= tail.target_rva
+            and target_end <= section.rva + len(section.raw)
+        ),
+        None,
+    )
+    if owner is None or not (owner.characteristics & IMAGE_SCN_MEM_EXECUTE):
+        raise FunctionRejected(
+            spec, "terminal tail target is not wholly file-backed executable code"
+        )
+    if owner.characteristics & IMAGE_SCN_MEM_DISCARDABLE:
+        raise FunctionRejected(
+            spec, "terminal tail target lies in a discardable section"
+        )
+    try:
+        target_body = bytes(
+            reader.read_file_backed_executable(tail.target_rva, tail.target_size)
+        )
+    except (TypeError, ValueError, VirtualizationPlanError) as exc:
+        raise FunctionRejected(
+            spec, f"terminal tail target cannot be read exactly: {exc}"
+        ) from exc
+    if hashlib.sha256(target_body).hexdigest() != tail.target_body_sha256:
+        raise FunctionRejected(spec, "terminal tail target body identity is stale")
+    return tail
+
+
 def _decode_exact(spec: FunctionSpec, code: bytes):
     decoder = Decoder(64, code, ip=spec.rva)
     instructions = list(decoder)
@@ -1039,19 +1257,47 @@ def _decode_exact(spec: FunctionSpec, code: bytes):
             spec,
             f"decoder consumed 0x{cursor - spec.rva:X} bytes, expected 0x{len(code):X}",
         )
-    for instruction in instructions:
-        if instruction.mnemonic == Mnemonic.JMP or instruction.mnemonic in x64_lifter._CC:
-            if instruction.op_kind(0) != OpKind.NEAR_BRANCH64:
-                raise FunctionRejected(spec, "indirect or non-near branch")
-            target = instruction.near_branch_target
-            if target not in starts:
+    final = instructions[-1]
+    tail = spec.tail_exit
+    if tail is not None:
+        final_offset = final.ip - spec.rva
+        direct_e9 = (
+            final.mnemonic == Mnemonic.JMP
+            and final.op_count == 1
+            and final.op_kind(0) == OpKind.NEAR_BRANCH64
+            and final.len == 5
+            and code[final_offset : final_offset + final.len][:1] == b"\xE9"
+        )
+        if (
+            not direct_e9
+            or final.ip != tail.instruction_rva
+            or final.near_branch_target != tail.target_rva
+        ):
+            raise FunctionRejected(
+                spec,
+                "terminal tail exit must be the final exact direct E9 to its "
+                "declared target",
+            )
+        for instruction in instructions[:-1]:
+            if instruction.flow_control != FlowControl.NEXT:
                 raise FunctionRejected(
                     spec,
-                    f"branch target RVA 0x{target:X} is not an instruction boundary",
+                    "terminal tail exit rejects nonterminal, conditional, "
+                    f"indirect, or CALL control flow at 0x{instruction.ip:X}",
                 )
-    final = instructions[-1]
-    if final.mnemonic != Mnemonic.RET or final.op_count != 0:
-        raise FunctionRejected(spec, "declared extent must end in a plain RET")
+    else:
+        for instruction in instructions:
+            if instruction.mnemonic == Mnemonic.JMP or instruction.mnemonic in x64_lifter._CC:
+                if instruction.op_kind(0) != OpKind.NEAR_BRANCH64:
+                    raise FunctionRejected(spec, "indirect or non-near branch")
+                target = instruction.near_branch_target
+                if target not in starts:
+                    raise FunctionRejected(
+                        spec,
+                        f"branch target RVA 0x{target:X} is not an instruction boundary",
+                    )
+        if final.mnemonic != Mnemonic.RET or final.op_count != 0:
+            raise FunctionRejected(spec, "declared extent must end in a plain RET")
     return instructions
 
 
@@ -1066,6 +1312,7 @@ def _compile_one(
     selected_extents: Sequence[tuple[int, int]],
     native_call_targets=frozenset(),
     retained_pdata_entries: frozenset[int] = frozenset(),
+    retained_runtime_functions: Sequence[PlannedRuntimeFunction] = (),
     guard_cf_dispatch_rva: int | None = None,
     native_runtime_ranges: Sequence[tuple[int, int]] = (),
     source_import_iat_rvas: frozenset[int] = frozenset(),
@@ -1106,6 +1353,9 @@ def _compile_one(
                 "INT3/NOP padding suffix",
             )
     _decode_exact(spec, lifted_body)
+    tail_exit = _validate_tail_exit_target(
+        spec, reader, retained_runtime_functions
+    )
     rejected_pdata_sites = native_tail_calls.retained_pdata_call_sites(
         lifted_body, base=spec.rva, sections=image_sections,
         retained_entries=retained_pdata_entries,
@@ -1149,21 +1399,37 @@ def _compile_one(
             f"and shadow-space effects proof at 0x{unproven_sites[0]:X}",
         )
     try:
-        call_analysis = x64_lifter.analyze_internal_calls(
-            lifted_body,
-            base=spec.rva,
-            source_extent_size=spec.size,
-            native_call_targets=native_call_targets,
-            guard_cf_dispatch_rva=guard_cf_dispatch_rva,
-        )
-        native_call_stack_bytes: dict[int, int] = {}
-        x64_lifter.validate_materialized_stack_window(
-            lifted_body,
-            base=spec.rva,
-            window_size=win64_thunk.STACK_WINDOW_SIZE,
-            native_call_targets=native_call_targets,
-            native_call_stack_bytes=native_call_stack_bytes,
-        )
+        if tail_exit is None:
+            call_analysis = x64_lifter.analyze_internal_calls(
+                lifted_body,
+                base=spec.rva,
+                source_extent_size=spec.size,
+                native_call_targets=native_call_targets,
+                guard_cf_dispatch_rva=guard_cf_dispatch_rva,
+            )
+            native_call_stack_bytes: dict[int, int] | None = {}
+            x64_lifter.validate_materialized_stack_window(
+                lifted_body,
+                base=spec.rva,
+                window_size=win64_thunk.STACK_WINDOW_SIZE,
+                native_call_targets=native_call_targets,
+                native_call_stack_bytes=native_call_stack_bytes,
+            )
+            tail_exit_pair = None
+        else:
+            # Tail-only bodies are straight-line and cannot contain a CALL or
+            # RET.  Their distinct admission proof verifies exact E9 form,
+            # zero entry-relative source stack depth, and no surviving RSP
+            # aliases/spills before the VM can emit success status 2.
+            call_analysis = x64_lifter.InternalCallAnalysis((), (), (), 0)
+            native_call_stack_bytes = None
+            tail_exit_pair = (tail_exit.instruction_rva, tail_exit.target_rva)
+            x64_lifter.validate_terminal_tail_exit(
+                lifted_body,
+                base=spec.rva,
+                tail_exit=tail_exit_pair,
+                window_size=win64_thunk.STACK_WINDOW_SIZE,
+            )
         rip_relative_references = x64_lifter.validate_rip_relative_references(
             lifted_body,
             base=spec.rva,
@@ -1179,6 +1445,12 @@ def _compile_one(
             native_call_targets=native_call_targets,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
             native_call_stack_bytes=native_call_stack_bytes,
+            tail_exit=tail_exit_pair,
+            tail_stack_window_size=(
+                None
+                if tail_exit_pair is None
+                else win64_thunk.STACK_WINDOW_SIZE
+            ),
         )
         # OPTIONAL, DEFAULT-OFF metamorphic mutation of the lifted .vasm between
         # lift and assembly. At mutate_level 0 (the default) the lifter/oracle
@@ -1235,9 +1507,16 @@ def _compile_one(
         program_format=program_format,
         thunk_symbol=thunk_symbol,
         descriptor_symbol=descriptor_symbol,
-        thunk_asm=win64_thunk.render_entry_thunk(thunk_symbol, descriptor_symbol),
+        thunk_asm=(
+            win64_thunk.render_entry_thunk(thunk_symbol, descriptor_symbol)
+            if tail_exit is None
+            else win64_thunk.render_tail_entry_thunk(
+                thunk_symbol, descriptor_symbol
+            )
+        ),
         call_analysis=call_analysis,
         rip_relative_references=rip_relative_references,
+        tail_exit=tail_exit,
     )
 
 
@@ -1337,9 +1616,20 @@ def compile_virtualization_manifest(
         raise VirtualizationPlanError(
             "authenticated page envelopes are incompatible with rolling programs"
         )
+    tail_specs = tuple(spec for spec in ordered if spec.tail_exit is not None)
+    if tail_specs and program_sealer is None:
+        raise FunctionRejected(
+            tail_specs[0],
+            "terminal tail exit requires an authenticated page sealer",
+        )
 
     if not isinstance(mutate_level, int) or mutate_level < 0:
         raise VirtualizationPlanError("mutate_level must be a non-negative integer")
+    if tail_specs and mutate_level:
+        raise FunctionRejected(
+            tail_specs[0],
+            "terminal tail exit does not admit post-proof bytecode mutation",
+        )
 
     image_sections = getattr(reader, "sections", None)
     selected_extents = tuple((spec.rva, spec.size) for spec in ordered)
@@ -1420,6 +1710,7 @@ def compile_virtualization_manifest(
             selected_extents=selected_extents,
             native_call_targets=native_call_targets,
             retained_pdata_entries=retained_pdata_entries,
+            retained_runtime_functions=retained_runtime_functions,
             guard_cf_dispatch_rva=guard_cf_dispatch_rva,
             native_runtime_ranges=runtime_ranges,
             source_import_iat_rvas=import_iat_rvas,
@@ -1429,7 +1720,6 @@ def compile_virtualization_manifest(
         )
         for spec in ordered
     )
-    descriptor_version = DESCRIPTOR_VERSION_PLAIN
     if program_sealer is not None:
         sealed_items = []
         for item in compiled:
@@ -1450,6 +1740,15 @@ def compile_virtualization_manifest(
                     item.spec,
                     "authenticated page sealer must return a 16-byte program identity",
                 )
+            if (
+                item.tail_exit is not None
+                and program_id[:4]
+                != struct.pack("<I", item.tail_exit.target_rva)
+            ):
+                raise FunctionRejected(
+                    item.spec,
+                    "terminal tail page identity does not bind its target RVA",
+                )
             sealed_items.append(
                 replace(
                     item,
@@ -1459,15 +1758,74 @@ def compile_virtualization_manifest(
                 )
             )
         compiled = tuple(sealed_items)
-        descriptor_version = DESCRIPTOR_VERSION_PAGED
 
     text_cursor = 0
     data_cursor = 0
     functions = []
     for item in compiled:
+        if item.tail_exit is None:
+            thunk_code_size = win64_thunk.THUNK_CODE_SIZE
+            thunk_common_rel32_offset = win64_thunk.THUNK_COMMON_REL32_OFFSET
+            thunk_descriptor_pointer_offset = (
+                win64_thunk.THUNK_DESCRIPTOR_POINTER_OFFSET
+            )
+            thunk_unwind_info = win64_thunk.THUNK_UNWIND_INFO
+            thunk_template = win64_thunk.render_entry_thunk_bytes()
+            descriptor_version = (
+                DESCRIPTOR_VERSION_PAGED
+                if item.program_format == "paged-v1"
+                else DESCRIPTOR_VERSION_PLAIN
+            )
+        else:
+            # A tail transfer is only valid with the authenticated paged
+            # runtime contract.  The packer sealer owns construction of the
+            # v5 program identity binding; planner metadata only preserves the
+            # independently re-proven target identity.
+            if item.program_format != "paged-v1" or len(item.program_id) != 16:
+                raise FunctionRejected(
+                    item.spec,
+                    "terminal tail exit requires an authenticated paged program",
+                )
+            thunk_code_size = win64_thunk.TAIL_THUNK_CODE_SIZE
+            thunk_common_rel32_offset = win64_thunk.TAIL_THUNK_COMMON_REL32_OFFSET
+            thunk_descriptor_pointer_offset = (
+                win64_thunk.TAIL_THUNK_DESCRIPTOR_POINTER_OFFSET
+            )
+            thunk_unwind_info = win64_thunk.TAIL_THUNK_UNWIND_INFO
+            thunk_template = win64_thunk.render_tail_entry_thunk_bytes()
+            descriptor_version = DESCRIPTOR_VERSION_PAGED_TAIL
         thunk_offset = _align(text_cursor, 16)
         thunk_rva = generated_text_rva + thunk_offset
-        text_cursor = thunk_offset + win64_thunk.THUNK_CODE_SIZE
+        text_cursor = thunk_offset + thunk_code_size
+        full_thunk_end_rva = thunk_rva + thunk_code_size
+        tail_thunk: TailExitThunkLayout | None = None
+        if item.tail_exit is not None:
+            primary_end_offset = win64_thunk.TAIL_THUNK_PRIMARY_END_OFFSET
+            popfq_offset = win64_thunk.TAIL_THUNK_POPFQ_OFFSET
+            popfq_end_offset = win64_thunk.TAIL_THUNK_POPFQ_END_OFFSET
+            jump_offset = win64_thunk.TAIL_THUNK_JUMP_OFFSET
+            target_rel32_offset = win64_thunk.TAIL_THUNK_TARGET_REL32_OFFSET
+            jump_end_offset = win64_thunk.TAIL_THUNK_JUMP_END_OFFSET
+            if not (
+                0 < primary_end_offset == popfq_offset < popfq_end_offset
+                == jump_offset < jump_end_offset <= thunk_code_size
+                and jump_offset + 1 == target_rel32_offset
+            ):
+                raise VirtualizationPlanError(
+                    "tail thunk split-unwind offsets do not describe a direct E9"
+                )
+            tail_thunk = TailExitThunkLayout(
+                status_rva=thunk_rva + win64_thunk.TAIL_THUNK_TAIL_STATUS_OFFSET,
+                restore_rva=thunk_rva + win64_thunk.TAIL_THUNK_TAIL_RESTORE_OFFSET,
+                popfq_rva=thunk_rva + popfq_offset,
+                jump_rva=thunk_rva + jump_offset,
+                target_rel32_rva=thunk_rva + target_rel32_offset,
+                jump_end_rva=thunk_rva + jump_end_offset,
+            )
+        if full_thunk_end_rva > _RVA_LIMIT:
+            raise VirtualizationPlanError(
+                "generated text output has an invalid RVA range"
+            )
 
         entry_displacement = thunk_rva - (
             item.spec.rva + TARGET_ENTRY_PATCH_SIZE
@@ -1489,7 +1847,7 @@ def compile_virtualization_manifest(
         )
         if runtime_common_rva is not None:
             common_displacement = runtime_common_rva - (
-                thunk_rva + win64_thunk.THUNK_COMMON_REL32_OFFSET + 4
+                thunk_rva + thunk_common_rel32_offset + 4
             )
             if not -(1 << 31) <= common_displacement <= (1 << 31) - 1:
                 raise VirtualizationPlanError(
@@ -1500,13 +1858,68 @@ def compile_virtualization_manifest(
         program_rva = generated_data_rva + program_offset
         data_cursor = program_offset + len(item.program)
 
-        unwind_offset = _align(data_cursor, 4)
-        unwind_rva = generated_data_rva + unwind_offset
-        data_cursor = unwind_offset + len(win64_thunk.THUNK_UNWIND_INFO)
+        if tail_thunk is None:
+            unwind_specs = (
+                (
+                    thunk_rva,
+                    full_thunk_end_rva,
+                    thunk_unwind_info,
+                ),
+            )
+        else:
+            unwind_specs = (
+                (
+                    thunk_rva,
+                    thunk_rva + win64_thunk.TAIL_THUNK_PRIMARY_END_OFFSET,
+                    thunk_unwind_info,
+                ),
+                (
+                    tail_thunk.popfq_rva,
+                    thunk_rva + win64_thunk.TAIL_THUNK_POPFQ_END_OFFSET,
+                    win64_thunk.TAIL_THUNK_POPFQ_UNWIND_INFO,
+                ),
+                (
+                    tail_thunk.jump_rva,
+                    tail_thunk.jump_end_rva,
+                    win64_thunk.TAIL_THUNK_JUMP_UNWIND_INFO,
+                ),
+            )
+        planned_unwinds: list[UnwindPlan] = []
+        for begin_rva, end_rva, unwind_info in unwind_specs:
+            unwind_offset = _align(data_cursor, 4)
+            unwind_rva = generated_data_rva + unwind_offset
+            data_cursor = unwind_offset + len(unwind_info)
+            planned_unwinds.append(
+                UnwindPlan(
+                    begin_rva=begin_rva,
+                    end_rva=end_rva,
+                    unwind_info_rva=unwind_rva,
+                    unwind_info=unwind_info,
+                    runtime_function=struct.pack(
+                        "<III", begin_rva, end_rva, unwind_rva
+                    ),
+                    runtime_function_rva=0,
+                )
+            )
+        primary_unwind = planned_unwinds[0]
+        tail_unwind = tuple(planned_unwinds[1:])
 
         descriptor_offset = _align(data_cursor, 8)
         descriptor_rva = generated_data_rva + descriptor_offset
-        if descriptor_version == DESCRIPTOR_VERSION_PAGED:
+        if descriptor_version == DESCRIPTOR_VERSION_PAGED_TAIL:
+            assert item.tail_exit is not None
+            descriptor_data = struct.pack(
+                "<IIQ16sQII",
+                DESCRIPTOR_VERSION_PAGED_TAIL,
+                len(item.program),
+                0,
+                item.program_id,
+                0,
+                item.tail_exit.target_rva,
+                0,
+            )
+            image_base_field_offset = 32
+        elif descriptor_version == DESCRIPTOR_VERSION_PAGED:
             descriptor_data = struct.pack(
                 "<IIQ16sQ",
                 DESCRIPTOR_VERSION_PAGED,
@@ -1523,8 +1936,7 @@ def compile_virtualization_manifest(
             image_base_field_offset = 16
         data_cursor = descriptor_offset + len(descriptor_data)
 
-        end_rva = thunk_rva + win64_thunk.THUNK_CODE_SIZE
-        if end_rva > _RVA_LIMIT:
+        if full_thunk_end_rva > _RVA_LIMIT:
             raise VirtualizationPlanError(
                 "generated text output has an invalid RVA range"
             )
@@ -1532,18 +1944,17 @@ def compile_virtualization_manifest(
             raise VirtualizationPlanError(
                 "generated data output has an invalid RVA range"
             )
-        runtime_function = struct.pack("<III", thunk_rva, end_rva, unwind_rva)
         relocations = (
             RelocationRequirement(
                 kind="REL32",
-                patch_rva=thunk_rva + win64_thunk.THUNK_COMMON_REL32_OFFSET,
+                patch_rva=thunk_rva + thunk_common_rel32_offset,
                 target_rva=runtime_common_rva,
                 target_symbol=STUB_COMMON_ENTRY_EXPORT,
             ),
             RelocationRequirement(
                 kind="DIR64",
                 patch_rva=(
-                    thunk_rva + win64_thunk.THUNK_DESCRIPTOR_POINTER_OFFSET
+                    thunk_rva + thunk_descriptor_pointer_offset
                 ),
                 target_rva=descriptor_rva,
                 add_image_base=True,
@@ -1561,6 +1972,21 @@ def compile_virtualization_manifest(
                 add_image_base=True,
             ),
         )
+        if item.tail_exit is not None:
+            assert tail_thunk is not None
+            tail_displacement = item.tail_exit.target_rva - (
+                tail_thunk.target_rel32_rva + 4
+            )
+            if not -(1 << 31) <= tail_displacement <= (1 << 31) - 1:
+                raise VirtualizationPlanError(
+                    f"function {item.spec.name!r} tail thunk target is outside "
+                    "signed rel32 range"
+                )
+            relocations = (*relocations, RelocationRequirement(
+                kind="REL32",
+                patch_rva=tail_thunk.target_rel32_rva,
+                target_rva=item.tail_exit.target_rva,
+            ))
         has_internal_calls = bool(item.call_analysis.internal_call_rvas)
         has_verified_native_import_call = any(
             proof.function_rva == item.spec.rva
@@ -1612,8 +2038,14 @@ def compile_virtualization_manifest(
                 item.spec.body_size < item.spec.size
             ),
         }
-        if descriptor_version == DESCRIPTOR_VERSION_PAGED:
+        if descriptor_version in (
+            DESCRIPTOR_VERSION_PAGED,
+            DESCRIPTOR_VERSION_PAGED_TAIL,
+        ):
             capabilities["authenticated_bytecode_paging"] = True
+        if item.tail_exit is not None:
+            capabilities["terminal_direct_tail_exit"] = True
+            capabilities["retained_tail_target_identity_proven"] = True
         functions.append(
             VirtualizedFunction(
                 name=item.spec.name,
@@ -1631,10 +2063,8 @@ def compile_virtualization_manifest(
                 thunk_symbol=item.thunk_symbol,
                 descriptor_symbol=item.descriptor_symbol,
                 thunk_asm=item.thunk_asm,
-                thunk_template=win64_thunk.render_entry_thunk_bytes(),
-                thunk_sha256=hashlib.sha256(
-                    win64_thunk.render_entry_thunk_bytes()
-                ).hexdigest(),
+                thunk_template=thunk_template,
+                thunk_sha256=hashlib.sha256(thunk_template).hexdigest(),
                 descriptor_rva=descriptor_rva,
                 descriptor_data=descriptor_data,
                 required_relocations=relocations,
@@ -1642,7 +2072,7 @@ def compile_virtualization_manifest(
                     GeneratedExecutableRange(
                         symbol=item.thunk_symbol,
                         rva=thunk_rva,
-                        size=win64_thunk.THUNK_CODE_SIZE,
+                        size=thunk_code_size,
                     ),
                 ),
                 # Every native caller continues to target the original RVA.
@@ -1650,23 +2080,28 @@ def compile_virtualization_manifest(
                 # the thunk is deliberately not an indirect CFG/XFG target.
                 cfg_target_rvas=(),
                 unwind=UnwindPlan(
-                    begin_rva=thunk_rva,
-                    end_rva=end_rva,
-                    unwind_info_rva=unwind_rva,
-                    unwind_info=win64_thunk.THUNK_UNWIND_INFO,
-                    runtime_function=runtime_function,
+                    begin_rva=primary_unwind.begin_rva,
+                    end_rva=primary_unwind.end_rva,
+                    unwind_info_rva=primary_unwind.unwind_info_rva,
+                    unwind_info=primary_unwind.unwind_info,
+                    runtime_function=primary_unwind.runtime_function,
                     runtime_function_rva=0,
                 ),
                 capabilities=capabilities,
                 internal_call_rvas=item.call_analysis.internal_call_rvas,
                 max_internal_call_depth=item.call_analysis.max_call_depth,
                 rip_relative_references=item.rip_relative_references,
+                tail_exit=item.tail_exit,
+                tail_thunk=tail_thunk,
+                tail_unwind=tail_unwind,
             )
         )
 
     exception_offset = _align(data_cursor, 4)
     exception_table_rva = generated_data_rva + exception_offset
-    exception_record_count = len(retained_runtime_functions) + len(functions)
+    exception_record_count = len(retained_runtime_functions) + sum(
+        1 + len(function.tail_unwind) for function in functions
+    )
     exception_table_size = exception_record_count * _RUNTIME_FUNCTION_SIZE
     _validate_rva_range(
         exception_table_rva,
@@ -1736,10 +2171,12 @@ __all__ = [
     "EXTERNAL_ENTRY_ASSUMPTION",
     "ExceptionTablePlan",
     "ExecutableReader",
+    "DESCRIPTOR_VERSION_PAGED_TAIL",
     "FunctionRejected",
     "FunctionSpec",
     "GeneratedExecutableRange",
     "IMAGE_SCN_MEM_EXECUTE",
+    "IMAGE_SCN_MEM_DISCARDABLE",
     "MANIFEST_VERSION",
     "OpcodeTable",
     "PlannedRuntimeFunction",
@@ -1755,6 +2192,8 @@ __all__ = [
     "TARGET_ENTRY_PATCH_SIZE",
     "TARGET_TOMBSTONE_POLICY",
     "TargetEntryPatch",
+    "TailExitSpec",
+    "TailExitThunkLayout",
     "UNW_FLAG_CHAININFO",
     "UNW_FLAG_EHANDLER",
     "UNW_FLAG_UHANDLER",

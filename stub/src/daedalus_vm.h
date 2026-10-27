@@ -117,6 +117,10 @@ typedef struct DaedalusX64Context {
 #define DVM_X64_DESCRIPTOR_SIZE    24u
 #define DVM_X64_PAGED_DESCRIPTOR_VERSION 4u
 #define DVM_X64_PAGED_DESCRIPTOR_SIZE    40u
+#define DVM_X64_PAGED_TAIL_DESCRIPTOR_VERSION 5u
+#define DVM_X64_PAGED_TAIL_DESCRIPTOR_SIZE    48u
+#define DVM_X64_STATUS_OK                  0
+#define DVM_X64_STATUS_TAIL_EXIT           2
 #define DVM_X64_CONTEXT_SIZE       392u
 
 typedef struct DaedalusX64Descriptor {
@@ -134,12 +138,29 @@ typedef struct DaedalusX64PagedDescriptor {
     const uint8_t *image_base;
 } DaedalusX64PagedDescriptor;
 
+/* Descriptor v5 is valid only for a planner-proven terminal direct tail exit.
+ * The first four program_id bytes duplicate tail_target_rva.  The paged VM
+ * authenticates the full program_id against the page envelope, so the common
+ * bridge can reject a descriptor target that is not bound to authenticated
+ * bytecode before it hands control to the retained native target. */
+typedef struct DaedalusX64PagedTailDescriptor {
+    uint32_t version;
+    uint32_t envelope_size;
+    const uint8_t *envelope;
+    uint8_t program_id[16];
+    const uint8_t *image_base;
+    uint32_t tail_target_rva;
+    uint32_t reserved;
+} DaedalusX64PagedTailDescriptor;
+
 typedef char DaedalusX64ContextSizeGuard[
     sizeof(DaedalusX64Context) == DVM_X64_CONTEXT_SIZE ? 1 : -1];
 typedef char DaedalusX64DescriptorSizeGuard[
     sizeof(DaedalusX64Descriptor) == DVM_X64_DESCRIPTOR_SIZE ? 1 : -1];
 typedef char DaedalusX64PagedDescriptorSizeGuard[
     sizeof(DaedalusX64PagedDescriptor) == DVM_X64_PAGED_DESCRIPTOR_SIZE ? 1 : -1];
+typedef char DaedalusX64PagedTailDescriptorSizeGuard[
+    sizeof(DaedalusX64PagedTailDescriptor) == DVM_X64_PAGED_TAIL_DESCRIPTOR_SIZE ? 1 : -1];
 
 /* ---- opcodes ------------------------------------------------------------ */
 
@@ -276,7 +297,10 @@ int daedalus_vm_exec(const uint8_t *program, uint32_t program_size,
 
 /* Execute a program emitted by lifter/x64_lifter.py against a captured x64
  * register frame. GPRs and CF/PF/ZF/SF/OF are imported into the lifter's fixed
- * local slots before dispatch and committed back only after a successful HALT.
+ * local slots before dispatch and committed back only after status OK.
+ * The structured TAIL_EXIT status is committed only by the internal paged-v5
+ * bridge entry declared below; generic callers retain zero-only commit
+ * semantics.
  * Other RFLAGS bits are preserved. A generated Win64 entry thunk will capture
  * the real caller frame and invoke this boundary; until then callers may build
  * a frame explicitly for leaf-function integration and native testing.
@@ -296,6 +320,16 @@ int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
                                const uint8_t expected_program_id[16],
                                DaedalusX64Context *context,
                                const uint8_t *image_base);
+
+/* Internal descriptor-v5 boundary used by daedalus_x64_thunk.asm only after
+ * it has selected an authenticated terminal-tail descriptor.  It is distinct
+ * from the generic paged API so a raw status-2 HALT cannot alter legacy frame
+ * commit behavior. */
+int daedalus_vm_exec_x64_paged_tail(const uint8_t *envelope,
+                                    uint32_t envelope_size,
+                                    const uint8_t expected_program_id[16],
+                                    DaedalusX64Context *context,
+                                    const uint8_t *image_base);
 
 #ifdef __cplusplus
 }

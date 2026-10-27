@@ -28,6 +28,7 @@ IMAGE_FILE_RELOCS_STRIPPED = 0x0001
 IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x0040
 IMAGE_SCN_CNT_CODE = 0x00000020
 IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
+IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_READ = 0x40000000
 _TEXT_SECTION_NAME = ".lvtx"
@@ -468,8 +469,34 @@ def _read_stub_provenance(
     return stub, common_rva, exported_hash, exported_handler_hash
 
 
-def _next_generated_rvas(parsed: pe_analyze.ParsedPE, function_count: int) -> tuple[int, int]:
-    if function_count <= 0:
+def _next_generated_rvas(
+    parsed: pe_analyze.ParsedPE,
+    functions: int | Sequence[object],
+) -> tuple[int, int]:
+    """Reserve generated sections using the exact emitted thunk layout.
+
+    The historical integer form is retained for callers/tests which only know
+    a function count.  A manifest/spec sequence is preferred: terminal-tail
+    functions use the distinct 64-byte shim, while ordinary v4 functions keep
+    the original 46-byte placement arithmetic byte-for-byte.
+    """
+    if isinstance(functions, int):
+        if functions <= 0:
+            raise _fail("at least one selected function is required")
+        thunk_sizes = (win64_thunk.THUNK_CODE_SIZE,) * functions
+    else:
+        items = tuple(functions)
+        if not items:
+            raise _fail("at least one selected function is required")
+        thunk_sizes = tuple(
+            (
+                win64_thunk.TAIL_THUNK_CODE_SIZE
+                if getattr(item, "tail_exit", None) is not None
+                else win64_thunk.THUNK_CODE_SIZE
+            )
+            for item in items
+        )
+    if not thunk_sizes:
         raise _fail("at least one selected function is required")
     if any(section.name in {_TEXT_SECTION_NAME, _DATA_SECTION_NAME} for section in parsed.sections):
         raise _fail("source PE already contains a reserved virtualization section")
@@ -478,13 +505,67 @@ def _next_generated_rvas(parsed: pe_analyze.ParsedPE, function_count: int) -> tu
         *(_section_end(section) for section in parsed.sections),
     )
     text_rva = _align(image_end, SECTION_ALIGNMENT)
-    predicted_text_size = _align(
-        function_count * win64_thunk.THUNK_CODE_SIZE, 16
-    )
+    text_cursor = 0
+    for thunk_size in thunk_sizes:
+        text_cursor = _align(text_cursor, 16) + thunk_size
+    predicted_text_size = _align(text_cursor, 16)
     data_rva = _align(text_rva + predicted_text_size, SECTION_ALIGNMENT)
     if data_rva >= 0x1_0000_0000:
         raise _fail("generated section placement exceeds the PE RVA space")
     return text_rva, data_rva
+
+
+def _derive_paged_program_identity(
+    spec: plan.FunctionSpec,
+    program: bytes,
+) -> tuple[bytes, bytes]:
+    """Return the authenticated page identity and deterministic salt domain.
+
+    The ordinary branch intentionally retains its historical v4 derivation.
+    Terminal-tail pages use a separate v5 domain and reserve the first four
+    program-ID bytes for the exact retained target RVA before envelope sealing.
+    """
+    tail = spec.tail_exit
+    if tail is None:
+        identity_input = (
+            b"Lethe-selected-function-page-id-v1\0"
+            + spec.name.encode("utf-8")
+            + struct.pack("<III", spec.rva, spec.size, spec.body_size)
+            + hashlib.sha256(program).digest()
+        )
+        return (
+            hashlib.sha256(identity_input).digest()[:16],
+            b"Lethe-selected-function-page-salt-v1\0",
+        )
+    if type(tail) is not plan.TailExitSpec:
+        raise ValueError("terminal tail identity has invalid type")
+    try:
+        target_body_digest = bytes.fromhex(tail.target_body_sha256)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("terminal tail target digest is malformed") from exc
+    if len(target_body_digest) != hashlib.sha256().digest_size:
+        raise ValueError("terminal tail target digest has invalid length")
+    identity_input = (
+        b"Lethe-selected-terminal-tail-page-id-v1\0"
+        + spec.name.encode("utf-8")
+        + struct.pack("<III", spec.rva, spec.size, spec.body_size)
+        + struct.pack(
+            "<IIII",
+            tail.instruction_rva,
+            tail.target_rva,
+            tail.target_size,
+            tail.target_unwind_info_rva,
+        )
+        + target_body_digest
+        + program
+    )
+    return (
+        struct.pack("<I", tail.target_rva)
+        # Page envelopes have a fixed 16-byte program ID: retain the target
+        # prefix and consume the next 12 digest bytes as authenticated suffix.
+        + hashlib.sha256(identity_input).digest()[4:16],
+        b"Lethe-selected-terminal-tail-page-salt-v1\0",
+    )
 
 
 def _compile_manifest(
@@ -504,7 +585,7 @@ def _compile_manifest(
     native_import_call_proofs: tuple[native_tail_calls.VerifiedNativeImportCallProof, ...] = (),
 ) -> tuple[plan.VirtualizationManifest, StubVirtualizationProvenance]:
     _validate_padding_suffix_bindings(parsed, specs)
-    text_rva, data_rva = _next_generated_rvas(parsed, len(specs))
+    text_rva, data_rva = _next_generated_rvas(parsed, specs)
     reader = plan.SectionImage.from_parsed_sections(parsed.sections)
     if len(page_master_key) != bytecode_pages.MASTER_KEY_SIZE:
         raise _fail("authenticated paging master key must be exactly 32 bytes")
@@ -524,16 +605,13 @@ def _compile_manifest(
             raise ValueError(
                 "paged selected-function programs currently require an empty data region"
             )
-        identity_input = (
-            b"Lethe-selected-function-page-id-v1\0"
-            + spec.name.encode("utf-8")
-            + struct.pack("<III", spec.rva, spec.size, spec.body_size)
-            + hashlib.sha256(program).digest()
-        )
-        program_id = hashlib.sha256(identity_input).digest()[:16]
+        # Identity construction precedes sealing so the v5 envelope
+        # authenticates the target-bound program ID, not an afterwards-mutated
+        # descriptor field.
+        program_id, salt_domain = _derive_paged_program_identity(spec, program)
         salt = hmac.new(
             page_master_key,
-            b"Lethe-selected-function-page-salt-v1\0" + program_id,
+            salt_domain + program_id,
             hashlib.sha256,
         ).digest()[:bytecode_pages.SALT_SIZE]
         envelope = bytecode_pages.seal_program(
@@ -694,12 +772,261 @@ def _validate_manifest_source(
             raise _fail("source runtime-function records changed after manifest compilation")
 
 
+def _validate_tail_exit_source_contract(
+    parsed: pe_analyze.ParsedPE,
+    manifest: plan.VirtualizationManifest,
+    runtime_functions: tuple[pe_analyze.ParsedRuntimeFunction, ...],
+) -> None:
+    """Re-prove every persisted v5 tail destination against current source.
+
+    The manifest stores a descriptive TailExitSpec, not an authorization token.
+    Before writing the E9 hole, re-read the selected terminal instruction and
+    the retained target's PDATA/body/section identity.  This closes stale or
+    manually edited manifests even when the selected wrapper body itself has
+    not changed.
+    """
+    tails = tuple(
+        function for function in manifest.functions
+        if function.tail_exit is not None
+    )
+    if not tails:
+        return
+    reader = plan.SectionImage.from_parsed_sections(parsed.sections)
+    selected_extents = tuple(
+        (function.target_rva, function.target_rva + function.target_size)
+        for function in manifest.functions
+    )
+    for function in tails:
+        tail = function.tail_exit
+        if type(tail) is not plan.TailExitSpec:
+            raise _fail(f"function {function.name!r} tail identity has invalid type")
+        if (
+            type(tail.instruction_rva) is not int
+            or type(tail.target_rva) is not int
+            or type(tail.target_size) is not int
+            or type(tail.target_unwind_info_rva) is not int
+            or type(tail.target_body_sha256) is not str
+            or function.lifted_body_size != function.target_size
+            or tail.instruction_rva != function.target_rva + function.target_size - 5
+            or not _HASH_RE.fullmatch(tail.target_body_sha256)
+        ):
+            raise _fail(f"function {function.name!r} tail source identity is invalid")
+        try:
+            selected_tail = reader.read_file_backed_executable(
+                tail.instruction_rva, 5
+            )
+        except plan.VirtualizationPlanError as exc:
+            raise _fail(
+                f"function {function.name!r} terminal-tail instruction is stale: {exc}"
+            ) from exc
+        if selected_tail[:1] != b"\xE9":
+            raise _fail(
+                f"function {function.name!r} terminal-tail instruction is not direct E9"
+            )
+        selected_target = tail.instruction_rva + 5 + struct.unpack_from(
+            "<i", selected_tail, 1
+        )[0]
+        if selected_target != tail.target_rva:
+            raise _fail(
+                f"function {function.name!r} terminal-tail target changed after planning"
+            )
+        matches = tuple(
+            record
+            for record in runtime_functions
+            if record.begin_rva == tail.target_rva
+            and record.end_rva == tail.target_rva + tail.target_size
+            and record.unwind_info_rva == tail.target_unwind_info_rva
+        )
+        if (
+            len(matches) != 1
+            or matches[0].unwind_flags
+            or matches[0].chain_primary_rva
+        ):
+            raise _fail(
+                f"function {function.name!r} tail target is not one retained "
+                "handler-free primary runtime function"
+            )
+        retained_matches = tuple(
+            record
+            for record in manifest.exception_table.retained
+            if record.origin == "source"
+            and record.begin_rva == tail.target_rva
+            and record.end_rva == tail.target_rva + tail.target_size
+            and record.unwind_info_rva == tail.target_unwind_info_rva
+            and record.unwind_flags == 0
+            and record.chain_primary_rva == 0
+        )
+        if len(retained_matches) != 1:
+            raise _fail(
+                f"function {function.name!r} tail target is absent from retained PDATA"
+            )
+        target_end = tail.target_rva + tail.target_size
+        owner = next(
+            (
+                section
+                for section in parsed.sections
+                if section.rva <= tail.target_rva
+                and target_end <= section.rva + len(section.raw)
+            ),
+            None,
+        )
+        if (
+            owner is None
+            or not (owner.characteristics & IMAGE_SCN_MEM_EXECUTE)
+            or owner.characteristics & IMAGE_SCN_MEM_DISCARDABLE
+        ):
+            raise _fail(
+                f"function {function.name!r} tail target is not retained file-backed code"
+            )
+        try:
+            target_body = reader.read_file_backed_executable(
+                tail.target_rva, tail.target_size
+            )
+        except plan.VirtualizationPlanError as exc:
+            raise _fail(
+                f"function {function.name!r} tail target cannot be re-read: {exc}"
+            ) from exc
+        if hashlib.sha256(target_body).hexdigest() != tail.target_body_sha256:
+            raise _fail(
+                f"function {function.name!r} tail target body changed after planning"
+            )
+        if any(
+            tail.target_rva < selected_end and selected_begin < target_end
+            for selected_begin, selected_end in selected_extents
+        ):
+            raise _fail(
+                f"function {function.name!r} tail target overlaps a selected extent"
+            )
+
+
+def _validate_tail_exit_provenance(
+    specs: Sequence[plan.FunctionSpec],
+    tail_exit_proof: direct_control_flow.DirectControlFlowProof | None,
+) -> None:
+    """Require proof that each requested native tail was an approved edge.
+
+    A TailExitSpec binds target bytes and PDATA, but it deliberately carries no
+    policy authorization.  This narrow materializer gate consumes the actual
+    direct-flow proof that recorded the reachable E9 approval.  Normal v4
+    callers remain unchanged and pass no proof.
+    """
+    tail_specs = tuple(spec for spec in specs if spec.tail_exit is not None)
+    if not tail_specs:
+        return
+    if type(tail_exit_proof) is not direct_control_flow.DirectControlFlowProof:
+        raise _fail(
+            "terminal tail exits require a matching direct-control-flow proof"
+        )
+    if (
+        tail_exit_proof.version != direct_control_flow.PROOF_VERSION
+        or tail_exit_proof.direct_reference_gate_passed is not True
+        or type(tail_exit_proof.selected_functions) is not tuple
+        or type(tail_exit_proof.selected_flows) is not tuple
+        or type(tail_exit_proof.direct_transfers) is not tuple
+        or any(
+            type(item) is not direct_control_flow.SelectedFunctionRange
+            for item in tail_exit_proof.selected_functions
+        )
+        or any(
+            type(item) is not direct_control_flow.SelectedFunctionFlow
+            or type(item.reachable_instruction_rvas) is not tuple
+            or type(item.approved_tail_exits) is not tuple
+            or any(
+                type(approval) is not direct_control_flow.TailExitApproval
+                for approval in item.approved_tail_exits
+            )
+            for item in tail_exit_proof.selected_flows
+        )
+        or any(
+            type(item) is not direct_control_flow.DirectControlTransfer
+            for item in tail_exit_proof.direct_transfers
+        )
+    ):
+        raise _fail(
+            "terminal tail direct-control-flow proof is not production-valid"
+        )
+    expected_selected = {
+        (spec.name, spec.rva, spec.size, spec.body_size) for spec in specs
+    }
+    proof_selected = {
+        (item.name, item.rva, item.size, item.body_size)
+        for item in tail_exit_proof.selected_functions
+    }
+    if (
+        len(expected_selected) != len(specs)
+        or len(proof_selected) != len(tail_exit_proof.selected_functions)
+        or proof_selected != expected_selected
+    ):
+        raise _fail(
+            "terminal tail direct-control-flow proof selected functions are stale"
+        )
+    flow_by_identity = {
+        (item.name, item.rva, item.size, item.lifted_body_size): item
+        for item in tail_exit_proof.selected_flows
+    }
+    if (
+        len(flow_by_identity) != len(tail_exit_proof.selected_flows)
+        or set(flow_by_identity) != expected_selected
+    ):
+        raise _fail("terminal tail direct-control-flow proof has stale flows")
+    desired_edges = set()
+    for spec in tail_specs:
+        tail = spec.tail_exit
+        if type(tail) is not plan.TailExitSpec:
+            raise _fail(f"function {spec.name!r} tail identity has invalid type")
+        identity = (spec.name, spec.rva, spec.size, spec.body_size)
+        flow = flow_by_identity.get(identity)
+        if flow is None:
+            raise _fail(
+                f"function {spec.name!r} tail direct-control-flow proof is stale"
+            )
+        edge = (spec.rva, tail.instruction_rva, tail.target_rva)
+        desired_edges.add(edge)
+        matching_approvals = tuple(
+            approval
+            for approval in flow.approved_tail_exits
+            if approval.function_rva == edge[0]
+            and approval.instruction_rva == edge[1]
+            and approval.target_rva == edge[2]
+        )
+        matching_transfers = tuple(
+            transfer
+            for transfer in tail_exit_proof.direct_transfers
+            if transfer.kind == "jump"
+            and transfer.source_rva == edge[1]
+            and transfer.target_rva == edge[2]
+            and transfer.source_range_begin_rva == spec.rva
+            and transfer.source_has_runtime_function is True
+            and transfer.source_selected_name == spec.name
+            and transfer.target_selected_name is None
+            and transfer.target_is_selected_entry is False
+            and transfer.reachable_from_selected_entry is True
+        )
+        if (
+            tail.instruction_rva not in flow.reachable_instruction_rvas
+            or len(matching_approvals) != 1
+            or len(matching_transfers) != 1
+        ):
+            raise _fail(
+                f"function {spec.name!r} tail direct-control-flow approval is absent"
+            )
+    consumed_edges = {
+        (approval.function_rva, approval.instruction_rva, approval.target_rva)
+        for flow in tail_exit_proof.selected_flows
+        for approval in flow.approved_tail_exits
+    }
+    if consumed_edges != desired_edges:
+        raise _fail(
+            "terminal tail direct-control-flow proof has stale or mismatched approvals"
+        )
+
+
 def _validate_manifest_layout(
     parsed: pe_analyze.ParsedPE,
     manifest: plan.VirtualizationManifest,
 ) -> int:
     expected_text_rva, expected_data_rva = _next_generated_rvas(
-        parsed, len(manifest.functions)
+        parsed, manifest.functions
     )
     if manifest.generated_text_rva != expected_text_rva:
         raise _fail("manifest generated-text reservation is stale")
@@ -723,9 +1050,26 @@ def _validate_function_artifacts(
     if len(function.generated_executable_ranges) != 1:
         raise _fail(f"function {function.name!r} must have exactly one generated thunk")
     generated = function.generated_executable_ranges[0]
-    if generated.symbol != function.thunk_symbol or generated.size != win64_thunk.THUNK_CODE_SIZE:
+    tail = function.tail_exit
+    if tail is not None and type(tail) is not plan.TailExitSpec:
+        raise _fail(f"function {function.name!r} tail identity has invalid type")
+    is_tail = tail is not None
+    expected_thunk_size = (
+        win64_thunk.TAIL_THUNK_CODE_SIZE
+        if is_tail
+        else win64_thunk.THUNK_CODE_SIZE
+    )
+    expected_thunk_template = (
+        win64_thunk.TAIL_THUNK_TEMPLATE
+        if is_tail
+        else win64_thunk.THUNK_TEMPLATE
+    )
+    if (
+        generated.symbol != function.thunk_symbol
+        or generated.size != expected_thunk_size
+    ):
         raise _fail(f"function {function.name!r} has invalid generated thunk metadata")
-    if function.thunk_template != win64_thunk.THUNK_TEMPLATE:
+    if function.thunk_template != expected_thunk_template:
         raise _fail(f"function {function.name!r} thunk template does not match the runtime ABI")
     if hashlib.sha256(function.thunk_template).hexdigest() != function.thunk_sha256:
         raise _fail(f"function {function.name!r} thunk hash is stale")
@@ -739,21 +1083,71 @@ def _validate_function_artifacts(
         or not _HASH_RE.fullmatch(function.lifted_body_sha256)
     ):
         raise _fail(f"function {function.name!r} source/body extent contract is invalid")
-    if function.program_format == "paged-v1":
-        if len(function.descriptor_data) != 40:
-            raise _fail(f"function {function.name!r} paged descriptor size is invalid")
-        version, envelope_size, pointer, program_id, image_base = struct.unpack(
-            "<IIQ16sQ", function.descriptor_data
+    if is_tail and function.program_format != "paged-v1":
+        raise _fail(
+            f"function {function.name!r} terminal-tail thunk requires authenticated paging"
         )
-        if (
-            version != plan.DESCRIPTOR_VERSION_PAGED
-            or envelope_size != len(function.program)
-            or pointer != 0
-            or image_base != 0
-            or len(function.program_id) != 16
-            or program_id != function.program_id
-        ):
-            raise _fail(f"function {function.name!r} paged descriptor ABI is invalid")
+    if function.program_format == "paged-v1":
+        if is_tail:
+            if (
+                type(tail.instruction_rva) is not int
+                or type(tail.target_rva) is not int
+                or type(tail.target_size) is not int
+                or type(tail.target_unwind_info_rva) is not int
+                or type(tail.target_body_sha256) is not str
+                or not 0 < tail.target_rva < 0x1_0000_0000
+                or tail.target_size <= 0
+                or tail.target_rva + tail.target_size > 0x1_0000_0000
+                or tail.target_unwind_info_rva % 4
+                or tail.instruction_rva
+                != function.target_rva + function.target_size - 5
+                or not _HASH_RE.fullmatch(tail.target_body_sha256)
+            ):
+                raise _fail(f"function {function.name!r} tail identity is invalid")
+            if len(function.descriptor_data) != 48:
+                raise _fail(
+                    f"function {function.name!r} terminal-tail descriptor size is invalid"
+                )
+            (
+                version,
+                envelope_size,
+                pointer,
+                program_id,
+                image_base,
+                tail_target_rva,
+                reserved,
+            ) = struct.unpack("<IIQ16sQII", function.descriptor_data)
+            if (
+                version != plan.DESCRIPTOR_VERSION_PAGED_TAIL
+                or envelope_size != len(function.program)
+                or pointer != 0
+                or image_base != 0
+                or tail_target_rva != tail.target_rva
+                or reserved != 0
+                or len(function.program_id) != 16
+                or program_id != function.program_id
+                or program_id[:4] != struct.pack("<I", tail.target_rva)
+            ):
+                raise _fail(
+                    f"function {function.name!r} terminal-tail descriptor ABI is invalid"
+                )
+        else:
+            # The v4 form remains strictly unchanged.  A v5 descriptor can
+            # only occur with a typed, independently proven terminal tail.
+            if len(function.descriptor_data) != 40:
+                raise _fail(f"function {function.name!r} paged descriptor size is invalid")
+            version, envelope_size, pointer, program_id, image_base = struct.unpack(
+                "<IIQ16sQ", function.descriptor_data
+            )
+            if (
+                version != plan.DESCRIPTOR_VERSION_PAGED
+                or envelope_size != len(function.program)
+                or pointer != 0
+                or image_base != 0
+                or len(function.program_id) != 16
+                or program_id != function.program_id
+            ):
+                raise _fail(f"function {function.name!r} paged descriptor ABI is invalid")
         try:
             envelope = bytecode_pages.parse_envelope(function.program)
         except bytecode_pages.BytecodePageError as exc:
@@ -763,6 +1157,10 @@ def _validate_function_artifacts(
         if envelope.program_id != function.program_id:
             raise _fail(
                 f"function {function.name!r} descriptor/envelope identity mismatch"
+            )
+        if is_tail and envelope.program_id[:4] != struct.pack("<I", tail.target_rva):
+            raise _fail(
+                f"function {function.name!r} terminal-tail envelope target binding is invalid"
             )
         if not (
             manifest.generated_data_rva <= function.program_rva
@@ -786,10 +1184,92 @@ def _validate_function_artifacts(
             or function.program_id
         ):
             raise _fail(f"function {function.name!r} descriptor ABI is invalid")
-    if function.unwind.unwind_info != win64_thunk.THUNK_UNWIND_INFO:
+    if function.unwind.unwind_info != (
+        win64_thunk.TAIL_THUNK_UNWIND_INFO
+        if is_tail
+        else win64_thunk.THUNK_UNWIND_INFO
+    ):
         raise _fail(f"function {function.name!r} unwind ABI is invalid")
-    if function.unwind.begin_rva != generated.rva or function.unwind.end_rva != generated.rva + generated.size:
+    primary_end_rva = generated.rva + (
+        win64_thunk.TAIL_THUNK_PRIMARY_END_OFFSET
+        if is_tail
+        else generated.size
+    )
+    if (
+        function.unwind.begin_rva != generated.rva
+        or function.unwind.end_rva != primary_end_rva
+        or function.unwind.runtime_function
+        != struct.pack(
+            "<III",
+            function.unwind.begin_rva,
+            function.unwind.end_rva,
+            function.unwind.unwind_info_rva,
+        )
+    ):
         raise _fail(f"function {function.name!r} unwind range is invalid")
+    if not is_tail:
+        if function.tail_thunk is not None or function.tail_unwind != ():
+            raise _fail(
+                f"function {function.name!r} ordinary thunk has tail-only metadata"
+            )
+    else:
+        assert tail is not None
+        expected_tail_thunk = plan.TailExitThunkLayout(
+            status_rva=generated.rva + win64_thunk.TAIL_THUNK_TAIL_STATUS_OFFSET,
+            restore_rva=generated.rva + win64_thunk.TAIL_THUNK_TAIL_RESTORE_OFFSET,
+            popfq_rva=generated.rva + win64_thunk.TAIL_THUNK_POPFQ_OFFSET,
+            jump_rva=generated.rva + win64_thunk.TAIL_THUNK_JUMP_OFFSET,
+            target_rel32_rva=(
+                generated.rva + win64_thunk.TAIL_THUNK_TARGET_REL32_OFFSET
+            ),
+            jump_end_rva=generated.rva + win64_thunk.TAIL_THUNK_JUMP_END_OFFSET,
+        )
+        if function.tail_thunk != expected_tail_thunk:
+            raise _fail(
+                f"function {function.name!r} terminal-tail thunk layout is invalid"
+            )
+        if type(function.tail_unwind) is not tuple or len(function.tail_unwind) != 2:
+            raise _fail(
+                f"function {function.name!r} terminal-tail unwind count is invalid"
+            )
+        expected_tail_unwinds = (
+            (
+                expected_tail_thunk.popfq_rva,
+                generated.rva + win64_thunk.TAIL_THUNK_POPFQ_END_OFFSET,
+                win64_thunk.TAIL_THUNK_POPFQ_UNWIND_INFO,
+            ),
+            (
+                expected_tail_thunk.jump_rva,
+                expected_tail_thunk.jump_end_rva,
+                win64_thunk.TAIL_THUNK_JUMP_UNWIND_INFO,
+            ),
+        )
+        for index, (unwind, expected) in enumerate(
+            zip(function.tail_unwind, expected_tail_unwinds)
+        ):
+            begin_rva, end_rva, unwind_info = expected
+            if (
+                unwind.begin_rva != begin_rva
+                or unwind.end_rva != end_rva
+                or unwind.unwind_info != unwind_info
+                or unwind.runtime_function
+                != struct.pack("<III", begin_rva, end_rva, unwind.unwind_info_rva)
+            ):
+                raise _fail(
+                    f"function {function.name!r} terminal-tail unwind {index} is invalid"
+                )
+        if (
+            function.thunk_template[win64_thunk.TAIL_THUNK_JUMP_OFFSET]
+            != 0xE9
+            or function.thunk_template[
+                win64_thunk.TAIL_THUNK_TARGET_REL32_OFFSET :
+                win64_thunk.TAIL_THUNK_TARGET_REL32_OFFSET + 4
+            ]
+            != b"\0" * 4
+        ):
+            raise _fail(
+                f"function {function.name!r} terminal-tail E9 template is invalid"
+            )
     if (
         not isinstance(function.capabilities, dict)
         or function.capabilities.get("direct_only_thunk") is not True
@@ -802,6 +1282,23 @@ def _validate_function_artifacts(
     ):
         raise _fail(
             f"function {function.name!r} direct-only CFG/XFG contract is invalid"
+        )
+    if is_tail:
+        if (
+            function.capabilities.get("authenticated_bytecode_paging") is not True
+            or function.capabilities.get("terminal_direct_tail_exit") is not True
+            or function.capabilities.get("retained_tail_target_identity_proven")
+            is not True
+        ):
+            raise _fail(
+                f"function {function.name!r} terminal-tail capability contract is invalid"
+            )
+    elif (
+        function.capabilities.get("terminal_direct_tail_exit") is True
+        or function.capabilities.get("retained_tail_target_identity_proven") is True
+    ):
+        raise _fail(
+            f"function {function.name!r} ordinary thunk advertises tail capability"
         )
 
     patch = function.target_entry_patch
@@ -848,6 +1345,14 @@ def _validate_function_artifacts(
             add_image_base=True,
         ),
     )
+    if is_tail:
+        assert tail is not None
+        assert function.tail_thunk is not None
+        expected_relocations = (*expected_relocations, plan.RelocationRequirement(
+            kind="REL32",
+            patch_rva=function.tail_thunk.target_rel32_rva,
+            target_rva=tail.target_rva,
+        ))
     if function.required_relocations != expected_relocations:
         raise _fail(f"function {function.name!r} relocation contract is invalid")
     return generated.rva
@@ -866,7 +1371,10 @@ def _validate_direct_only_references(
     parsed_targets = tuple(getattr(parsed, "generated_cfg_targets", ()))
     exception = manifest.exception_table
     generated_records = tuple(exception.generated)
-    if len(generated_records) != len(manifest.functions):
+    expected_generated_count = sum(
+        1 + len(function.tail_unwind) for function in manifest.functions
+    )
+    if len(generated_records) != expected_generated_count:
         raise _fail("direct-only thunk/unwind ownership count is inconsistent")
     expected_merged = tuple(sorted(
         (*exception.retained, *generated_records),
@@ -904,19 +1412,25 @@ def _validate_direct_only_references(
         unwind_owners = tuple(
             record
             for record in manifest.exception_table.generated
-            if record.begin_rva == thunk.rva
+            if record.function_name == function.name
         )
-        if (
-            len(unwind_owners) != 1
-            or unwind_owners[0].function_name != function.name
-            or unwind_owners[0].end_rva != function.unwind.end_rva
-            or unwind_owners[0].unwind_info_rva != function.unwind.unwind_info_rva
-            or unwind_owners[0].record_rva != function.unwind.runtime_function_rva
-        ):
+        expected_unwinds = (function.unwind, *function.tail_unwind)
+        if len(unwind_owners) != len(expected_unwinds):
             raise _fail(
                 f"function {function.name!r} direct-only thunk has invalid "
                 "unwind references"
             )
+        for record, unwind in zip(unwind_owners, expected_unwinds):
+            if (
+                record.begin_rva != unwind.begin_rva
+                or record.end_rva != unwind.end_rva
+                or record.unwind_info_rva != unwind.unwind_info_rva
+                or record.record_rva != unwind.runtime_function_rva
+            ):
+                raise _fail(
+                    f"function {function.name!r} direct-only thunk has invalid "
+                    "unwind references"
+                )
 
 
 def _build_generated_sections(
@@ -941,6 +1455,12 @@ def _build_generated_sections(
             function.unwind.unwind_info,
             f"{function.name} unwind info",
         )
+        for index, unwind in enumerate(function.tail_unwind):
+            writer.place(
+                unwind.unwind_info_rva,
+                unwind.unwind_info,
+                f"{function.name} tail unwind info {index}",
+            )
         writer.place(
             function.descriptor_rva,
             function.descriptor_data,
@@ -1114,6 +1634,7 @@ def _commit_manifest(
     reverified_native_import_call_proofs: tuple[
         native_tail_calls.VerifiedNativeImportCallProof, ...
     ] | None = None,
+    tail_exit_proof: direct_control_flow.DirectControlFlowProof | None = None,
 ) -> pe_analyze.ParsedPE:
     if acknowledge_no_interior_entries is not True:
         raise _fail(
@@ -1125,9 +1646,10 @@ def _commit_manifest(
         )
     selected_specs = tuple(
         plan.FunctionSpec(function.name, function.target_rva, function.target_size,
-                          function.lifted_body_size)
+                          function.lifted_body_size, function.tail_exit)
         for function in manifest.functions
     )
+    _validate_tail_exit_provenance(selected_specs, tail_exit_proof)
     if manifest.source_coverage_mode == "pdb":
         if manifest.pdb_commit_binding is None:
             raise _fail("PDB commit binding is missing")
@@ -1159,6 +1681,11 @@ def _commit_manifest(
     source_relocations, source_runtime_functions = _validate_source_image(parsed)
     _validate_manifest_source(
         parsed, manifest, source_relocations, source_runtime_functions
+    )
+    for function in manifest.functions:
+        _validate_function_artifacts(function, manifest)
+    _validate_tail_exit_source_contract(
+        parsed, manifest, source_runtime_functions
     )
     try:
         direct_control_flow.validate_known_source_references(parsed, selected_specs)
@@ -1286,6 +1813,7 @@ def apply_virtualization_manifest(
     *,
     acknowledge_no_interior_entries: bool = False,
     native_import_contract_path: str | None = None,
+    tail_exit_proof: direct_control_flow.DirectControlFlowProof | None = None,
 ) -> pe_analyze.ParsedPE:
     """Atomically apply a previously compiled manifest to a copied ParsedPE.
 
@@ -1306,6 +1834,7 @@ def apply_virtualization_manifest(
                 function.target_rva,
                 function.target_size,
                 function.lifted_body_size,
+                function.tail_exit,
             )
             for function in manifest.functions
         )
@@ -1324,6 +1853,7 @@ def apply_virtualization_manifest(
         manifest,
         acknowledge_no_interior_entries=acknowledge_no_interior_entries,
         reverified_native_import_call_proofs=reverified_native_import_call_proofs,
+        tail_exit_proof=tail_exit_proof,
     )
 
 
@@ -1340,10 +1870,12 @@ def materialize_selected_functions(
     rolling_seed: bytes | None = None,
     pdb_coverage_proof: pdb_coverage.PdbCoverageProof | None = None,
     native_import_contract_path: str | None = None,
+    tail_exit_proof: direct_control_flow.DirectControlFlowProof | None = None,
 ) -> MaterializationResult:
     """Compile and atomically materialize explicit first-party function specs."""
     if not isinstance(parsed, pe_analyze.ParsedPE):
         raise _fail("parsed must be a ParsedPE instance")
+    _validate_tail_exit_provenance(tuple(specs), tail_exit_proof)
     page_master_key = bytes(page_master_key)
     if len(page_master_key) != bytecode_pages.MASTER_KEY_SIZE:
         raise _fail("authenticated paging master key must be exactly 32 bytes")
@@ -1407,6 +1939,7 @@ def materialize_selected_functions(
         manifest,
         acknowledge_no_interior_entries=acknowledge_no_interior_entries,
         reverified_native_import_call_proofs=reverified_native_import_call_proofs,
+        tail_exit_proof=tail_exit_proof,
     )
     return MaterializationResult(
         parsed=committed,

@@ -80,15 +80,111 @@ def test_generated_thunk_has_fixed_descriptor_and_cet_return_shape() -> None:
     common = (ROOT / "stub/src/daedalus_x64_thunk.asm").read_text(
         encoding="utf-8"
     )
-    assert "test    eax, eax\n    jne     dvm_enter_failed" in common
+    assert (
+        "test    eax, eax\n"
+        "    je      dvm_enter_succeeded\n"
+        "    cmp     eax, DVM_STATUS_TAIL_EXIT\n"
+        "    je      dvm_enter_tail\n"
+        "    jmp     dvm_enter_failed"
+    ) in common
     assert "cmp     eax, -1" not in common
     assert "DVM_DESCRIPTOR_VERSION_PLAIN EQU 3" in common
     assert "DVM_DESCRIPTOR_VERSION_PAGED EQU 4" in common
+    assert "DVM_DESCRIPTOR_VERSION_TAIL  EQU 5" in common
+    assert "DVM_STATUS_TAIL_EXIT         EQU 2" in common
+    assert "EXTERN daedalus_vm_exec_x64_paged_tail:PROC" in common
+    assert (
+        "cmp     DWORD PTR [r11], DVM_DESCRIPTOR_VERSION_TAIL\n"
+        "    je      dvm_enter_paged_tail"
+    ) in common
+    assert "dvm_enter_paged_tail:" in common
+    tail_label = common.index("dvm_enter_paged_tail:")
+    tail_call = common.index("call    daedalus_vm_exec_x64_paged_tail", tail_label)
+    preflight = (
+        "mov     eax, DWORD PTR [r11 + 40]\n"
+        "    test    eax, eax\n"
+        "    jz      dvm_enter_failed\n"
+        "    cmp     eax, DWORD PTR [r11 + 16]\n"
+        "    jne     dvm_enter_failed\n"
+        "    cmp     DWORD PTR [r11 + 44], 0\n"
+        "    jne     dvm_enter_failed"
+    )
+    assert common.index(preflight, tail_label) < tail_call
+    assert "cmp     eax, DWORD PTR [rdx + 16]" in common
+    assert "cmp     DWORD PTR [rdx + 44], 0" in common
+    assert "mov     QWORD PTR [rsp + SHIM_SAVED_RFLAGS], rax" in common
     assert "mov     r9, QWORD PTR [r11 + 16]" in common
     assert "mov     rax, QWORD PTR [r11 + 32]" in common
     assert "mov     QWORD PTR [rsp + 32], rax" in common
     with pytest.raises(ValueError):
         win64_thunk.render_entry_thunk("bad-name", "descriptor")
+
+
+def test_generated_tail_thunk_has_split_unwind_and_cet_tail_shape() -> None:
+    source = win64_thunk.render_tail_entry_thunk(
+        "virtual_tail", "tail_descriptor"
+    )
+    assert "pushfq\n    .allocstack 8" in source
+    assert "sub     rsp, 544\n    .allocstack 544" in source
+    assert "call    daedalus_x64_enter_common_stack512" in source
+    assert "jmp     SHORT virtual_tail_resume" in source
+    assert "dq      OFFSET tail_descriptor" in source
+    assert "cmp     DWORD PTR [rsp], 0" in source
+    assert "jne     virtual_tail_tail_check" in source
+    assert "cmp     DWORD PTR [rsp], 2" in source
+    assert "je      virtual_tail_tail_restore" in source
+    assert "lea     rsp, [rsp + 544]" in source
+    assert "popfq" in source
+    assert "db      0E9h, 0, 0, 0, 0 ; rel32 patched by materializer" in source
+    assert "ret" in source  # normal status 0 retains the original CALL/RET pair.
+    assert "jmp     virtual_tail_tail_restore" not in source
+
+    direct = win64_thunk.render_tail_entry_thunk(
+        "virtual_tail", "tail_descriptor", "retained_target"
+    )
+    assert "jmp     retained_target" in direct
+    with pytest.raises(ValueError):
+        win64_thunk.render_tail_entry_thunk(
+            "virtual_tail", "tail_descriptor", "bad-target"
+        )
+
+    template = win64_thunk.render_tail_entry_thunk_bytes()
+    assert template == win64_thunk.TAIL_THUNK_TEMPLATE
+    assert len(template) == win64_thunk.TAIL_THUNK_CODE_SIZE == 64
+    assert template[win64_thunk.TAIL_THUNK_COMMON_REL32_OFFSET : 13] == bytes(4)
+    assert template[
+        win64_thunk.TAIL_THUNK_DESCRIPTOR_POINTER_OFFSET : 23
+    ] == bytes(8)
+    assert template[win64_thunk.TAIL_THUNK_TAIL_STATUS_OFFSET : 41] == bytes.fromhex(
+        "833c2402"
+    )
+    assert template[
+        win64_thunk.TAIL_THUNK_TAIL_RESTORE_OFFSET : win64_thunk.TAIL_THUNK_PRIMARY_END_OFFSET
+    ] == bytes.fromhex("488da42420020000")
+    assert template[
+        win64_thunk.TAIL_THUNK_POPFQ_OFFSET : win64_thunk.TAIL_THUNK_POPFQ_END_OFFSET
+    ] == b"\x9d"
+    assert template[win64_thunk.TAIL_THUNK_JUMP_OFFSET] == 0xE9
+    assert template[
+        win64_thunk.TAIL_THUNK_TARGET_REL32_OFFSET : win64_thunk.TAIL_THUNK_JUMP_END_OFFSET
+    ] == bytes(4)
+    assert (
+        win64_thunk.TAIL_THUNK_PRIMARY_END_OFFSET
+        == win64_thunk.TAIL_THUNK_POPFQ_OFFSET
+    )
+    assert (
+        win64_thunk.TAIL_THUNK_POPFQ_END_OFFSET
+        == win64_thunk.TAIL_THUNK_JUMP_OFFSET
+    )
+    assert (
+        win64_thunk.TAIL_THUNK_JUMP_END_OFFSET
+        == win64_thunk.TAIL_THUNK_CODE_SIZE
+    )
+    assert win64_thunk.TAIL_THUNK_UNWIND_INFO == win64_thunk.THUNK_UNWIND_INFO
+    assert win64_thunk.TAIL_THUNK_POPFQ_UNWIND_INFO == bytes.fromhex(
+        "0100010000020000"
+    )
+    assert win64_thunk.TAIL_THUNK_JUMP_UNWIND_INFO == bytes.fromhex("01000000")
 
 
 @pytest.mark.parametrize("rolling", [False, True], ids=["plain", "rolling"])
@@ -246,6 +342,16 @@ int daedalus_vm_exec_x64_paged(const uint8_t *envelope,
                                const uint8_t expected_program_id[16],
                                DaedalusX64Context *context,
                                const uint8_t *image_base)
+{{
+    (void)envelope; (void)envelope_size;
+    (void)expected_program_id; (void)context; (void)image_base;
+    return -1;
+}}
+int daedalus_vm_exec_x64_paged_tail(const uint8_t *envelope,
+                                    uint32_t envelope_size,
+                                    const uint8_t expected_program_id[16],
+                                    DaedalusX64Context *context,
+                                    const uint8_t *image_base)
 {{
     (void)envelope; (void)envelope_size;
     (void)expected_program_id; (void)context; (void)image_base;

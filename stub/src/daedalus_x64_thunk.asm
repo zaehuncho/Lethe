@@ -24,6 +24,7 @@
 ; legal epilogue or fail-fast path, keeping normal CET call/return pairing.
 
 EXTERN daedalus_vm_exec_x64_paged:PROC
+EXTERN daedalus_vm_exec_x64_paged_tail:PROC
 IFDEF DVM_PLAIN_DESCRIPTOR_TEST_ONLY
 EXTERN daedalus_vm_exec_x64:PROC
 ENDIF
@@ -31,6 +32,8 @@ PUBLIC daedalus_x64_enter_common_stack512
 
 DVM_DESCRIPTOR_VERSION_PLAIN EQU 3
 DVM_DESCRIPTOR_VERSION_PAGED EQU 4
+DVM_DESCRIPTOR_VERSION_TAIL  EQU 5
+DVM_STATUS_TAIL_EXIT         EQU 2
 
 FRAME_SIZE          EQU 664
 CTX                 EQU 40
@@ -88,6 +91,7 @@ SAVE_XMM12          EQU 592
 SAVE_XMM13          EQU 608
 SAVE_XMM14          EQU 624
 SAVE_XMM15          EQU 640
+SAVED_DESCRIPTOR    EQU 656
 
 COMMON_RETURN       EQU FRAME_SIZE
 SHIM_STATUS         EQU FRAME_SIZE + 8
@@ -167,8 +171,11 @@ daedalus_x64_enter_common_stack512 PROC FRAME
     mov     r11, [r11 + 2]
     test    r11, r11
     jz      dvm_enter_failed
+    mov     [rsp + SAVED_DESCRIPTOR], r11
     cmp     DWORD PTR [r11], DVM_DESCRIPTOR_VERSION_PAGED
     je      dvm_enter_paged
+    cmp     DWORD PTR [r11], DVM_DESCRIPTOR_VERSION_TAIL
+    je      dvm_enter_paged_tail
 IFDEF DVM_PLAIN_DESCRIPTOR_TEST_ONLY
     cmp     DWORD PTR [r11], DVM_DESCRIPTOR_VERSION_PLAIN
     jne     dvm_enter_failed
@@ -195,12 +202,65 @@ dvm_enter_paged:
     jz      dvm_enter_failed
     mov     QWORD PTR [rsp + 32], rax
     call    daedalus_vm_exec_x64_paged
+    jmp     dvm_check_result
+
+dvm_enter_paged_tail:
+    ; Only a descriptor-v5 bridge may commit the structured status-2 frame.
+    ; Validate its descriptor binding before the tail-only C boundary exports
+    ; a status-2 VM frame; malformed v5 metadata must retain failure semantics.
+    ; v4 and direct callers continue through the generic zero-only API above.
+    mov     eax, DWORD PTR [r11 + 40]
+    test    eax, eax
+    jz      dvm_enter_failed
+    cmp     eax, DWORD PTR [r11 + 16]
+    jne     dvm_enter_failed
+    cmp     DWORD PTR [r11 + 44], 0
+    jne     dvm_enter_failed
+    mov     edx, DWORD PTR [r11 + 4] ; envelope_size (trusted outer section)
+    mov     rcx, QWORD PTR [r11 + 8] ; authenticated page envelope
+    lea     r8, [r11 + 16]           ; descriptor-bound expected program_id
+    lea     r9, [rsp + CTX]
+    mov     rax, QWORD PTR [r11 + 32] ; fifth arg: loader-relocated image base
+    test    rax, rax
+    jz      dvm_enter_failed
+    mov     QWORD PTR [rsp + 32], rax
+    call    daedalus_vm_exec_x64_paged_tail
 
 dvm_check_result:
     test    eax, eax
-    jne     dvm_enter_failed
+    je      dvm_enter_succeeded
+    cmp     eax, DVM_STATUS_TAIL_EXIT
+    je      dvm_enter_tail
+    jmp     dvm_enter_failed
 
+dvm_enter_succeeded:
     mov     DWORD PTR [rsp + SHIM_STATUS], 0
+    jmp     dvm_restore_context
+
+dvm_enter_tail:
+    ; A tail result is accepted only from descriptor v5.  Its target RVA is
+    ; duplicated into the first four authenticated program-id bytes; changing
+    ; either descriptor field makes the paged VM identity check or this compare
+    ; fail before the generated shim restores VM state.  The generated shim
+    ; contains the separately planner-proven direct E9 target and preserves the
+    ; original caller-to-target CET pairing.
+    mov     rdx, [rsp + SAVED_DESCRIPTOR]
+    cmp     DWORD PTR [rdx], DVM_DESCRIPTOR_VERSION_TAIL
+    jne     dvm_enter_failed
+    mov     eax, DWORD PTR [rdx + 40]
+    test    eax, eax
+    jz      dvm_enter_failed
+    cmp     eax, DWORD PTR [rdx + 16]
+    jne     dvm_enter_failed
+    cmp     DWORD PTR [rdx + 44], 0
+    jne     dvm_enter_failed
+    ; The tail shim's POPFQ consumes the original saved-flags slot after its
+    ; status dispatch.  Replace it only after the authenticated VM export has
+    ; produced the lifted arithmetic flags; dvm_restore_context reloads RAX
+    ; from CTX below, so this scratch use cannot leak into the target state.
+    mov     rax, QWORD PTR [rsp + CTX_RFLAGS]
+    mov     QWORD PTR [rsp + SHIM_SAVED_RFLAGS], rax
+    mov     DWORD PTR [rsp + SHIM_STATUS], DVM_STATUS_TAIL_EXIT
     jmp     dvm_restore_context
 
 dvm_enter_failed:
