@@ -94,6 +94,24 @@ def test_exact_runtime_candidates_report_lift_rejection_and_handler_flags():
     assert all(item.indirect_target_closure_proven is False for item in report.candidates)
 
 
+def test_three_byte_runtime_extent_rejects_before_decode_or_lift() -> None:
+    """A PDATA-backed 33 C0 C3 leaf cannot host the required entry patch."""
+    report = discovery.discover_functions(
+        _parsed([(0x1000, b"\x33\xC0\xC3", 0)]), exports=()
+    )
+    candidate, = report.candidates
+
+    assert candidate.extent_kind == "runtime_function"
+    assert candidate.exact_extent is True
+    assert candidate.size == 3
+    assert candidate.liftable is False
+    assert candidate.rejection_reason == (
+        "function is too small for a five-byte near-JMP entry patch"
+    )
+    assert candidate.first_unsupported_instruction is None
+    assert candidate.rip_relative_references == ()
+
+
 def test_xmm_memory_and_logical_coverage_reports_exact_liftability() -> None:
     supported = (
         _asm("movd xmm0, dword ptr [rcx]; movd eax, xmm0; ret", 0x1300),
