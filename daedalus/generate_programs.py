@@ -2,9 +2,9 @@
 """
 generate_programs.py -- emit daedalus_programs_shuffled.h at build time.
 
-The Daedalus VM's ``daedalus_programs.h`` carries hand-written bytecode blobs for
-``DVM_PROG_DERIVE_KEY`` and ``DVM_PROG_SHARD_XOR`` encoded with the CANONICAL
-opcode map. When ``DVM_SHUFFLE_OPCODES=ON`` (the default) the interpreter is
+The Daedalus VM's ``daedalus_programs.h`` carries a hand-written bytecode blob for
+``DVM_PROG_DERIVE_KEY`` encoded with the CANONICAL opcode map. When
+``DVM_SHUFFLE_OPCODES=ON`` (the default) the interpreter is
 built to dispatch a per-build randomized map, so the canonical bytecode would
 be misinterpreted and every packed binary would fail its first crypto call.
 
@@ -36,7 +36,6 @@ from pathlib import Path
 # what daedalus_programs.h exposes.
 PROGRAMS = [
     ("DVM_PROG_DERIVE_KEY", "derive_key.vasm"),
-    ("DVM_PROG_SHARD_XOR",  "shard_xor.vasm"),
 ]
 
 

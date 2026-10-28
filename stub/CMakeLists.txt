@@ -23,6 +23,7 @@ add_library(lethe_stub_x64 SHARED
     src/daedalus_vm.c
     src/daedalus_trampoline.asm
     src/daedalus_x64_thunk.asm
+    src/entry_thunks.asm
     src/miniz.c
     src/chkstk.asm
 )
@@ -64,6 +65,8 @@ target_link_options(lethe_stub_x64 PRIVATE
     /HIGHENTROPYVA
     /CETCOMPAT
     /EXPORT:daedalus_x64_enter_common
+    /EXPORT:StubExeEntry
+    /EXPORT:StubDllMain
 )
 
 # Vendored miniz: strip to inflate-only (no stdio/time/archive/zip writer),

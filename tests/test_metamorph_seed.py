@@ -39,7 +39,7 @@ def test_subseed_matches_cryptography_hkdf(domain, length):
     assert seed.subseed(domain, length) == _oracle(MASTER, domain.encode(), length)
 
 
-@pytest.mark.parametrize("symbol", ["derive_key", "shard_xor", "n_sha256"])
+@pytest.mark.parametrize("symbol", ["derive_key", "key_scatter", "n_sha256"])
 def test_subseed_for_program_matches_oracle(symbol):
     seed = MetamorphSeed(MASTER)
     info = ms.DOMAIN_ROLLING.encode() + b"|" + symbol.encode()
@@ -97,7 +97,7 @@ def test_domains_are_independent():
 def test_program_seed_varies_by_symbol():
     seed = MetamorphSeed(MASTER)
     a = seed.subseed_for_program(ms.DOMAIN_ROLLING, "derive_key")
-    b = seed.subseed_for_program(ms.DOMAIN_ROLLING, "shard_xor")
+    b = seed.subseed_for_program(ms.DOMAIN_ROLLING, "key_scatter")
     assert a != b
 
 

@@ -137,8 +137,8 @@ def test_invalid_stage_is_not_uploaded_or_published_and_is_removed(
             output_path=str(output), is_dll=False,
             server_shard=True,
             shard_url=f"https://{orchestrator._SHARD_API_HOST}",
-            shard_auth="build-token", shard_license_id="license-1",
-            shard_hwid_hash="b" * 64))
+            shard_publish_signing_key_pem="publisher.pem",
+            shard_reason="structural validation test"))
 
     assert not result.ok
     assert "staged output failed structural validation" in result.error
@@ -262,8 +262,8 @@ def test_keyed_invalid_stage_is_not_uploaded_or_published_and_is_removed(
             output_path=str(output), is_dll=False,
             server_shard=True,
             shard_url=f"https://{orchestrator._SHARD_API_HOST}",
-            shard_auth="build-token", shard_license_id="license-1",
-            shard_hwid_hash="b" * 64))
+            shard_publish_signing_key_pem="publisher.pem",
+            shard_reason="keyed validation test"))
 
     assert not result.ok
     assert "staged output failed keyed validation" in result.error

@@ -84,7 +84,23 @@ def test_process_attach_is_manual_and_exactly_once() -> None:
     assert "if (s_tls_process_attached)" in attach
     assert attach.index("s_tls_process_attached = 1;") < attach.index(
         "tls_invoke_callbacks(DLL_PROCESS_ATTACH);")
+    assert attach.index("s_tls_process_attached = 1;") < attach.index(
+        "tls_initialize_existing_threads();") < attach.index(
+        "tls_invoke_callbacks(DLL_PROCESS_ATTACH);")
     assert "if (tls_process_attach() != 0)" in LOADER
+
+
+def test_preexisting_threads_receive_tls_template_without_forged_callbacks() -> None:
+    existing = _function(
+        LOADER, "static void tls_initialize_existing_threads(",
+        "static void tls_invoke_callbacks(")
+    assert "CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)" in existing
+    assert "NtQueryInformationThread" in existing
+    assert "ReadProcessMemory" in existing
+    assert "WriteProcessMemory" in existing
+    assert "tls_copy_template_to_storage(staged, recipe);" in existing
+    assert "DLL_THREAD_ATTACH" not in existing
+    assert "tls_invoke_callbacks" not in existing
 
 
 def test_live_pe_header_path_is_preserved_for_windows_runtime_apis() -> None:
@@ -127,7 +143,7 @@ def test_dll_detach_preserves_native_dllmain_then_tls_order() -> None:
     assert process_detach.index("invoke_dll_oep") < process_detach.index(
         "release_dll_runtime")
     cleanup = _function(STUB_MAIN, "static void release_dll_runtime(",
-                        "__declspec(dllexport)\nvoid __cdecl StubExeEntry(")
+                        "__declspec(noinline)\nvoid __cdecl StubExeEntryImpl(")
     assert cleanup.index("pe_loader_tls_dll_detach") < cleanup.index(
         "memguard_shutdown")
     assert thread_detach.index("invoke_dll_oep") < thread_detach.index(

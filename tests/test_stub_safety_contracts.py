@@ -107,7 +107,7 @@ def test_paged_vm_owns_scattered_key_until_module_teardown() -> None:
     )
     assert "release_dll_runtime(hInst, reason, reserved);" in entry
     cleanup = entry[entry.index("static void release_dll_runtime("):
-                    entry.index("__declspec(dllexport)\nvoid __cdecl")]
+                    entry.index("void __cdecl StubExeEntryImpl(void)")]
     assert "key_scatter_destroy();" in cleanup
     assert re.search(r"fail:.*?key_scatter_destroy\(\);", loader, re.DOTALL)
 

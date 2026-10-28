@@ -1,0 +1,101 @@
+{
+  "schema": "lethe.venice_server_shard_v3_qualification.v1",
+  "protocol": "venice-server-shard-v3-pipe",
+  "v3_source_commit": "cfbb1912b6c2a95bc7b11f5e73f4aa9a11ff505a",
+  "release_command": {
+    "requires_default_cli": true,
+    "required_flags": [
+      "--process-hardening",
+      "--server-shard",
+      "--enable-experimental-server-shard",
+      "--shard-reason"
+    ],
+    "forbidden_flags": [
+      "--anti-debug",
+      "--memory-guard"
+    ]
+  },
+  "files": {
+    "bootstrap/CMakeLists.txt": "74d5b12e706d826accac3ad3bfa00d382eea6ef1d3bb75c74a37548e0ac711f5",
+    "bootstrap/broker_binding.h.in": "55182e25123fda9ef239f1f2ea4d524220ff6fadbd145d4ae3e2872541680e94",
+    "bootstrap/broker_handoff.c": "9e99cdd23284740c16f538312aa8ec638f17041f1906b9dfac1559ab5c7a1df2",
+    "bootstrap/broker_handoff.h": "f7f76263e1fdf18bdad828ec2502d2dd7a7e423aa470a319d734761d973d6f9b",
+    "bootstrap/shard_bootstrap.c": "15828c9844568d50fe802802df85e872b540bec895af72a59fd46a9480d567eb",
+    "bootstrap/tests/broker_handoff_test.c": "777b65eb4add6ea9c762068269acacb448ea67fafe22a83ce5bdb1d8df4fca83",
+    "stub/src/pe_loader.c": "5b83492ad80c1691a9ade2c6563ecd3dad86026a4b8320faeb9278dad4fabfd0",
+    "stub/src/pack_info.h": "c45687f814248bf6a6c0a6894cec61914f4e81bdc56915b84e0971d3c3604b97",
+    "packer/assemble.py": "7c6d7631c9a758f1773fdb6f2ecc4bb7709d5d948d02b34be426c7dffa0f4a12",
+    "packer/container.py": "bac00f190e3b6c37e63163389271d81036dfafd9153c5f83fa543c30de074538",
+    "packer/keyed_validation.py": "0b32695388cf733020866b990668b326cd77c1478c0c8e81f4eef7ebd0036acd",
+    "packer/orchestrator.py": "f95c5f65e3e3c53dcc4d918029c6a37e10ca7beef30ff120f29cde700b48b0da",
+    "packer/report.py": "65e0bde8ee09bfb9d2e999d3dc4deae9c3b5c9807491077dccce8c460e380347",
+    "daedalus/generate_programs.py": "ded6e86fa7d254431940c34edbb2065935e6c69878d8ac33a685c9c26079b135",
+    "lethe.py": "514383dbe153fe21614c175e0485abee45274b7ed100166f5235cc807fe5a5c2"
+  },
+  "required_markers": {
+    "bootstrap/CMakeLists.txt": [
+      "LETHE_ORION_ACTIVATE_SHA256",
+      "LETHE_ORION_ACTIVATE_SHA256_NORMALIZED",
+      "must be exactly 64 hexadecimal characters"
+    ],
+    "bootstrap/broker_binding.h.in": [
+      "LETHE_ORION_ACTIVATE_SHA256_HEX",
+      "ORION_ACTIVATE_SHA256:@LETHE_ORION_ACTIVATE_SHA256_NORMALIZED@"
+    ],
+    "bootstrap/broker_handoff.c": [
+      "BCRYPT_SHA256_ALGORITHM",
+      "BCryptFinishHash",
+      "TokenElevation"
+    ],
+    "bootstrap/broker_handoff.h": [
+      "lethe_sha256_file_handle",
+      "lethe_current_process_elevated"
+    ],
+    "bootstrap/shard_bootstrap.c": [
+      "VSG3",
+      "FILE_TYPE_PIPE",
+      "launch_sibling_broker",
+      "LETHE_ORION_ACTIVATE_SHA256_HEX",
+      "lethe_current_process_elevated(&elevated)"
+    ],
+    "bootstrap/tests/broker_handoff_test.c": [
+      "SHA-256(\"abc\")",
+      "ORION_ACTIVATE_SHA256:"
+    ],
+    "stub/src/pe_loader.c": [
+      "\"VSG3\"",
+      "LETHE_FLAG_SERVER_SHARD_PIPE",
+      "No environment, command-line, disk, or cache fallback exists"
+    ],
+    "stub/src/pack_info.h": [
+      "LETHE_FLAG_SERVER_SHARD_PIPE 0x200u"
+    ],
+    "packer/container.py": [
+      "FLAG_SERVER_SHARD_PIPE = 1 << 9"
+    ],
+    "packer/assemble.py": [
+      "The stub reads one 32-byte shard only from the broker's VSG3 stdin frame"
+    ],
+    "packer/keyed_validation.py": [
+      "FLAG_SERVER_SHARD_PIPE"
+    ],
+    "packer/orchestrator.py": [
+      "/api/shard/v3/store",
+      "V3 KMS gate",
+      "offline release signature"
+    ]
+  },
+  "forbidden_markers": [
+    "NV_RT_GATE",
+    "orion-entitlement-v1",
+    "/api/shard/retrieve",
+    "CryptUnprotectData",
+    "WinHttpOpen",
+    "shard_xor.vasm",
+    "X-Orion-Admin-Secret",
+    "LETHE_SHARD_ADMIN_SECRET",
+    "LETHE_SHARD_EDGE_AUTH",
+    "LETHE_SHARD_ADMIN_TOTP",
+    "LETHE_SHARD_PUBLISHER_SECRET"
+  ]
+}

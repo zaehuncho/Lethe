@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import struct
 from pathlib import Path
 
 import pytest
@@ -21,27 +22,31 @@ def _configured_fixture(name: str) -> Path:
     return path
 
 
-def _run(executable: Path, gate: str | None) -> subprocess.CompletedProcess:
-    env = os.environ.copy()
-    for name in tuple(env):
-        if name.upper() == "NV_RT_GATE":
-            del env[name]
-    if gate is not None:
-        env["NV_RT_GATE"] = gate
+def _vsg3_frame(shard: bytes, *, trailing: bytes = b"") -> bytes:
+    assert len(shard) == 32
+    return b"VSG3" + struct.pack("<HH", 3, 32) + shard + trailing
+
+
+def _run(executable: Path, frame: bytes | None) -> subprocess.CompletedProcess:
+    kwargs = {}
+    if frame is not None:
+        # subprocess closes its write end after the bytes are sent, which proves
+        # the runtime's mandatory EOF condition as well as the fixed wire frame.
+        kwargs["input"] = frame
     return subprocess.run(
         [str(executable)],
         cwd=str(executable.parent),
-        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
         check=False,
+        **kwargs,
     )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native loader is Windows-only")
-def test_native_server_shard_rejects_missing_and_wrong_gate(tmp_path,
-                                                            monkeypatch):
+def test_native_server_shard_rejects_missing_wrong_and_trailing_pipe_frames(tmp_path,
+                                                                             monkeypatch):
     stub = _configured_fixture("LETHE_NATIVE_STUB_PATH")
     sample = _configured_fixture("LETHE_NATIVE_SAMPLE_EXE")
     packed = tmp_path / "sample_exe.sharded.exe"
@@ -72,13 +77,15 @@ def test_native_server_shard_rejects_missing_and_wrong_gate(tmp_path,
     assert keyed.ok, keyed.reason
 
     expected = _run(sample, None)
-    missing = _run(packed, None)
+    missing = _run(packed, b"")
     wrong_bytes = bytes(byte ^ 0xFF for byte in assembly.server_shard)
-    wrong = _run(packed, wrong_bytes.hex())
-    correct = _run(packed, assembly.server_shard.hex())
+    wrong = _run(packed, _vsg3_frame(wrong_bytes))
+    trailing = _run(packed, _vsg3_frame(assembly.server_shard, trailing=b"x"))
+    correct = _run(packed, _vsg3_frame(assembly.server_shard))
 
     assert missing.returncode == 1
     assert wrong.returncode == 1
+    assert trailing.returncode == 1
     assert correct.returncode == expected.returncode
     assert correct.stdout == expected.stdout
     assert correct.stderr == expected.stderr

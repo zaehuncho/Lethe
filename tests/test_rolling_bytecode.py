@@ -63,7 +63,12 @@ def _real_program_blobs():
 
 def test_real_programs_present():
     blobs = _real_program_blobs()
-    assert len(blobs) >= 8, f"expected the real .vasm corpus, found {len(blobs)}"
+    # V3 deliberately removed the legacy raw-shard environment-variable
+    # program (``shard_xor.vasm``).  Keep a real rolling-bytecode corpus while
+    # making reintroduction of the replayable NV_RT_GATE path a visible change,
+    # rather than papering over the V3 migration by restoring it for a count.
+    assert len(blobs) >= 7, f"expected the real .vasm corpus, found {len(blobs)}"
+    assert "shard_xor.vasm" not in blobs
 
 
 def test_codec_roundtrip_real_programs():

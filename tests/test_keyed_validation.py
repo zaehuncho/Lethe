@@ -90,7 +90,7 @@ def _build_fixture() -> _Fixture:
         original_size_of_image=0x3000,
         oep_rva=0x1000,
         is_dll=0,
-        flags=0,
+        flags=container.FLAG_SERVER_SHARD_PIPE,
         section_count=1,
         meta_rva=_META_RVA,
         meta_stored_size=len(meta_compressed),
@@ -123,7 +123,7 @@ def _build_fixture() -> _Fixture:
         kdf_salt=salt,
         stored_sections=[stored],
         metadata=metadata,
-        flags=0,
+        flags=container.FLAG_SERVER_SHARD_PIPE,
         oep_rva=0x1000,
         is_dll=0,
         original_image_base=0x140000000,
@@ -551,8 +551,8 @@ def test_real_keyed_failures_preserve_existing_output_and_remove_stage(
             output_path=str(output), is_dll=False,
             server_shard=True,
             shard_url=f"https://{orchestrator._SHARD_API_HOST}",
-            shard_auth="build-token", shard_license_id="license-1",
-            shard_hwid_hash="b" * 64))
+            shard_publish_signing_key_pem="publisher.pem",
+            shard_reason="keyed validation test"))
 
     assert not result.ok
     assert "staged output failed keyed validation" in result.error

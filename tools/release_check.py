@@ -181,8 +181,14 @@ def main() -> int:
     bootstrap_source = (ROOT / "bootstrap" / "shard_bootstrap.c").read_text(encoding="utf-8")
     if '_SHARD_API_HOST = "shard.example.invalid"' not in shard_source:
         errors.append("experimental Python shard client is not pinned to the reserved example host")
-    if '#define SHARD_HOST      L"shard.example.invalid"' not in bootstrap_source:
-        errors.append("experimental bootstrap is not pinned to the reserved example host")
+    forbidden_bootstrap_tokens = (
+        "WinHttp", "CryptUnprotectData", "NV_RT_GATE", "shard_session.dat",
+        "/api/shard/retrieve", "SetEnvironmentVariable",
+    )
+    for token in forbidden_bootstrap_tokens:
+        if token in bootstrap_source:
+            errors.append(
+                f"V3 bootstrap must be pipe-only; forbidden legacy token {token!r} found")
 
     _check_manifest(errors)
     _check_workflow_pins(errors)

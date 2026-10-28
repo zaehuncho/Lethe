@@ -113,8 +113,8 @@ static void release_dll_runtime(HINSTANCE hInst, DWORD reason, LPVOID reserved)
     s_pdata_count = 0;
 }
 
-__declspec(dllexport)
-void __cdecl StubExeEntry(void)
+__declspec(noinline)
+void __cdecl StubExeEntryImpl(void)
 {
     void *base = (void *)GetModuleHandleW(NULL);
     int antidebug_on = (g_packinfo.flags & LETHE_FLAG_ANTIDEBUG) != 0;
@@ -149,8 +149,8 @@ void __cdecl StubExeEntry(void)
     ExitProcess(invoke_exe_oep());
 }
 
-__declspec(dllexport)
-BOOL WINAPI StubDllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
+__declspec(noinline)
+BOOL WINAPI StubDllMainImpl(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 {
     /* hInst IS the correct base address of the loaded DLL. */
     void *base = (void *)hInst;

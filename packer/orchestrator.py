@@ -97,9 +97,10 @@ class PackOptions:
     is_dll: Optional[bool] = None       # None => auto-detect from the PE header
     server_shard: bool = False          # Tier 3: XOR a server-held shard into the key
     shard_url: Optional[str] = None     # experimental shard gate base URL
-    shard_auth: Optional[str] = None    # owner admin secret for shard upload
-    shard_edge_auth: Optional[str] = None    # edge secret; pack-time only
-    shard_admin_totp: Optional[str] = None   # optional owner TOTP; pack-time only
+    # V3 publication is authorized by one fresh offline Ed25519 signature.  This
+    # is a local PEM path, never a shared cloud/edge/admin credential.
+    shard_publish_signing_key_pem: Optional[str] = None
+    shard_reason: Optional[str] = None
     # Legacy v2 fields retained so older callers deserialize, but the v3 public
     # release upload never sends them: customer enforcement is per session.
     shard_license_id: Optional[str] = None
@@ -249,30 +250,102 @@ def _validate_build_id(build_id: str) -> str:
     return normalized
 
 
-def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
-                  edge_auth: Optional[str] = None,
-                  admin_totp: Optional[str] = None,
+def _v3_publish_message(*, build_id: str, shard_hex: str, ttl_hours: int,
+                        reason: str, publish_timestamp: int,
+                        publish_nonce: str) -> bytes:
+    """Build the exact offline release-signature transcript accepted by V3."""
+    canonical = {
+        "protocol": 1,
+        "build_id": build_id,
+        "shard": shard_hex,
+        "ttl_hours": ttl_hours,
+        "reason": reason,
+        "publish_timestamp": publish_timestamp,
+        "publish_nonce": publish_nonce,
+    }
+    return (b"orion-shard-v3-store-publish\n"
+            + json.dumps(canonical, separators=(",", ":"), ensure_ascii=True).encode("ascii"))
+
+
+def _load_v3_publish_signer(signing_key_pem: str):
+    """Load one local Ed25519 release key without ever serializing its bytes."""
+    if not isinstance(signing_key_pem, str) or not signing_key_pem.strip():
+        raise ValueError("V3 shard publication requires a local signing-key PEM path")
+    path = os.path.abspath(signing_key_pem)
+    if not os.path.isfile(path):
+        raise ValueError("V3 shard publication signing-key PEM is unavailable")
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        with open(path, "rb") as pem_file:
+            signer = serialization.load_pem_private_key(pem_file.read(), password=None)
+    except Exception as exc:
+        raise ValueError("V3 shard publication signing key could not be loaded") from exc
+    if not isinstance(signer, Ed25519PrivateKey):
+        raise ValueError("V3 shard publication key must be an Ed25519 private key")
+    return signer
+
+
+def _build_v3_publish_body(*, build_id: str, shard: bytes, ttl_hours: int,
+                           reason: str, signing_key_pem: str) -> dict:
+    """Return one short-lived, signed V3 storage request body.
+
+    The private key signs only the canonical publication transcript.  The
+    resulting proof contains a fresh nonce and timestamp, so it is neither a
+    reusable bearer credential nor a substitute for the backend's KMS policy.
+    """
+    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 200:
+        raise ValueError("V3 shard publication requires a bounded reason")
+    reason = reason.strip()
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in reason):
+        raise ValueError("V3 shard publication reason contains control characters")
+    publish_timestamp = int(time.time())
+    publish_nonce = secrets.token_urlsafe(32).rstrip("=")
+    shard_hex = shard.hex()
+    message = _v3_publish_message(
+        build_id=build_id, shard_hex=shard_hex, ttl_hours=ttl_hours,
+        reason=reason, publish_timestamp=publish_timestamp,
+        publish_nonce=publish_nonce)
+    signature = _load_v3_publish_signer(signing_key_pem).sign(message)
+    return {
+        "build_id": build_id,
+        "shard": shard_hex,
+        "ttl_hours": ttl_hours,
+        "reason": reason,
+        "publish_timestamp": publish_timestamp,
+        "publish_nonce": publish_nonce,
+        "signature": base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii"),
+    }
+
+
+def _upload_shard(shard: bytes, *, build_id: str, url: str,
+                  signing_key_pem: str, reason: str,
                   license_id: str = "", hwid_hash: str = "",
                   max_activations: int = 0, ttl_hours: int = 0,
                   allow_unpinned_host: bool = False,
                   pin_pem: Optional[str] = None,
                   progress: ProgressFn = None) -> dict:
-    """Upload a build's server shard to the Lambda shard gate (POST /api/shard/store).
+    """Upload a build's server shard to the V3 Lambda gate.
 
     The shard is sent hex-encoded under the signing-stable SHA-256 PE content
-    ``build_id``. The server encrypts it at rest. Customer/license/machine
-    enforcement happens at retrieval time; the shared release row is unbound.
-    and returns ``{ok, build_id, expires_at}``. Raises on any non-success so the
+    ``build_id``. An offline release signature controls build admission before
+    storage; the server encrypts the accepted shard with its V3 KMS envelope. Customer,
+    license, device-key, build, nonce, and binding-revision enforcement happens
+    only at V3 grant time.  Old per-customer upload fields are rejected rather
+    than silently ignored. Returns ``{ok, build_id, expires_at}``. Raises on any
+    non-success so the
     caller can delete the half-baked output (a shard that never reached the
     server leaves the packed binary permanently unrunnable).
     """
     build_id = _validate_build_id(build_id)
     if len(shard) != 32:
         raise ValueError("server shard must be exactly 32 bytes")
-    if not auth.strip():
-        raise ValueError("shard upload owner secret must not be empty")
-    if max_activations < 0 or ttl_hours < 0:
-        raise ValueError("shard activation and TTL limits must be non-negative")
+    if license_id or hwid_hash or max_activations:
+        raise ValueError(
+            "V3 shard storage is build-scoped; license, HWID, and activation "
+            "limits belong to the authenticated grant path, not the upload")
+    if ttl_hours < 0:
+        raise ValueError("shard TTL must be non-negative")
     # --- HTTPS enforcement: never send the shard + Bearer token in cleartext --
     parsed = urlparse(url)
     if parsed.scheme != "https":
@@ -293,25 +366,11 @@ def _upload_shard(shard: bytes, *, build_id: str, url: str, auth: str,
         _emit(progress, f"WARNING: shard upload host {parsed.hostname!r} != "
                         f"pinned {_SHARD_API_HOST!r} (allowed by override)")
 
-    endpoint = f"{parsed.scheme}://{parsed.netloc}/api/shard/store"
-    body = json.dumps({
-        "build_id": build_id,
-        "license_id": "",
-        "hwid_hash": "",
-        "shard": shard.hex(),
-        "max_activations": int(max_activations),
-        "ttl_hours": int(ttl_hours),
-    }).encode()
-    request_headers = {
-        "Content-Type": "application/json",
-        "X-Orion-Admin-Secret": auth,
-    }
-    resolved_edge_auth = edge_auth or os.environ.get("LETHE_SHARD_EDGE_AUTH", "")
-    resolved_totp = admin_totp or os.environ.get("LETHE_SHARD_ADMIN_TOTP", "")
-    if resolved_edge_auth:
-        request_headers["X-Edge-Auth"] = resolved_edge_auth
-    if resolved_totp:
-        request_headers["X-Orion-Admin-TOTP"] = resolved_totp
+    endpoint = f"{parsed.scheme}://{parsed.netloc}/api/shard/v3/store"
+    body = json.dumps(_build_v3_publish_body(
+        build_id=build_id, shard=shard, ttl_hours=int(ttl_hours), reason=reason,
+        signing_key_pem=signing_key_pem), separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    request_headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(
         endpoint,
         data=body,
@@ -740,12 +799,13 @@ def pack_file(input_path: str, options: PackOptions,
         # permanently unrunnable -- with no error. Refuse up front.
         if getattr(options, "server_shard", False):
             _shard_url = getattr(options, "shard_url", None)
-            _shard_auth = getattr(options, "shard_auth", None)
-            if not _shard_url or not _shard_auth:
+            _shard_signing_key = getattr(options, "shard_publish_signing_key_pem", None)
+            _shard_reason = getattr(options, "shard_reason", None)
+            if not _shard_url or not _shard_signing_key or not _shard_reason:
                 raise ValueError(
-                    "server_shard=True requires both shard_url and shard_auth — "
-                    "without them, the packed binary would be permanently "
-                    "unrunnable (keyed to a shard that was never uploaded)")
+                    "server_shard=True requires shard_url, shard_reason, and a local "
+                    "V3 publication signing-key PEM — without them, the packed binary "
+                    "would be permanently unrunnable (keyed to a shard that was never uploaded)")
             # v3 uses one shard per public release. Legacy caller fields are
             # deliberately ignored and never uploaded; the backend rejects a
             # per-customer build row.
@@ -962,16 +1022,15 @@ def pack_file(input_path: str, options: PackOptions,
         _assert_source_unchanged(input_path, source_identity, source_sha256)
 
         # --- 3b. upload server shard if one was generated --------------------
-        if asm_result.server_shard and eff.shard_url and eff.shard_auth:
-            _emit(progress, "uploading server shard (v2 shard gate)")
+        if (asm_result.server_shard and eff.shard_url
+                and eff.shard_publish_signing_key_pem and eff.shard_reason):
+            _emit(progress, "uploading server shard (V3 KMS gate)")
             try:
                 _upload_shard(asm_result.server_shard,
                               build_id=build_id,
-                              url=eff.shard_url, auth=eff.shard_auth,
-                              edge_auth=getattr(eff, "shard_edge_auth", None),
-                              admin_totp=getattr(eff, "shard_admin_totp", None),
-                              license_id="", hwid_hash="",
-                              max_activations=eff.shard_max_activations,
+                              url=eff.shard_url,
+                              signing_key_pem=eff.shard_publish_signing_key_pem,
+                              reason=eff.shard_reason,
                               ttl_hours=eff.shard_ttl_hours,
                               allow_unpinned_host=getattr(eff, "allow_unpinned_host", False),
                               pin_pem=(eff.shard_pin_pem

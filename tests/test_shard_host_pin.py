@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -40,27 +42,41 @@ class _Response:
         return payload if size < 0 else payload[:size]
 
 
-def test_wrong_host_hard_fails_before_any_network():
+@pytest.fixture
+def signing_key(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    path = tmp_path / "publisher.pem"
+    path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ))
+    return str(path)
+
+
+def test_wrong_host_hard_fails_before_any_network(signing_key):
     with pytest.raises(ValueError, match="does not match the pinned"):
         orchestrator._upload_shard(
             _SHARD,
             build_id=_BUILD_ID,
             url="https://evil.example.com/api/shard",
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="host guard test",
         )
 
 
-def test_non_https_is_refused_before_any_network():
+def test_non_https_is_refused_before_any_network(signing_key):
     with pytest.raises(ValueError, match="requires HTTPS"):
         orchestrator._upload_shard(
             _SHARD,
             build_id=_BUILD_ID,
             url=f"http://{orchestrator._SHARD_API_HOST}/api/shard",
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="scheme guard test",
         )
 
 
-def test_override_flag_bypasses_the_host_guard(monkeypatch):
+def test_override_flag_bypasses_the_host_guard(monkeypatch, signing_key):
     def offline(*_args, **_kwargs):
         raise OSError("offline test")
 
@@ -70,23 +86,25 @@ def test_override_flag_bypasses_the_host_guard(monkeypatch):
             _SHARD,
             build_id=_BUILD_ID,
             url="https://staging.nonexistent.invalid/api/shard",
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="staging host test",
             allow_unpinned_host=True,
         )
     assert "does not match the pinned" not in str(excinfo.value)
 
 
-def test_invalid_build_id_fails_before_network():
+def test_invalid_build_id_fails_before_network(signing_key):
     with pytest.raises(ValueError, match="64-character"):
         orchestrator._upload_shard(
             _SHARD,
             build_id="00000000-0000-0000-0000-000000000000",
             url=_PINNED_URL,
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="build id test",
         )
 
 
-def test_upload_requires_matching_response_build_id(monkeypatch):
+def test_upload_requires_matching_response_build_id(monkeypatch, signing_key):
     monkeypatch.setattr(
         orchestrator,
         "_open_shard_request",
@@ -97,11 +115,12 @@ def test_upload_requires_matching_response_build_id(monkeypatch):
             _SHARD,
             build_id=_BUILD_ID,
             url=_PINNED_URL,
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="response test",
         )
 
 
-def test_upload_accepts_exact_response_build_id(monkeypatch):
+def test_upload_accepts_exact_response_build_id(monkeypatch, signing_key):
     monkeypatch.setattr(
         orchestrator,
         "_open_shard_request",
@@ -111,7 +130,8 @@ def test_upload_accepts_exact_response_build_id(monkeypatch):
         _SHARD,
         build_id=_BUILD_ID,
         url=_PINNED_URL,
-        auth="token",
+        signing_key_pem=signing_key,
+        reason="response test",
     )
     assert result["ok"] is True
 
@@ -126,7 +146,7 @@ def test_redirect_handler_never_constructs_a_followup_request():
         request, None, 302, "Found", {}, "https://evil.example/shard") is None
 
 
-def test_oversized_response_is_rejected(monkeypatch):
+def test_oversized_response_is_rejected(monkeypatch, signing_key):
     class Oversized(_Response):
         def read(self, size=-1):
             return b"x" * (orchestrator._MAX_SHARD_RESPONSE + 1)
@@ -141,5 +161,6 @@ def test_oversized_response_is_rejected(monkeypatch):
             _SHARD,
             build_id=_BUILD_ID,
             url=_PINNED_URL,
-            auth="token",
+            signing_key_pem=signing_key,
+            reason="response size test",
         )

@@ -72,8 +72,10 @@ def test_flag_bits_are_distinct_powers_of_two():
         container.FLAG_LOAD_CONFIG,
         container.FLAG_DLL_PRELOAD_IAT,
         container.FLAG_PROCESS_HARDENING,
+        container.FLAG_TAMPER_MONITOR,
+        container.FLAG_SERVER_SHARD_PIPE,
     ]
-    assert bits == [1, 2, 4, 8, 16, 32, 64, 128]
+    assert bits == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
     # no overlap, so flags OR/AND cleanly
     assert 0 == container.FLAG_HAS_TLS & container.FLAG_HAS_EXCEPTIONS
 

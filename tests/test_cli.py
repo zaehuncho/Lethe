@@ -256,7 +256,7 @@ def test_cli_requires_explicit_indirect_target_acknowledgement(tmp_path, capsys)
     assert "--acknowledge-unproven-indirect-targets" in capsys.readouterr().err
 
 
-def test_environment_secrets_are_passed_to_core(monkeypatch, tmp_path):
+def test_v3_publisher_key_path_is_passed_to_core(monkeypatch, tmp_path):
     input_path = tmp_path / "input.exe"
     input_path.write_bytes(b"test fixture")
     captured = {}
@@ -268,33 +268,22 @@ def test_environment_secrets_are_passed_to_core(monkeypatch, tmp_path):
         return _result(input_path=path)
 
     monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
-    monkeypatch.setenv("LETHE_SHARD_AUTH", "env-token")
+    monkeypatch.setenv("LETHE_SHARD_PUBLISH_SIGNING_KEY_PEM", "publisher.pem")
     monkeypatch.setenv("LETHE_SHARD_PIN_PEM", "pin.pem")
 
     rc = lethe.main([str(input_path), "output.exe"])
 
     assert rc == lethe.EXIT_OK
-    assert captured["options"].shard_auth == "env-token"
+    assert captured["options"].shard_publish_signing_key_pem == "publisher.pem"
     assert captured["options"].shard_pin_pem == "pin.pem"
 
 
-def test_cli_secret_overrides_environment(monkeypatch, tmp_path):
+def test_cli_rejects_retired_shared_secret_flag(monkeypatch, tmp_path):
     input_path = tmp_path / "input.exe"
     input_path.write_bytes(b"test fixture")
-    captured = {}
-
-    def fake_pack(_path, options, progress=None):
-        captured["options"] = options
-        return _result()
-
-    monkeypatch.setattr(orchestrator, "pack_file", fake_pack)
-    monkeypatch.setenv("LETHE_SHARD_AUTH", "env-token")
-
-    rc = lethe.main([
-        str(input_path), "output.exe", "--shard-auth", "cli-token",
-        "--stub-path", "fresh-stub.dll",
-    ])
-
-    assert rc == lethe.EXIT_OK
-    assert captured["options"].shard_auth == "cli-token"
-    assert captured["options"].stub_path == "fresh-stub.dll"
+    with pytest.raises(SystemExit) as exc:
+        lethe.main([
+            str(input_path), "output.exe", "--shard-auth", "retired-token",
+            "--stub-path", "fresh-stub.dll",
+        ])
+    assert exc.value.code == 2

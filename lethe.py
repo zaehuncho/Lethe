@@ -278,11 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="experimental shard gate base URL",
     )
     parser.add_argument(
-        "--shard-auth",
+        "--shard-reason",
         default=None,
-        metavar="TOKEN",
-        help=("owner admin secret for shard upload; prefer the "
-              "LETHE_SHARD_ADMIN_SECRET environment variable to avoid argv exposure"),
+        metavar="TEXT",
+        help=("required bounded audit reason for the one-time V3 shard publication "
+              "proof"),
     )
     parser.add_argument(
         "--shard-license-id",
@@ -501,11 +501,8 @@ def main(argv: "list[str] | None" = None) -> int:
         is_dll=(True if args.dll else None),  # None => auto-detect from the header
         server_shard=args.server_shard,
         shard_url=args.shard_url,
-        shard_auth=(args.shard_auth
-                    or os.environ.get("LETHE_SHARD_ADMIN_SECRET")
-                    or os.environ.get("LETHE_SHARD_AUTH")),
-        shard_edge_auth=os.environ.get("LETHE_SHARD_EDGE_AUTH"),
-        shard_admin_totp=os.environ.get("LETHE_SHARD_ADMIN_TOTP"),
+        shard_publish_signing_key_pem=os.environ.get("LETHE_SHARD_PUBLISH_SIGNING_KEY_PEM"),
+        shard_reason=args.shard_reason,
         shard_license_id=args.shard_license_id,
         shard_hwid_hash=args.shard_hwid_hash,
         shard_max_activations=args.shard_max_activations,

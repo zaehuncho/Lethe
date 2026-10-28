@@ -28,6 +28,7 @@
 #define LETHE_FLAG_DLL_PRELOAD_IAT 0x40u
 #define LETHE_FLAG_PROCESS_HARDENING 0x80u
 #define LETHE_FLAG_TAMPER_MONITOR 0x100u  /* opt-in periodic runtime tamper monitor */
+#define LETHE_FLAG_SERVER_SHARD_PIPE 0x200u /* require one broker VSG3 stdin frame */
 
 /* Import func entry: hint_or_ordinal == LETHE_IMPORT_BY_HASH means the function
  * is resolved by FNV-1a hash of its name (walking the export table); any other

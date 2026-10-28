@@ -1,0 +1,11 @@
+#pragma once
+
+/*
+ * Generated only by the production bootstrap CMake configure step. This digest
+ * is release metadata, not a shared secret: it binds the pipe-only bootstrap
+ * to the exact unpacked broker that owns device proof and shard issuance.
+ */
+#define LETHE_ORION_ACTIVATE_SHA256_HEX "@LETHE_ORION_ACTIVATE_SHA256_NORMALIZED@"
+#define LETHE_ORION_ACTIVATE_SHA256_NORMALIZED "@LETHE_ORION_ACTIVATE_SHA256_NORMALIZED@"
+#define LETHE_ORION_ACTIVATE_SHA256_MARKER \
+    "ORION_ACTIVATE_SHA256:@LETHE_ORION_ACTIVATE_SHA256_NORMALIZED@"

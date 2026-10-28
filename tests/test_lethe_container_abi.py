@@ -118,6 +118,10 @@ def test_header_flag_bits_match_container():
     assert _define_int(text, "LETHE_FLAG_MEMGUARD") == container.FLAG_MEMGUARD
     assert (_define_int(text, "LETHE_FLAG_PROCESS_HARDENING") ==
             container.FLAG_PROCESS_HARDENING)
+    assert (_define_int(text, "LETHE_FLAG_TAMPER_MONITOR") ==
+            container.FLAG_TAMPER_MONITOR)
+    assert (_define_int(text, "LETHE_FLAG_SERVER_SHARD_PIPE") ==
+            container.FLAG_SERVER_SHARD_PIPE)
 
 
 def test_header_hash_marker_matches_container():

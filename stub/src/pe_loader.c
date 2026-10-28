@@ -5,6 +5,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #include <intrin.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -59,6 +60,60 @@ static void pl_zero(void *p, size_t n)
 {
     volatile uint8_t *d = (volatile uint8_t *)p;
     for (size_t i = 0; i < n; i++) d[i] = 0;
+}
+
+/* Read exactly one broker-produced VSG3 frame from anonymous stdin:
+ *   "VSG3" | u16le protocol=3 | u16le length=32 | shard[32] | EOF
+ *
+ * No environment, command-line, disk, or cache fallback exists.  The broker
+ * writes and closes the pipe before creating the bootstrap, and the bootstrap
+ * forwards only this stdin handle, so requiring EOF prevents an attacker from
+ * appending/replacing a later record in the same launch.
+ */
+static int read_server_shard_pipe(uint8_t shard[32])
+{
+    uint8_t frame[40];
+    uint8_t extra = 0;
+    HANDLE pipe = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD total = 0;
+    DWORD read = 0;
+    int result = 1;
+
+    if (!shard || pipe == NULL || pipe == INVALID_HANDLE_VALUE ||
+        GetFileType(pipe) != FILE_TYPE_PIPE)
+        goto done;
+    while (total < sizeof(frame)) {
+        read = 0;
+        if (!ReadFile(pipe, frame + total, (DWORD)(sizeof(frame) - total),
+                      &read, NULL) || read == 0)
+            goto done;
+        total += read;
+    }
+    /* The write end is closed before process creation. If a byte remains, the
+     * protocol is malformed rather than a valid grant prefix. */
+    read = 0;
+    /* Anonymous-pipe EOF is reported as either a zero-byte successful read or
+     * ERROR_BROKEN_PIPE, depending on the Windows pipe implementation.  Both
+     * are the required closed-writer condition; anything else is malformed. */
+    if (!ReadFile(pipe, &extra, 1, &read, NULL)) {
+        if (GetLastError() != ERROR_BROKEN_PIPE)
+            goto done;
+    } else if (read != 0) {
+        goto done;
+    }
+    if (frame[0] != 'V' || frame[1] != 'S' || frame[2] != 'G' || frame[3] != '3'
+        || frame[4] != 3 || frame[5] != 0 || frame[6] != 32 || frame[7] != 0)
+        goto done;
+    for (DWORD i = 0; i < 32; ++i)
+        shard[i] = frame[8 + i];
+    result = 0;
+
+done:
+    pl_zero(frame, sizeof(frame));
+    extra = 0;
+    if (result != 0)
+        pl_zero(shard, 32);
+    return result;
 }
 
 static DWORD chars_to_prot(uint32_t c)
@@ -1075,7 +1130,28 @@ typedef struct TlsThreadState {
     uint32_t detach_delivered;
 } TlsThreadState;
 
+/* NtQueryInformationThread(ThreadBasicInformation) is used only to locate a
+ * sibling thread's already-reserved static TLS anchor.  Importing it through
+ * ntdll would expand the release import surface, so resolve the optional API
+ * at runtime and treat any query failure as a best-effort miss. */
+typedef struct LetheThreadBasicInformation {
+    LONG exit_status;
+    PVOID teb_base_address;
+    struct {
+        HANDLE unique_process;
+        HANDLE unique_thread;
+    } client_id;
+    ULONG_PTR affinity_mask;
+    LONG priority;
+    LONG base_priority;
+} LetheThreadBasicInformation;
+
+typedef LONG (NTAPI *LetheNtQueryInformationThreadFn)(
+    HANDLE thread, ULONG information_class, PVOID information,
+    ULONG information_length, PULONG return_length);
+
 #define TLS_THREAD_STATE_MAGIC 0x534C544Cu
+#define LETHE_TEB_THREAD_LOCAL_STORAGE_POINTER_OFFSET 0x58u
 
 static uint8_t            *s_tls_base = NULL;
 static ProtectedTlsRecipe *s_tls_recipe = NULL;
@@ -1107,6 +1183,19 @@ static TlsThreadState *tls_current_state(uint8_t *storage)
     return (TlsThreadState *)(void *)(storage + ORION_STUB_TLS_CAPACITY);
 }
 
+static void tls_copy_template_to_storage(uint8_t *storage,
+                                         ProtectedTlsRecipe *recipe)
+{
+    TlsThreadState *state;
+
+    pl_zero(storage, ORION_STUB_TLS_ALLOCATION_SIZE);
+    if (recipe->raw_size > 0)
+        __movsb(storage, tls_recipe_template(recipe), recipe->raw_size);
+    state = tls_current_state(storage);
+    state->magic = TLS_THREAD_STATE_MAGIC;
+    state->initialized = 1;
+}
+
 static int tls_initialize_current(void)
 {
     ProtectedTlsRecipe *recipe = s_tls_recipe;
@@ -1123,13 +1212,117 @@ static int tls_initialize_current(void)
     if (state->magic == TLS_THREAD_STATE_MAGIC && state->initialized)
         return 0;
 
-    pl_zero(storage, ORION_STUB_TLS_ALLOCATION_SIZE);
-    if (recipe->raw_size > 0)
-        __movsb(storage, tls_recipe_template(recipe), recipe->raw_size);
-    state = tls_current_state(storage);
-    state->magic = TLS_THREAD_STATE_MAGIC;
-    state->initialized = 1;
+    tls_copy_template_to_storage(storage, recipe);
     return 0;
+}
+
+/* Windows calls a DLL's TLS callback for future threads, but threads which
+ * existed before LoadLibrary receive only the zeroed static-TLS anchor.  The
+ * protected image's TLS template must still be visible to those threads: its
+ * code can be invoked immediately after the DLL is loaded.  Copy just the
+ * template and private state into every pre-existing anchor.  Deliberately do
+ * not synthesize DLL_THREAD_ATTACH callbacks for those threads; Windows does
+ * not deliver them, and user callbacks must never run on a foreign thread.
+ *
+ * This runs while the process is initializing the protected DLL.  It is
+ * best-effort: a thread that exits, is protected, or cannot be queried simply
+ * retains the OS-default zeroed anchor.  The current thread is already
+ * initialized by tls_initialize_current(). */
+static void tls_initialize_existing_threads(void)
+{
+    HANDLE snapshot = INVALID_HANDLE_VALUE;
+    HANDLE process = GetCurrentProcess();
+    HMODULE ntdll;
+    LetheNtQueryInformationThreadFn nt_query;
+    THREADENTRY32 entry;
+    const DWORD process_id = GetCurrentProcessId();
+    const DWORD current_thread_id = GetCurrentThreadId();
+    ProtectedTlsRecipe *recipe = s_tls_recipe;
+    uint8_t staged[ORION_STUB_TLS_ALLOCATION_SIZE];
+
+    if (!s_tls_active || !recipe ||
+        recipe->total_size > ORION_STUB_TLS_CAPACITY ||
+        s_tls_slot == TLS_OUT_OF_INDEXES)
+        return;
+
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return;
+    nt_query = (LetheNtQueryInformationThreadFn)(void *)GetProcAddress(
+        ntdll, "NtQueryInformationThread");
+    if (!nt_query)
+        return;
+
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return;
+
+    tls_copy_template_to_storage(staged, recipe);
+    pl_zero(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    if (!Thread32First(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    do {
+        HANDLE thread = NULL;
+        LetheThreadBasicInformation thread_info;
+        uintptr_t tls_array = 0;
+        uintptr_t storage = 0;
+        TlsThreadState existing_state;
+        SIZE_T transferred = 0;
+
+        if (entry.th32OwnerProcessID != process_id ||
+            entry.th32ThreadID == current_thread_id)
+            goto next_thread;
+
+        thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE,
+                            entry.th32ThreadID);
+        if (!thread)
+            goto next_thread;
+        pl_zero(&thread_info, sizeof(thread_info));
+        if (nt_query(thread, 0, &thread_info, sizeof(thread_info), NULL) != 0 ||
+            !thread_info.teb_base_address)
+            goto close_thread;
+
+        if (!ReadProcessMemory(process,
+                (const uint8_t *)thread_info.teb_base_address +
+                    LETHE_TEB_THREAD_LOCAL_STORAGE_POINTER_OFFSET,
+                &tls_array, sizeof(tls_array), &transferred) ||
+            transferred != sizeof(tls_array) || !tls_array)
+            goto close_thread;
+        transferred = 0;
+        if (!ReadProcessMemory(process,
+                (const void *)(tls_array + (uintptr_t)s_tls_slot *
+                    sizeof(void *)),
+                &storage, sizeof(storage), &transferred) ||
+            transferred != sizeof(storage) || !storage)
+            goto close_thread;
+
+        /* Do not clobber a thread that has already received a normal anchor
+         * dispatch while this snapshot is being processed. */
+        transferred = 0;
+        if (ReadProcessMemory(process,
+                (const uint8_t *)storage + ORION_STUB_TLS_CAPACITY,
+                &existing_state, sizeof(existing_state), &transferred) &&
+            transferred == sizeof(existing_state) &&
+            existing_state.magic == TLS_THREAD_STATE_MAGIC &&
+            existing_state.initialized)
+            goto close_thread;
+
+        transferred = 0;
+        (void)WriteProcessMemory(process, (void *)storage, staged,
+                                 sizeof(staged), &transferred);
+
+close_thread:
+        CloseHandle(thread);
+next_thread:
+        entry.dwSize = sizeof(entry);
+    } while (Thread32Next(snapshot, &entry));
+
+    pl_zero(staged, sizeof(staged));
+    CloseHandle(snapshot);
 }
 
 static void tls_invoke_callbacks(DWORD reason)
@@ -1176,6 +1369,7 @@ static int tls_process_attach(void)
     if (tls_initialize_current() != 0)
         return 1;
     s_tls_process_attached = 1;
+    tls_initialize_existing_threads();
     tls_invoke_callbacks(DLL_PROCESS_ATTACH);
     return 0;
 }
@@ -1435,7 +1629,8 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
                        LETHE_FLAG_PAGED_DVM | LETHE_FLAG_LOAD_CONFIG |
                        LETHE_FLAG_DLL_PRELOAD_IAT |
                        LETHE_FLAG_PROCESS_HARDENING |
-                       LETHE_FLAG_TAMPER_MONITOR))
+                       LETHE_FLAG_TAMPER_MONITOR |
+                       LETHE_FLAG_SERVER_SHARD_PIPE))
         return 1;
     if (!!(cpi->flags & LETHE_FLAG_DLL_PRELOAD_IAT) != !!cpi->is_dll)
         return 1;
@@ -1471,20 +1666,19 @@ int pe_loader_run(void *image_base, volatile PackInfo *pi, void **out_oep)
     if (crypto_derive_key(cpi, image_base, key))
         return 1;
 
-    /* Server shard gate: the launcher passes a 32-byte shard (hex-encoded,
-       64 hex chars) via the NV_RT_GATE environment variable. The builder XOR'd
-       this shard 1:1 into aes_key_enc at pack time, so without it the derived
-       key is wrong and every GCM auth check will fail. If the env var is absent
-       the key stays as-is. */
-    {
-        /* Shard fetch/hex-decode/XOR/wipe/unset now lives in Daedalus VM bytecode
-           (DVM_PROG_SHARD_XOR); the VM performs the GetEnvironmentVariableA,
-           hex decode, in-place key XOR, SetEnvironmentVariableA(NULL) and local
-           wipe via native ops. See daedalus_programs.h. */
-        uint64_t shard_args[1];
-        shard_args[0] = (uint64_t)(uintptr_t)key;
-        daedalus_vm_exec(DVM_PROG_SHARD_XOR, DVM_PROG_SHARD_XOR_SIZE,
-                       shard_args, 1);
+    /* Server-shard V3: only a server-sharded PackInfo requires the broker's
+       fixed-size VSG3 stdin frame. Missing, wrong-version, trailing, or non-pipe
+       input fails before any payload decryption; ordinary Lethe builds remain
+       independent of the Venice broker. */
+    if (cpi->flags & LETHE_FLAG_SERVER_SHARD_PIPE) {
+        uint8_t shard[32];
+        if (read_server_shard_pipe(shard) != 0) {
+            pl_zero(shard, sizeof(shard));
+            return 1;
+        }
+        for (size_t shard_index = 0; shard_index < sizeof(key); ++shard_index)
+            key[shard_index] ^= shard[shard_index];
+        pl_zero(shard, sizeof(shard));
     }
 
     /* Scatter the key across random pages and zero the contiguous copy. */

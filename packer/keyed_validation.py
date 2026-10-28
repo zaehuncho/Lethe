@@ -223,8 +223,16 @@ def validate_staged_output(
 
         expected_sections = _artifact_sections(artifacts)
         expected_meta = artifacts.metadata
+        expected_flags = int(artifacts.flags)
+        if server_shard is not None:
+            expected_flags |= container.FLAG_SERVER_SHARD_PIPE
+        else:
+            # A caller that claims an ordinary build must not accidentally
+            # validate a broker-only artifact whose launch contract differs.
+            _require(not (info.flags & container.FLAG_SERVER_SHARD_PIPE),
+                     "staged output unexpectedly requires a server shard pipe")
         scalar_pairs = (
-            (info.flags, int(artifacts.flags), "flags"),
+            (info.flags, expected_flags, "flags"),
             (info.section_count, len(expected_sections), "section count"),
             (info.oep_rva, int(artifacts.oep_rva), "entry point"),
             (info.is_dll, int(artifacts.is_dll), "image type"),

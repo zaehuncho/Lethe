@@ -442,7 +442,16 @@ finally {
     }
 }
 
-$stubHash = (Get-FileHash -LiteralPath $StubPath -Algorithm SHA256).Hash.ToLowerInvariant()
+# Some release shells expose only the core PowerShell cmdlets.  Use the .NET
+# implementation directly so qualification evidence never depends on an
+# optional shell module being present.
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $stubHashBytes = $sha256.ComputeHash([System.IO.File]::ReadAllBytes($StubPath))
+} finally {
+    $sha256.Dispose()
+}
+$stubHash = -join ($stubHashBytes | ForEach-Object { $_.ToString('x2') })
 Write-Host 'Collecting source provenance...'
 $commit = (& git -C $Root rev-parse HEAD 2>$null).Trim()
 $dirty = [bool]((& git -C $Root status --porcelain --untracked-files=no 2>$null) |
@@ -450,6 +459,7 @@ $dirty = [bool]((& git -C $Root status --porcelain --untracked-files=no 2>$null)
 $passed = @($script:Results | Where-Object { $_.status -eq 'passed' }).Count
 $evidence = [pscustomobject][ordered]@{
     schema = 1
+    scope = 'exe'
     source_commit = $commit
     tracked_source_dirty = $dirty
     stub_path = $StubPath

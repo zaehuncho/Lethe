@@ -816,6 +816,11 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
                                                          default=False)))
     flags = int(_get(artifacts, "flags", default=0))
     server_shard_requested = bool(options and getattr(options, "server_shard", False))
+    if server_shard_requested:
+        # The packed stub must fail closed unless a verified broker forwards a
+        # one-use VSG3 frame on stdin.  Keep ordinary/non-shard Lethe outputs
+        # launchable without a broker by making this an explicit PackInfo bit.
+        flags |= container.FLAG_SERVER_SHARD_PIPE
     _require_experimental_runtime_paths(
         is_dll=is_dll, server_shard=server_shard_requested)
 
@@ -1004,8 +1009,8 @@ def build_output_pe(parsed, artifacts, output_path: str, *,
     aes_key_enc = bytes(a ^ b for a, b in zip(raw_key, mask))
 
     # Server shard gate (Tier 3): XOR a random 32-byte shard into aes_key_enc.
-    # The stub reads the 64-char hex shard from the NV_RT_GATE env var. Without
-    # the shard the key is wrong and every GCM auth fails — hard online gate.
+    # The stub reads one 32-byte shard only from the broker's VSG3 stdin frame.
+    # Without it the key is wrong and startup fails — hard online gate.
     server_shard = None
     if server_shard_requested:
         server_shard = os.urandom(32)
