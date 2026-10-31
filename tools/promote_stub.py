@@ -538,7 +538,7 @@ def execute(args: argparse.Namespace) -> Path | None:
             f"-DPython3_EXECUTABLE={host['python']}",
             f"-DDVM_SHUFFLE_SEED={shuffle_seed}",
             "-DCMAKE_C_FLAGS=/W4 /WX /Brepro",
-            "-DCMAKE_C_FLAGS_RELEASE=/O2 /Brepro",
+            "-DCMAKE_C_FLAGS_RELEASE=/O2 /DNDEBUG /Brepro",
             "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/Brepro",
             "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/Brepro",
         ],
