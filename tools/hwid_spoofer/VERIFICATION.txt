@@ -1,0 +1,51 @@
+HWID SPOOFER VERIFICATION
+Changed branch/field: WindowsBackend + spoof()/restore() mutate HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid and the selected NIC class key's NetworkAddress; Restart-NetAdapter applies the NIC setting. Baseline only inspects these identifiers. Self-tests use FakeBackend, so tests did not change host IDs.
+MODIFIED_FILE: tools/hwid_spoofer/HWID_SPOOFER.py
+DIFF_FILE: tools/hwid_spoofer/DIFF_FILE.patch
+VERIFICATION.txt: tools/hwid_spoofer/VERIFICATION.txt
+ROLLBACK.sh: tools/hwid_spoofer/ROLLBACK.sh
+Original baseline: tools/hwid_spoofer/BASELINE.py
+Rollback test copy: tools/hwid_spoofer/ROLLBACK_TEST_COPY.py
+Original SHA256: D90FEC38940BDAE1E62EB00F1D485452C9F9ADFBBF02F71CCEBFDA0CDF271940
+Modified SHA256: 66486B76CE45CE81FF901DDEB9DF9CA31E2D64145B50EBE01CF5D65BF6838793
+
+BASELINE
+Command (PowerShell, cwd <repo-root>):
+$o = python 'tools\hwid_spoofer\BASELINE.py' inspect | ConvertFrom-Json; $ec=$LASTEXITCODE; "BASELINE MachineGuidPresent=$([bool]$o.MachineGuid); AdapterCount=$(@($o.adapters).Count)"; exit $ec
+Input: current Windows registry and Get-NetAdapter inventory; output redacts the identifier itself.
+Literal result: BASELINE MachineGuidPresent=True; AdapterCount=5
+Exit status: 0
+
+MODIFIED
+Command (PowerShell, cwd <repo-root>):
+python 'tools\hwid_spoofer\HWID_SPOOFER.py' selftest; exit $LASTEXITCODE
+Input: FakeBackend with original MachineGuid 11111111-1111-4111-8111-111111111111 and no NetworkAddress; replacement MachineGuid 22222222-2222-4222-8222-222222222222 and MAC 02:11:22:33:44:55.
+Literal result:
+test_existing_backup_is_preserved (__main__.SelfTests.test_existing_backup_is_preserved) ... ok
+test_failure_rolls_back (__main__.SelfTests.test_failure_rolls_back) ... ok
+test_normalization (__main__.SelfTests.test_normalization) ... ok
+test_spoof_and_restore (__main__.SelfTests.test_spoof_and_restore) ... ok
+----------------------------------------------------------------------
+Ran 4 tests in 0.025s
+OK
+Exit status: 0
+
+ROLLBACK
+Command (PowerShell, cwd <repo-root>):
+Copy-Item -LiteralPath 'tools\hwid_spoofer\HWID_SPOOFER.py' -Destination 'tools\hwid_spoofer\ROLLBACK_TEST_COPY.py' -Force; & 'bash.exe' -lc 'cd <repo-root> && chmod +x tools/hwid_spoofer/ROLLBACK.sh && tools/hwid_spoofer/ROLLBACK.sh tools/hwid_spoofer/ROLLBACK_TEST_COPY.py'; $ec=$LASTEXITCODE; "ROLLBACK Exit=$ec"; "RestoredCopyMatchesBaseline=$((Get-FileHash 'tools\hwid_spoofer\ROLLBACK_TEST_COPY.py').Hash -eq (Get-FileHash 'tools\hwid_spoofer\BASELINE.py').Hash)"; "ModifiedFileStillChanged=$((Get-FileHash 'tools\hwid_spoofer\HWID_SPOOFER.py').Hash -ne (Get-FileHash 'tools\hwid_spoofer\BASELINE.py').Hash)"; exit $ec
+Input: separate copy of modified file, SHA256 66486B76CE45CE81FF901DDEB9DF9CA31E2D64145B50EBE01CF5D65BF6838793.
+Literal result:
+ROLLED_BACK baseline_sha256=d90fec38940bdae1e62eb00f1d485452c9f9adfbbf02f71ccebfda0cdf271940
+ROLLBACK Exit=0
+RestoredCopyMatchesBaseline=True
+ModifiedFileStillChanged=True
+Exit status: 0
+
+RESTORED BEHAVIOR
+Command (PowerShell, cwd <repo-root>):
+$o = python 'tools\hwid_spoofer\ROLLBACK_TEST_COPY.py' inspect | ConvertFrom-Json; $ec=$LASTEXITCODE; "RESTORED MachineGuidPresent=$([bool]$o.MachineGuid); AdapterCount=$(@($o.adapters).Count)"; exit $ec
+Input: rolled-back test copy and current Windows inventory.
+Literal result: RESTORED MachineGuidPresent=True; AdapterCount=5
+Exit status: 0
+
+The tool's spoof/restore branches have not been run against the host. Run spoof from an elevated terminal with an explicit backup path, then reboot. Run restore using that backup, then reboot. The program verifies the applied MAC and preserves originals for reversal. SMBIOS, firmware UUIDs, and physical disk serials are not changed.

@@ -31,6 +31,7 @@ challenge.json
 
 # Build outputs (CMake, Nuitka, MSVC, regenerable sample fixtures under */build/)
 build/
+build_diag/
 *.log
 *.obj
 *.ilk
@@ -42,3 +43,6 @@ build/
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# Claude Code local worktrees / session state
+.claude/
