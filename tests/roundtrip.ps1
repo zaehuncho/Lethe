@@ -107,7 +107,6 @@ function Invoke-Captured {
     try {
         $procArgs = @{
             FilePath               = $FilePath
-            Wait                   = $true
             NoNewWindow            = $true
             PassThru               = $true
             RedirectStandardOutput = $stdoutFile
@@ -116,7 +115,13 @@ function Invoke-Captured {
         if ($Arguments.Count -gt 0) {
             $procArgs['ArgumentList'] = $Arguments
         }
+        # Do not use -Wait: with -Wait -PassThru the returned object can drop the
+        # process handle and report a $null ExitCode (a PowerShell quirk that made
+        # this harness intermittently flag a passing run as a mismatch). Cache the
+        # handle, then WaitForExit, so ExitCode is always populated.
         $proc = Start-Process @procArgs
+        $null = $proc.Handle
+        $proc.WaitForExit()
         $stdout = Get-Content -Path $stdoutFile -Raw -ErrorAction SilentlyContinue
         $stderr = Get-Content -Path $stderrFile -Raw -ErrorAction SilentlyContinue
         if ($stdout -eq $null) { $stdout = '' }
